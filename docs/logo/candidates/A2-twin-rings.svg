@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 候选 A2 · 双环（交叠更收敛） -->
+  <g fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round">
+    <circle cx="186" cy="256" r="104" />
+    <circle cx="326" cy="256" r="104" />
+  </g>
+</svg>

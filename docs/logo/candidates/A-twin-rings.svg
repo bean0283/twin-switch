@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 候选 A · 双环（∞）：两个客户端，彼此连通 -->
+  <g fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round">
+    <circle cx="196" cy="256" r="106" />
+    <circle cx="316" cy="256" r="106" />
+  </g>
+</svg>

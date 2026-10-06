@@ -1,0 +1,416 @@
+//! 首页「本机概览」：把分散在 Trae / WorkBuddy 两侧的状态汇总成一份快照。
+//!
+//! **只读**：本模块只做统计，不写任何客户端数据、不触发解密、不发起网络请求。
+//! 需要联网的东西（积分）走 [`crate::modules::workbuddy_credits::cached`]，只读缓存；
+//! 需要遍历磁盘的东西（可回收空间）由前端另行调用两边的 `*_cleanup_scan` 并行拉取。
+//!
+//! 之所以把这两块拆出去，是因为首页必须**秒开**：
+//! - 解密快照可能有 300 MB 量级，`list_sessions` 在 WAL 变动时会复制整份快照；
+//! - 清理扫描要递归统计几 GB 目录；
+//! - 进程枚举（WMI）本身也要几百毫秒到数秒。
+//!
+//! 因此这里 Trae 的会话数直接读**快照元信息里 `chat_session` 表的行数**（文件级读取，毫秒级），
+//! 并附上 `current` 标记说明这个数字是否仍然等于实时库。
+//!
+//! ## 磁盘缓存（首屏加速）
+//!
+//! 即便做了上面的裁剪，全量 [`snapshot`] 仍然要跑进程枚举 + SQLite 统计，冷启动可能几百毫秒到数秒。
+//! 所以把它整体落盘到 `~/.twin-switch/cache/overview.json`：
+//!
+//! - [`cached`]：**只读文件**，毫秒级返回上次的结果 + `ageMs`，前端拿到先渲染，页面立刻可操作；
+//! - [`snapshot`]：算完之后**立刻写回缓存**，下次启动就是热的；
+//! - [`save_reclaim`]：把前端并行扫出来的可回收空间一起并进缓存（下次连扫描结果也是热的）。
+//!
+//! 缓存是纯派生数据，随时可以删；删了只是回到「首屏要等一下」。
+
+use serde_json::{json, Value};
+use std::path::Path;
+
+use crate::modules::{
+    config, trae_discover, trae_export, trae_switch, trae_vault, workbuddy_accounts, workbuddy_auth,
+    workbuddy_credits, workbuddy_source, workbuddy_switch, workbuddy_vault,
+};
+
+/// Trae 会话表名（会话列表就是它）。
+const TRAE_SESSION_TABLE: &str = "chat_session";
+
+/// 缓存文件名（落在 `config::cache_dir()` 下）。
+const CACHE_NAME: &str = "overview.json";
+
+/// 缓存结构版本。字段一改就 +1，旧缓存直接当作不存在，避免前端读到半新半旧的对象。
+const CACHE_VERSION: u64 = 1;
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Trae 侧
+// ---------------------------------------------------------------------------
+
+fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
+    let Some(client) = trae_discover::get_client(c.key) else {
+        return json!({ "key": c.key, "label": c.label, "installed": false });
+    };
+    let processes = trae_switch::list_processes(client);
+    let accounts = trae_vault::list_vault_accounts(c.key);
+
+    let snap = trae_export::decrypted_db_path(c.key);
+    let snap_exists = snap.is_file();
+    let meta = trae_export::read_snapshot_meta(c.key);
+    let current = match (&meta, snap_exists) {
+        (Some(m), true) => trae_export::snapshot_is_current(c.key, &snap, m),
+        _ => false,
+    };
+    // 会话数取快照元信息，避免为了首页去复制整份快照。
+    let session_count = meta
+        .as_ref()
+        .and_then(|m| m.tables.iter().find(|t| t.name == TRAE_SESSION_TABLE))
+        .map(|t| t.count);
+
+    json!({
+        "key": c.key,
+        "label": c.label,
+        "installed": c.installed,
+        "exe": c.exe,
+        "userDataDir": c.user_data_dir,
+        "hasLogin": c.has_login,
+        "running": !processes.is_empty(),
+        "processCount": processes.len(),
+        "accounts": accounts.len(),
+        "decrypted": {
+            "exists": snap_exists,
+            "current": current,
+            "path": snap.to_string_lossy(),
+            "pages": meta.as_ref().map(|m| m.pages).unwrap_or(0),
+            "tableCount": meta.as_ref().map(|m| m.tables.len()).unwrap_or(0),
+            "createdMs": meta.as_ref().map(|m| m.created_ms).unwrap_or(0),
+            "sessionCount": session_count,
+            "dbBytes": file_len(&snap),
+        },
+    })
+}
+
+fn trae_overview() -> Value {
+    let clients: Vec<Value> = trae_discover::list_installed_clients()
+        .iter()
+        .filter(|c| c.installed)
+        .map(trae_client_overview)
+        .collect();
+    let account_total: u64 = clients
+        .iter()
+        .filter_map(|c| c["accounts"].as_u64())
+        .sum();
+    let running = clients.iter().filter(|c| c["running"] == json!(true)).count();
+    let session_total: u64 = clients
+        .iter()
+        .filter_map(|c| c["decrypted"]["sessionCount"].as_u64())
+        .sum();
+    let any_decrypted = clients
+        .iter()
+        .any(|c| c["decrypted"]["exists"] == json!(true));
+
+    json!({
+        "clients": clients,
+        "installedClients": clients.len(),
+        "runningClients": running,
+        "accountTotal": account_total,
+        "sessionTotal": session_total,
+        "anyDecrypted": any_decrypted,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// WorkBuddy 侧
+// ---------------------------------------------------------------------------
+
+fn workbuddy_overview() -> Value {
+    let processes = workbuddy_switch::list_processes();
+    let exe = workbuddy_switch::resolve_exe().map(|p| p.to_string_lossy().into_owned());
+    let auth_path = workbuddy_auth::auth_file_path();
+    let logged_in = workbuddy_auth::is_logged_in();
+    let current_uid = workbuddy_auth::current_uid().unwrap_or_default();
+
+    let vault = workbuddy_vault::load_accounts();
+    let accounts: Vec<Value> = vault
+        .iter()
+        .map(|a| {
+            let uid = workbuddy_auth::get_str(a, "uid").unwrap_or_default();
+            let name = workbuddy_vault::display_name(a);
+            let token_state = match a.get("access_token") {
+                Some(Value::Object(_)) => "envelope",
+                Some(Value::String(s)) if !s.trim().is_empty() => "plain",
+                _ => "missing",
+            };
+            json!({
+                "id": workbuddy_vault::account_id(a),
+                "uid": uid,
+                "name": name,
+                "tokenState": token_state,
+                // 只有明文凭据才查得了积分 / 官方用量
+                "queryable": token_state == "plain",
+                "isCurrent": !current_uid.is_empty() && uid == current_uid,
+                "lastUsedAt": a.get("lastUsedAt"),
+            })
+        })
+        .collect();
+    let queryable = accounts
+        .iter()
+        .filter(|a| a["queryable"] == json!(true))
+        .count();
+
+    let db = workbuddy_auth::workbuddy_db_path();
+    let (live, deleted_titles) = match workbuddy_source::list_sessions() {
+        Ok(list) => {
+            let total = list.len();
+            let dead = list.iter().filter(|s| s.deleted).count();
+            (Some(total - dead), Some(dead))
+        }
+        Err(_) => (None, None),
+    };
+    let projects = workbuddy_auth::projects_dir();
+    let jsonl_files = count_jsonl(&projects);
+
+    json!({
+        "running": !processes.is_empty(),
+        "processCount": processes.len(),
+        "processes": processes.iter().map(|(n, p)| json!({"name": n, "pid": p})).collect::<Vec<_>>(),
+        "exe": exe,
+        "loggedIn": logged_in,
+        "currentUid": current_uid,
+        "currentLabel": if current_uid.is_empty() {
+            Value::Null
+        } else {
+            json!(workbuddy_accounts::label_for(&current_uid))
+        },
+        "authFilePath": auth_path.to_string_lossy(),
+        "authFileExists": auth_path.is_file(),
+        "authFileBytes": file_len(&auth_path),
+        "accounts": accounts,
+        "accountCount": accounts.len(),
+        "queryableCount": queryable,
+        "sessionCount": live,
+        "deletedSessionCount": deleted_titles,
+        "bodyFileCount": jsonl_files,
+        "dbPath": db.to_string_lossy(),
+        "dbBytes": file_len(&db),
+        "dbExists": db.is_file(),
+        "lastSwitch": workbuddy_switch::last_switch(),
+    })
+}
+
+/// 统计 `projects/` 下 `.jsonl` 文件数（会话正文）。
+fn count_jsonl(root: &Path) -> u64 {
+    fn walk(dir: &Path, depth: u32) -> u64 {
+        if depth > 3 {
+            return 0;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut n = 0;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += walk(&p, depth + 1);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                n += 1;
+            }
+        }
+        n
+    }
+    walk(root, 0)
+}
+
+// ---------------------------------------------------------------------------
+// 磁盘缓存
+// ---------------------------------------------------------------------------
+
+/// 把 `{version, generatedAt, snapshot, reclaim}` 组装成缓存文档。
+///
+/// 纯函数，便于单测；真正落盘的是 [`snapshot`] / [`save_reclaim`]。
+/// `reclaim` 由调用方显式传入（两次调用分别保留旧值 / 写入新值）。
+fn build_cache_doc(snapshot: &Value, reclaim: Value) -> Value {
+    json!({
+        "version": CACHE_VERSION,
+        "generatedAt": snapshot.get("generatedAt").cloned().unwrap_or(json!(config::now_ms())),
+        "snapshot": snapshot,
+        "reclaim": reclaim,
+    })
+}
+
+/// 读磁盘缓存（**只读文件，不重算**）。
+///
+/// 返回 `{ok, empty, generatedAt, ageMs, snapshot, reclaim}`。
+/// 没有缓存 / 版本不符 / 文件损坏都返回 `empty = true`，调用方据此回落到实时计算。
+pub fn cached() -> Value {
+    let doc = config::read_cache_json(CACHE_NAME);
+    let fresh = doc
+        .as_ref()
+        .filter(|d| d.get("version").and_then(Value::as_u64) == Some(CACHE_VERSION))
+        .filter(|d| d.get("snapshot").map(Value::is_object).unwrap_or(false));
+
+    let Some(doc) = fresh else {
+        return json!({
+            "ok": true,
+            "empty": true,
+            "generatedAt": Value::Null,
+            "ageMs": Value::Null,
+            "snapshot": Value::Null,
+            "reclaim": Value::Null,
+        });
+    };
+
+    let at = doc["generatedAt"].as_i64().unwrap_or(0);
+    json!({
+        "ok": true,
+        "empty": false,
+        "generatedAt": at,
+        "ageMs": (config::now_ms() - at).max(0),
+        "snapshot": doc["snapshot"].clone(),
+        "reclaim": doc.get("reclaim").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// 从旧缓存里取一个字段（文件缺失 / 版本不符 / 字段不存在都返回 `Null`）。
+fn prev_field(key: &str) -> Value {
+    config::read_cache_json(CACHE_NAME)
+        .filter(|d| d.get("version").and_then(Value::as_u64) == Some(CACHE_VERSION))
+        .and_then(|d| d.get(key).cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// 把前端并行扫出的可回收空间并进缓存（下次首屏连这块也是热的）。
+pub fn save_reclaim(trae_bytes: u64, wb_bytes: u64) -> Value {
+    let snapshot = prev_field("snapshot");
+    let reclaim = json!({
+        "traeBytes": trae_bytes,
+        "wbBytes": wb_bytes,
+        "totalBytes": trae_bytes.saturating_add(wb_bytes),
+        "at": config::now_ms(),
+    });
+    config::write_cache_json(CACHE_NAME, &build_cache_doc(&snapshot, reclaim.clone()));
+    reclaim
+}
+
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+
+/// 本机总览快照。
+///
+/// 全部同步、纯统计；不触发解密、不联网。积分只读缓存。
+/// 算完**立刻写回磁盘缓存**（`~/.twin-switch/cache/overview.json`），下次启动直接热启。
+pub fn snapshot() -> Value {
+    let trae = trae_overview();
+    let workbuddy = workbuddy_overview();
+    let credits = workbuddy_credits::cached();
+
+    let mut notes: Vec<String> = Vec::new();
+    if workbuddy["accountCount"].as_u64().unwrap_or(0) > 0
+        && workbuddy["queryableCount"].as_u64().unwrap_or(0) == 0
+    {
+        notes.push(
+            "WorkBuddy 账号库里没有明文凭据账号，积分查询不可用；\
+             用「发起网页登录」扫码添加可获得明文凭据"
+                .to_string(),
+        );
+    }
+    if trae["installedClients"].as_u64().unwrap_or(0) > 0 && trae["anyDecrypted"] != json!(true) {
+        notes.push("Trae 还没有解密快照，会话记录需要先到「Trae 会话记录」页执行一次解密".to_string());
+    }
+    if workbuddy["dbExists"] != json!(true) {
+        notes.push("没有找到 WorkBuddy 会话库（~/.workbuddy/workbuddy.db）".to_string());
+    }
+
+    let out = json!({
+        "ok": true,
+        "generatedAt": config::now_ms(),
+        "trae": trae,
+        "workbuddy": workbuddy,
+        "credits": credits,
+        "notes": notes,
+    });
+
+    // 写回缓存：保留上一份的可回收空间（它是前端另一条腿扫出来的，这次没重算）。
+    config::write_cache_json(
+        CACHE_NAME,
+        &build_cache_doc(&out, prev_field("reclaim")),
+    );
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_is_read_only_and_shaped() {
+        let v = snapshot();
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["generatedAt"].as_i64().unwrap() > 0);
+        // 三个大块必须在
+        for key in ["trae", "workbuddy", "credits"] {
+            assert!(v.get(key).is_some(), "缺少 {key}");
+        }
+        assert!(v["trae"]["clients"].is_array());
+        assert!(v["workbuddy"]["accounts"].is_array());
+        // 积分只读缓存：首次调用不该有已经查好的账号
+        assert!(v["credits"]["accounts"].is_array());
+        // notes 永远是数组（前端直接 map）
+        assert!(v["notes"].is_array());
+    }
+
+    #[test]
+    fn workbuddy_block_reports_client_state() {
+        let v = workbuddy_overview();
+        // 进程 / 登录态都是布尔，不能是 null
+        assert!(v["running"].is_boolean());
+        assert!(v["loggedIn"].is_boolean());
+        assert!(v["dbBytes"].is_number());
+        // 账号条目字段齐备
+        for a in v["accounts"].as_array().unwrap() {
+            for key in ["id", "uid", "name", "tokenState", "queryable"] {
+                assert!(a.get(key).is_some(), "账号条目缺少 {key}");
+            }
+            assert!(a["queryable"].is_boolean());
+            // 绝不下发凭据
+            assert!(a.get("access_token").is_none());
+            assert!(a.get("refresh_token").is_none());
+        }
+    }
+
+    #[test]
+    fn count_jsonl_handles_missing_dir() {
+        assert_eq!(count_jsonl(&std::path::PathBuf::from("Z:/definitely/missing")), 0);
+    }
+
+    #[test]
+    fn cache_doc_keeps_reclaim_and_carries_version() {
+        let snap = json!({ "ok": true, "generatedAt": 1234, "notes": [] });
+        let reclaim = json!({ "traeBytes": 10, "wbBytes": 5, "totalBytes": 15, "at": 1 });
+        let doc = build_cache_doc(&snap, reclaim.clone());
+        assert_eq!(doc["version"], json!(CACHE_VERSION));
+        assert_eq!(doc["generatedAt"], json!(1234)); // 用快照自己的时间，不是 now
+        assert_eq!(doc["snapshot"], snap);
+        assert_eq!(doc["reclaim"], reclaim);
+        // 没有快照时不 panic，generatedAt 回落到当前时间
+        let doc2 = build_cache_doc(&Value::Null, Value::Null);
+        assert!(doc2["generatedAt"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn cached_is_always_an_object_and_never_panics() {
+        // 本机可能压根没写过缓存 —— 两种情况下形状都必须一致，前端才不会踩空。
+        let v = cached();
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["empty"].is_boolean());
+        assert!(v.get("snapshot").is_some());
+        assert!(v.get("reclaim").is_some());
+        if v["empty"] == json!(false) {
+            assert!(v["snapshot"].is_object());
+            assert!(v["ageMs"].as_i64().unwrap() >= 0);
+        }
+    }
+}

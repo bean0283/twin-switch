@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 候选 B · 双箭头互换（⇄）：直接表达「切换 / 迁移」 -->
+  <g fill="#111827">
+    <!-- 上：向右 -->
+    <rect x="118" y="166" width="234" height="40" rx="20" />
+    <path d="M 344 136 L 424 186 L 344 236 Z" />
+    <!-- 下：向左 -->
+    <rect x="160" y="306" width="234" height="40" rx="20" />
+    <path d="M 168 276 L 88 326 L 168 376 Z" />
+  </g>
+</svg>
