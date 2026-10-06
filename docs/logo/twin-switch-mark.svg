@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <!--
+    TwinSwitch · 双栖 —— 标记母版（512 画布，纯描边，不写死颜色）。
+    stroke="currentColor" 让它可以随容器文字颜色走，一套资产同时适配明暗主题。
+  -->
+  <g stroke="currentColor" stroke-width="42" stroke-linecap="round">
+    <circle cx="186" cy="256" r="104" />
+    <circle cx="326" cy="256" r="104" />
+  </g>
+</svg>

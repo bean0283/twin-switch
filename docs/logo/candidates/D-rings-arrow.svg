@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 候选 D · 双环 + 断口箭头：两个客户端，且中间有东西在「切换」 -->
+  <g fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round">
+    <circle cx="196" cy="256" r="106" />
+  </g>
+  <!-- 右环：在右上留一个断口，断口末端是一个箭头 -->
+  <g fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round">
+    <path d="M 352 164 A 106 106 0 1 1 316 362" />
+  </g>
+  <g fill="#111827">
+    <path d="M 300 116 L 396 122 L 340 200 Z" />
+  </g>
+</svg>

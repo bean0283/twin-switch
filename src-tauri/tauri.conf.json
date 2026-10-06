@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TwinSwitch",
+  "version": "0.2.0",
+  "identifier": "com.twinswitch.cn",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "TwinSwitch · Trae / WorkBuddy 管理台",
+        "width": 1000,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 30
+        },
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDMDQyRTAyRjlEQUI4QzEKUldUQnVOcjVBaTRFN0l1cGFIakg2TlVOWUk1RXRqWWJLK0RtL3pJOTkvK1VBRVNBeGFoSWVLbXcK",
+      "endpoints": [
+        "https://github.com/bean0283/twin-switch/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

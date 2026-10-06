@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- 候选 C · S 回路 + 双点：Switch 的 S，两端各一个「栖位」 -->
+  <g fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 356 132 A 92 92 0 0 0 264 224 A 92 92 0 0 1 172 316" />
+  </g>
+  <g fill="#111827">
+    <circle cx="356" cy="132" r="34" />
+    <circle cx="172" cy="316" r="34" />
+  </g>
+</svg>

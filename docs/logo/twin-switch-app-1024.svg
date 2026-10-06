@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    TwinSwitch · 双栖 —— 应用图标母版（1024 画布）。
+    石墨黑圆角方块 + 反白线条，单色、无渐变；16px 任务栏尺寸下仍可辨识。
+    留 52px 透明外边距，兼容 macOS 图标需要呼吸感的惯例。
+  -->
+  <rect x="52" y="52" width="920" height="920" rx="200" fill="#18181B" />
+  <g stroke="#FAFAFA" stroke-width="56" stroke-linecap="round" fill="none">
+    <circle cx="405" cy="512" r="158" />
+    <circle cx="619" cy="512" r="158" />
+  </g>
+</svg>
