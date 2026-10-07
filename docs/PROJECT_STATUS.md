@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-07 / **v0.2.11**）
+> 分析时间：2026-10-04（最近更新：2026-10-07 / **v0.2.11 已发布**）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -29,13 +29,13 @@
 | 项 | 值 |
 | --- | --- |
 | 产物名 | **TwinSwitch**（v0.0.24 起；Rust 包名仍为 `wb-switch-rust` / `wb-switch-core`） |
-| 仓库 | https://github.com/bean0283/twin-switch（**主项目** ✅ 公开，单一根提交 `4f7e00b`「首次提交」；`v0.1.0` / `v0.2.0` 两个 tag 均指向它）· 旧仓库 https://github.com/bean0283/trae-switch-cn（**保持原样不动**，停在 v0.0.3；用户明确决定**不归档**，仍可提交/开 issue） |
+| 仓库 | https://github.com/bean0283/twin-switch（**主项目** ✅ 公开；根提交 `f15b053`「首次提交」= **v0.2.0** 的代码，其上 `7970e97` = **v0.2.11**；tag `v0.1.0` / `v0.2.0` → `f15b053`，tag `v0.2.11` → `7970e97`）· 旧仓库 https://github.com/bean0283/trae-switch-cn（**保持原样不动**，停在 v0.0.3；用户明确决定**不归档**，仍可提交/开 issue） |
 | 技术栈 | Tauri 2（Rust）+ React 19 + TypeScript + Vite + Tailwind/Radix |
 | 核心逻辑位置 | `crates/wb-switch-core/src/modules/`（31 个模块，约 13k 行，纯 Rust、不依赖 Tauri） |
 | 前端 | `src/main.tsx`（**启动编排**：先 `primeOverview()` 读磁盘缓存 → 挂载 → 后台 `refreshOverview()`）· `src/pages/HomePage.tsx`（侧栏「首页」·本机概览仪表盘，数据走 `src/lib/overview-store.ts` 的进程内单例）、`src/pages/TraeSwitchPage.tsx` 与 `src/pages/TraeRecordsPage.tsx`（侧栏「Trae」区的账号管理与会话记录）、`src/pages/WorkbuddyImportPage.tsx` 与 `src/pages/WorkbuddyExportPage.tsx`（侧栏「数据迁移」区的双向会话迁移）、`src/pages/WorkbuddyCleanupPage.tsx` 与 `src/pages/TraeCleanupPage.tsx`（侧栏「本机维护」区的残留清理：WorkBuddy 侧 / Trae 侧）、`src/pages/WorkbuddySwitchPage.tsx` 与 `src/pages/WorkbuddyRecordsPage.tsx`（侧栏「WorkBuddy」区的账号管理与会话记录 / 复制 / 关联，账号卡内嵌积分块）。两个账号页共用 `src/components/credits-ui.tsx` 与 `src/components/account-card.tsx` 的展示层 |
 | 派生缓存 | `~/.twin-switch/cache/`（**可整目录删**）：`overview.json`（总览 + 可回收空间）、`credits.json` / `trae-credits.json`（积分结果）、清理扫描的两份槽位 |
 | 任务台账 | `docs/任务书.md`（后续 AI 先读它，再读本文件） |
-| 当前版本 | **0.2.11** ✅（四处文件 + 一处兜底串：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`） |
+| 当前版本 | **0.2.11** ✅ **已发布**（GitHub Release `v0.2.11`，2026-10-07；四处文件 + 一处兜底串：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`） |
 | 自动更新 | ✅ v0.2.0 起对接 GitHub Releases（`tauri-plugin-updater` + `latest.json`）。实现见 `crates/wb-switch-core/src/modules/update.rs`（版本比较/端点/缓存）、`src-tauri/src/update_service.rs`（状态机）、`src/components/update-entry.tsx`（侧栏入口+对话框）；发版一键脚本 `npm run release` → `scripts/release.mjs` |
 
 ---
@@ -461,6 +461,34 @@ WorkBuddy 侧补了表头全选，两端机制一致。
 
 ---
 
+### 发布核验（2026-10-07，**v0.2.11 已发版**）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 提交 | `7970e97`（建在根提交 `f15b053` 之上，**不再 amend 根提交**）；35 文件 / +9643 / −352 |
+| tag | `v0.1.0` / `v0.2.0` → `f15b053`（保持不动）；**`v0.2.11` → `7970e97`** |
+| Release | `v0.2.11` ✅ 非 draft、非 prerelease，2026-10-07T07:08:14Z |
+| 资产 | `TwinSwitch_0.2.11_x64-setup.exe`（5 869 822 B）· 同名 `.sig`（424 B）· `latest.json`（8 221 B） |
+| `latest.json` | `version=0.2.11` ✅；两个 platform 均指向 `releases/latest/download/TwinSwitch_0.2.11_x64-setup.exe` ✅；`signature` 与 `.sig` 文件逐字符一致 ✅；`notes` = 更新描述全文（3 263 字符，与本地草稿逐字一致） |
+| 构建 | `cargo test --workspace` 201 + 15 全绿、`tsc` 零错误、`vite build` 通过、`npx tauri build` 2m25s 出 NSIS + MSI 双产物且均带签名 |
+| 遗留 | ✅ 无 |
+
+本轮把 **T25 – T38 全部 14 轮一次性发布**。发布过程中踩到两条环境级坑，已写进
+`.workbuddy/memory/MEMORY.md`：
+
+1. ⚠️ **本机网络阻断 `github.com` 主域**（直连 `Connection was reset`、走环境代理 `CONNECT tunnel failed 502`），
+   而 `api.github.com` / `uploads.github.com` / `objects.githubusercontent.com` / `codeload.github.com`
+   **直连正常**。⇒ `git push` / `git fetch` 一律不可用，推送改走 **GitHub Git Data API**
+   （blob → tree（带 `base_tree`）→ commit → `PATCH refs/heads/main`）。
+   只要 author / committer / 日期 / 正文**照抄本地提交对象**，生成的 **SHA 与本地完全相同**，
+   不会制造分叉。⚠️ 这同时意味着本机的**自动更新检查**（端点落在 `github.com`）在此网络下也会失败。
+2. ⚠️ **Node 里 `spawnSync` 一律 `EBUSY`**（`git` / `npm.cmd` / `cmd.exe` 都如此）⇒
+   `scripts/release.mjs` 的构建步骤只能自己在 shell 里跑 `npx tauri build`，再带 `--no-build` 发布；
+   并需预置 `GITHUB_TOKEN` 让脚本跳过 `git credential fill` 那条 spawn。
+   （`git credential fill` 取令牌本身**不需要联网**，GCM 里存着 `gho_…`。）
+
+---
+
 ## 四、关键技术机制（务必传承，别重新踩坑）
 
 这几条是本项目最贵的经验，代码注释里也只有部分写了。
@@ -879,11 +907,21 @@ npm run tauri build        # 产出 target/release/bundle/{nsis,msi}
 - 两个仓库都是 **public**
 - v0.1.0：仓库内容**重做为单一根提交 `8d0799d`（提交信息只有「首次提交」四个字，无父提交）**，与旧仓库历史彻底分离
 - 已发布 **Release `v0.1.0`**（当时的 tag）：`TwinSwitch_0.1.0_x64-setup.exe`（NSIS，5.15 MB）+ `TwinSwitch_0.1.0_x64_en-US.msi`（7.20 MB）
-- **v0.2.0（当前）**：加入**自动更新**（见 `docs/任务书.md` **T24**）。
-  - 根提交 amend 后为 **`4f7e00b`**（239 文件；提交信息仍只有「首次提交」四字、无 body）
-  - **`v0.1.0` 与 `v0.2.0` 两个 tag 均已同步指向 `4f7e00b`**（`git tag -f` + `push -f origin refs/tags/...`）
+- **v0.2.0**：加入**自动更新**（见 `docs/任务书.md` **T24**）。
+  - 根提交 `f15b053`（239 文件；提交信息只有「首次提交」四字、无 body）
+  - `v0.1.0` 与 `v0.2.0` 两个 tag 均指向它（历史上曾写过 `4f7e00b`，那是一次 amend 后的旧 SHA，已成历史）
   - `Release v0.2.0` 资产三份：`latest.json` · `TwinSwitch_0.2.0_x64-setup.exe`（5 738 300 B）· 同名 `.exe.sig`（420 B）
   - 自动更新清单固定读 `https://github.com/bean0283/twin-switch/releases/latest/download/latest.json`
+- **v0.2.11（当前，2026-10-07 已发布）**：T25 – T38 共 14 轮一次发出（见 `docs/任务书.md` **T25–T38**）。
+  - 提交 **`7970e97`** 建在 `f15b053` **之上**（35 文件 / +9643 / −352）；
+    ⚠️ **不再 amend 根提交**，也不再 force push —— 用户本次明确「后续的提交不用都写首次提交了」
+  - tag `v0.2.11` → `7970e97`；`v0.1.0` / `v0.2.0` **保持不动**（继续正确指向 v0.2.0 的代码）
+  - `Release v0.2.11` 资产三份：`TwinSwitch_0.2.11_x64-setup.exe`（5 869 822 B）· 同名 `.exe.sig`（424 B）· `latest.json`（8 221 B）
+  - ⚠️ **本机网络阻断 `github.com` 主域** ⇒ `git push` 不可用，本次推送走 **GitHub Git Data API**
+    （`api.github.com` 直连正常）。做法：blob → tree（`base_tree`）→ commit（照抄本地
+    author/committer/日期/正文）→ `PATCH refs/heads/main` ⇒ **远端 SHA 与本地完全相同**（`7970e97`）。
+    详见 `docs/任务书.md` T38 第五节与 `## 三` 的「发布核验」。
+  - ⚠️ 同一原因：本机**自动更新检查**（端点落在 `github.com`）在此网络下也会失败，需要代理。
   - ⚠️ **签名私钥在仓库外 `~/.twin-switch-keys/twin-switch-updater.key`**，与 `tauri.conf.json` 的
     `plugins.updater.pubkey` 是一对；**丢失后老客户端再也验不过新包**，必须备份
   - ⚠️ **v0.1.0 的安装包不含更新能力**，用户须先手动装一次 v0.2.0，之后才会收到自动更新
