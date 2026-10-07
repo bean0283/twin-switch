@@ -7,10 +7,11 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    app_overview, config, error_log, trae_cleanup, trae_credits, trae_delete, trae_discover,
-    trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth, trae_profile, trae_remote,
-    trae_switch, trae_vault, workbuddy_cleanup, workbuddy_credits, workbuddy_export,
-    workbuddy_import, workbuddy_oauth, workbuddy_sessions, workbuddy_switch, workbuddy_vault,
+    app_overview, client_usage, config, error_log, trae_cleanup, trae_credits, trae_delete,
+    trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
+    trae_profile, trae_remote, trae_switch, trae_vault, workbuddy_cleanup, workbuddy_credits,
+    workbuddy_export, workbuddy_import, workbuddy_oauth, workbuddy_sessions, workbuddy_switch,
+    workbuddy_vault,
 };
 
 // ---------------------------------------------------------------------------
@@ -182,22 +183,48 @@ pub fn trae_export_dir() -> String {
 /// 列出已安装的 Trae 客户端（含登录态与安装路径）。
 ///
 /// 要遍历各客户端的安装目录与配置文件，走后台（见 [`off_main`]）。
+///
+/// **顺序由使用记忆决定**（`client_usage`）：按「切换次数 ×3 + 打开页面次数」降序排，
+/// 没有历史时退回内置偏好顺序（`solo-cn` 第一）。`topPick` 是排在最前且**确有使用历史**
+/// 的那个 key，界面据此打「常用」徽标。
 #[tauri::command]
 pub async fn trae_list_clients() -> Value {
-    off_main(|| json!({ "clients": trae_discover::list_installed_clients() }))
-        .await
-        .unwrap_or_else(|e| json!({ "clients": [], "error": e }))
+    off_main(|| {
+        let mut clients = trae_discover::list_installed_clients();
+        client_usage::sort_installed(&mut clients);
+        let keys: Vec<&str> = clients.iter().map(|c| c.key).collect();
+        json!({
+            "clients": clients,
+            "usage": client_usage::snapshot_for(&keys),
+        })
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "clients": [], "error": e }))
+}
+
+/// 清空「客户端使用记忆」，排序回到内置偏好（`solo-cn` 第一）。
+#[tauri::command]
+pub async fn trae_client_usage_reset() -> Value {
+    off_main(|| {
+        client_usage::reset();
+        json!({ "ok": true })
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
 }
 
 /// Trae 账号总览：当前登录态（describe_account）+ 账号库已建档列表。
 /// 资料（昵称 / 积分）只读缓存，不自动访问接口（避免风控）；
 /// 登录成功由后端拉取一次，之后仅能通过 trae_refresh_profile 手动刷新。
+///
+/// 顺带记一次「使用记忆」：打开这个客户端的账号页 = 在用这个客户端。
 #[tauri::command]
 pub async fn trae_account_overview(client_key: String) -> Result<Value, String> {
     if trae_discover::get_client(&client_key).is_none() {
         return Err(format!("未知客户端：{client_key}"));
     }
     tauri::async_runtime::spawn_blocking(move || {
+        client_usage::record_use(&client_key);
         let client = trae_discover::get_client(&client_key).ok_or("未知客户端")?;
         let live = trae_switch::describe_account(&client_key);
         let vault: Vec<Value> = trae_vault::list_vault_accounts(&client_key)
@@ -324,6 +351,8 @@ pub async fn trae_switch_to(client_key: String, account_id: String) -> Result<Va
         let progress = progress.into_inner().unwrap_or_default();
         match r {
             Ok(sr) => {
+                // 切号成功才记账：失败的那次不代表「我在用这个客户端」。
+                client_usage::record_switch(&client_key);
                 let mut v = serde_json::to_value(&sr).map_err(|e| e.to_string())?;
                 v["progress"] = json!(progress);
                 Ok(v)
@@ -346,6 +375,7 @@ pub async fn trae_rollback_to(client_key: String, account_id: String) -> Result<
         let progress = progress.into_inner().unwrap_or_default();
         match r {
             Ok(sr) => {
+                client_usage::record_switch(&client_key);
                 let mut v = serde_json::to_value(&sr).map_err(|e| e.to_string())?;
                 v["progress"] = json!(progress);
                 Ok(v)
@@ -539,6 +569,8 @@ pub async fn trae_cleanup_working_files() -> Result<Value, String> {
 #[tauri::command]
 pub async fn trae_list_sessions(client_key: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // 会话记录页也是「在用这个客户端」，一并记账。
+        client_usage::record_use(&client_key);
         Ok(json!({ "sessions": trae_export::list_sessions(&client_key)? }))
     })
     .await
@@ -612,6 +644,44 @@ pub async fn trae_import_run(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let result = trae_import::import_sessions(&src, &dst, uid.as_deref(), &sessions, Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))?;
+        Ok(json!(result))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 诊断：列出目标库里「`session_project.project_id` 与 `chat_session.project_id` 不一致」
+/// 的会话。只读，不改任何数据。
+#[tauri::command]
+pub async fn trae_find_misaligned_projects(client_key: String) -> Result<Value, String> {
+    off_main(move || {
+        let rows = trae_import::find_misaligned_session_projects(&client_key)?;
+        Ok(json!({
+            "count": rows.len(),
+            "sessions": rows.into_iter().map(|(sid, sp_pid, sess_pid)| json!({
+                "session_id": sid,
+                "session_project_id": sp_pid,
+                "chat_session_project_id": sess_pid,
+            })).collect::<Vec<_>>(),
+        }))
+    })
+    .await?
+}
+
+/// 自愈：把历史副本的工程归属对齐到其真实账号的项目。
+///
+/// 背景：早前版本的同库复制漏改 `session_project.project_id`，导致副本挂在源账号的旧项目下，
+/// 用户在 Trae 客户端里**删不掉**、**重启后记录复活**。此命令一次性修干净。
+/// 重活（解密整库 + 增量加密回写），必须走 async + 阻塞线程池。
+#[tauri::command]
+pub async fn trae_heal_session_projects(
+    app: tauri::AppHandle,
+    client_key: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = trae_import::heal_session_projects(&client_key, Some(&|m| {
             let _ = app.emit("trae-import-progress", json!({ "line": m }));
         }))?;
         Ok(json!(result))
@@ -905,6 +975,103 @@ pub async fn trae_delete_session(client_key: String, session_id: String) -> Resu
         }
     };
     v["cloud"] = cloud;
+    v["progress"] = json!(progress.lock().unwrap().clone());
+    Ok(v)
+}
+
+/// **批量**彻底删除会话：与 [`trae_delete_session`] 同一条链路，但整批只走一趟 ——
+/// 一次解密、一次增量回写、**一份**整库备份。
+///
+/// 为什么要单独开一条命令而不是前端循环调单条：`delete_session` 每次都做一遍
+/// 「结束客户端 → 整库备份 → 解密 → 改 → 加密回写 → 重启」，批量删 20 条就是
+/// 20 份整库备份 + 20 次全库加解密，备份目录会按整库大小线性膨胀。
+///
+/// 云端任务列表的删除仍**逐条尽力尝试**：单条失败只记进结果提示，不影响其余条目，
+/// 也不影响已经完成的本地删除。
+#[tauri::command]
+pub async fn trae_delete_sessions(
+    client_key: String,
+    session_ids: Vec<String>,
+) -> Result<Value, String> {
+    // 去重但保持用户勾选顺序（`delete_sessions` 内部也会去重，这里是为了让
+    // 下面这轮「查归属」的次数与用户实际勾选条数一致，不做无用功）。
+    let mut uniq: Vec<String> = Vec::new();
+    for sid in session_ids {
+        if !sid.is_empty() && !uniq.contains(&sid) {
+            uniq.push(sid);
+        }
+    }
+    if uniq.is_empty() {
+        return Err("没有选中任何会话".into());
+    }
+
+    // ⚠️ 归属账号必须在本地删除**之前**解析完：本地删除会同步清掉解密库里的会话行，
+    //    删完再查就查不到归属，云端任务列表里那些记录会永久残留。
+    let owners: Vec<(String, Option<String>)> = uniq
+        .iter()
+        .map(|sid| (sid.clone(), trae_import::session_owner_uid(&client_key, sid)))
+        .collect();
+
+    let progress: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let local = tauri::async_runtime::spawn_blocking({
+        let client_key = client_key.clone();
+        let ids = uniq.clone();
+        let progress = progress.clone();
+        move || {
+            trae_delete::delete_sessions(&client_key, &ids, Some(&|m| {
+                progress.lock().unwrap().push(m.to_string());
+            }))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut v = match local {
+        Ok(v) => v,
+        Err(e) => return Err(format!("{e}\n{}", progress.lock().unwrap().join("\n"))),
+    };
+
+    // 云端同步删除：逐条尽力而为。单条失败只记录，不让整批失败 ——
+    // 本地删除已经落盘完成，这里失败最多是任务列表多留一条记录。
+    let mut cloud_ok = 0usize;
+    let mut cloud_failed: Vec<Value> = Vec::new();
+    let mut cloud_skipped: Vec<Value> = Vec::new();
+    for (sid, owner) in &owners {
+        let tail = |uid: &str| uid[uid.len().saturating_sub(6)..].to_string();
+        match owner.as_deref() {
+            Some(uid) if trae_remote::has_cloud_credential(&client_key, uid) => {
+                match trae_remote::delete_cloud_session(&client_key, uid, sid).await {
+                    Ok(_) => {
+                        cloud_ok += 1;
+                        progress
+                            .lock()
+                            .unwrap()
+                            .push(format!("云端记录已删除（uid …{}）", tail(uid)));
+                    }
+                    Err(e) => {
+                        progress
+                            .lock()
+                            .unwrap()
+                            .push(format!("云端删除失败（已忽略）：{e}"));
+                        cloud_failed.push(json!({ "sessionId": sid, "uid": uid, "error": e }));
+                    }
+                }
+            }
+            Some(uid) => {
+                cloud_skipped
+                    .push(json!({ "sessionId": sid, "uid": uid, "reason": "no_credential" }));
+            }
+            None => {
+                cloud_skipped.push(json!({ "sessionId": sid, "reason": "no_owner" }));
+            }
+        }
+    }
+
+    v["cloud"] = json!({
+        "deleted": cloud_ok,
+        "failed": cloud_failed,
+        "skipped": cloud_skipped,
+    });
     v["progress"] = json!(progress.lock().unwrap().clone());
     Ok(v)
 }
@@ -1227,6 +1394,104 @@ pub async fn workbuddy_session_links_preview(source_uid: String, target_uid: Str
     off_main(move || workbuddy_sessions::links_preview(&source_uid, &target_uid))
         .await
         .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// Trae：同客户端下两个账号之间的会话副本关联（只读）。
+///
+/// 会去读一次已解密库判定副本存活，属重活 ⇒ 必须 `off_main`。
+#[tauri::command]
+pub async fn trae_session_links_preview(
+    client_key: String,
+    source_uid: String,
+    target_uid: String,
+) -> Value {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::links_preview(&client_key, &source_uid, &target_uid)
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// Trae：删除一个关联组（只删本工具的关联记录，不动任何会话数据）。
+#[tauri::command]
+pub async fn trae_session_unlink(group_id: String) -> Result<Value, String> {
+    off_main(move || wb_switch_core::modules::trae_session_links::unlink_group(&group_id)).await?
+}
+
+/// Trae：「同步差异」——把关联组里较新一端的内容，就地覆盖到较旧一端
+/// （保持会话 id 不变，客户端里的位置与归属不动）。
+///
+/// 这是**写库**操作：内部会结束客户端 → 整份备份 → 增量回写 → 校验 → 重启，
+/// 全程几十秒，必须走 `spawn_blocking`（与 `trae_import_run` 同款处理），
+/// 否则会占住 Tauri 主线程把窗口冻住。
+#[tauri::command]
+pub async fn trae_session_sync_group(
+    app: tauri::AppHandle,
+    client_key: String,
+    group_id: String,
+    direction: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::trae_import::sync_group(
+            &client_key,
+            &group_id,
+            &direction,
+            Some(&|m| {
+                let _ = app.emit("trae-import-progress", json!({ "line": m }));
+            }),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 批量同步的一项（前端传 `[{ groupId, direction }]`）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncGroupRequest {
+    pub group_id: String,
+    pub direction: String,
+}
+
+/// Trae：**批量**「同步差异」——一次写库周期完成多个关联组。
+///
+/// 为什么要单独有它：每个写库周期都要「退客户端 → 备份 → 回写 → 重启」。
+/// 切号后一次性同步 N 组时，若逐组调 `trae_session_sync_group`，客户端要被重启 N 次、
+/// 备份 N 份，用户干等几十秒 ×N。批量版只重启一次。
+///
+/// ⚠️ 同样是写库操作，必须走 `spawn_blocking`。
+#[tauri::command]
+pub async fn trae_session_sync_groups(
+    app: tauri::AppHandle,
+    client_key: String,
+    items: Vec<SyncGroupRequest>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let reqs: Vec<(String, String)> = items
+            .into_iter()
+            .map(|i| (i.group_id, i.direction))
+            .collect();
+        wb_switch_core::modules::trae_import::sync_groups(&client_key, &reqs, Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Trae：切号后的**分叉探测**（只读）——某账号参与的关联组里，哪些两端已经不一致。
+///
+/// 返回 `groups[]`，每项带 `partnerUid` / `selfRole` / `suggestedDirection`，
+/// 前端据此弹「要不要同步」。`count` 为 0 表示没有需要提醒的内容。
+#[tauri::command]
+pub async fn trae_session_links_diverged(
+    client_key: String,
+    uid: String,
+) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::diverged_groups(&client_key, &uid)
+    })
+    .await
 }
 
 /// 删除一个关联组（只删本工具的关联记录，不动任何会话数据）。

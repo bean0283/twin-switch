@@ -17,6 +17,8 @@ import type {
   TraeImportInspect,
   TraeImportReport,
   TraeImportResult,
+  TraeBatchDeleteReport,
+  TraeClientUsageSnapshot,
   TraeInstalledClient,
   TraeOAuthPending,
   TraeOAuthSessionStatus,
@@ -26,6 +28,8 @@ import type {
   TraeSessionDetail,
   TraeSessionInfo,
   TraeSwitchResult,
+  TraeLinksPreview,
+  TraeDivergedLinks,
   TraeVaultMeta,
   TraeWbCleanupReport,
   TraeWbCleanupScan,
@@ -82,9 +86,23 @@ function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 // Trae 模块：账号切换 / 记录解密导出 / 彻底删除 / 交接记忆
 // ---------------------------------------------------------------------------
 
-/** 列出已安装的 Trae 客户端（含登录态与安装路径）。 */
-export function traeListClients(): Promise<{ clients: TraeInstalledClient[] }> {
+/**
+ * 列出已安装的 Trae 客户端（含登录态与安装路径）。
+ *
+ * **顺序已由后端按「使用记忆」排好**：切换次数 ×3 + 打开页面次数，降序；
+ * 没有历史时退回内置偏好（`solo-cn` 第一）。前端不要再自己排序，
+ * 否则换个页面顺序就变了。`usage.topPick` 供「常用」徽标使用。
+ */
+export function traeListClients(): Promise<{
+  clients: TraeInstalledClient[];
+  usage?: TraeClientUsageSnapshot;
+}> {
   return call("trae_list_clients");
+}
+
+/** 清空「客户端使用记忆」（排序回到内置偏好：`solo-cn` 第一）。 */
+export function traeClientUsageReset(): Promise<{ ok: boolean }> {
+  return call("trae_client_usage_reset");
 }
 
 /** Trae 账号总览：当前登录态 + 账号库已建档列表。 */
@@ -253,6 +271,19 @@ export function traeDeleteSession(
   return call("trae_delete_session", { clientKey, sessionId });
 }
 
+/**
+ * **批量**彻底删除会话。
+ *
+ * 与单条删除是同一条链路，但整批只走一趟：一次解密、一次增量回写、**一份**整库备份。
+ * 逐条调用会让备份目录按整库大小线性膨胀（删 20 条 = 20 份全库备份）。
+ */
+export function traeDeleteSessions(
+  clientKey: string,
+  sessionIds: string[],
+): Promise<TraeBatchDeleteReport> {
+  return call("trae_delete_sessions", { clientKey, sessionIds });
+}
+
 /** 账号维度导入候选：全部本机账号（vault + 解密库 local + 当前登录态），可自由切换目标。 */
 export function traeImportCandidates(
   exclude: string,
@@ -277,6 +308,119 @@ export function traeImportRun(
   sessions: string[],
 ): Promise<TraeImportReport> {
   return call("trae_import_run", { src, dst, uid, sessions });
+}
+
+/** 诊断：列出「会话的工程归属与关联表不一致」的会话（只读）。 */
+export function traeFindMisalignedProjects(clientKey: string): Promise<{
+  count: number;
+  sessions: {
+    session_id: string;
+    session_project_id: string;
+    chat_session_project_id: string;
+  }[];
+}> {
+  return call("trae_find_misaligned_projects", { clientKey });
+}
+
+/** 自愈：把历史副本的工程归属对齐到其真实账号的项目（一次修干净）。 */
+export function traeHealSessionProjects(clientKey: string): Promise<{
+  checked: boolean;
+  fixed_sessions: number;
+  fixed_contexts: number;
+  sessions: string[];
+  backup?: string;
+  relaunched: boolean;
+  note: string;
+}> {
+  return call("trae_heal_session_projects", { clientKey });
+}
+
+/**
+ * 同客户端下两个账号之间的会话副本关联（只读）。
+ *
+ * 会读一次已解密库判定副本存活；`client_key` 是 Trae 客户端键（如 `trae-cn`）。
+ */
+export function traeSessionLinksPreview(
+  clientKey: string,
+  sourceUid: string,
+  targetUid: string,
+): Promise<TraeLinksPreview> {
+  return call("trae_session_links_preview", { clientKey, sourceUid, targetUid });
+}
+
+/** 解除一个关联组（只删本工具的关联记录，不动任何会话数据）。 */
+export function traeSessionUnlink(
+  groupId: string,
+): Promise<{ ok: boolean; remaining: number }> {
+  return call("trae_session_unlink", { groupId });
+}
+
+/**
+ * 「同步差异」：把关联组里较新一端的内容就地覆盖到较旧一端。
+ *
+ * ⚠️ 这是**写库**操作（会结束客户端 → 备份 → 增量回写 → 校验 → 重启），
+ * 耗时几十秒。进度走 `trae-import-progress` 事件。
+ *
+ * `direction` 指「以哪一端为准」：`sourceToTarget` / `targetToSource`。
+ */
+export function traeSessionSyncGroup(
+  clientKey: string,
+  groupId: string,
+  direction: "sourceToTarget" | "targetToSource",
+): Promise<{
+  ok: boolean;
+  groupId: string;
+  direction: string;
+  keptSid: string;
+  fromSid: string;
+  removedRows: number;
+  writtenRows: number;
+  pages: number;
+  relaunched: boolean;
+  backupDir: string;
+  note: string;
+}> {
+  return call("trae_session_sync_group", { clientKey, groupId, direction });
+}
+
+/**
+ * **批量**「同步差异」：一次写库周期完成多个关联组。
+ *
+ * 逐组调 `traeSessionSyncGroup` 会把客户端重启 N 次、备份 N 份；批量版只重启一次。
+ * 同样是写库操作（会结束客户端 → 备份 → 增量回写 → 校验 → 重启），耗时几十秒。
+ */
+export function traeSessionSyncGroups(
+  clientKey: string,
+  items: { groupId: string; direction: "sourceToTarget" | "targetToSource" }[],
+): Promise<{
+  ok: boolean;
+  count: number;
+  groups: {
+    groupId: string;
+    direction: string;
+    keptSid: string;
+    fromSid: string;
+    removedRows: number;
+    writtenRows: number;
+  }[];
+  pages: number;
+  relaunched: boolean;
+  backupDir: string;
+}> {
+  return call("trae_session_sync_groups", { clientKey, items });
+}
+
+/**
+ * 切号后的**分叉探测**（只读）：某 uid 参与的关联组里，哪些两端已经不一致。
+ *
+ * 每一项都带 `partnerUid` / `selfRole` / `suggestedDirection`，供前端弹「要不要同步」。
+ * `count` 为 0 表示没有需要提醒的内容。
+ */
+export function traeSessionLinksDiverged(
+  clientKey: string,
+  uid: string,
+): Promise<TraeDivergedLinks> {
+  return call("trae_session_links_diverged", { clientKey, uid });
 }
 
 /** 交接记忆预览：解密库自动生成条目 → 组装文档，报告落点，不落盘。 */

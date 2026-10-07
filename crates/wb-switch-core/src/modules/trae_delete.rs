@@ -423,6 +423,46 @@ struct BatchOutcome {
 /// 为什么要批量：单会话删除每次都要整库备份（每批 ≈ 一个整库大小）。逐条删除几十个
 /// 空会话会累积出几十份备份（实测 `trae/backup` 曾堆到 2.2 GB）。批量走一趟，
 /// 只做一次解密与一次增量回写，备份只留 1 份。
+/// 在一个**已打开的明文副本连接**上删掉某个会话的全部行。
+///
+/// 与 [`delete_sessions_core`] 的区别：那个函数自己管「结束客户端 → 解密 → 改 → 加密回写 →
+/// 替换」的全套流程；本函数**只做「删行」这一步**，供需要把「删旧 + 写新」放在**同一次**
+/// 回写里完成的调用方复用（目前是 `trae_import::sync_group` 的差异同步）。
+///
+/// 复用 [`classify_tables`] 的「按列名找表」策略：只要表带 `session_id` 或
+/// `message_id` 就会被清掉 —— Trae 各版本表结构不一，写死表名列表必然漏表。
+///
+/// 返回实际删除的行数合计。
+pub fn delete_rows_in_conn(conn: &Connection, sid: &str) -> Result<usize, String> {
+    let (tables_with_sid, tables_mid_only) = classify_tables(conn)?;
+    let plan = rows_for(conn, sid, &tables_with_sid, &tables_mid_only, false);
+    // 先删仅 message_id 的表（它引用 chat_message.message_id，必须在外键来源之前删）
+    let mut total = 0usize;
+    for t in &tables_mid_only {
+        // 表不存在该会话时不报错，跳过即可（rows_for 已在 count 阶段容错）
+        if plan.get(t).and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+            continue;
+        }
+        let sql = format!(
+            "DELETE FROM \"{t}\" WHERE message_id IN \
+             (SELECT message_id FROM chat_message WHERE session_id=?)"
+        );
+        total += conn
+            .execute(&sql, [sid])
+            .map_err(|e| format!("清除 {t} 失败: {e}"))?;
+    }
+    for t in &tables_with_sid {
+        if plan.get(t).and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+            continue;
+        }
+        let sql = format!("DELETE FROM \"{t}\" WHERE session_id=?");
+        total += conn
+            .execute(&sql, [sid])
+            .map_err(|e| format!("清除 {t} 失败: {e}"))?;
+    }
+    Ok(total)
+}
+
 fn delete_sessions_core(
     client_key: &str,
     session_ids: &[String],

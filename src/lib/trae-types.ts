@@ -11,6 +11,31 @@ export interface TraeInstalledClient {
   has_login: boolean;
 }
 
+/** 单个客户端的「使用记忆」（对应 `client_usage::ClientUsage`）。 */
+export interface TraeClientUsageEntry {
+  key: string;
+  /** 打开该客户端功能页（账号页 / 会话记录页）的次数。 */
+  uses: number;
+  /** 成功切换 / 回滚到该客户端账号的次数。 */
+  switches: number;
+  lastUsedAt: number;
+  /** `switches * switchWeight + uses`，越大越常用。 */
+  score: number;
+}
+
+/**
+ * `trae_list_clients` 里的排序快照。
+ *
+ * `topPick` = 排在最前**且确有使用历史**的客户端 key；全是 0 分时是 `null`
+ * —— 那种情况排第一的只是内置默认值，不该给它打「常用」徽标。
+ */
+export interface TraeClientUsageSnapshot {
+  topPick: string | null;
+  switchWeight: number;
+  preference: string[];
+  clients: TraeClientUsageEntry[];
+}
+
 export interface TraeCarrierFile {
   rel: string;
   len: number;
@@ -240,10 +265,20 @@ export interface TraeSessionInfo {
   created: string;
   updated: string;
   turns: number;
+  /** 消息总条数（chat_message 全部未删行）。列表「正文」列用它当体量指标。 */
+  messages: number;
   /** 归属账号 uid（project.user_id；无归属为空串）。 */
   owner_uid: string;
   /** 归属账号显示名（昵称或 uid 尾号）。 */
   owner_label: string;
+}
+
+/** Trae 详情里的一个「提问 + 回答」回合（形态对齐 WbSessionTurn，好让两端共用渲染）。 */
+export interface TraeSessionRound {
+  userText: string;
+  assistantText: string;
+  /** 该回合出现过的工具调用次数。 */
+  toolCalls: number;
 }
 
 export interface TraeSessionDetail {
@@ -254,6 +289,11 @@ export interface TraeSessionDetail {
   messages: number;
   created: string;
   updated: string;
+  /** 归属账号（原列表列，现挪进详情）。 */
+  owner_uid: string;
+  owner_label: string;
+  /** 逐回合正文。 */
+  rounds: TraeSessionRound[];
 }
 
 export interface TraeExportMeta {
@@ -320,6 +360,114 @@ export interface TraeImportReport {
   /** 导入后是否已自动重启目标客户端。 */
   relaunched?: boolean;
   backup_dir: string;
+  /** 源目标是否同一客户端库（同库跨账号复制）。 */
+  same_db?: boolean;
+  /** 本次成功登记的跨账号关联组数（仅同库复制时有值）。 */
+  linked?: number;
+}
+
+// ---------------------------------------------------------------------------
+// 跨账号关联（Trae）
+// ---------------------------------------------------------------------------
+
+/** 关联组里的一个副本：某账号上的某个会话。 */
+export interface TraeLinkMemberInfo {
+  sessionId: string;
+  /** 副本是否仍然有效：会话存在、未软删、且归属账号仍是预期账号。 */
+  alive: boolean;
+  ownedBy?: string | null;
+  title: string | null;
+  /** Trae 的时间是字符串，原样透传（不做时区换算）。 */
+  updated?: string | null;
+  created?: string | null;
+  /** 消息条数（分叉判定的主判据；不可读时为 null）。 */
+  messages?: number | null;
+  /**
+   * 数据自检问题清单（**空 = 健康**）。判据见后端 `session_integrity`：
+   * 消息缺内容行、轮次引用错位 —— 都是「客户端一定渲染不出来」的硬伤。
+   * 与「分叉」正交：写坏的副本两端条数可能完全相等，光看分叉发现不了。
+   */
+  integrity?: string[];
+}
+
+/**
+ * 两端副本的分叉状态（复制之后各自继续使用导致的差异）：
+ * `none` 未分叉 · `sourceAhead` 源更靠前 · `targetAhead` 目标更靠前 ·
+ * `unknown` 任一端读不到（不推断）。
+ */
+export type TraeLinkDivergence = "none" | "sourceAhead" | "targetAhead" | "unknown";
+
+export interface TraeLinkGroup {
+  groupId: string;
+  title: unknown;
+  source: TraeLinkMemberInfo;
+  target: TraeLinkMemberInfo;
+  verdict: "linked" | "targetMissing" | "sourceMissing" | "gone";
+  /** 两端是否已分叉（见 `TraeLinkDivergence`）。 */
+  divergence?: TraeLinkDivergence;
+  /** 是否允许「同步差异」（两端都在且确实分叉）。 */
+  canSync?: boolean;
+  /** 是否允许「按对端重建」（两端都在即可，方向由用户点）。 */
+  canRebuild?: boolean;
+  /** 任一端自检有问题（副本数据写坏了，客户端里渲染不出来）。 */
+  broken?: boolean;
+  canCopy: boolean;
+  defaultChecked: boolean;
+  linkedAt: number;
+}
+
+export interface TraeLinksPreview {
+  ok: boolean;
+  storeStatus?: string;
+  clientKey?: string;
+  sourceUid: string;
+  targetUid: string;
+  count: number;
+  groups: TraeLinkGroup[];
+  storePath?: string;
+  error?: string;
+}
+
+/** 关联组里「用哪一端覆盖哪一端」。相对**规范角色**说的，见后端 `group_members`。 */
+export type TraeSyncDirection = "sourceToTarget" | "targetToSource";
+
+/**
+ * 切号后探测到的一项：**肯定已分叉**的关联组。
+ *
+ * 除常规组字段外，带一组「当前账号视角」的信息，前端据此写「谁比谁新」。
+ * `selfRole` 决定当前账号对应 `source` 还是 `target` —— 同步方向 DO NOT guess。
+ */
+export interface TraeDivergedGroup extends TraeLinkGroup {
+  partnerUid: string;
+  partnerLabel: string;
+  selfLabel: string;
+  selfRole: "source" | "target";
+  /**
+   * 后端建议的方向（`sourceAhead` ⇒ `sourceToTarget`）；用户仍可改。
+   *
+   * ⚠️ **`null` = 推不出方向**（副本写坏了 ⇒ 两端条数可能相等，谁新无从判断）。
+   * 此时界面不给「（推荐）」、不预置选择，用户不点就**不下发**这条同步。
+   */
+  suggestedDirection: TraeSyncDirection | null;
+  /** 当前账号那份的自检问题（空 = 健康）。 */
+  selfIssues?: string[];
+  /** 对端那份的自检问题（空 = 健康）。 */
+  partnerIssues?: string[];
+  selfMessages: number | null;
+  selfUpdated: string | null;
+  partnerMessages: number | null;
+  partnerUpdated: string | null;
+}
+
+/** `trae_session_links_diverged` 的返回：`count` 为 0 表示没有需要提醒的内容。 */
+export interface TraeDivergedLinks {
+  ok: boolean;
+  storeStatus?: string;
+  error?: string;
+  clientKey: string;
+  uid: string;
+  count: number;
+  groups: TraeDivergedGroup[];
 }
 
 export interface TraeDeleteFileInfo {
@@ -351,6 +499,36 @@ export interface TraeCloudDeleteInfo {
   http?: unknown;
   reason?: "no_credential" | "no_owner" | string;
   error?: string;
+}
+
+/** 批量删除结果（trae_delete_sessions）。整批只做一趟解密 / 回写 / 备份。 */
+export interface TraeBatchDeleteReport {
+  ok: boolean;
+  source: string;
+  /** 实际删掉的会话数（去重后）。 */
+  count: number;
+  sessions: Array<{
+    session_id: string;
+    title: string;
+    /** 各表删掉的行数（表名 → 行数）。 */
+    deleted_rows: Record<string, number>;
+    /** 移入回收站的文件数。 */
+    moved_files: number;
+  }>;
+  deleted_rows_total: number;
+  wal_merged: number;
+  relaunched: boolean;
+  moved_detail?: string[];
+  backup: string[];
+  trash_dirs: string[];
+  hint: string;
+  /** 云端任务列表的删除汇总：逐条尽力而为，失败不影响本地结果。 */
+  cloud: {
+    deleted: number;
+    failed: Array<{ sessionId: string; uid: string; error: string }>;
+    skipped: Array<{ sessionId: string; uid?: string; reason: string }>;
+  };
+  progress?: string[];
 }
 
 export interface TraeHandoffItem {
@@ -1135,6 +1313,19 @@ export interface OverviewTraeDecrypted {
   dbBytes: number;
 }
 
+export interface OverviewTraeCredits {
+  /** 该客户端账号库里的账号数。 */
+  accountCount: number;
+  /** 其中有多少个能联网查积分（有网页凭证）。 */
+  queryable: number;
+  /** 其中有多少个已经拉到过积分数据。 */
+  withData: number;
+  /** 合计剩余积分（只算拉取成功的账号）。 */
+  totalRemaining: number;
+  /** 最近一次成功拉取的时间（毫秒）；从没拉过是 null。 */
+  updatedAt: number | null;
+}
+
 export interface OverviewTraeClient {
   key: string;
   label: string;
@@ -1142,9 +1333,13 @@ export interface OverviewTraeClient {
   exe: string | null;
   userDataDir: string;
   hasLogin: boolean;
+  /** 当前登录账号显示名（真实昵称 + uid 尾号）；未登录或读不出是 null。 */
+  loginLabel: string | null;
   running: boolean;
   processCount: number;
   accounts: number;
+  /** 该客户端自己的积分摘要（离线读 profile.json，不联网）。 */
+  credits: OverviewTraeCredits;
   decrypted: OverviewTraeDecrypted;
 }
 
@@ -1168,6 +1363,8 @@ export interface Overview {
     accountTotal: number;
     sessionTotal: number;
     anyDecrypted: boolean;
+    /** 排在最前且确有使用历史的客户端 key（全 0 分时是 null）——用来打「常用」徽标。 */
+    topPick: string | null;
   };
   workbuddy: {
     running: boolean;

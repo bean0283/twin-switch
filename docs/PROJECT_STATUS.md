@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-06 / **v0.2.0**）
+> 分析时间：2026-10-04（最近更新：2026-10-07 / **v0.2.11**）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -35,7 +35,7 @@
 | 前端 | `src/main.tsx`（**启动编排**：先 `primeOverview()` 读磁盘缓存 → 挂载 → 后台 `refreshOverview()`）· `src/pages/HomePage.tsx`（侧栏「首页」·本机概览仪表盘，数据走 `src/lib/overview-store.ts` 的进程内单例）、`src/pages/TraeSwitchPage.tsx` 与 `src/pages/TraeRecordsPage.tsx`（侧栏「Trae」区的账号管理与会话记录）、`src/pages/WorkbuddyImportPage.tsx` 与 `src/pages/WorkbuddyExportPage.tsx`（侧栏「数据迁移」区的双向会话迁移）、`src/pages/WorkbuddyCleanupPage.tsx` 与 `src/pages/TraeCleanupPage.tsx`（侧栏「本机维护」区的残留清理：WorkBuddy 侧 / Trae 侧）、`src/pages/WorkbuddySwitchPage.tsx` 与 `src/pages/WorkbuddyRecordsPage.tsx`（侧栏「WorkBuddy」区的账号管理与会话记录 / 复制 / 关联，账号卡内嵌积分块）。两个账号页共用 `src/components/credits-ui.tsx` 与 `src/components/account-card.tsx` 的展示层 |
 | 派生缓存 | `~/.twin-switch/cache/`（**可整目录删**）：`overview.json`（总览 + 可回收空间）、`credits.json` / `trae-credits.json`（积分结果）、清理扫描的两份槽位 |
 | 任务台账 | `docs/任务书.md`（后续 AI 先读它，再读本文件） |
-| 当前版本 | **0.2.0** ✅（四处文件 + 一处兜底串：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`） |
+| 当前版本 | **0.2.11** ✅（四处文件 + 一处兜底串：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`） |
 | 自动更新 | ✅ v0.2.0 起对接 GitHub Releases（`tauri-plugin-updater` + `latest.json`）。实现见 `crates/wb-switch-core/src/modules/update.rs`（版本比较/端点/缓存）、`src-tauri/src/update_service.rs`（状态机）、`src/components/update-entry.tsx`（侧栏入口+对话框）；发版一键脚本 `npm run release` → `scripts/release.mjs` |
 
 ---
@@ -112,6 +112,352 @@
 | 仓库可见性 | 已改公开 ✅ |
 
 **结论：主线上代码与发布均已收口，v0.0.3 是一个完整可交付的状态，不是半途中断的状态。**
+
+### 追加核验（2026-10-06，T25 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.0**（本轮不动；未打包、未发版、未推 GitHub —— 用户明确要求） |
+| `cargo test` | **173 + 15 全绿，0 failed**（`trae_session_links` 新增 8 条、`trae_import` 新增 3 条） |
+| `npx tsc --noEmit` | 零错误 |
+| 界面渲染自检 | 1600 / 1360 / 730 三档宽度 × Trae 双 Tab，外加 WorkBuddy 侧防回归；无按钮折行 |
+| 工作区 | 10 改 + 2 新（含 `trae_session_links.rs`、`docs/后续优化建议.md`），`preview/` 已清理 |
+
+本轮把 Trae 记录页对齐 WorkBuddy（双 Tab + 跨账号关联），并顺带修掉同库多会话复制的 id 共用 bug。
+详见 `docs/任务书.md` 的 **T25**。
+
+### 追加核验（2026-10-06，T26 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.1**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test` | **179 + 15 全绿，0 failed**（新增 `pair_rounds` 配对 6 条） |
+| `npx tsc --noEmit` | 零错误 |
+| 界面渲染自检 | 列表 1600/1360 表宽 1068 = 容器 1068（不溢出）；730 溢出但可滚（与 WorkBuddy 一致）。详情 1600/730：6 格元信息 + 逐回合正文、缩放手柄在位、按钮零折行 |
+| 工作区 | 16 改 + 2 新，`preview/` 已清理 |
+
+本轮按用户要求把 Trae 会话列表精简为**四列**（标题 / 更新时间 / 正文 / 操作），归属账号与轮数等
+挪进详情；详情弹窗新增**逐回合正文**（后端 `pair_rounds` 把扁平消息配对成「提问 + 回答」）。
+详见 `docs/任务书.md` 的 **T26**。
+
+### 追加核验（2026-10-06，T27 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.2**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test` | **179 + 15 全绿，0 failed**（本轮后端零改动） |
+| `npx tsc --noEmit` | 零错误 |
+| 界面渲染自检 | Trae「复制与关联」三档宽度均有「会话复制」卡（3 行会话 + 复制按钮）；WorkBuddy 列表详情按钮已是 `Eye` 图标（`text: ""` + `hasSvg: true`） |
+| 工作区 | 17 改 + 2 新，`preview/` 已清理 |
+
+本轮修用户反馈的两点：Trae「复制与关联」页签**补齐整个会话复制区块**（之前只有账号选择器 + 关联列表，
+切过去看不到任何会话）；WorkBuddy 列表的**详情按钮由文字改为眼睛图标**，与 Trae 统一。
+详见 `docs/任务书.md` 的 **T27**。
+
+### 追加核验（2026-10-06，T28 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.3**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test` | **181 + 15 全绿，0 failed, 1 ignored**（新增 `incremental_write_with_old_plain_matches_decrypt_path`、`incremental_write_aborts_when_changed_page_reserved_area_dirty` 共 2 条） |
+| `npx tsc --noEmit` | 零错误（本轮前端零改动） |
+| 性能 | 一次复制从 **3 遍整库（80041 页 × 3，分钟量级）** 降到 **1 遍解密 + 1 遍字节复制 + 几百页加密回写（秒级）** |
+
+用户问「单独会话的复制关联是不是必须解密全部并加密全部回写」——**答案是不必，而且实现里确实有 bug**：
+`decrypt_database`（全量解）→ `copy_session`（只碰几页）→ **`encrypt_db_file`（全量重写 80041 页 ← 截图里那串日志）**
+→ **再全量解密一遍只为查一个 `count(*)`**。
+同文件早就写好 `write_db_incremental()`（只重写变动页 + 2 条单测），模块头注释第 13 行也写着要用它，
+**但主流程没接上**。本轮把它接上（新增带 `old_plain` 参数的 `write_db_incremental_with`），
+另把「保留原库明文当比对基准」与「轻量自检」一并落地。
+详见 `docs/任务书.md` 的 **T28**。
+
+### 追加核验（2026-10-06，T29 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.4**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test` | **184 + 15 全绿，0 failed, 1 ignored**（新增 `same_db_copy_remaps_session_project_and_context_project_id`、`rewrite_last_real_project_id_only_touches_matching_json`、`session_project_self_heal_aligns_project_id` 共 3 条） |
+| `npx tsc --noEmit` | 零错误 |
+| 只读预演 | 自愈 SQL 的只读版**精确命中 1 行**（副本 `5bad8258…`，uid `4052137095223728` → `925158341882023`），与预期一致后才动真库 |
+| 新增探针 | `examples/trae_sessions_probe.rs`（只读，长期保留） |
+
+用户报「**从别的项目复制了会话过来，在 trae 里删除删不掉，重启 trae 记录会恢复**」——**是真 bug**。
+根因：`copy_session` 的 `session_project` 复制块**只改 `session_id`、照抄源行 `project_id`**，
+而 `chat_session.project_id` 已改成目标账号的新项目 ⇒ **两表打架**：
+
+| 表 | 副本该行的 project_id | 归属 |
+| --- | --- | --- |
+| `chat_session` | `c81807b85bfee8b28d042160`（新项目） | 目标账号 ✅ |
+| `session_project` | `6ac3a1a44de871d609c84147`（旧项目） | **源账号** ❌ |
+
+Trae 客户端**按 `session_project.project_id` 组织项目下会话** ⇒ 用户在**新项目**里删除时按归属校验
+**找不到这条关联** ⇒ 删不掉；重启从 `chat_session` 重新加载 ⇒ **复活**。
+连带第二处：`context.last_real_project_id` 同样照抄源行，指向源账号旧项目，会触发客户端自身修复逻辑。
+**修复**：复制时同步改写 `session_project.project_id` 与 `context.last_real_project_id`；
+导入时加「5b) 目标库自愈」把历史脏副本一次对齐；另加独立诊断/自愈命令 + 界面卡片。
+详见 `docs/任务书.md` 的 **T29**。
+
+> ⚠️ 上一轮类似反馈（「手动删了一个记录，重新扫描还在」）**不是 bug**：库里 `chat_session` 确实只剩 8 条，
+> 用户删的已生效；剩下的是一条**标题/时间戳完全相同的复制副本**（T25 产物），界面无「副本」标识 ⇒ 误判。
+> 同一症状、两个不同原因，排查时**先看 `session_project` 与 `chat_session` 是否一致**。
+
+### 追加核验（2026-10-06，T30 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.5**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test` | **188 passed / 0 failed / 1 ignored**（较 T29 的 184 增 4 条分叉判定测试） |
+| `cargo test -p wb-switch-rust` | **15 passed / 0 failed**（`off_main` 护栏未破） |
+| `npx tsc --noEmit` | 零错误 |
+| 渲染自查 | 临时 `preview/` + 无头 Edge，1600 / 1360 / 730 三档出图 + 量宽；抓到并修掉状态列徽章折行 |
+
+用户问「**关联记录怎么用**」——排查后确认他遇到的两件事（无弹窗、另一侧不自动更新）**都属功能未实现**，
+不是 bug：关联原先只做「复制时自动登记 + 走查两端存活」，**没有变化检测、没有弹窗**。
+本轮补齐四项：① 分叉检测（`divergence_of`，消息数为主判据 / 时间为次判据 / 任一端失效一律 `unknown`）；
+② 进页面自动重扫（确认原有 `useEffect` 已覆盖）；③ **一键同步差异**（`trae_import::sync_group`，
+**就地覆盖、保持会话 id 不变**，删旧行 + 以旧 id 重写，同一次回写完成）；④ 分叉提醒弹窗（可「不再提示」）。
+详见 `docs/任务书.md` 的 **T30**。
+
+### 追加核验（2026-10-06，T31 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.6**（五处同步；仍未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | **190 passed / 0 failed / 1 ignored** + **15 passed**（较 T30 增 2 条 `plan_roles` 测试） |
+| `npx tsc --noEmit` / `npx vite build` | 零错误 / 通过 |
+| 渲染自查 | `DivergedRow` 三档宽度 1600 / 1360 / 730：长标题 `truncate` 生效、按钮组单行不折行 |
+
+用户报「**跨账号关联同步失败**」+ 要求「**切号后两端不一致时弹窗询问是否同步**」。
+
+**① 同步失败的根因（真实数据坐实）**：`sync_group` 的归属校验把 uid 角色写反了 ——
+被覆盖一端按**写死的另一个 uid** 比对，跨账号时两端 uid 必然不同 ⇒ **每次同步 100% 报
+「被覆盖的会话已不在预期账号下」**。离线核用户真实关联库：唯一一组两端 uid
+`4052137095` vs `8426816007`，正是必触发条件。修法 = 抽 `plan_roles(...)` 作为**唯一出口**，
+归属校验与写库都从这里取 uid（结构性防复发，配 2 条单测锁死映射）。
+
+**② 批量同步**：`sync_groups(client, &[(group_id, direction)])` 一次写库周期完成多组
+（一次退客户端 / 一次备份 / 一次重启），切号后 N 组分叉不再重启 N 次客户端。
+批量前整批校验：任一组不合法整体放弃；另挡「组重复」与「A 组目标是 B 组拷贝源」。
+
+**③ 切号后提示窗**：`onSwitch` / `onRollback` 成功后 `probeDivergence(res.uid)` →
+`trae_session_links_diverged`（只读探测）→ 有分叉组才弹。每组一行：勾选 + 「同步到当前账号 /
+同步到对端」，默认取后端 `suggestedDirection`，可跳过、可只勾部分；同步走
+`trae_session_sync_groups` 一次完成。⚠️ 方向按钮由 `selfRole` 推导成**人话**，
+`sourceToTarget` 是相对规范角色的术语，直接甩给用户必选反。
+详见 `docs/任务书.md` 的 **T31**。
+
+### 追加核验（2026-10-07，T32 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.7**（五处同步 + `Cargo.lock`；仍未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | **192 passed / 0 failed / 2 ignored** + **15 passed**（较 T31 增 2 条：消息 id 对齐护栏 + 会话完整性检测；另加 1 条 `#[ignore]` 真实库演练） |
+| `npx tsc --noEmit` / `npx vite build` | 零错误 / 通过 |
+| 真实数据 | 只读演练（跑在真库副本上，实时库未改动）：重放前消息 id 错位 **4** 个 → 重放后 **0** 个 |
+
+用户报「**账号 B 新增对话 → 关联同步到账号 A → 切回 A 后会话只剩一句**」。
+
+**① 真根因（数据没丢，是引用被搅乱）**：`copy_session` 复制 `chat_message` 时写成
+`mids.iter().zip(rows)` —— `mids` 是 `session_id` 索引的 **rowid 序**，而
+`SELECT … WHERE message_id IN (…)` 走 **`message_id` 索引、按字母序**返回。
+两个序列的顺序保证不同 ⇒ 每条消息写上的新 id **属于另一条源消息**，
+`chat_turn` 的 `reply_to_message_id` / `response_message_id` 随之全部指向错人；
+客户端按「轮次」把 user ↔ assistant 配对渲染，配对全落空 ⇒ **塌成一句**。
+修法 = 新 id **只由行自带的 `message_id` 推导** + **先建齐全量 `mid_map` 再统一改写引用**（可能有前向引用）。
+护栏 `same_db_copy_aligns_message_ids_with_their_own_rows`：夹具刻意让 id **字母序与插入序完全相反**。
+
+**② 同一个同步写路径还漏了合并 WAL（会永久丢数据）**：Trae 是 WAL 模式，客户端刚写下的消息
+可能**还只在 `database.db-wal` 里**；`sync_groups_inner` 只解密主库 ⇒ 拿到陈旧内容，
+随后删 WAL 就把它永久抹掉（删除路径早有此步，同步路径漏了）。第 4b 步补
+`trae_delete::merge_wal_into_plain(&plain, &wal, &key)`；**只有工作副本 `plain` 合并，
+`orig_plain` 保持「纯解密」**（它要作增量回写的逐页比对基准）。
+
+**③ 顺带查清一条会误导排查的读取陷阱**：`reader_plain_path()` 只在**主库文件**签名变化时刷新快照，
+而 Trae 写入几乎全在 WAL ⇒ 旧快照 + 新 WAL 合并出的视图是坏的（`--example wal_merge_check`
+四组对照：旧快照视图 `quick_check` 报 `server_history_info ... malformed`，刷新快照后 `ok`）。
+⇒ 排查脚本读库前先跑 `trae_export::ensure_decrypted()`。
+
+**遗留**：T32 修复后**尚未在客户端实测**「重放修复后的同步」这一动作（只做了只读演练）；
+用户在 A 账号里那条已被搅乱的旧副本需要**再同步一次**才会恢复正常。
+详见 `docs/任务书.md` 的 **T32**。
+
+---
+
+### 追加核验（2026-10-07，T33 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.8**（五处同步 + `Cargo.lock`；仍未打包、未发版、未推 GitHub） |
+| `cargo test -p wb-switch-core` | **193 passed / 0 failed / 2 ignored** + `wb_switch_rust_lib` **15 passed**（较 T32 增 1 条静态护栏 `every_wal_removal_site_merges_wal_first`） |
+| 护栏负向验证 | 故意注释掉 `heal_session_projects` 里的合并调用 → 按预期失败并给出函数签名提示；恢复后转绿 |
+| `npx tsc --noEmit` / `npx vite build` | 零错误 / 通过（主 chunk 642.85 kB / gzip 196.43 kB，>500 kB 告警为既有 P0 项） |
+| 真实数据 | 逐表核对副本完整性（见下）；未改动实时库 |
+
+用户报「**trae 复制对话后，发起新内容，trae 无法正常响应，一直在思考，重启 trae 还是无法继续对话**」。
+
+**①「一直在思考」= Trae 云端 agent 对某一个 conversation 卡死，不是本地数据被写坏。**
+客户端日志显示每次卡住的发送都走完了本地全流程
+（`sendMessage` → `startStream` → `commitAndStartStream done` → `subscribeStream registered/active`
+→ `metadata received status=in_progress`），**之后就再没有任何内容事件**（无 `[sse-summary] plan item`、无 `[done]`）。
+同期对照：源会话（12:01:32）与用户新建的会话（11:58:46）都正常走完
+`plan item first observed` → `[done] payloadStatus=completed`。
+⇒ 服务端收到了请求并回了回执，但那个 conversation 的云端 agent 什么都不产出；
+**卡的是云端，所以重启客户端必然无效**。Trae 官方论坛上这是长期已知问题
+（「对话卡死，一直在思考中，无法中断」），官方给的路子是换新会话 / 在**网页版**对那个会话点「停止」
+把云端那次运行终止掉。⇒ 该 conversation 只能弃用，**重新复制**会生成新的 conversation_id 才恢复得回来。
+
+**② 副本数据本身逐表核对过，是完整的**（所以不是我们写坏了）：
+`chat_message`+`general`/`task` 8 行与源逐条一致；`chat_turn` 4 行引用无悬空；
+`history_v2` **25/25 行一行不缺**（按 `created_at`+`content_source`+长度比对）；
+`session_project`/`project` 指向目标账号自己的 project；`fts_*` 词条已照抄；
+**跨会话重复的 `message_id`/`agent_run_id` = 0**。
+
+**③ 但确实找到了一个真实且严重的自身缺陷，日志把它坐实了 —— 本次修的就是它。**
+`import_sessions` / `heal_session_projects` **解密主库后直接改写、第 4 步再删掉 `-wal`，
+中间没有先合并 WAL**（T32 只补了同步路径）。Trae 是 WAL 模式，客户端写下的消息可能长时间只在
+`database.db-wal` 里、主库字节不变。证据链：
+
+- 11:44:51 发「你刚刚干了什么」→ 服务端 11:47:47 回了 **28144 token** 的正常答复；
+- 11:47:40 再发 → 客户端 `[done] payloadStatus=completed`、`SessionStatusTrace` 3→5，**完整成功**；
+- 这两轮在现在的库里 **`chat_message` / `chat_turn` / `history_v2` 里一条都不剩**，
+  只在 `server_history_info` 留下 `hid/cid` 痕迹（`11:44:53 e60cc114`、`11:47:41 ef790e24`、`11:47:47 ef790f80`）；
+- 中间只发生过一次整库回写：**11:49:06 的同步**（`import_backup/solo-cn-sync-20261007-114906`）。
+
+⇒ 客户端刚写下、还没 checkpoint 的两轮内容，被那次「解密主库 → 改 → 删 WAL」永久抹掉。
+修法：抽出 `merge_live_wal_into()`，**解密明文后、任何改动前**先合并 WAL，挪了帧就重新打 reserved 字段；
+落点 `heal_session_projects` 与 `import_sessions` 的第 2b 步。**`orig_plain` 保持纯解密**
+（增量回写靠它逐页比对，掺 WAL 帧会判错「哪页变了」）。
+
+**④ 新增静态护栏 `every_wal_removal_site_merges_wal_first`**：扫 `trae_import.rs` / `trae_delete.rs` /
+`workbuddy_import.rs`，凡函数体内出现 `remove_file(&wal)` 的，同一函数体必须也出现
+`merge_wal_into_plain(` 或 `merge_live_wal_into(`；扫到的点位少于 5 处则测试自身失败（防扫空）。
+`split_fn_bodies()` 按行首切函数体**并跳过 `//` 注释行** —— 这点被负向测试坐实：不跳注释行时，
+把调用注释掉护栏仍会误判为「已合并」。
+
+**遗留（未修）**：① `chat_message_task.task_id` 被原样继承，源会话与账号 A 每个副本共用同一批
+`task_id`（当前库内 3 个 id 各自横跨 3 个 session；Trae 容忍，源会话照常工作，但属真实保真度缺口，
+要修需同时改 `chat_message_task`/`task`/`server_history_info` 三表，属判断题）；
+② 副本 `chat_session.context.skill_list_revisions` 仍留源会话 id 的键（暂无实测危害）；
+③ 读取侧盲区仍在：快照刷新只看主库签名，Trae 只写 WAL 时会读到陈旧快照；
+④ 账号 A 那个卡死的 conversation **再同步救不回来**（T30「就地覆盖」保留原 `session_id`），
+须在 Trae 里删掉副本、从 B 重新复制一次。
+详见 `docs/任务书.md` 的 **T33**。
+
+---
+
+### 追加核验（2026-10-07，T34 / T35 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.9**（五处同步 + `Cargo.lock`；仍未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | `wb-switch-core` **199 passed / 0 failed / 2 ignored**（较 T33 增 6 条，全部是 `client_usage` 的排序单测）+ `wb_switch_rust_lib` **15 passed**；零 warning |
+| `npx tsc --noEmit` | 零错误 |
+| `npx vite build` | 通过（主 chunk 645.76 kB / gzip 197.40 kB，>500 kB 告警为既有 P0 项） |
+| 渲染自查 | 真组件 + CDP 真点击，1600 / 1360 / 730 三档；核完已删临时 `preview/` |
+
+**T34 · 客户端排序 + 使用记忆。** 原先「哪个客户端排第一」被推导了两次
+（后端 `CLIENTS` 数组顺序 + 前端各自 `find("trae-cn")`），结果实际最常用的 **TRAE SOLO CN
+永远排第二、且不是默认选中项**。现在排序只有 `client_usage::order_keys()` 一个出口：
+`score = 切换次数 ×3 + 打开页面次数`，降序；同分看 `lastUsedAt`，再看**内置偏好**，
+最后按 key 字典序兜底（全序、可复现）。**没有历史时退回内置偏好 —— 而它正好以 `solo-cn`
+打头**，所以默认体验就是用户要的那一个，记忆只在其上做微调。
+落盘 `~/.twin-switch/trae-client-usage.json`（放 `store_dir` 而不是 `cache/`：
+清缓存不该顺手清掉使用习惯）。新增「重置排序」按钮与 `trae_client_usage_reset` 命令。
+⚠️ 本模块**只决定展示顺序**，不参与任何写库 / 遍历逻辑的顺序语义。
+
+**T35 · 同步确认窗口前移。** 原先 `onSwitch` 是「先 `traeSwitchTo` → 再 `probeDivergence`」，
+即**账号已经切完才弹窗**，用户想反悔都来不及。前移成立的前提是
+`diverged_groups(client_key, uid)` **只读本地数据**、`uid` 仅表示「站在谁的角度看」，
+与「客户端当前登的是谁」无关 ⇒ 可以用**目标账号的 uid** 提前探测。
+目标 uid 取 `entry.meta?.verified_uid ?? entry.oauth?.uid`；取不到就不探测、直接静默切。
+同步成功后由 `runPending()` 接着把待执行的切换 / 回滚做掉；同步失败则**停在原地**
+（保留 `pendingSwitch`，用户可改选「直接切换」或重试）。
+⚠️ **连带修掉的语义错位**：`DivergedRow` 原写「同步到**当前账号**」，其隐含前提是
+「被探测的那一端 == 当前登录账号」—— 窗口前移后该前提**不再成立**，照旧文案会把方向
+**说反**，而这个动作是**覆盖数据**。现在两端一律用后端给的 `selfLabel` / `partnerLabel`。
+
+⚠️ **渲染自查抓到一处真缺陷**：弹窗页脚提示文字塞在 `DialogFooter`（≥640px 为 `flex-row`）
+里，三个按钮吃满宽度后文字列被压到几十像素，**730px 下折成「一个字一行」共 8 行**。
+已挪成页脚上方独立一行；同类写法全仓库已排查（仅此一处）。
+
+> 量宽脚本报的「账号卡身份行溢出 13px」是**误报**：该元素带 `truncate`
+> （`overflow:hidden + text-overflow:ellipsis`），而 `Range.getClientRects()`
+> 返回的是**未裁剪**的排版宽度。判溢出前先确认元素有没有 `truncate`。
+
+---
+
+### 追加核验（2026-10-07，T36 / T37 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.10**（五处同步 + `Cargo.lock`；仍未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | `wb-switch-core` **201 passed / 0 failed / 2 ignored**（较 T34/T35 增 2 条：`trae_clients_carry_their_own_accounts_sessions_and_credits`、`credit_summary_is_compact_and_never_panics`）+ `wb_switch_rust_lib` **15 passed**；零 warning |
+| `npx tsc --noEmit` | 零错误 |
+| 渲染自查 | 真组件 + CDP 真点击，1600 / 1360 / 730 三档；核完已删临时 `preview/` |
+
+**T36 · Trae 会话记录批量删除。** 后端 `trae_delete::delete_sessions` 早就有（Trae 清理页在用），
+只是没接出来。走批量命令的真正理由是**成本**：`delete_session` 每条都做一遍
+「结束客户端 → 整库备份 → 解密 → 改 → 加密回写 → 重启」，逐条调单删 = N 份整库备份 +
+N 次全库加解密。新增 `trae_delete_sessions` 让整批只走一趟。
+⚠️ **归属 uid 必须在本地删除之前解析完**（`session_owner_uid`），否则解密库里的行已被删，
+云端任务列表的记录永久残留 —— 单条路径本来就这样做，批量照抄。
+弹窗按 1 条（逐表预检）/ 多条（整批说明 + 归属账号分组 + 标题清单）分支；
+结果卡片留在列表下方（弹窗一做完就关，放里面等于看不见）。
+WorkBuddy 侧补了表头全选，两端机制一致。
+
+**T37 · 首页 Trae 卡片按客户端独立。** 用户要求得很具体：「不用客户端添加一个小标签来切换，
+不要互相影响。不同客户端的会话独立」。Trae 的 4 个客户端各有独立的 `database.db`
+与独立账号库，所以每个已安装客户端渲染一块，块内自己一套
+「登录状态 / 账号库 / 会话 / 解密库 / 客户端路径 / 积分」，数字**只从它自己的 key 算**。
+后端补 `loginLabel`（读客户端 `storage.json` 取当前 uid → 账号名）、
+`credits`（`trae_credits::cached(Some(key))` 的**压缩摘要**，不联网）、
+`trae.topPick`（复用 `client_usage::snapshot_for`，不在首页另算一遍「谁最常用」）。
+⚠️ **`CACHE_VERSION` 1 → 2**：字段变了，旧缓存必须整份作废，否则前端会读到半新半旧的对象。
+每个客户端自带「查询积分」按钮，只查它自己；查完 `refreshOverview()` 重算而不是前端拼摘要
+（摘要的唯一出口在后端）。
+⚠️ 双栏网格加了 **`items-start`**：Trae 卡片涨到 ~700px（3 个客户端）后，
+默认 `stretch` 会把 WorkBuddy 卡片拉成同高、中间留一大块空白。
+
+---
+
+### 追加核验（2026-10-07，T38 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.11**（五处同步 + `Cargo.lock`；仍未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | `wb-switch-core` **201 passed / 0 failed / 2 ignored** + `wb_switch_rust_lib` **15 passed**；零 warning（本轮纯前端 + 文案，未加后端测试） |
+| `npx tsc --noEmit` | 零错误（`noUnusedLocals` / `noUnusedParameters` 都开着，无用导入不会被放过） |
+| `npx vite build` | 通过（1950 modules） |
+| 渲染自查 | 真组件 + CDP 真点击，首页 1600 / 1360 / 730 + 会话记录页 1600；核完已删临时 `preview/` |
+
+**T38 · 首页客户端切换标签 + 快捷入口文案对齐。**
+
+> ⚠️ **这条推翻了 T37 的展示形态**。T37 当时按用户「不用客户端添加一个小标签来切换」做成了
+> 「每客户端各渲染一块、纵向堆叠」；客户端一多卡片被撑到 ~700px，用户本轮明确要求
+> **「当本地有几个客户端就搞几个标签」**。**两条要求中不可变的那一条仍然有效**：
+> 数字永远只从各自客户端的 key 算，**绝不合并** —— 切换只决定「看哪一块」。
+
+- 新增 `src/components/trae-client-switcher.tsx`，**首页与会话记录页共用**：
+  客户端顺序、「常用」徽标、未安装置灰只有一处实现（顺序与徽标本来就同源：
+  `client_usage::order_keys()` / `snapshot_for()["topPick"]`），前端只做
+  `has_login → hasLogin` 的字段翻译。用 `role="group"` 而非 Radix `Tabs`：
+  会话记录页上方已有一个 `Tabs`（会话记录 / 复制与关联），两者视觉不同是**刻意的**。
+- 会话记录页那段内联 pill 行删掉改用组件，并补上「耗时写库期间禁止切换」（`disabled={busy}`）：
+  切到一半换客户端会让进度与结果对不上。
+- 首页 `TraeClientBlock` 的标题行（名字 + 「常用」徽标 + 运行 Dot）删掉，改为明细首行
+  「运行状态」—— 名字与徽标已由切换条承担，重复两遍没意义。
+- 快捷入口：`WorkBuddy 会话导入` / `Trae 会话导出` → **`WorkBuddy → Trae` / `Trae → WorkBuddy`**，
+  图标也换成侧栏 `数据迁移` 分组那两个（`HardDriveDownload` / `HardDriveUpload`），
+  并补上分组标签与方向说明。**同一功能在首页叫「导入/导出」、在侧栏与页面标题叫「A → B」
+  会让人怀疑是不是两回事**，现在分组名 / 条目名 / 图标三样对齐。
+
+**这轮脚手架新踩的三个坑**（已写进 `.workbuddy/memory/MEMORY.md`，下次照抄别再踩）：
+① 页面里有 `<Link>` ⇒ 预览外壳**必须包 `MemoryRouter`**，否则整棵树抛 `basename of null`，页面全白；
+② `@tauri-apps/api/event` 的 `unlisten` 读的是 `window.__TAURI_EVENT_PLUGIN_INTERNALS__`
+（**不是** `__TAURI_INTERNALS__`，后者只够 `invoke`），夹具要单独补这个全局；
+③ 截图前**必须先把外壳 `h-screen overflow-hidden` 的高度与 overflow 放开**再拍 ——
+`captureBeyondViewport` 只放大「文档」视口，而 `<main>` 的溢出被它自己的 `overflow` 裁掉了，
+不放开的话拍出来下半页是白的（这个坑上一轮记的配方没写清楚，本轮才定位到根因）。
 
 ---
 
@@ -430,16 +776,68 @@ Trae 运行中会把内存登录态回写 `storage.json` / leveldb，不关进�
 
 ## 六、后续行动建议（按优先级）
 
-### 先把 P0 的「答案」补齐 —— 这两个是用户问过、需要回话的
-- **A. 登录态文件安全性答复**：给出「切换是否重写 `storage.json` / 当前不重写是否有风险」的明确结论与建议开关位（建议做成可配置项，默认沿用现状）。
-- **B. 重复会话合并策略**：定「保留源 / 保留目标 / 保留更近更新」中的一种，实现去重（软删 `deleted_at` 列已存在，可复用）。
+> **2026-10-06 重新盘点（v0.2.0）**：本节旧条目已核实并更新，新增「自动更新」与「工程卫生」
+> 两块实测结论。以下按「该不该做 / 值不值得做」排序，标注了每条的实际代价。
 
-### 然后按这个顺序推进
-1. **补测试**（解 P2-6）：至少给 `trae_decrypt` / `trae_import` / `trae_delete` 的页面级加解密补单元用例。这套「解密→改→加密回写→原子替换」是全项目最核心、也最没有自动化保护的资产，且**动了会直接破坏用户本地真实账号库**。
-2. **统一密钥获取策略**（解 P1-5）：让 `trae_import` 与 `trae_delete` 走同一条「存盘 → 校验 → 过期重扫」链路。
-3. **跨账号导入长周期验证**（解 P1-3）：找一个真实账号验证导入后能否发消息、云端是否会回滚本地孤儿行。
-4. **版本号与发版流程固化**（见第七节），每次修完按最新版本号（当前 `0.0.18`）走一遍。
-5. 顺手清理 P2-7 / P2-8 的命名与路径残留。
+### A. 建议优先做（投入小、收益明确）
+
+1. **`npm test` 目前是死的** —— `package.json` 有 `"test": "vitest run"`，`vitest` 依赖与
+   `vitest.config.ts` 都在，但 `include: src/**/*.test.ts` **一个测试文件都没有**，
+   跑起来直接 `No test files found, exiting with code 1`。**要么补上、要么删掉这条脚本**，
+   别留一个必然失败的命令在那儿误导人。
+   - 最该先补的三处（都是纯函数，不需要跑 Tauri）：`src/lib/credit-package-names.ts` 的
+     `PackageCode` 映射与回落链、`src/lib/storage-keys.ts` 的新旧键兜底逻辑、
+     `src/lib/avatar-tone.ts`。这三个都是「错了不报错、只是显示不对」的类型，最容易悄悄回归。
+2. **代理配置需要手写 JSON，且没有任何界面入口** —— `~/.twin-switch/update.json` 的 `proxy`
+   字段是 GitHub 连不通时唯一的自救手段，但全项目 `update_config` **只有 Rust 侧读取、
+   前端零调用**，也**没有设置页**（`src/pages/` 下 9 个页面无一个是设置）。
+   ⇒ 普通用户遇到「检查更新一直转圈」时**无从下手**。
+   - 建议：在更新对话框里加一个「网络设置」折叠项（一个输入框 + 保存），
+     并在检查失败且错误像网络问题时，直接把入口指过去。
+3. **没有「跳过此版本」** —— `update-entry.tsx` 里搜不到任何 skip / 忽略逻辑。
+   当前是「有新版本就一直提示」。用户如果因为某个原因不想升当前这版，只能被反复打扰。
+   - 代价很小：`localStorage` 存一个 `skippedVersion`，与 `latest` 比对时跳过即可。
+     注意**不要**因此漏掉更高版本。
+
+### B. 自动更新的两处纵深加固（有安全价值，但要权衡）
+
+4. **`requireSignedVersion` 未开（真实缺口，但现在开了会全断）** —— 已实测：v0.2.0 的 `.sig`
+   trusted comment 是 `timestamp:…\tfile:…`，**没有 `version:` 字段**（本地 CLI 2.11.4），
+   开启会报 `MissingSignedVersion`。
+   - 源码注释点明的风险：`latest.json` **清单本身不签名**，能伪造清单响应的人可
+     「版本号写大 + 指向旧版的 url/signature」诱导**降级**。
+   - 暴露面：需要能伪造 github.com 的 HTTPS 响应（受信证书 MITM）。**门槛不低，不急。**
+   - 要做就是一条链：升 CLI → 确认签名里带 `version:` → 下个补丁版开启 → 重签重发。
+5. **CSP 未配置** —— `tauri.conf.json` 的 `app.security.csp` 是空的。
+   这个应用会**读解密后的账号库并在界面上渲染其中的文本**（会话标题、项目路径等）。
+   多一道 CSP 能在出现 DOM 注入时把外连掐掉。属于低成本纵深防御。
+
+### C. 之前记的 P0/P1，本次核实结果
+
+6. ~~**P0-1 切换是否重写 `storage.json`**~~ → **已闭环，是过时账**。
+   `trae_carriers.rs` 现已实现「载体」概念（`User/globalStorage/storage.json` + 深度 ≤5 的
+   leveldb 目录，上限 16 条），模块注释明写「**只换 storage.json 会出现半新半旧的登录态**」。
+   ⇒ 该问题在后续实现中已被正确处理，本节旧结论作废。
+7. **P0-2 重复会话合并** —— **仍未实现**（`trae_import.rs` 里 `deleted_at` 只用于查项目，
+   无去重逻辑）。当前属跨账号导入的正常副产物。
+   - ⚠️ 但要注意：**这未必该做**。两条会话分属不同账号、内容是真实的，强行合并等于伪造数据。
+     建议结论是「**不合并，但在导入结果里明确标注来源账号**」，比合并更诚实也更省事。
+8. ~~**P2-6 没有任何测试**~~ → **已修复**：当前 `#[test]` 计数 **185 个**。
+   本节旧条的「133 passed」已过时（含 `wb-switch-core` 162 + `src-tauri` 15 + 护栏 2）。
+9. **P2-7 绝对路径残留** —— **已清理**，全项目搜不到 `D:\htw` 硬编码。✅
+10. **P2-8 `types.ts` 命名残留** —— **仍在，但属误报**。`"workbuddy"` 是**产品线的真实标识**
+    （WorkBuddy 侧的 `SessionGroupClient` 等），不是旧名 `trae-switch-cn` 的残留。
+    **不要改**，改了反而破坏语义。
+
+### D. 更早的旧条目（保留备查）
+
+- ~~**补测试**（原 P2-6）~~ → 见第 8 条，已大幅改善；剩余空间在**前端**（见第 1 条）。
+- **统一密钥获取策略**：让 `trae_import` 与 `trae_delete` 走同一条「存盘 → 校验 → 过期重扫」链路。
+  **本次未重新核实**，需动手前先确认是否仍成立。
+- **跨账号导入长周期验证**：需真实账号跑一段时间，确认云端是否会回滚本地孤儿行。仍未做。
+- **版本号与发版流程固化** → 已固化：`npm run release` 一条命令走完
+  「带签名构建 → latest.json → Release → 三份资产」，版本号**四处文件 + 一处兜底串**同步。
+- ⚠️ **版本号规则**：每次只进一位补丁号（0.1.0 → 0.1.1 → 0.1.2），**只有用户明确要求才跳次版本号**。
 
 ---
 
@@ -509,3 +907,17 @@ curl -s https://api.github.com/repos/bean0283/twin-switch | python -m json.tool
 3. **最高频的返工根因就三条**：进程名含空格、rusqlite 无 SQLCipher 特性（必须页面级加解密）、内存扫描窗口语义（必须全滑动窗口）。动这三块前先读第四节。
 4. **涉及导入 / 删除的操作会直接改写用户本地真实账号库**，任何改动都要保留「备份 → 原子替换 → 失败回滚」，并先跑单元测试。
 5. 用户节奏偏好：**一次给一串编号问题（1、2、3…）→ 要求执行前先询问确认 → 修完要求提版本号 + 同步 GitHub**。续接时遇到「执行前发我发起询问」类指令，务必先出方案再动手。
+6. **动 Trae 会话复制 / 删除前，先读 T29**：`chat_session` 与 `session_project` 两张表的 `project_id`
+   **必须一致**（客户端按 `session_project.project_id` 组织项目下会话），`chat_session.context` 里的
+   `last_real_project_id` 也要跟着改。三者任一错位就表现为「客户端里删不掉 / 重启后记录复活」。
+7. **判断 Trae 库里到底有什么，必须走 `reader_plain_path()`（快照 + 合并 WAL）**：客户端写入都在 WAL 里，
+   主库文件字节不变。探针 `cargo run -p wb-switch-core --example trae_sessions_probe -- solo-cn` 一把看清。
+8. **任何基于截图上的 hash / id 下的结论，先把原图放大再读**（6 px 字号下 24 位 hex 极易看错，
+   上一轮就把 `6ac3a1a4…` 读成了 `6ac31a84…` 而误判方向）。
+9. **改「关联（links）」相关功能前先想清楚「谁触发检测」**：关联**只在本工具复制成功时自动登记**，
+   没有任何常驻监听 —— Trae 客户端里聊出来的新内容，本工具**只有在打开页面时**才看得到。
+   所以任何「自动同步 / 自动关联」都只能是**进页面时的快照比对**，别去设计实时推送。
+10. **「同步差异」是就地覆盖、不是再复制**：`sync_group` 删旧行 + 以**旧 session_id** 重写，
+    这样客户端里的位置 / 归属 / 关联登记都不变。直接调 `import_sessions` 会每次多生成一条副本。
+11. **分叉判定的 `unknown` 不要图省事按另一端推断**：它驱动界面上的「可同步」暗示，
+    而同步会写库覆盖数据，猜错方向就是真丢内容。

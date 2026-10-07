@@ -8,6 +8,8 @@ import {
   Cpu,
   Eraser,
   HardDrive,
+  HardDriveDownload,
+  HardDriveUpload,
   KeyRound,
   Loader2,
   MessageSquare,
@@ -22,11 +24,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import * as api from "@/lib/api";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { refreshOverview, rememberReclaim, useOverviewState } from "@/lib/overview-store";
 import { cn } from "@/lib/utils";
-import type { WbCreditResource, WbCreditsResult } from "@/lib/trae-types";
+import type { OverviewTraeClient, WbCreditResource, WbCreditsResult } from "@/lib/trae-types";
 
 /**
  * 可回收空间的「保鲜期」：超过这个时间才在后台重扫。
@@ -174,6 +177,119 @@ function PackageLine({ r }: { r: WbCreditResource }) {
   );
 }
 
+/**
+ * Trae 单个客户端一块：账号库 / 会话 / 解密库 / 积分**全部只算它自己**。
+ *
+ * ⚠️ 首页用 `<TraeClientSwitcher>` 切换「看哪一个客户端」，但**数字永远不许合并**：
+ *    Trae 的 4 个客户端各有独立的 `database.db` 与独立的账号库，
+ *    合并出来的数字谁也不对应。切换只决定看哪一块，每一块的数字仍只由它自己的 key 算出。
+ *
+ * ⚠️ 标题与「常用」徽标由切换条承担（单一出口），这一块里不再重复，只保留明细行。
+ */
+function TraeClientBlock({
+  client,
+  creditBusy,
+  onQueryCredits,
+}: {
+  client: OverviewTraeClient;
+  creditBusy: boolean;
+  onQueryCredits: () => void;
+}) {
+  const d = client.decrypted;
+  const cr = client.credits;
+  return (
+    <div className="rounded-lg border">
+      <div className="divide-y px-3">
+        <Row label="运行状态">
+          <Dot
+            on={client.running}
+            label={client.running ? `${client.processCount} 个进程` : "已退出"}
+          />
+        </Row>
+        <Row label="登录状态">
+          {client.hasLogin ? (
+            <span className="text-emerald-600">
+              已登录{client.loginLabel ? ` · ${client.loginLabel}` : ""}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">未登录</span>
+          )}
+        </Row>
+        <Row label="账号库">
+          {client.accounts} 个 · 其中 {cr.queryable} 个可查积分
+        </Row>
+        <Row label="会话">
+          {d.sessionCount != null
+            ? `${d.sessionCount} 个（本客户端库）`
+            : "未解密，读不到会话数"}
+        </Row>
+        <Row label="解密库">
+          {d.exists ? (
+            d.current ? (
+              <span className="text-emerald-600">最新（与实时库一致）</span>
+            ) : (
+              <span className="text-amber-600">待刷新</span>
+            )
+          ) : (
+            <span className="text-muted-foreground">不存在，需先解密</span>
+          )}
+        </Row>
+        <Row label="客户端路径" mono>
+          {client.exe ?? "未定位到"}
+        </Row>
+      </div>
+
+      {/* 积分：离线读该客户端账号库里的 profile.json，点按钮才联网。 */}
+      <div className="border-t p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Coins className="size-4 text-muted-foreground" />
+            积分
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 px-2 text-xs"
+            onClick={onQueryCredits}
+            disabled={creditBusy || cr.queryable === 0}
+            title={
+              cr.queryable === 0
+                ? "这个客户端的账号库里没有带网页凭证的账号，查不了积分"
+                : "只查这个客户端账号库里的账号，不影响其它客户端"
+            }
+          >
+            {creditBusy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            查询积分
+          </Button>
+        </div>
+        {cr.withData > 0 ? (
+          <div className="mt-1.5 flex items-baseline gap-2">
+            <span className="text-lg leading-6 font-semibold tabular-nums">
+              {fmtCredits(cr.totalRemaining)}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              合计剩余 · {cr.withData}/{cr.accountCount} 个账号
+              {cr.updatedAt ? ` · ${fmtTime(cr.updatedAt)}` : ""}
+            </span>
+          </div>
+        ) : (
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            {cr.accountCount === 0
+              ? "这个客户端还没有账号，先到「Trae 账号管理」添加。"
+              : cr.queryable === 0
+                ? "账号库里只有切换载体账号（没有网页凭证），查不了积分。"
+                : "尚未查询。点「查询积分」拉取这个客户端的账号额度。"}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function HomePage() {
   /**
    * 总览数据来自**进程内共享 store**（App 启动时已经预热过一遍）。
@@ -186,6 +302,16 @@ export default function HomePage() {
   const [creditsOverride, setCreditsOverride] = useState<WbCreditsResult | null>(null);
   const [creditsBusy, setCreditsBusy] = useState(false);
   const [reclaimBusy, setReclaimBusy] = useState(false);
+  /** 正在联网查积分的 Trae 客户端 key（一次只查一个客户端，互不影响）。 */
+  const [traeCreditBusy, setTraeCreditBusy] = useState<string | null>(null);
+  /**
+   * 首页正在看哪一个 Trae 客户端。
+   *
+   * ⚠️ 这里只决定「看哪一块」，不参与任何统计：每个客户端的账号 / 会话 / 积分
+   *    都由后端按它自己的 key 算好。默认值必须是列表第一项 —— 后端已按
+   *    `client_usage::sort_installed()` 排过序，前端别再写死某个 key。
+   */
+  const [traeClientKey, setTraeClientKey] = useState<string | null>(null);
 
   const credits = creditsOverride ?? ov?.credits ?? null;
 
@@ -255,6 +381,66 @@ export default function HomePage() {
   const totalSessions = (trae?.sessionTotal ?? 0) + (wb?.sessionCount ?? 0);
   const reclaimTotal = reclaim?.totalBytes ?? 0;
 
+  /** 本机已安装的 Trae 客户端（后端已按使用记忆排序，`[0]` 就是默认要看的那一个）。 */
+  const traeClients = useMemo(() => trae?.clients ?? [], [trae]);
+
+  /**
+   * 切换条的入参；`top` 只认后端下发的 `topPick`，前端不另算「谁最常用」。
+   * 同一个组件也被「Trae 会话记录」用着，这里只做字段翻译。
+   */
+  const traeClientOptions = useMemo<TraeClientOption[]>(
+    () =>
+      traeClients.map((c) => ({
+        key: c.key,
+        label: c.label,
+        installed: c.installed,
+        hasLogin: c.hasLogin,
+        top: c.key === trae?.topPick,
+      })),
+    [traeClients, trae?.topPick],
+  );
+
+  /**
+   * 选中的客户端。列表首项兜底 + 已被卸载/消失时自动落回首项，
+   * 因此下拉不会出现「选中态指向一个不存在的客户端」。
+   */
+  const activeTraeClient = useMemo(
+    () => traeClients.find((c) => c.key === traeClientKey) ?? traeClients[0] ?? null,
+    [traeClients, traeClientKey],
+  );
+
+  useEffect(() => {
+    if (traeClients.length === 0) {
+      if (traeClientKey !== null) setTraeClientKey(null);
+      return;
+    }
+    if (!traeClients.some((c) => c.key === traeClientKey)) {
+      setTraeClientKey(traeClients[0].key);
+    }
+  }, [traeClients, traeClientKey]);
+
+  /**
+   * 查询**单个 Trae 客户端**账号库的积分。
+   *
+   * 查完直接重算总览 —— 不在这里自己拼一份积分摘要：摘要的唯一出口是后端的
+   * `app_overview::trae_client_credits`，在两端各推一遍迟早会对不上。
+   * 代价是多跑一次总览（和点「刷新」同一条路径），换来的是首页数字永远同源。
+   */
+  const refreshTraeCredits = useCallback(async (clientKey: string, label: string) => {
+    setTraeCreditBusy(clientKey);
+    try {
+      const res = await api.traeCreditsQuery(clientKey, true);
+      toast.success(`${label}：积分已更新 ${res.summary.succeeded}/${res.summary.queried}`, {
+        description: `合计剩余 ${fmtCredits(res.summary.totalRemaining)}`,
+      });
+      await refreshOverview();
+    } catch (e) {
+      toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setTraeCreditBusy(null);
+    }
+  }, []);
+
   /** 首页只展示「近期到期」的前 3 个包，完整列表在「WorkBuddy 账号管理」页。 */
   const expiring = useMemo(() => {
     return (credits?.accounts ?? [])
@@ -320,7 +506,11 @@ export default function HomePage() {
           icon={<MessageSquare className="size-4" />}
           label="会话总数"
           value={totalSessions.toLocaleString("zh-CN")}
-          sub={`Trae ${trae?.sessionTotal ?? 0} · WorkBuddy ${wb?.sessionCount ?? "—"}`}
+          sub={
+            trae?.anyDecrypted
+              ? `Trae 已解密客户端 ${trae.sessionTotal} · WorkBuddy ${wb?.sessionCount ?? "—"}`
+              : `Trae 未解密 · WorkBuddy ${wb?.sessionCount ?? "—"}`
+          }
           loading={!ov}
         />
         <Stat
@@ -338,8 +528,10 @@ export default function HomePage() {
         />
       </div>
 
-      {/* 双栏状态卡 */}
-      <div className="grid gap-4 lg:grid-cols-2">
+      {/* 双栏状态卡。
+          ⚠️ `items-start`：Trae 侧是「每个客户端一块」，客户端多的时候会比 WorkBuddy
+          侧高出一大截；默认的 `stretch` 会把矮的那张拉成同高，中间留一块空白。 */}
+      <div className="grid items-start gap-4 lg:grid-cols-2">
         {/* Trae */}
         <Card className="flex flex-col">
           <CardHeader className="pb-3">
@@ -351,7 +543,7 @@ export default function HomePage() {
                 </CardTitle>
                 <CardDescription>
                   {trae
-                    ? `${trae.runningClients}/${trae.installedClients} 个客户端在运行`
+                    ? `${trae.runningClients}/${trae.installedClients} 个客户端在运行 · 每个客户端的账号库与会话库各自独立`
                     : "加载中…"}
                 </CardDescription>
               </div>
@@ -364,42 +556,29 @@ export default function HomePage() {
           <CardContent className="flex flex-1 flex-col gap-3">
             {!trae ? (
               <Skeleton className="h-24 rounded-lg" />
-            ) : (trae?.clients ?? []).length === 0 ? (
+            ) : traeClients.length === 0 ? (
               <p className="text-sm text-muted-foreground">本机没有检测到已安装的 Trae 客户端。</p>
             ) : (
-              <div className="divide-y rounded-lg border">
-                {(trae?.clients ?? []).map((c) => (
-                  <div key={c.key} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2.5">
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm">{c.label}</div>
-                      <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
-                        <Dot on={c.running} label={c.running ? `${c.processCount} 个进程` : "已退出"} />
-                        <span>·</span>
-                        <span>{c.accounts} 个账号</span>
-                        <span>·</span>
-                        <span>
-                          {c.decrypted.sessionCount != null
-                            ? `${c.decrypted.sessionCount} 个会话`
-                            : "未解密"}
-                        </span>
-                      </div>
-                    </div>
-                    {c.decrypted.exists ? (
-                      <Badge
-                        className={
-                          c.decrypted.current
-                            ? "bg-emerald-500/15 text-emerald-600"
-                            : "bg-amber-500/15 text-amber-600"
-                        }
-                      >
-                        {c.decrypted.current ? "解密库最新" : "解密库待刷新"}
-                      </Badge>
-                    ) : (
-                      <Badge variant="secondary">未解密</Badge>
-                    )}
-                  </div>
-                ))}
-              </div>
+              <>
+                {/* 本机有几个客户端就几个标签，与「Trae 会话记录」用的是同一个组件。 */}
+                <TraeClientSwitcher
+                  clients={traeClientOptions}
+                  value={activeTraeClient?.key ?? null}
+                  onChange={setTraeClientKey}
+                  disabled={traeCreditBusy !== null}
+                  label="Trae 客户端（首页）"
+                />
+                {activeTraeClient ? (
+                  <TraeClientBlock
+                    key={activeTraeClient.key}
+                    client={activeTraeClient}
+                    creditBusy={traeCreditBusy === activeTraeClient.key}
+                    onQueryCredits={() =>
+                      void refreshTraeCredits(activeTraeClient.key, activeTraeClient.label)
+                    }
+                  />
+                ) : null}
+              </>
             )}
 
             <div className="mt-auto flex flex-wrap gap-2 pt-1">
@@ -617,13 +796,38 @@ export default function HomePage() {
                 没有需要提醒的事项。会话、账号与客户端状态都正常。
               </p>
             )}
-            <div className="flex flex-wrap gap-2 pt-1">
-              <Button asChild variant="outline" size="sm">
-                <Link to="/workbuddy-import">WorkBuddy 会话导入</Link>
-              </Button>
-              <Button asChild variant="outline" size="sm">
-                <Link to="/workbuddy-export">Trae 会话导出</Link>
-              </Button>
+            {/*
+              跨工具迁移：**文案、分组名、图标三样都与侧栏「数据迁移」区域严格一致**。
+              ⚠️ 同一个功能在首页叫「导入 / 导出」、在侧栏叫「A → B」，用户就得猜是不是
+                 同一件事；这里统一到侧栏那套「谁 → 谁」的说法，页面标题也是这么写的。
+            */}
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-medium tracking-wide text-muted-foreground/70">
+                  数据迁移
+                </span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+              <p className="text-xs leading-5 text-muted-foreground">
+                <span className="font-medium text-foreground/80">WorkBuddy → Trae</span> 把 WorkBuddy
+                的明文会话转成 Trae 的库结构后加密写入指定账号；
+                <span className="font-medium text-foreground/80"> Trae → WorkBuddy</span>{" "}
+                把 Trae 的会话导出成本机 WorkBuddy 的明文记录。
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button asChild variant="outline" size="sm">
+                  <Link to="/workbuddy-import">
+                    <HardDriveDownload className="size-3.5" />
+                    WorkBuddy → Trae
+                  </Link>
+                </Button>
+                <Button asChild variant="outline" size="sm">
+                  <Link to="/workbuddy-export">
+                    <HardDriveUpload className="size-3.5" />
+                    Trae → WorkBuddy
+                  </Link>
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>
