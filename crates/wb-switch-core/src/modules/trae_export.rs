@@ -663,6 +663,9 @@ pub struct SessionInfo {
     pub created: String,
     pub updated: String,
     pub turns: i64,
+    /// 消息总条数（chat_message 全部未删行）。列表「正文」列用它当体量指标 ——
+    /// Trae 的正文存在 SQLite 里没有独立文件，WorkBuddy 那边的 MB 在这里没有对应物。
+    pub messages: i64,
     /// 归属账号 uid（project.user_id；无归属为空串）。
     pub owner_uid: String,
     /// 归属账号显示名（昵称或 uid 尾号；无归属为「（无归属）」）。
@@ -706,6 +709,18 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(|e| format!("轮数统计失败: {e}"))?;
 
+    // 消息总条数：与轮数同一张表，只是不过滤 role，顺手一起聚合。
+    let messages_map: HashMap<String, i64> = conn
+        .prepare(
+            "SELECT session_id, count(*) FROM chat_message \
+             WHERE ifnull(deleted_at,0)=0 GROUP BY session_id",
+        )
+        .map_err(|e| format!("消息数统计失败: {e}"))?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| format!("消息数统计失败: {e}"))?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|e| format!("消息数统计失败: {e}"))?;
+
     Ok(rows
         .into_iter()
         .map(|(id, title, created, updated, owner_uid)| {
@@ -720,6 +735,7 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
                 created: format_ts(&created),
                 updated: format_ts(&updated),
                 turns: turns_map.get(&id).copied().unwrap_or(0),
+                messages: messages_map.get(&id).copied().unwrap_or(0),
                 owner_uid,
                 owner_label,
             }
@@ -1308,7 +1324,12 @@ pub fn export_session(client_key: &str, session_id: &str) -> Result<ExportedFile
     })
 }
 
-/// 会话信息（查询会话信息用）。
+/// 会话信息（详情弹窗用）。
+///
+/// 除计数外还返回**逐回合正文**（`turns[]`），形态对齐 WorkBuddy 的 `WbSessionDetail`，
+/// 让两端详情弹窗能共用同一套渲染。Trae 库里的消息是**扁平的 user/assistant 交错序列**，
+/// 这里按「一个 user 起头、其后连续 assistant 归并」配对成回合；配不上的 assistant
+/// 归到前一个回合（或单独成回合），与 MD 导出的并列顺序保持一致。
 pub fn session_detail(client_key: &str, session_id: &str) -> Result<Value, String> {
     if !is_session_id(session_id) {
         return Err("会话 ID 格式不正确，应为 20~24 位十六进制".into());
@@ -1316,33 +1337,97 @@ pub fn session_detail(client_key: &str, session_id: &str) -> Result<Value, Strin
     let conn = open_decrypted(client_key)?;
     let row = conn
         .query_row(
-            "SELECT session_title, created_at, updated_at FROM chat_session WHERE session_id=?",
+            "SELECT s.session_title, s.created_at, s.updated_at, COALESCE(p.user_id, '') \
+             FROM chat_session s LEFT JOIN project p ON s.project_id = p.project_id \
+             WHERE s.session_id=?",
             [session_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, rusqlite::types::Value>(1)?,
                     row.get::<_, rusqlite::types::Value>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .map_err(|_| format!("会话 {session_id} 不在当前数据源中"))?;
-    let (title, created, updated) = row;
+    let (title, created, updated, owner_uid) = row;
     let turns = fetch_conversation(&conn, session_id)?;
     let title = if title.trim().is_empty() {
         session_id.to_string()
     } else {
         title.trim().to_string()
     };
+    let owner_label = if owner_uid.is_empty() {
+        "（无归属）".to_string()
+    } else {
+        crate::modules::trae_vault::account_label(client_key, &owner_uid)
+    };
+    let created_s = format_ts(&created);
+    let updated_s = format_ts(&updated);
+
+    let rounds = pair_rounds(&turns);
     Ok(json!({
         "session_id": session_id,
         "title": title,
         "source": label_of(client_key),
         "turns": turns.iter().filter(|t| t.role == "user").count(),
         "messages": turns.len(),
-        "created": format_ts(&created),
-        "updated": format_ts(&updated),
+        "created": created_s,
+        "updated": updated_s,
+        // 归属账号（原列表列，本次挪进详情）
+        "owner_uid": owner_uid,
+        "owner_label": owner_label,
+        // 逐回合正文（对齐 WorkBuddy 的 turns[] 形态）
+        "rounds": rounds,
     }))
+}
+
+/// 把扁平的 user/assistant 消息序列配对成「提问 + 回答」回合。
+///
+/// 规则（与 MD 导出的并列顺序一致，不丢消息）：
+/// - `user` 起一个新回合；
+/// - `assistant` 追加到当前回合的回答里，多条用空行连接；
+/// - 开头就是 `assistant`（没有前导 user）时单开一个只有回答的回合，不丢弃。
+fn pair_rounds(turns: &[Turn]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur_user: Option<String> = None;
+    let mut cur_asst: Vec<String> = Vec::new();
+    let mut cur_tools: usize = 0;
+
+    for t in turns {
+        if t.role == "user" {
+            // 遇到新的 user：先把上一回合收口
+            flush_round(&mut out, &mut cur_user, &mut cur_asst, &mut cur_tools);
+            cur_user = Some(t.text.clone());
+        } else {
+            if !t.text.is_empty() {
+                cur_asst.push(t.text.clone());
+            }
+            cur_tools += t.tools.len();
+        }
+    }
+    flush_round(&mut out, &mut cur_user, &mut cur_asst, &mut cur_tools);
+    out
+}
+
+/// 把当前累积的回合推进 `out`；尚未开始任何内容时是空操作。
+fn flush_round(
+    out: &mut Vec<Value>,
+    user: &mut Option<String>,
+    asst: &mut Vec<String>,
+    tools: &mut usize,
+) {
+    if user.is_none() && asst.is_empty() {
+        return;
+    }
+    out.push(json!({
+        "userText": user.take().unwrap_or_default(),
+        "assistantText": asst.join("\n\n"),
+        "toolCalls": *tools,
+    }));
+    asst.clear();
+    *tools = 0;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1447,6 +1532,83 @@ pub fn remove_file_quiet(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(role: &str, text: &str, tools: &[&str]) -> Turn {
+        Turn {
+            role: role.to_string(),
+            text: text.to_string(),
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// 正常的 user/assistant 交错：逐条配对成回合。
+    #[test]
+    fn pair_rounds_matches_user_with_following_assistant() {
+        let turns = vec![
+            turn("user", "问题一", &[]),
+            turn("assistant", "回答一", &["Read"]),
+            turn("user", "问题二", &[]),
+            turn("assistant", "回答二", &[]),
+        ];
+        let r = pair_rounds(&turns);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0]["userText"], "问题一");
+        assert_eq!(r[0]["assistantText"], "回答一");
+        assert_eq!(r[0]["toolCalls"], 1);
+        assert_eq!(r[1]["userText"], "问题二");
+        assert_eq!(r[1]["assistantText"], "回答二");
+    }
+
+    /// 同一个 user 后跟多条 assistant（工具调用拆成多段）时，回答要合并而不是丢掉。
+    #[test]
+    fn pair_rounds_merges_multiple_assistant_messages_into_one_round() {
+        let turns = vec![
+            turn("user", "问", &[]),
+            turn("assistant", "第一段", &["Bash"]),
+            turn("assistant", "第二段", &["Read", "Write"]),
+        ];
+        let r = pair_rounds(&turns);
+        assert_eq!(r.len(), 1, "多条 assistant 应归并进同一回合");
+        assert_eq!(r[0]["assistantText"], "第一段\n\n第二段");
+        assert_eq!(r[0]["toolCalls"], 3, "工具调用数应累加");
+    }
+
+    /// 开头就是 assistant（没有前导 user）不能丢，要单开一个只有回答的回合。
+    #[test]
+    fn pair_rounds_keeps_leading_assistant_without_user() {
+        let turns = vec![turn("assistant", "开场白", &[]), turn("user", "问", &[])];
+        let r = pair_rounds(&turns);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0]["userText"], "");
+        assert_eq!(r[0]["assistantText"], "开场白");
+        assert_eq!(r[1]["userText"], "问");
+        assert_eq!(r[1]["assistantText"], "", "该回合没有回答，答案为空串而不是被省略");
+    }
+
+    /// 结尾悬空的 user（有问无答）也要保留，否则列表里会少一轮。
+    #[test]
+    fn pair_rounds_keeps_trailing_user_without_assistant() {
+        let turns = vec![turn("user", "有问无答", &[])];
+        let r = pair_rounds(&turns);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["userText"], "有问无答");
+        assert_eq!(r[0]["assistantText"], "");
+    }
+
+    /// 空序列不产生任何回合（也不能因为 flush 判空逻辑漏判而多出一个空回合）。
+    #[test]
+    fn pair_rounds_of_empty_input_is_empty() {
+        assert!(pair_rounds(&[]).is_empty());
+    }
+
+    /// 角色大小写/其余取值一律当 assistant 处理（库里的 role 不只是 user/assistant）。
+    #[test]
+    fn pair_rounds_treats_non_user_roles_as_assistant() {
+        let turns = vec![turn("user", "问", &[]), turn("system", "系统提示", &[])];
+        let r = pair_rounds(&turns);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["assistantText"], "系统提示");
+    }
 
     #[test]
     fn backup_group_key_parses_all_three_naming_schemes() {

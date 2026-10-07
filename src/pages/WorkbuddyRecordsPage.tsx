@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import {
   AlertTriangle,
   Copy,
+  Eye,
   FileDown,
   Link2Off,
   Loader2,
@@ -176,6 +177,12 @@ export default function WorkbuddyRecordsPage() {
     setter(next);
   };
 
+  /** 全选：会话列表当前账号下的全部行（与 Trae 会话记录页同款）。 */
+  const allSelected = sessions.length > 0 && sessions.every((s) => selected.has(s.id));
+  const toggleAll = () => {
+    setSelected(allSelected ? new Set() : new Set(sessions.map((s) => s.id)));
+  };
+
   const openDetail = async (item: WbSessionItem) => {
     setBusy(item.id);
     try {
@@ -326,7 +333,19 @@ export default function WorkbuddyRecordsPage() {
                   <table className="w-full text-sm">
                     <thead className="border-b bg-muted/40 text-xs text-muted-foreground">
                       <tr>
-                        <th className="w-10 px-3 py-2" />
+                        <th className="w-10 px-3 py-2">
+                          <input
+                            type="checkbox"
+                            className="size-4 cursor-pointer align-middle"
+                            aria-label="全选当前列表"
+                            title="全选当前列表"
+                            checked={allSelected}
+                            ref={(el) => {
+                              if (el) el.indeterminate = selected.size > 0 && !allSelected;
+                            }}
+                            onChange={toggleAll}
+                          />
+                        </th>
                         <th className="px-3 py-2 text-left font-medium">标题</th>
                         <th className="px-3 py-2 text-left font-medium">更新时间</th>
                         <th className="px-3 py-2 text-left font-medium">正文</th>
@@ -359,13 +378,14 @@ export default function WorkbuddyRecordsPage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
+                                title="查看详情"
                                 disabled={busy === s.id}
                                 onClick={() => void openDetail(s)}
                               >
                                 {busy === s.id ? (
                                   <Loader2 className="size-4 animate-spin" />
                                 ) : (
-                                  "详情"
+                                  <Eye className="size-4" />
                                 )}
                               </Button>
                               <Button
@@ -602,7 +622,7 @@ export default function WorkbuddyRecordsPage() {
                     <thead className="border-b bg-muted/40 text-xs text-muted-foreground">
                       <tr>
                         <th className="px-3 py-2 text-left font-medium">会话</th>
-                        <th className="w-28 px-3 py-2 text-left font-medium">状态</th>
+                        <th className="w-32 px-3 py-2 text-left font-medium">状态</th>
                         <th className="w-40 px-3 py-2 text-left font-medium">源副本</th>
                         <th className="w-40 px-3 py-2 text-left font-medium">目标副本</th>
                         <th className="w-20 px-3 py-2 text-right font-medium">操作</th>
@@ -622,7 +642,7 @@ export default function WorkbuddyRecordsPage() {
                               </div>
                             </td>
                             <td className="px-3 py-2">
-                              <span className={cn("rounded border px-2 py-0.5 text-xs", v.tone)}>
+                              <span className={cn("inline-block whitespace-nowrap rounded border px-2 py-0.5 text-xs", v.tone)}>
                                 {v.label}
                               </span>
                             </td>

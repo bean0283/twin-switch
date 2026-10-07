@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
   AlertTriangle,
@@ -8,6 +9,7 @@ import {
   FileDown,
   FileUp,
   Globe,
+  GitCompare,
   Loader2,
   LogIn,
   PencilLine,
@@ -60,10 +62,13 @@ import type {
   TraeAccountOverview,
   TraeBrowserInfo,
   TraeCreditEntry,
+  TraeDivergedGroup,
+  TraeDivergedLinks,
   TraeInstalledClient,
   TraeOAuthSessionStatus,
   TraeOAuthStartResult,
   TraeSwitchResult,
+  TraeSyncDirection,
   TraeVaultEntry,
 } from "@/lib/trae-types";
 
@@ -120,8 +125,134 @@ function tokenExpiryLabel(ms: number | null | undefined): string | null {
   return null;
 }
 
+/**
+ * 弹窗里的一行：一个**需要处理**的关联组（两端分叉，或副本数据写坏了）。
+ *
+ * 方向一律翻译成账号名，**不再出现「当前账号」**：
+ * 这个弹窗从 T35 起是在**切换之前**弹的，那时「当前账号」还是旧的那个 ——
+ * 写成「当前账号」会把方向说反，而这个动作是要**覆盖数据**的。
+ * 两端名字都来自后端（`selfLabel` / `partnerLabel`），与「我现在登的是谁」无关。
+ *
+ * ⚠️ 导出仅为**本地渲染自查 / 预览**（`preview/`，不进生产入口）：本块的「自检警示」
+ *    是多行文本 + 按钮组，属于最容易在小宽度下压坏的那类布局，必须能单独渲染核对。
+ */
+export function DivergedRow({
+  group,
+  checked,
+  direction,
+  disabled,
+  onChecked,
+  onDirection,
+}: {
+  group: TraeDivergedGroup;
+  checked: boolean;
+  /** `null` = 还没选方向（后端推不出谁新时不给建议，用户必须自己点）。 */
+  direction: TraeSyncDirection | null;
+  disabled: boolean;
+  onChecked: (v: boolean) => void;
+  onDirection: (v: TraeSyncDirection) => void;
+}) {
+  const title = (group.title as string) || "(无标题)";
+  const selfIsSource = group.selfRole === "source";
+  const syncInDir: TraeSyncDirection = selfIsSource ? "targetToSource" : "sourceToTarget";
+  const syncOutDir: TraeSyncDirection = selfIsSource ? "sourceToTarget" : "targetToSource";
+  // `selfLabel` 是「被探测的那一端」的账号名（切换前 = 要切过去的那个账号）。
+  const self = group.selfLabel || "本端账号";
+  const partner = group.partnerLabel || "对端账号";
+  // 自检问题：**哪一份坏了必须写清楚** —— 用户据此决定往哪边同步（方向不能猜）。
+  const selfIssues = group.selfIssues ?? [];
+  const partnerIssues = group.partnerIssues ?? [];
+  const broken = selfIssues.length > 0 || partnerIssues.length > 0;
+
+  return (
+    <div className="flex items-start gap-3 rounded-md border p-3">
+      <input
+        type="checkbox"
+        className="mt-1 size-4 shrink-0 accent-primary"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChecked(e.target.checked)}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-medium" title={title}>
+          {title}
+        </div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          {self} {group.selfMessages ?? "?"} 条 · {partner} {group.partnerMessages ?? "?"} 条
+        </div>
+        {broken && (
+          <div className="mt-1.5 space-y-0.5 rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-xs text-destructive">
+            <div className="font-medium">⚠️ 这条副本的数据引用已错位，客户端里会显示不全</div>
+            {selfIssues.length > 0 && <div>· {self}：{selfIssues.join("；")}</div>}
+            {partnerIssues.length > 0 && (
+              <div>
+                · {partner}：{partnerIssues.join("；")}
+              </div>
+            )}
+            <div className="text-destructive/90">
+              {selfIssues.length > 0 && partnerIssues.length === 0
+                ? `点「同步到「${self}」」，用「${partner}」的内容重建这一份。`
+                : partnerIssues.length > 0 && selfIssues.length === 0
+                  ? `点「同步到「${partner}」」，用「${self}」的内容重建对面那份。`
+                  : "两份都有问题，请人工判断该保留哪一份。"}
+            </div>
+          </div>
+        )}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <Button
+            size="sm"
+            variant={direction === syncInDir ? "default" : "outline"}
+            disabled={disabled || !checked}
+            onClick={() => onDirection(syncInDir)}
+          >
+            同步到「{self}」
+            {/* 标「推荐」而非「较新」：推荐的是**保留较新一端**这个方向，
+                写成「较新」容易被读成「对面那个更新」，正好选反。
+                副本写坏时后端不给建议（`null`），两个按钮都不标。 */}
+            {group.suggestedDirection === syncInDir ? "（推荐）" : ""}
+          </Button>
+          <Button
+            size="sm"
+            variant={direction === syncOutDir ? "default" : "outline"}
+            disabled={disabled || !checked}
+            onClick={() => onDirection(syncOutDir)}
+          >
+            同步到「{partner}」
+            {group.suggestedDirection === syncOutDir ? "（推荐）" : ""}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 一次「用户已经点了、但**还没有执行**」的切换（T35）。
+ *
+ * 以前是**切完了**才探测并弹窗：用户看到提示时账号已经换过去了，想反悔都来不及。
+ * 现在探测与确认都挪到切换**之前**，这个对象就是「弹窗背后待执行的那次动作」。
+ */
+interface PendingSwitch {
+  entry: TraeVaultEntry;
+  kind: "switch" | "rollback";
+  /** 目标账号的 uid —— 探测分叉必须有一个「自己」，拿不到就无从探测。 */
+  targetUid: string;
+}
+
+/**
+ * 从账号库条目里取目标账号的 uid。
+ *
+ * 载体（`carrier`）看 `meta.verified_uid`；网页凭证（`oauth`）看 `oauth.uid`。
+ * 两个都兜一遍：备份时可能还没验出 uid，而 oauth 条目也带 verified_uid。
+ */
+function targetUidOf(entry: TraeVaultEntry): string | null {
+  return entry.meta?.verified_uid ?? entry.oauth?.uid ?? null;
+}
+
 export default function TraeSwitchPage() {
   const [clients, setClients] = useState<TraeInstalledClient[]>([]);
+  /** 排在最前且**确有使用历史**的客户端（全 0 分时是 null）——只用来打「常用」徽标。 */
+  const [usageTopPick, setUsageTopPick] = useState<string | null>(null);
   const [clientKey, setClientKey] = useState<string | null>(null);
   const [overview, setOverview] = useState<TraeAccountOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -152,6 +283,23 @@ export default function TraeSwitchPage() {
   /** 底部「回滚」卡里选中的账号 id（回滚 = 切回它）。 */
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null);
 
+  // **切换前**的「两端不一致」确认框（T35）：探测到分叉/写坏才弹，纯粹是提醒，
+  // 失败不影响主流程 —— 提醒不成立就照常切，不打扰用户。
+  const [diverged, setDiverged] = useState<TraeDivergedLinks | null>(null);
+  /** 每组是否参与本次同步（默认全选）。 */
+  const [divergedOn, setDivergedOn] = useState<Record<string, boolean>>({});
+  /** 每组选的方向（默认取后端建议值）。 */
+  const [divergedDir, setDivergedDir] = useState<Record<string, TraeSyncDirection>>({});
+  /**
+   * 弹窗背后**还没执行**的那次切换（T35 的关键：先问、再切）。
+   *
+   * `null` = 这次弹窗不是由切换触发的（纯提醒），此时按钮只做「同步」。
+   * 有值 = 用户在账号卡上点了切换/回滚，等他答完再决定要不要真的切。
+   */
+  const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncLog, setSyncLog] = useState<string[]>([]);
+
   // 交接记忆表单
   const [hoProject, setHoProject] = useState("");
   const [hoSessions, setHoSessions] = useState("");
@@ -169,11 +317,14 @@ export default function TraeSwitchPage() {
 
   async function loadClients() {
     try {
-      const { clients } = await api.traeListClients();
+      const { clients, usage } = await api.traeListClients();
       setClients(clients);
+      setUsageTopPick(usage?.topPick ?? null);
+      // ⚠️ 顺序**已经由后端按「使用记忆」排好**（默认 `solo-cn` 第一）
+      //    ⇒ 默认选中第一个即可。前端**不要**再自己写一套「trae-cn 优先」的规则：
+      //    同一件事被两处独立推导，早晚会不一致（页面之间顺序不同就是这么来的）。
       const installed = clients.filter((c) => c.installed);
-      const preferred = installed.find((c) => c.key === "trae-cn") ?? installed[0];
-      setClientKey((prev) => prev ?? preferred?.key ?? null);
+      setClientKey((prev) => prev ?? installed[0]?.key ?? null);
     } catch (cause) {
       setError(api.asError(cause));
     }
@@ -182,6 +333,22 @@ export default function TraeSwitchPage() {
   useEffect(() => {
     void loadClients();
   }, []);
+
+  /**
+   * 清空「使用记忆」，客户端顺序回到内置默认（TRAE SOLO CN 第一）。
+   *
+   * 这个动作**只影响展示顺序**，不碰账号库、不碰任何会话数据，所以不需要二次确认。
+   */
+  async function onResetUsageOrder() {
+    try {
+      await api.traeClientUsageReset();
+      setClientKey(null);
+      await loadClients();
+      toast.success("已重置排序记忆", { description: "客户端顺序回到内置默认（TRAE SOLO CN 第一）" });
+    } catch (cause) {
+      toast.error("重置排序记忆失败", { description: api.asError(cause) });
+    }
+  }
 
   async function loadOverview(key: string) {
     setLoading(true);
@@ -354,8 +521,127 @@ export default function TraeSwitchPage() {
     setProgress((prev) => [...prev, ...lines]);
   }
 
-  async function onSwitch(entry: TraeVaultEntry) {
-    if (!clientKey || busy) return;
+  // 「同步差异」的进度行走 trae-import-progress；这里单独收一列，给弹窗自检用。
+  useEffect(() => {
+    // 同 TraeRecordsPage：`listen()` 是异步的，StrictMode 下首轮清理拿不到 un，
+    // 会残留一个监听把每条进度事件投递两遍。
+    let active = true;
+    let un: (() => void) | undefined;
+    void listen<{ line: string }>("trae-import-progress", (e) => {
+      setSyncLog((prev) => [...prev, e.payload.line]);
+    }).then((u) => {
+      if (active) un = u;
+      else u();
+    });
+    return () => {
+      active = false;
+      un?.();
+    };
+  }, []);
+
+  const syncSelected = diverged
+    ? diverged.groups.filter(
+        (g) => divergedOn[g.groupId] && (divergedDir[g.groupId] ?? g.suggestedDirection),
+      ).length
+    : 0;
+
+  /**
+   * 探测**指定账号**有没有「与其它账号还留着关联、但两端已经不一致」的会话副本。
+   * 返回 `null` = 没什么要提醒的（或探测失败）。
+   *
+   * ⚠️ 这个探测**只读本地数据**（关联登记 + 实时库里的会话），与「客户端当前登的是谁」
+   *    完全无关 —— 所以可以在切换**之前**拿目标账号的 uid 去探。
+   *    T35 之前是切完再探，用户只能在账号已经换过去之后被动接受，想放弃都来不及。
+   * ⚠️ 探测失败**绝不挡主流程**：切换是用户明确要的动作，提醒只是锦上添花，
+   *    把一个正常的切换改成失败反而误导。
+   */
+  async function probeTargetDivergence(uid: string): Promise<TraeDivergedLinks | null> {
+    if (!clientKey) return null;
+    try {
+      const v = await api.traeSessionLinksDiverged(clientKey, uid);
+      return v.ok && v.count > 0 ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 把探测结果装进弹窗（默认全选、方向取后端建议），并记下背后待执行的那次切换。 */
+  function openDivergencePrompt(v: TraeDivergedLinks, pending: PendingSwitch | null) {
+    setDiverged(v);
+    setDivergedOn(Object.fromEntries(v.groups.map((g) => [g.groupId, true])));
+    // ⚠️ 后端推不出方向时给 `null`（副本写坏了 ⇒ 条数相等，猜谁新必错）。
+    //    这种组**不预置方向**，用户不点就不下发 —— 缺省值必须能表达「没选」。
+    setDivergedDir(
+      Object.fromEntries(
+        v.groups
+          .filter((g) => g.suggestedDirection !== null)
+          .map((g) => [g.groupId, g.suggestedDirection as TraeSyncDirection]),
+      ),
+    );
+    setPendingSwitch(pending);
+  }
+
+  /** 关掉弹窗（跳过 / 取消），并清掉背后待执行的那次切换。 */
+  function closeDivergencePrompt() {
+    setDiverged(null);
+    setPendingSwitch(null);
+  }
+
+  /** 把待执行的那次动作跑完（切 / 回滚走同一套确认，只有最后一步不同）。 */
+  async function runPending(p: PendingSwitch) {
+    if (p.kind === "rollback") await doRollback(p.entry.id);
+    else await doSwitch(p.entry);
+  }
+
+  /**
+   * 执行弹窗里勾选的同步：一次写库周期搞定全部组，客户端只重启一次。
+   *
+   * 同步成功后**接着把待执行的那次切换做掉** —— 用户最初点的是「切换」，
+   * 同步只是他同意加上的前置步骤，不该让他再点一次。
+   */
+  async function runDivergedSync() {
+    if (!clientKey || !diverged || syncBusy) return;
+    const pending = pendingSwitch;
+    const items: { groupId: string; direction: TraeSyncDirection }[] = [];
+    for (const g of diverged.groups) {
+      if (!divergedOn[g.groupId]) continue;
+      const direction = divergedDir[g.groupId] ?? g.suggestedDirection;
+      // ⚠️ 没有方向就**绝不下发**：这是覆盖数据的操作，猜错方向 = 拿旧内容盖掉新内容。
+      if (!direction) continue;
+      items.push({ groupId: g.groupId, direction });
+    }
+    if (items.length === 0) {
+      // 一项都没勾 ≈ 用户实际想跳过同步。此时主按钮已被禁用，这段只是兜底：
+      // 别让「点了主按钮却什么都不发生」的情况出现。
+      if (pending) {
+        closeDivergencePrompt();
+        await runPending(pending);
+      }
+      return;
+    }
+    setSyncBusy(true);
+    setSyncLog([]);
+    try {
+      const r = await api.traeSessionSyncGroups(clientKey, items);
+      toast.success(`已同步 ${r.count} 个关联会话`, {
+        description: r.relaunched ? "已自动重启客户端" : "同步完成，但自动重启客户端失败",
+      });
+      setDiverged(null);
+      await loadOverview(clientKey);
+      setPendingSwitch(null);
+      if (pending) await runPending(pending);
+    } catch (cause) {
+      // 同步失败就**停在原地**：待执行的切换留着，用户还能改选「直接切换」或重试。
+      // 不能默默把切换做掉 —— 那等于绕过了他刚提的那个要求。
+      toast.error("同步失败", { description: api.asError(cause) });
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  /** 真正执行一次切换。先经过 [`onSwitch`] 的分叉探测与确认。 */
+  async function doSwitch(entry: TraeVaultEntry) {
+    if (!clientKey) return;
     setBusy(true);
     setProgress([]);
     try {
@@ -366,6 +652,8 @@ export default function TraeSwitchPage() {
         description: res.message || undefined,
       });
       await loadOverview(clientKey);
+      // ⚠️ 切完**不再**弹同步确认：T35 起已经在切换之前问过了。
+      //    再弹一次等于把同一个问题问两遍，而且是真的「切完才问」。
     } catch (cause) {
       toast.error("切换失败", { description: api.asError(cause) });
     } finally {
@@ -374,12 +662,53 @@ export default function TraeSwitchPage() {
   }
 
   /**
+   * 切换到某个账号。
+   *
+   * **先问、再切**（T35）：目标账号若有「关联副本已分叉 / 写坏」，先弹确认框，
+   * 由用户决定「先同步再切」「直接切」还是「取消」。没有要提醒的就照常静默切换。
+   */
+  async function onSwitch(entry: TraeVaultEntry) {
+    if (!clientKey || busy) return;
+    const uid = targetUidOf(entry);
+    // 拿不到 uid 就无从探测（探测必须有一个 uid 当「自己」）⇒ 不打扰，直接切。
+    if (uid) {
+      setBusy(true);
+      const v = await probeTargetDivergence(uid);
+      setBusy(false);
+      if (v) {
+        openDivergencePrompt(v, { entry, kind: "switch", targetUid: uid });
+        return;
+      }
+    }
+    await doSwitch(entry);
+  }
+
+  /**
    * 回滚到指定账号。后端语义 `trae_switch::rollback_to` ≡ `switch_to`，
    * 即「结束客户端 → 写回该账号的登录态 → 重启」，用于切换异常后恢复。
    * 入口在页面底部的独立「回滚」卡里（与 WorkBuddy 账号页同款位置与外观）。
+   *
+   * 与切换走同一套「先问、再执行」—— 回滚同样是切换，没有理由少问一次。
    */
   async function onRollback(accountId: string) {
     if (!clientKey || busy) return;
+    const entry = overview?.vault.find((e) => e.id === accountId);
+    const uid = entry ? targetUidOf(entry) : null;
+    if (entry && uid) {
+      setBusy(true);
+      const v = await probeTargetDivergence(uid);
+      setBusy(false);
+      if (v) {
+        openDivergencePrompt(v, { entry, kind: "rollback", targetUid: uid });
+        return;
+      }
+    }
+    await doRollback(accountId);
+  }
+
+  /** 真正执行一次回滚。先经过 [`onRollback`] 的分叉探测与确认。 */
+  async function doRollback(accountId: string) {
+    if (!clientKey) return;
     setBusy(true);
     setProgress([]);
     try {
@@ -565,7 +894,8 @@ export default function TraeSwitchPage() {
         </p>
       </div>
 
-      {/* 客户端选择 */}
+      {/* 客户端选择：顺序由「使用记忆」决定（切换次数 ×3 + 打开页面次数，降序；
+          没有历史时内置偏好 `solo-cn` 第一）。 */}
       {clients.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
           {clients.map((c) => {
@@ -575,6 +905,11 @@ export default function TraeSwitchPage() {
                 key={c.key}
                 type="button"
                 disabled={!c.installed}
+                title={
+                  c.key === usageTopPick
+                    ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
+                    : undefined
+                }
                 onClick={() => setClientKey(c.key)}
                 className={cn(
                   "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -585,6 +920,11 @@ export default function TraeSwitchPage() {
                 )}
               >
                 {c.label}
+                {c.key === usageTopPick ? (
+                  <span className="rounded bg-foreground/[0.08] px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                    常用
+                  </span>
+                ) : null}
                 {c.installed && c.has_login ? (
                   <span className="size-2 rounded-full bg-emerald-500" />
                 ) : null}
@@ -594,6 +934,16 @@ export default function TraeSwitchPage() {
           <Badge variant="secondary" className="ml-auto">
             {overview?.running ? "客户端运行中" : "客户端未运行"}
           </Badge>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-muted-foreground"
+            title="清空使用记忆，排序回到内置默认（TRAE SOLO CN 第一）"
+            onClick={() => void onResetUsageOrder()}
+          >
+            <RotateCcw className="size-4" />
+            重置排序
+          </Button>
           <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
             <FileUp className="size-4" />
             导入备份
@@ -1113,6 +1463,106 @@ export default function TraeSwitchPage() {
 
       {/* 全部积分包 */}
       <TraeCreditsDialog entry={credits.expand} onClose={() => credits.setExpand(null)} />
+
+      {/* 切换**之前**的「两端不一致」确认框（T35）：非强迫、可跳过，失败不打断主流程。
+          以前是切完再弹 —— 那时账号已经换过去了，用户想反悔都来不及。 */}
+      <Dialog
+        open={diverged !== null}
+        onOpenChange={(o) => {
+          if (!o && !syncBusy) closeDivergencePrompt();
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <GitCompare className="size-4 text-amber-500" />
+              {pendingSwitch
+                ? `${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${pendingSwitch.entry.id}」前，先处理 ${diverged?.count ?? 0} 个会话？`
+                : `检测到 ${diverged?.count ?? 0} 个会话需要处理`}
+            </DialogTitle>
+            <DialogDescription>
+              这些会话此前在账号之间复制过并建立过关联，现在**两端内容不一致**，
+              或**副本的数据引用已经错位**（后者在客户端里会显示不全）。
+              同步会把**被覆盖那一端**的内容换成另一端，会话 id 与账号归属都保持不变。
+              {pendingSwitch ? (
+                <span className="mt-1 block">
+                  现在还没切换，可以先处理干净再切；也可以直接切换，
+                  之后仍能在「会话记录 → 跨账号关联」里同步。
+                </span>
+              ) : null}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[46vh] space-y-2 overflow-y-auto pr-1">
+            {(diverged?.groups ?? []).map((g) => (
+              <DivergedRow
+                key={g.groupId}
+                group={g}
+                checked={divergedOn[g.groupId] ?? true}
+                direction={divergedDir[g.groupId] ?? g.suggestedDirection}
+                disabled={syncBusy}
+                onChecked={(v) => setDivergedOn((p) => ({ ...p, [g.groupId]: v }))}
+                onDirection={(v) => setDivergedDir((p) => ({ ...p, [g.groupId]: v }))}
+              />
+            ))}
+          </div>
+          {syncLog.length > 0 && (
+            <pre className="max-h-28 overflow-y-auto rounded-md border bg-muted/40 p-2 text-[11px] leading-relaxed">
+              {syncLog.join("\n")}
+            </pre>
+          )}
+          {/* ⚠️ 这行提示**不能**塞进 `DialogFooter`：那个容器在 ≥640px 是 `flex-row`，
+              三个按钮已经把宽度吃满，文字列会被压到几十像素 ⇒ **一个字一行**
+              （730px 实测折成 8 行）。单独占一行，任何宽度都正常。 */}
+          <p className="text-xs text-muted-foreground">
+            {pendingSwitch
+              ? `会先整份备份再回写；同步完成后自动${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${pendingSwitch.entry.id}」`
+              : "会先整份备份再回写，并自动重启客户端"}
+          </p>
+          <DialogFooter>
+            {pendingSwitch ? (
+              <>
+                {/* 「取消」= 连切换一起放弃（用户本来只想切号，看到有分叉决定先不动）。 */}
+                <Button variant="outline" onClick={closeDivergencePrompt} disabled={syncBusy}>
+                  取消{pendingSwitch.kind === "rollback" ? "回滚" : "切换"}
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={syncBusy}
+                  onClick={() => {
+                    const p = pendingSwitch;
+                    closeDivergencePrompt();
+                    void runPending(p);
+                  }}
+                >
+                  直接{pendingSwitch.kind === "rollback" ? "回滚" : "切换"}（不同步）
+                </Button>
+                <Button
+                  onClick={() => void runDivergedSync()}
+                  disabled={syncBusy || syncSelected === 0}
+                >
+                  {syncBusy && <Loader2 className="mr-2 size-4 animate-spin" />}
+                  {syncSelected > 0
+                    ? `同步 ${syncSelected} 项并${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}`
+                    : "选定方向后可继续"}
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" onClick={closeDivergencePrompt} disabled={syncBusy}>
+                  跳过
+                </Button>
+                <Button
+                  onClick={() => void runDivergedSync()}
+                  disabled={syncBusy || syncSelected === 0}
+                >
+                  {syncBusy && <Loader2 className="mr-2 size-4 animate-spin" />}
+                  {syncSelected > 0 ? `同步选中的 ${syncSelected} 项` : "选定方向后可同步"}
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

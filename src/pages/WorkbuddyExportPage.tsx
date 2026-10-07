@@ -68,6 +68,8 @@ function humanSize(bytes: number): string {
 export default function WorkbuddyExportPage() {
   const [target, setTarget] = useState<TraeWbTarget | null>(null);
   const [clients, setClients] = useState<TraeInstalledClient[]>([]);
+  /** 排在最前且**确有使用历史**的客户端（全 0 分时是 null）——只用来打「常用」徽标。 */
+  const [usageTopPick, setUsageTopPick] = useState<string | null>(null);
   const [clientKey, setClientKey] = useState<string | null>(null);
   const [sessions, setSessions] = useState<TraeWbSourceSession[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -115,11 +117,13 @@ export default function WorkbuddyExportPage() {
 
   const loadClients = useCallback(async () => {
     try {
-      const { clients } = await api.traeListClients();
+      const { clients, usage } = await api.traeListClients();
       setClients(clients);
+      setUsageTopPick(usage?.topPick ?? null);
+      // ⚠️ 顺序**已经由后端按「使用记忆」排好**（默认 `solo-cn` 第一）⇒ 直接取第一个。
+      //    前端别再自己写一套「trae-cn 优先」的规则，否则各页面顺序会不一致。
       const installed = clients.filter((c) => c.installed);
-      const preferred = installed.find((c) => c.key === "trae-cn") ?? installed[0];
-      setClientKey((prev) => prev ?? preferred?.key ?? null);
+      setClientKey((prev) => prev ?? installed[0]?.key ?? null);
     } catch (cause) {
       setError(api.asError(cause));
     }
@@ -397,7 +401,7 @@ export default function WorkbuddyExportPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
-          {/* 客户端选择 */}
+          {/* 客户端选择：顺序由「使用记忆」决定（默认 `solo-cn` 第一） */}
           {clients.length > 0 ? (
             <div className="flex flex-wrap items-center gap-2">
               {clients.map((c) => {
@@ -407,6 +411,11 @@ export default function WorkbuddyExportPage() {
                     key={c.key}
                     type="button"
                     disabled={!c.installed || busy}
+                    title={
+                      c.key === usageTopPick
+                        ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
+                        : undefined
+                    }
                     onClick={() => setClientKey(c.key)}
                     className={cn(
                       "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -417,6 +426,11 @@ export default function WorkbuddyExportPage() {
                     )}
                   >
                     {c.label}
+                    {c.key === usageTopPick ? (
+                      <span className="rounded bg-foreground/[0.08] px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                        常用
+                      </span>
+                    ) : null}
                     {c.installed && c.has_login ? (
                       <span className="size-2 rounded-full bg-emerald-500" />
                     ) : null}

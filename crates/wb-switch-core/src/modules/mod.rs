@@ -1,4 +1,5 @@
 pub mod app_overview;
+pub mod client_usage;
 pub mod config;
 pub mod error_log;
 pub mod process_list;
@@ -16,6 +17,7 @@ pub mod trae_oauth;
 pub mod trae_import;
 pub mod trae_profile;
 pub mod trae_remote;
+pub mod trae_session_links;
 pub mod trae_switch;
 pub mod trae_synth;
 pub mod trae_vault;

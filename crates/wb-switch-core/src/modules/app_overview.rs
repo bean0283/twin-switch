@@ -27,8 +27,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::modules::{
-    config, trae_discover, trae_export, trae_switch, trae_vault, workbuddy_accounts, workbuddy_auth,
-    workbuddy_credits, workbuddy_source, workbuddy_switch, workbuddy_vault,
+    client_usage, config, trae_credits, trae_discover, trae_export, trae_switch, trae_vault,
+    workbuddy_accounts, workbuddy_auth, workbuddy_credits, workbuddy_source, workbuddy_switch,
+    workbuddy_vault,
 };
 
 /// Trae 会话表名（会话列表就是它）。
@@ -38,7 +39,7 @@ const TRAE_SESSION_TABLE: &str = "chat_session";
 const CACHE_NAME: &str = "overview.json";
 
 /// 缓存结构版本。字段一改就 +1，旧缓存直接当作不存在，避免前端读到半新半旧的对象。
-const CACHE_VERSION: u64 = 1;
+const CACHE_VERSION: u64 = 2;
 
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
@@ -75,9 +76,14 @@ fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
         "exe": c.exe,
         "userDataDir": c.user_data_dir,
         "hasLogin": c.has_login,
+        // 当前登录账号（真实昵称 + uid 尾号）。未登录 / 读不出登录态 ⇒ null。
+        "loginLabel": if c.has_login { live_login_label(c.key, client) } else { None },
         "running": !processes.is_empty(),
         "processCount": processes.len(),
         "accounts": accounts.len(),
+        // ⚠️ 每个客户端的会话 / 账号 / 积分都**只从它自己的库与它自己的账号库算** ——
+        //    Trae 的 4 个客户端各有独立的 database.db，合并统计会得到一个谁也不对应的数。
+        "credits": trae_client_credits(c.key),
         "decrypted": {
             "exists": snap_exists,
             "current": current,
@@ -91,8 +97,52 @@ fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
     })
 }
 
+/// 当前登录账号的显示名（客户端 `storage.json` 里那个 uid → 账号库里的真实昵称）。
+///
+/// 只读两个几 KB 的 JSON，毫秒级；未登录 / 解不出 Km 一律 `None`（不报错）。
+fn live_login_label(client_key: &str, client: &trae_discover::TraeClient) -> Option<String> {
+    let text = std::fs::read_to_string(trae_discover::storage_json_path(client)).ok()?;
+    let uid = trae_vault::uid_from_storage_text(&text)?;
+    Some(trae_vault::account_label(client_key, &uid))
+}
+
+/// 单个客户端的积分摘要（**只读账号库里的 `profile.json`，不联网**）。
+///
+/// 首页必须秒开，所以这里绝不触发接口调用；界面上的「查询积分」按钮才真去拉。
+/// 返回的是压缩过的摘要（不含逐包明细），避免把逐账号明细塞进总览缓存文件。
+fn trae_client_credits(client_key: &str) -> Value {
+    let res = trae_credits::cached(Some(client_key.to_string()));
+    let empty = Vec::new();
+    let accounts = res["accounts"].as_array().unwrap_or(&empty);
+    let queryable = accounts
+        .iter()
+        .filter(|a| a["queryable"] == json!(true))
+        .count();
+    // 「有数据」= 曾经成功拉到过积分（profile.json 里 credit_ok = true）。
+    let with_data = accounts
+        .iter()
+        .filter(|a| a["ok"] == json!(true))
+        .count();
+    let updated = accounts
+        .iter()
+        .filter_map(|a| a["updatedAt"].as_i64())
+        .max()
+        .unwrap_or(0);
+    json!({
+        "accountCount": accounts.len(),
+        "queryable": queryable,
+        "withData": with_data,
+        "totalRemaining": res["summary"]["totalRemaining"].clone(),
+        "updatedAt": if updated > 0 { json!(updated) } else { Value::Null },
+    })
+}
+
 fn trae_overview() -> Value {
-    let clients: Vec<Value> = trae_discover::list_installed_clients()
+    // 与 `trae_list_clients` 同一套排序：首页与账号页看到的客户端顺序必须一致，
+    // 否则用户会以为「换个页面顺序就变了」。
+    let mut installed = trae_discover::list_installed_clients();
+    client_usage::sort_installed(&mut installed);
+    let clients: Vec<Value> = installed
         .iter()
         .filter(|c| c.installed)
         .map(trae_client_overview)
@@ -109,6 +159,14 @@ fn trae_overview() -> Value {
     let any_decrypted = clients
         .iter()
         .any(|c| c["decrypted"]["exists"] == json!(true));
+    // 「常用」徽标：只能有一个客户端戴上，且必须与实际排序的第一名一致
+    // ⇒ 复用 `client_usage` 的唯一出口，别在首页另算一遍。
+    let keys: Vec<&str> = installed
+        .iter()
+        .filter(|c| c.installed)
+        .map(|c| c.key)
+        .collect();
+    let top_pick = client_usage::snapshot_for(&keys)["topPick"].clone();
 
     json!({
         "clients": clients,
@@ -117,6 +175,7 @@ fn trae_overview() -> Value {
         "accountTotal": account_total,
         "sessionTotal": session_total,
         "anyDecrypted": any_decrypted,
+        "topPick": top_pick,
     })
 }
 
@@ -384,6 +443,45 @@ mod tests {
     #[test]
     fn count_jsonl_handles_missing_dir() {
         assert_eq!(count_jsonl(&std::path::PathBuf::from("Z:/definitely/missing")), 0);
+    }
+
+    /// 首页 Trae 卡片要「按客户端独立」：每个客户端必须自带账号库 / 会话 / 积分三块，
+    /// 且数字只能是它**自己**的（不能是全局合计）。
+    #[test]
+    fn trae_clients_carry_their_own_accounts_sessions_and_credits() {
+        let v = trae_overview();
+        let clients = v["clients"].as_array().unwrap();
+        let total = v["accountTotal"].as_u64().unwrap();
+        for c in clients {
+            for key in ["accounts", "credits", "decrypted"] {
+                assert!(c.get(key).is_some(), "客户端条目缺少 {key}");
+            }
+            assert!(c["accounts"].is_number());
+            // 单个客户端的账号数不可能超过所有客户端的合计
+            assert!(c["accounts"].as_u64().unwrap() <= total);
+            let cr = &c["credits"];
+            for key in ["accountCount", "queryable", "withData", "totalRemaining"] {
+                assert!(cr.get(key).is_some(), "积分摘要缺少 {key}");
+            }
+            // 可查积分的账号数不能超过账号总数
+            assert!(cr["queryable"].as_u64().unwrap() <= cr["accountCount"].as_u64().unwrap());
+            // 登录名要么是字符串要么是 null，绝不能是 undefined 之外的东西
+            assert!(c["loginLabel"].is_string() || c["loginLabel"].is_null());
+        }
+        // 「常用」徽标只有一个（或没有历史时为 null）
+        assert!(v["topPick"].is_string() || v["topPick"].is_null());
+    }
+
+    /// 积分摘要必须是**压缩过**的：不含逐账号明细（否则总览缓存会被撑大）。
+    #[test]
+    fn credit_summary_is_compact_and_never_panics() {
+        let c = trae_client_credits("definitely-not-a-client");
+        assert_eq!(c["accountCount"], json!(0));
+        assert_eq!(c["queryable"], json!(0));
+        assert_eq!(c["withData"], json!(0));
+        assert!(c["totalRemaining"].is_number());
+        assert!(c["updatedAt"].is_null());
+        assert!(c.get("accounts").is_none(), "摘要不该带上逐账号明细");
     }
 
     #[test]
