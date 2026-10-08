@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-07 / **v0.2.11 已发布**）
+> 分析时间：2026-10-04（最近更新：2026-10-08 / **v0.2.12 未发版**，含 T39 + T40 + T41；上一个正式版 **v0.2.11 已发布**）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -35,7 +35,7 @@
 | 前端 | `src/main.tsx`（**启动编排**：先 `primeOverview()` 读磁盘缓存 → 挂载 → 后台 `refreshOverview()`）· `src/pages/HomePage.tsx`（侧栏「首页」·本机概览仪表盘，数据走 `src/lib/overview-store.ts` 的进程内单例）、`src/pages/TraeSwitchPage.tsx` 与 `src/pages/TraeRecordsPage.tsx`（侧栏「Trae」区的账号管理与会话记录）、`src/pages/WorkbuddyImportPage.tsx` 与 `src/pages/WorkbuddyExportPage.tsx`（侧栏「数据迁移」区的双向会话迁移）、`src/pages/WorkbuddyCleanupPage.tsx` 与 `src/pages/TraeCleanupPage.tsx`（侧栏「本机维护」区的残留清理：WorkBuddy 侧 / Trae 侧）、`src/pages/WorkbuddySwitchPage.tsx` 与 `src/pages/WorkbuddyRecordsPage.tsx`（侧栏「WorkBuddy」区的账号管理与会话记录 / 复制 / 关联，账号卡内嵌积分块）。两个账号页共用 `src/components/credits-ui.tsx` 与 `src/components/account-card.tsx` 的展示层 |
 | 派生缓存 | `~/.twin-switch/cache/`（**可整目录删**）：`overview.json`（总览 + 可回收空间）、`credits.json` / `trae-credits.json`（积分结果）、清理扫描的两份槽位 |
 | 任务台账 | `docs/任务书.md`（后续 AI 先读它，再读本文件） |
-| 当前版本 | **0.2.11** ✅ **已发布**（GitHub Release `v0.2.11`，2026-10-07；四处文件 + 一处兜底串：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`） |
+| 当前版本 | **0.2.12**（工作区，**未发版**）—— 上一个正式版 **0.2.11 已发布**（GitHub Release `v0.2.11`，2026-10-07）。版本号五处同步：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`（+ `Cargo.lock` 跑 `cargo test` 自动跟上） |
 | 自动更新 | ✅ v0.2.0 起对接 GitHub Releases（`tauri-plugin-updater` + `latest.json`）。实现见 `crates/wb-switch-core/src/modules/update.rs`（版本比较/端点/缓存）、`src-tauri/src/update_service.rs`（状态机）、`src/components/update-entry.tsx`（侧栏入口+对话框）；发版一键脚本 `npm run release` → `scripts/release.mjs` |
 
 ---
@@ -458,6 +458,119 @@ WorkBuddy 侧补了表头全选，两端机制一致。
 ③ 截图前**必须先把外壳 `h-screen overflow-hidden` 的高度与 overflow 放开**再拍 ——
 `captureBeyondViewport` 只放大「文档」视口，而 `<main>` 的溢出被它自己的 `overflow` 裁掉了，
 不放开的话拍出来下半页是白的（这个坑上一轮记的配方没写清楚，本轮才定位到根因）。
+
+---
+
+### 追加核验（2026-10-07，T39 后，未发版）
+
+| 核验项 | 结果 |
+| --- | --- |
+| 版本号 | **0.2.12**（五处同步 + `Cargo.lock`；未打包、未发版、未推 GitHub） |
+| `cargo test --workspace` | `wb-switch-core` **201 passed / 0 failed / 2 ignored** + `wb_switch_rust_lib` **15 passed**；零 warning（本轮纯前端，未加后端测试） |
+| `npx tsc --noEmit` | 零错误 |
+| `npx vite build` | 通过，1950 modules，仅剩既有的 >500 kB 分块提示 |
+| 渲染自查 | 真 `<App />` + CDP 真点击：导入页 / 导出页 × 1600 / 1360 / 730，两个确认弹窗，切换窗自动关闭；核完已删临时 `preview/` |
+
+**T39 · 切换成功弹窗自动关闭 + 两个迁移方向版式统一。**
+
+- **① 切换成功不再留窗**：`WorkbuddySwitchPage` 在 `runSwitch()` 成功后挂一个
+  `AUTO_CLOSE_MS = 2500` 的定时器自动关窗，窗里写明「此窗口即将自动关闭（结果也会留在右下角
+  提示里）」。⚠️ 定时器必须能被 `openSwitch()` / `closeSwitch()` / 卸载三处打断，否则
+  「切完 A 马上点 B」时 A 的定时器会把 B 的窗一起关掉。
+  Trae 侧本来就是 toast + 进度行、没有常驻弹窗，**没有**为了「统一」去给它加一个。
+- **② 两个迁移方向版式统一**：以 `WorkbuddyExportPage`（Trae → WorkBuddy）为基准，
+  `WorkbuddyImportPage` 改成同一套骨架——目标卡（徽标 + 客户端切换条 + 目标账号 chips）/
+  来源卡（右上刷新·全选 + 计数 + 数据根 + 筛选 + `max-h-96` 列表）/ 操作条 / 进度与结果 /
+  `max-w-2xl` 确认弹窗。原先导入侧把「目标选择 + 勾选 + 进度 + 结果」全塞在一个
+  `ResizableDialogContent` 里、页面只剩一张介绍卡，两页因此完全不像。
+  逻辑上移到页面后，`src/components/workbuddy-import-card.tsx` **已删除**（只被这一个页面引用）。
+- 顺手补齐两处：目标卡用 `trae_import_inspect` 显示**就绪状态 + 密钥情况**
+  （「密钥不在且客户端没在跑」= 导入必然失败，现在点之前就说清楚）；确认弹窗用
+  `trae_workbuddy_preview` 出回合 / 工具步骤统计与逐条明细（接口一直在，只是以前没人调）。
+- **客户端切换条的第三份实现消失**：`WorkbuddyExportPage` 内联那段 pill 换成共用
+  `<TraeClientSwitcher>`，与 T38 定的「切换条只有一个出口」对齐；两个迁移页各做一次字段翻译。
+- ⚠️ **筛选与勾选**（T36 的规矩在新页面显式兑现）：`全选` 只作用于可见行；被筛选 /
+  「显示已删除」藏起来的已勾选会话**不静默取消**，而是在操作条与确认弹窗里各写一句
+  「另有 N 个被藏起来，仍会一起导入」。
+
+**这轮脚手架的两个变化**（已写进 `.workbuddy/memory/MEMORY.md`）：
+① 不再手抄 `App.tsx` 外壳——**直接渲染真 `<App />`**，靠 `BrowserRouter` + vite dev server
+的 SPA 回退让 `/workbuddy-import` 落到真实路由上；② `--remote-debugging-port` 用**固定端口**
+时，上一次的 Edge 没退干净会让新实例静默绑定失败、探针连到上一个实例上量尺寸（实测量出过
+`docW 552` 的假结果），已改成每次随机端口。
+
+---
+
+### 追加核验（2026-10-08，T40 后，未发版）
+
+**用户报障**：「今天突然 workbuddy 的账号都没挪到参考工具库，没有进入账号库，无法进行账号切换和迁移了」，
+截图是「账号 0 个 / 账号库还是空的」+「仅存在于参考工具库的账号」3 条。
+
+**结论：账号一条都没丢。** `~/.twin-switch/workbuddy-accounts.json` 完好（44 653 B / 3 条，mtime 仍是上次切换那刻）。
+**是读取侧 panic 了**：`workbuddy_accounts.rs::scan_uid_names` 里
+`let window_end = (end + PAIR_WINDOW).min(text.len()); &text[end..window_end]`
+用**字节**偏移切字符串，落在中文（`'工'`）中间 ⇒
+`byte index 3942102 is not a char boundary`。触发文件是 `~/.workbuddy/logs/daemon.log`
+（8.28 MB > `LOG_READ_CAP` 4 MB ⇒ 只读尾部 4 MB 那条路），断点前正是 `"name":"逆向贱人工具箱6.5工具"`。
+
+⚠️ **这是内容相关 bug，不是数据损坏** —— daemon.log 一直增长/轮转，尾部窗口一移对齐就变，
+所以「今天突然」且可能自己时好时坏。`label_for` 被 6 个模块调用（首页 / 会话记录 / 迁移 / 清理 / 积分 / 账号库），
+所以一个「只为把 uid 显示成人名」的解析 panic 把**切换与迁移整条链路**一起打空了。
+
+⚠️ **失败被静默降级成空**：命令层 `unwrap_or_else(|e| json!({ "accounts": [], "error": e }))`，
+前端又从不读 `error` ⇒ 显示「账号库还是空的」。**「空」和「失败」长得一样**，才是这次误以为数据丢了的原因。
+
+**修复三处**：① `workbuddy_accounts.rs` 新增 `clamp_boundary()`，本模块三处切片全部过它；
+② `commands.rs` 的 `workbuddy_account_list` 改成 `Result<Value, String>`，失败原样抛前端；
+③ `WorkbuddySwitchPage.tsx` 读取失败时撤掉「账号库还是空的」卡片，并补一句「这是读取失败，不是账号被删」。
+
+| 核验项 | 结果 |
+| --- | --- |
+| `--example wb_accounts_probe` | 修前 **panic**（`workbuddy_accounts.rs:182`）→ 修后 **账号数: 3**，三条都带姓名与「当前登录」 |
+| `--example wb_audit` | `解析出 3 个账号`，来源含「运行日志+账号库+本工具账号库+账号快照」 |
+| `cargo test --workspace` | **203 passed / 0 failed / 2 ignored**（新增 2 个单测）+ `wb_switch_rust_lib` 15 passed，零 warning |
+| `npx tsc --noEmit` / `vite build` | 零错误 / 通过（仅既有 >500 kB 提示） |
+| 渲染自查（真 `<App />`，1600 / 1360 / 730） | 正常形态 3 张卡 + 「账号 3」；失败形态显示「读取账号库失败」+ 澄清句且空卡消失；`bigText`/`overflow` 全 0、零异常、无横向滚动 |
+| 版本号 | 五处 + `Cargo.lock` = **0.2.12**（T39 未曾发布，T40 并入同一版） |
+| 推送 / 发版 | **都没有** |
+
+**这轮脚手架新踩的坑**：夹具给 `update_state` 返回 `{}` ⇒ 侧栏 `UpdateEntry` 直接渲染 `current`，
+React 抛 `Objects are not valid as a React child`，**整棵树被 ErrorBoundary 接走，量出来是全空页**。
+凡是前端会直接渲染其字段的命令，桩都不能只给 `{}`。
+另：回归测试夹具用 `"工".repeat(n)` 撞窗口终点命中恒为 0 —— 全是 3 字节字符时模 3 关系不变，
+必须用**不同字节长度**的前缀错开对齐。
+
+---
+
+### 追加核验（2026-10-08，T41 后，未发版）
+
+**用户提问**：首页提示「WorkBuddy 账号库里没有明文凭据账号，积分查询不可用；用「发起网页登录」扫码添加可获得
+明文凭据」是什么原因。同一屏上账号库写着「3 个 · 其中 0 个可查积分」，积分卡却显示 **8,837.18 / 3/3 个账号**。
+
+**结论：提示误报，账号没坏，也不用重新扫码。** 两处口径不同源：
+
+- 提示看的是 `app_overview::workbuddy_overview()` 的 `queryableCount` —— **只统计本工具账号库**
+  （`~/.twin-switch/workbuddy-accounts.json`），其中三条凭据全是 WorkBuddy 加密信封 ⇒ 0；
+- 积分查询走的是 `workbuddy_credits::collect_accounts()` —— **合并「本工具账号库 + 参考工具库」**、
+  同 uid 明文优先；同一批 uid 在 `~/.wb-switch/accounts.json` 里是明文 ⇒ 3/3 查得动。
+
+⚠️ **同一屏的两个数字必须同源**：一处用单侧库、另一处用合并视图，界面迟早自相矛盾到像报了假警。
+
+**修复**：`workbuddy_credits.rs` 把去重规则抽成唯一出口 `prefer_over(...)` 并新增
+`merged_queryable_count()`（不解析展示名，避免首页每次刷新都扫 4 MB 日志）；`app_overview.rs` 的提示判定
+抽成纯函数 `workbuddy_credential_note(...)`（合并后无明文才报「不可用」，账号库单侧为 0 而合并有明文时改成
+说明句）；`HomePage.tsx` 的积分卡空态补上「会由参考工具库里的同一账号代查」。
+
+| 核验项 | 结果 |
+| --- | --- |
+| `--example wb_overview_probe` | 提示已变为「本工具账号库的 3 个账号存的都是加密信封凭据…积分目前由参考工具库…代查」 |
+| `cargo test --workspace` | **206 passed / 0 failed / 2 ignored**（新增 3 个 `credential_note_*`）+ `wb_switch_rust_lib` 15 passed |
+| `npx tsc --noEmit` / `vite build` | 零错误 / 通过（仅既有 >500 kB 提示） |
+| 渲染自查（真 `<App />`，1600 / 1360 / 730） | 默认提示 3 行（`h=60/lh=20`）；`?mode=no-credential` 警告句 2 行；`?mode=no-credits` 空态说明 2 行；`unresolved` 为空、零异常 |
+| ⚠️ 730 档首页横向滚动（`docW 778 > winW 706`） | **与 T41 无关**：`?mode=no-notes` 去掉提示后 `docW` 仍为 778，来源是 Trae 客户端卡（`left 236 / right 778`）。既有问题，本轮未动 |
+
+**这轮脚手架新增的判据**：**判断某个溢出是不是本次改动引入的，就加一个「去掉该元素」的对照形态再量一次。**
+比「我觉得跟这个改动没关系」可靠得多。
 
 ---
 
@@ -912,7 +1025,10 @@ npm run tauri build        # 产出 target/release/bundle/{nsis,msi}
   - `v0.1.0` 与 `v0.2.0` 两个 tag 均指向它（历史上曾写过 `4f7e00b`，那是一次 amend 后的旧 SHA，已成历史）
   - `Release v0.2.0` 资产三份：`latest.json` · `TwinSwitch_0.2.0_x64-setup.exe`（5 738 300 B）· 同名 `.exe.sig`（420 B）
   - 自动更新清单固定读 `https://github.com/bean0283/twin-switch/releases/latest/download/latest.json`
-- **v0.2.11（当前，2026-10-07 已发布）**：T25 – T38 共 14 轮一次发出（见 `docs/任务书.md` **T25–T38**）。
+- **v0.2.12（工作区，未发版）**：T39（切换成功弹窗自动关闭 + 两个迁移方向版式统一）。
+  - 版本号五处 + `Cargo.lock` 已同步到 `0.2.12`；`cargo test --workspace` 201 + 15 全绿、`tsc` 零错误、`vite build` 通过
+  - **未提交、未推送、未打包、未发版**（`HEAD` 仍是 `56d9684`）
+- **v0.2.11（2026-10-07 已发布）**：T25 – T38 共 14 轮一次发出（见 `docs/任务书.md` **T25–T38**）。
   - 提交 **`7970e97`** 建在 `f15b053` **之上**（35 文件 / +9643 / −352）；
     ⚠️ **不再 amend 根提交**，也不再 force push —— 用户本次明确「后续的提交不用都写首次提交了」
   - tag `v0.2.11` → `7970e97`；`v0.1.0` / `v0.2.0` **保持不动**（继续正确指向 v0.2.0 的代码）

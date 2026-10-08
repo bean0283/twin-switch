@@ -52,6 +52,15 @@ import type {
   WorkbuddySwitchResult,
 } from "@/lib/trae-types";
 
+/**
+ * 切换成功后确认窗自动关闭的延时（ms）。
+ *
+ * 这个窗在切换成功后已经没有可做的事（结果同时以 toast 留在屏幕上、下面的账号卡也已经
+ * 刷成「当前登录」），但它会盖住整片账号区 —— 用户切完往往还要接着看积分 / 再切下一个。
+ * 留 2.5 s 让他看清「结束 N 个进程 / 是否重启」，然后把位置让出来。
+ */
+const AUTO_CLOSE_MS = 2500;
+
 /** 过期时间的人话描述。 */
 function expiryLabel(expiresAt: number | null): string | null {
   if (!expiresAt) return null;
@@ -155,6 +164,24 @@ export default function WorkbuddySwitchPage() {
   const [precheck, setPrecheck] = useState<WorkbuddySwitchPrecheck | null>(null);
   const [switchResult, setSwitchResult] = useState<WorkbuddySwitchResult | null>(null);
 
+  /**
+   * 切换成功后的自动关窗定时器。
+   *
+   * ⚠️ 必须能被「手动关闭 / 重新打开」打断：否则上一次残留的定时器会把**下一个**弹窗
+   *    一起关掉（切完 A 又马上点 B，B 的窗会在 2.5 s 后自己消失）。
+   */
+  const autoCloseRef = useRef<number | null>(null);
+  const clearAutoClose = useCallback(() => {
+    if (autoCloseRef.current !== null) {
+      window.clearTimeout(autoCloseRef.current);
+      autoCloseRef.current = null;
+    }
+  }, []);
+  const closeSwitch = useCallback(() => {
+    clearAutoClose();
+    setSwitchTarget(null);
+  }, [clearAutoClose]);
+
   // 改名
   const [renameTarget, setRenameTarget] = useState<WorkbuddyAccount | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -184,15 +211,17 @@ export default function WorkbuddySwitchPage() {
     void load();
   }, [load]);
 
-  // 组件卸载时停掉轮询
+  // 组件卸载时停掉轮询与自动关窗定时器
   useEffect(
     () => () => {
       if (pollRef.current !== null) window.clearInterval(pollRef.current);
+      if (autoCloseRef.current !== null) window.clearTimeout(autoCloseRef.current);
     },
     [],
   );
 
   const openSwitch = async (acc: WorkbuddyAccount) => {
+    clearAutoClose();
     setSwitchTarget(acc);
     setSwitchResult(null);
     setPrecheck(null);
@@ -212,6 +241,12 @@ export default function WorkbuddySwitchPage() {
       setSwitchResult(r);
       toast.success(`已切换到 ${acc.name}`);
       await load();
+      // 切换已经结束，这扇窗没有剩余职责：留着只会挡住下面已经变成「当前登录」的账号卡。
+      // 成功结果同时以 toast 形式留在屏幕上，关掉窗不会丢信息。
+      autoCloseRef.current = window.setTimeout(() => {
+        autoCloseRef.current = null;
+        setSwitchTarget(null);
+      }, AUTO_CLOSE_MS);
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -435,8 +470,17 @@ export default function WorkbuddySwitchPage() {
       {error && (
         <Alert variant="destructive" className="mb-4">
           <AlertTriangle className="size-4" />
-          <AlertTitle>读取失败</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
+          <AlertTitle>读取账号库失败</AlertTitle>
+          <AlertDescription>
+            <div className="break-all">{error}</div>
+            {/* ⚠️ 这一句很关键：读取失败长得和「账号库是空的」一模一样，
+                不说清楚会被当成账号丢了（2026-10-08 真的这么误会过一次）。 */}
+            <div className="mt-1 text-xs opacity-80">
+              这是<span className="font-medium">读取</span>失败，不是账号被删。账号库文件{" "}
+              <code className="rounded bg-background/40 px-1">~/.twin-switch/workbuddy-accounts.json</code>{" "}
+              不会被本操作改动，修好读取问题后账号就会回来。
+            </div>
+          </AlertDescription>
         </Alert>
       )}
 
@@ -470,7 +514,7 @@ export default function WorkbuddySwitchPage() {
           <Skeleton className="h-56 rounded-2xl" />
           <Skeleton className="h-56 rounded-2xl" />
         </div>
-      ) : accounts.length === 0 ? (
+      ) : error ? null : accounts.length === 0 ? (
         <Card>
           <CardContent className="py-10 text-center text-sm text-muted-foreground">
             账号库还是空的。点「导入本机登录态」把当前登录的 WorkBuddy 账号收进来，或用「扫码添加账号」新增。
@@ -548,11 +592,11 @@ export default function WorkbuddySwitchPage() {
         </Card>
       </div>
 
-      {/* 切换确认 */}
+      {/* 切换确认。成功后由 `runSwitch` 里那个定时器自动关掉（见 `AUTO_CLOSE_MS`）。 */}
       <Dialog
         open={switchTarget !== null}
         onOpenChange={(o) => {
-          if (!o) setSwitchTarget(null);
+          if (!o) closeSwitch();
         }}
       >
         <DialogContent>
@@ -584,10 +628,13 @@ export default function WorkbuddySwitchPage() {
             <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm">
               切换完成：结束 {switchResult.killed.length} 个进程
               {switchResult.relaunched ? "，已重启客户端" : "，未重启客户端"}
+              <span className="mt-1 block text-xs text-emerald-700/80">
+                此窗口即将自动关闭（结果也会留在右下角提示里）。
+              </span>
             </div>
           )}
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setSwitchTarget(null)}>
+            <Button variant="ghost" onClick={closeSwitch}>
               关闭
             </Button>
             <Button

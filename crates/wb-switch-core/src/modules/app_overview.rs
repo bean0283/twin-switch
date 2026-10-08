@@ -356,6 +356,37 @@ pub fn save_reclaim(trae_bytes: u64, wb_bytes: u64) -> Value {
 // 入口
 // ---------------------------------------------------------------------------
 
+/// 首页「注意事项」里的 WorkBuddy 凭据提示。纯函数，便于单测。
+///
+/// ⚠️ 「能不能查积分」必须用**合并后的**明文账号数（本工具账号库 + 参考工具库），
+/// 不能只看账号库单侧。本工具账号库存的凭据一律是加密信封（「导入本机登录态」就是
+/// 这么落的），而参考工具库通常存明文 —— 只看前者会稳定误报「积分查询不可用」，
+/// 可同一屏的积分卡又明明有数（2026-10-08 真事）。
+fn workbuddy_credential_note(
+    account_count: u64,
+    own_queryable: usize,
+    merged_queryable: usize,
+) -> Option<String> {
+    if account_count == 0 {
+        return None;
+    }
+    if merged_queryable == 0 {
+        return Some(
+            "WorkBuddy 侧没有任何可直接查询的明文凭据账号（本工具账号库与参考工具库都没有），\
+             积分查询不可用；用「发起网页登录」扫码添加可获得明文凭据"
+                .to_string(),
+        );
+    }
+    if own_queryable == 0 {
+        return Some(format!(
+            "本工具账号库的 {account_count} 个账号存的都是加密信封凭据，不能直接调积分接口；\
+             积分目前由参考工具库（~/.wb-switch/accounts.json）里的明文账号代查，\
+             刷新出来的 token 不会写回本工具账号库"
+        ));
+    }
+    None
+}
+
 /// 本机总览快照。
 ///
 /// 全部同步、纯统计；不触发解密、不联网。积分只读缓存。
@@ -366,14 +397,12 @@ pub fn snapshot() -> Value {
     let credits = workbuddy_credits::cached();
 
     let mut notes: Vec<String> = Vec::new();
-    if workbuddy["accountCount"].as_u64().unwrap_or(0) > 0
-        && workbuddy["queryableCount"].as_u64().unwrap_or(0) == 0
-    {
-        notes.push(
-            "WorkBuddy 账号库里没有明文凭据账号，积分查询不可用；\
-             用「发起网页登录」扫码添加可获得明文凭据"
-                .to_string(),
-        );
+    if let Some(note) = workbuddy_credential_note(
+        workbuddy["accountCount"].as_u64().unwrap_or(0),
+        workbuddy["queryableCount"].as_u64().unwrap_or(0) as usize,
+        workbuddy_credits::merged_queryable_count(),
+    ) {
+        notes.push(note);
     }
     if trae["installedClients"].as_u64().unwrap_or(0) > 0 && trae["anyDecrypted"] != json!(true) {
         notes.push("Trae 还没有解密快照，会话记录需要先到「Trae 会话记录」页执行一次解密".to_string());
@@ -443,6 +472,39 @@ mod tests {
     #[test]
     fn count_jsonl_handles_missing_dir() {
         assert_eq!(count_jsonl(&std::path::PathBuf::from("Z:/definitely/missing")), 0);
+    }
+
+    /// 2026-10-08 真事：账号库 3 条全是加密信封（`queryableCount = 0`），但参考工具库里
+    /// 同样 3 个 uid 是明文 ⇒ 积分其实查得了。此时**不许**再说「积分查询不可用」。
+    #[test]
+    fn credential_note_stays_quiet_when_the_reference_store_can_query() {
+        let note = workbuddy_credential_note(3, 0, 3).expect("应当给出一条说明");
+        assert!(
+            !note.contains("积分查询不可用"),
+            "参考工具库有明文时不能报「不可用」，实际：{note}"
+        );
+        assert!(note.contains("参考工具库"), "要说清积分是谁在代查，实际：{note}");
+        assert!(note.contains("加密信封"), "要点明账号库存的是信封，实际：{note}");
+    }
+
+    /// 只有**合并后**一个明文都没有，才允许说「积分查询不可用」。
+    #[test]
+    fn credential_note_warns_only_when_nothing_anywhere_is_queryable() {
+        let note = workbuddy_credential_note(3, 0, 0).expect("应当报警");
+        assert!(note.contains("积分查询不可用"), "实际：{note}");
+        assert!(
+            note.contains("发起网页登录"),
+            "要给出恢复办法，实际：{note}"
+        );
+    }
+
+    /// 没有账号 / 账号库自己就能查时，都不该多嘴。
+    #[test]
+    fn credential_note_is_silent_in_normal_states() {
+        assert!(workbuddy_credential_note(0, 0, 0).is_none(), "没有账号就别提示");
+        assert!(workbuddy_credential_note(3, 3, 3).is_none(), "账号库自己能查就别提示");
+        // 账号库自己有明文、参考库也有 —— 同样不多嘴
+        assert!(workbuddy_credential_note(3, 1, 3).is_none());
     }
 
     /// 首页 Trae 卡片要「按客户端独立」：每个客户端必须自带账号库 / 会话 / 积分三块，

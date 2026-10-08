@@ -145,10 +145,29 @@ fn read_capped(path: &Path, cap: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// 把字节下标收拢到 UTF-8 字符边界上，并夹在 `text` 长度内。
+///
+/// **⚠️ 本模块所有切片都必须先过这一层。** 日志里混着中文（昵称、工具名、标题），
+/// 而这里的下标全是「字节偏移量 + 一个常量跨度」算出来的（见 [`PAIR_WINDOW`]）——
+/// 只要跨度落在一个多字节字符中间，`&text[a..b]` 就会 panic：
+/// `byte index N is not a char boundary; it is inside '工'`。
+///
+/// 这个 panic 的后果特别恶劣：它发生在「只是为了把 uid 显示成人名」的只读解析里，
+/// 却会把**整条调用链**一起带走（`workbuddy_vault::list` 直接 panic ⇒ 命令层拿到
+/// JoinError ⇒ 界面显示「账号库还是空的」）。所以这里只往前退、绝不往外抛。
+fn clamp_boundary(text: &str, idx: usize) -> usize {
+    let mut i = idx.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// 解析 `key` 后面的字符串值，容忍 JSON 在被嵌进日志时产生的 `\"` / `\\"` 转义。
 ///
 /// 返回值与「值结束的位置」；找不到返回 `None`。
 fn take_value(text: &str, from: usize, key: &str) -> Option<(String, usize)> {
+    let from = clamp_boundary(text, from);
     if from >= text.len() {
         return None;
     }
@@ -159,14 +178,15 @@ fn take_value(text: &str, from: usize, key: &str) -> Option<(String, usize)> {
     while i < bytes.len() && matches!(bytes[i], b'\\' | b'"' | b':' | b' ' | b'\t') {
         i += 1;
     }
-    let start = i;
+    let start = clamp_boundary(text, i);
     while i < bytes.len() && !matches!(bytes[i], b'\\' | b'"') {
         i += 1;
     }
-    if i == start {
+    let end = clamp_boundary(text, i);
+    if end <= start {
         return None;
     }
-    Some((text[start..i].to_string(), i))
+    Some((text[start..end].to_string(), end))
 }
 
 /// 从一段日志文本中抽取 `userId → username` 配对。
@@ -178,8 +198,12 @@ fn scan_uid_names(text: &str, out: &mut BTreeMap<String, String>) {
             continue;
         }
         // 姓名紧跟其后；优先 userNickname（WorkBuddy 5.6 起 username 可能是邮箱或空）
-        let window_end = (end + PAIR_WINDOW).min(text.len());
-        let window = &text[end..window_end];
+        //
+        // ⚠️ `end + PAIR_WINDOW` 是**字节**偏移，可能正好落在中文字符中间 ——
+        // 必须收拢到字符边界再切片，否则这里会 panic（2026-10-08 线上真事：
+        // `daemon.log` 尾部中文工具名踩中，账号库整页变成「空」）。
+        let window_end = clamp_boundary(text, end + PAIR_WINDOW);
+        let window = &text[clamp_boundary(text, end)..window_end];
         let name = take_value(window, 0, "userNickname")
             .or_else(|| take_value(window, 0, "username"))
             .map(|(v, _)| v)
@@ -558,6 +582,61 @@ mod tests {
         assert_eq!(
             out.get("fbd4139a-676d-4271-bcbe-8360aa5d5e70").map(String::as_str),
             Some("19550125362")
+        );
+    }
+
+    #[test]
+    fn clamp_boundary_never_returns_a_mid_char_index() {
+        let t = "abc工作工具";
+        assert_eq!(clamp_boundary(t, 0), 0);
+        assert_eq!(clamp_boundary(t, 3), 3); // '工' 起点，本身就是边界
+        assert_eq!(clamp_boundary(t, 4), 3); // '工' 中间 → 退回起点
+        assert_eq!(clamp_boundary(t, 5), 3);
+        assert_eq!(clamp_boundary(t, 6), 6); // '作' 起点
+        assert_eq!(clamp_boundary(t, 999), t.len()); // 越界夹到长度
+        // 中文尾部：'具' 占 12..15，落在其中的下标都要退回 12
+        assert_eq!(clamp_boundary(t, 13), 12);
+        assert_eq!(clamp_boundary(t, 14), 12);
+    }
+
+    /// 回归（2026-10-08 线上真事）：`end + PAIR_WINDOW` 是**字节**偏移，
+    /// 落在中文工具名 / 昵称中间时，`&text[end..window_end]` 会 panic ——
+    /// 而那个 panic 会把 `workbuddy_vault::list()` 一起带走，界面变成「账号库还是空的」。
+    ///
+    /// 触发文件是 `~/.workbuddy/logs/daemon.log`（>4 MB，只读尾部 4 MB 那条路），
+    /// 断点前正好是一串中文。
+    #[test]
+    fn scan_survives_window_ending_inside_a_multibyte_char() {
+        // ⚠️ 前缀必须换**不同字节长度**：全是 3 字节中文时，`end + 400` 与字符边界
+        // 的模 3 关系不变，永远撞不上（第一版夹具就是这么写错的，恒为 0 次命中）。
+        let mut reproduced = 0;
+        for lead in ["", "x", "xx", "xy", "😀", "abcde"] {
+            let text = format!(
+                r#"{{"qimei36":"abc","userId":"63e05cca-cf7d-4dfa-af52-65168597eac1","userNickname":"张萍","note":"{}{}"}}"#,
+                lead,
+                // 断点后是一长串 3 字节中文 —— 与 daemon.log 里那句中文工具名同形
+                "工作工具".repeat(120),
+            );
+            let (_, end) = take_value(&text, 0, "userId").unwrap();
+            let window_end = end + PAIR_WINDOW;
+            // 只关心真的会踩到字符中间的那些形状
+            if window_end >= text.len() || text.is_char_boundary(window_end) {
+                continue;
+            }
+            reproduced += 1;
+            // 修好之前这一行会 panic
+            let mut out = BTreeMap::new();
+            scan_uid_names(&text, &mut out);
+            assert_eq!(
+                out.get("63e05cca-cf7d-4dfa-af52-65168597eac1")
+                    .map(String::as_str),
+                Some("张萍"),
+                "窗口被截断到字符边界后，昵称仍应解析出来"
+            );
+        }
+        assert!(
+            reproduced > 0,
+            "夹具没能构造出「PAIR_WINDOW 落在多字节字符中间」的形状"
         );
     }
 

@@ -156,7 +156,7 @@ WorkBuddy 明文 JSONL + 明文 sessions 表
 | --- | --- |
 | `crates/wb-switch-core/src/modules/workbuddy_source.rs` | 发现并解析 WorkBuddy 会话：读 `workbuddy.db`（先复制 db+wal+shm 避免争锁）、定位 `projects/*/{id}.jsonl`、把事件流归一化为「回合 = 用户提问 + 助手最终回答 + 有序过程事件」 |
 | `crates/wb-switch-core/src/modules/workbuddy_import.rs` | 转换 + 编排：把回合映射为 Trae 10 张表的行，复用页面级解密 / 加密回写 / 备份 / 原子替换链路写回目标账号 |
-| `src/components/workbuddy-import-card.tsx` | 前端卡片 + 勾选对话框（来源勾选、目标客户端 / 账号选择、进度与结果） |
+| `src/components/workbuddy-import-card.tsx` → **T39（v0.2.12）已并入 `src/pages/WorkbuddyImportPage.tsx`** | 前端：目标卡（客户端 / 账号）+ 来源勾选（筛选 / 全选 / 每组只留最新）+ 操作条 + 确认弹窗（`trae_workbuddy_preview` 统计与逐条明细）；版式与 `WorkbuddyExportPage` 逐块同构 |
 
 新增 Tauri 命令：`trae_workbuddy_list`、`trae_workbuddy_preview`、`trae_workbuddy_import`
 （进度事件 `trae-workbuddy-progress`）。
@@ -578,7 +578,7 @@ useEffect(() => {
 （1,1,2,2,3,3…）与「同一事件被两个监听器同时收下」完全吻合。
 
 修复：用一个 `active` 标记兜住竞态——如果监听器拿到手时组件已经卸载，就**立刻注销**它。
-`workbuddy-import-card.tsx` 与 `TraeRecordsPage.tsx`（`trae-import-progress`）两处同模式都改了。
+`WorkbuddyImportPage.tsx`（T39 前叫 `workbuddy-import-card.tsx`）与 `TraeRecordsPage.tsx`（`trae-import-progress`）两处同模式都改了。
 
 ### 验证
 
