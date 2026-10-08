@@ -605,8 +605,11 @@ Node `fetch`（undici / BoringSSL）直连被断，Python `urllib`（OpenSSL）�
 **完整原文**、同名资产**先删再传**（GitHub 不允许覆盖，直接传 422）、传完删掉本地 `latest.json`。
 **下次发版：要么先给 `release.mjs` 换传输层，要么继续用这份复刻件。**
 
-⚠️ 这条代理链**偶发**握手失败（同一端点手动重跑就 200）⇒ curl 一律带
-`--retry 3 --retry-all-errors`，**加** Python 侧的指数退避；一次失败不等于网络不可用。
+⚠️ 这条代理链**偶发失败**（TLS 握手被断，或代理返回 502 `upstream connect failed`；同一端点手动重跑就好）
+⇒ **重试放在 Python 侧**退避重试；一次失败不等于网络不可用。
+**⚠️ 但不要给 curl 加 `--retry`**：它会把每次尝试的 body 与状态码交错打到 stdout，与 `-w` 拼在一起
+解析必然错乱（第一版就踩了，报出来是 `json: Expecting value`）。正确姿势是 **body 用 `-o` 落文件、
+`-w` 只回状态码**，两者彻底分离。
 
 ---
 
