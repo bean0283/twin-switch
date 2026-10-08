@@ -195,12 +195,29 @@ fn token_state_of(acc: &Value) -> TokenState {
     }
 }
 
+/// 同一个 uid 出现两份凭据时，新的那份要不要顶掉旧的。
+///
+/// 规则（**唯一出口**——`collect_accounts` 与 [`merged_queryable_count`] 都走这里）：
+/// 1. **明文凭据优先**——信封根本调不了接口；
+/// 2. 同档位时**本工具账号库优先**（只有 `Origin::Own` 的刷新结果能落盘）。
+///
+/// ⚠️ 别在别处再抄一遍这个 `match`：同一条去重规则被两处独立推导，迟早有一处跑偏。
+fn prefer_over(
+    old_origin: Origin,
+    old_state: TokenState,
+    new_origin: Origin,
+    new_state: TokenState,
+) -> bool {
+    match (old_state == TokenState::Plain, new_state == TokenState::Plain) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => old_origin == Origin::Ref && new_origin == Origin::Own,
+    }
+}
+
 /// 合并账号来源，按 uid 去重。
 ///
-/// 去重规则（顺序即优先级）：
-/// 1. **明文凭据优先**——同一个 uid 在参考工具库里是明文、在本工具库里是信封时，
-///    取明文的那个（信封根本查不了积分）；
-/// 2. 都是明文时**本工具账号库优先**（能落盘刷新结果）。
+/// 去重规则见 [`prefer_over`]。
 fn collect_accounts() -> Vec<CreditAccount> {
     let mut by_uid: HashMap<String, CreditAccount> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -212,13 +229,7 @@ fn collect_accounts() -> Vec<CreditAccount> {
                 by_uid.insert(acc.uid.clone(), acc);
             }
             Some(old) => {
-                let better = match (old.queryable(), acc.queryable()) {
-                    (false, true) => true,
-                    (true, false) => false,
-                    // 同档位：本工具账号库优先
-                    _ => old.origin == Origin::Ref && acc.origin == Origin::Own,
-                };
-                if better {
+                if prefer_over(old.origin, old.token_state, acc.origin, acc.token_state) {
                     by_uid.insert(acc.uid.clone(), acc);
                 }
             }
@@ -287,6 +298,51 @@ fn reference_accounts() -> Vec<Value> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// 合并「本工具账号库 + 参考工具库」后，**可以直接发请求查积分**的账号数。
+///
+/// 去重规则与 `collect_accounts` 共用 [`prefer_over`]，但**不解析展示名**——
+/// `label_for` 要扫 `~/.workbuddy/logs/*.log`（4 MB 级），而首页总览每次刷新都会同步
+/// 跑一遍，不能在这里付出解析日志的代价。
+///
+/// ⚠️ 首页那条「账号库里没有明文凭据账号，积分查询不可用」的提示**必须**用这个合并
+/// 结果判定，不能只看 `workbuddy_vault::load_accounts()`：本工具账号库里的凭据一律是
+/// 加密信封（「导入本机登录态」就是这么落的），而参考工具库通常存的是明文——
+/// 只看前者会**稳定误报**「积分查询不可用」，可同一屏的积分卡又明明有数
+/// （2026-10-08 真事：账号库 3 个 / 0 个可查积分，积分却显示 3/3 个账号查询成功）。
+pub fn merged_queryable_count() -> usize {
+    let mut by_uid: HashMap<String, (Origin, TokenState)> = HashMap::new();
+    let mut consider = |uid: String, origin: Origin, state: TokenState| match by_uid.get(&uid).copied() {
+        None => {
+            by_uid.insert(uid, (origin, state));
+        }
+        Some((old_origin, old_state)) => {
+            if prefer_over(old_origin, old_state, origin, state) {
+                by_uid.insert(uid, (origin, state));
+            }
+        }
+    };
+
+    for a in workbuddy_vault::load_accounts() {
+        let uid = str_at(&a, "uid");
+        if uid.is_empty() {
+            continue;
+        }
+        consider(uid, Origin::Own, token_state_of(&a));
+    }
+    for a in reference_accounts() {
+        let uid = str_at(&a, "uid");
+        if uid.is_empty() {
+            continue;
+        }
+        consider(uid, Origin::Ref, token_state_of(&a));
+    }
+
+    by_uid
+        .values()
+        .filter(|(_, state)| *state == TokenState::Plain)
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,33 +1418,44 @@ mod tests {
     #[test]
     fn plaintext_credentials_win_over_envelope_regardless_of_origin() {
         // 本工具库是信封、参考工具库是明文 → 取明文
-        let mut by_uid: HashMap<String, CreditAccount> = HashMap::new();
-        let own = CreditAccount {
-            id: "own".into(),
-            uid: "u".into(),
-            name: "本工具".into(),
-            origin: Origin::Own,
-            domain: String::new(),
-            token_state: TokenState::Envelope,
-            raw: json!({}),
-        };
-        by_uid.insert("u".into(), own);
-        let reference = CreditAccount {
-            id: "ref:u".into(),
-            uid: "u".into(),
-            name: "参考".into(),
-            origin: Origin::Ref,
-            domain: String::new(),
-            token_state: TokenState::Plain,
-            raw: json!({}),
-        };
-        let old = &by_uid["u"];
-        let better = match (old.queryable(), reference.queryable()) {
-            (false, true) => true,
-            (true, false) => false,
-            _ => old.origin == Origin::Ref && reference.origin == Origin::Own,
-        };
-        assert!(better, "明文凭据应胜出");
+        assert!(prefer_over(
+            Origin::Own,
+            TokenState::Envelope,
+            Origin::Ref,
+            TokenState::Plain
+        ));
+        // 反过来（本工具库已经明文）→ 不许被参考库顶掉
+        assert!(!prefer_over(
+            Origin::Own,
+            TokenState::Plain,
+            Origin::Ref,
+            TokenState::Envelope
+        ));
+        assert!(!prefer_over(
+            Origin::Own,
+            TokenState::Plain,
+            Origin::Ref,
+            TokenState::Plain
+        ));
+        // 同档位时本工具账号库优先；参考库之间不互相顶
+        assert!(prefer_over(
+            Origin::Ref,
+            TokenState::Envelope,
+            Origin::Own,
+            TokenState::Envelope
+        ));
+        assert!(!prefer_over(
+            Origin::Own,
+            TokenState::Missing,
+            Origin::Ref,
+            TokenState::Envelope
+        ));
+        assert!(prefer_over(
+            Origin::Ref,
+            TokenState::Missing,
+            Origin::Own,
+            TokenState::Missing
+        ));
     }
 
     #[test]

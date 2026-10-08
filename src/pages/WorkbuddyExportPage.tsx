@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type {
@@ -263,6 +264,22 @@ export default function WorkbuddyExportPage() {
   }
 
   const accounts = target?.accounts ?? [];
+
+  /**
+   * 客户端切换条的入参：本页只做一次字段名翻译（`has_login` → `hasLogin`、
+   * `usage.topPick` → `top`），顺序与徽标规则全在 `TraeClientSwitcher` 里（T38/T39）。
+   */
+  const clientOptions = useMemo<TraeClientOption[]>(
+    () =>
+      clients.map((c) => ({
+        key: c.key,
+        label: c.label,
+        installed: c.installed,
+        hasLogin: c.has_login,
+        top: c.key === usageTopPick,
+      })),
+    [clients, usageTopPick],
+  );
   const previewTotal = preview?.preview.reduce(
     (acc, p) => ({
       turns: acc.turns + p.turns,
@@ -401,44 +418,15 @@ export default function WorkbuddyExportPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
-          {/* 客户端选择：顺序由「使用记忆」决定（默认 `solo-cn` 第一） */}
-          {clients.length > 0 ? (
-            <div className="flex flex-wrap items-center gap-2">
-              {clients.map((c) => {
-                const active = c.key === clientKey;
-                return (
-                  <button
-                    key={c.key}
-                    type="button"
-                    disabled={!c.installed || busy}
-                    title={
-                      c.key === usageTopPick
-                        ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
-                        : undefined
-                    }
-                    onClick={() => setClientKey(c.key)}
-                    className={cn(
-                      "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-                      active
-                        ? "border-foreground/20 bg-foreground/[0.06] font-medium"
-                        : "border-border bg-background hover:bg-foreground/[0.03]",
-                      (!c.installed || busy) && "cursor-not-allowed opacity-40",
-                    )}
-                  >
-                    {c.label}
-                    {c.key === usageTopPick ? (
-                      <span className="rounded bg-foreground/[0.08] px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
-                        常用
-                      </span>
-                    ) : null}
-                    {c.installed && c.has_login ? (
-                      <span className="size-2 rounded-full bg-emerald-500" />
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
+          {/* 客户端选择：与首页 / 会话记录 / WorkBuddy → Trae 共用同一个组件——
+              顺序、「常用」徽标、未安装置灰只有那一处实现，两个迁移方向因此长得一样。 */}
+          <TraeClientSwitcher
+            clients={clientOptions}
+            value={clientKey}
+            onChange={setClientKey}
+            disabled={busy}
+            label="Trae 客户端（导出源）"
+          />
 
           <input
             value={filter}

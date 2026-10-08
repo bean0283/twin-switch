@@ -1210,11 +1210,17 @@ pub async fn trae_import_all_local_logins() -> Value {
 // ---------------------------------------------------------------------------
 
 /// 账号列表 + 当前登录态。**只读 WorkBuddy 侧数据**，不做任何写操作。
+///
+/// ⚠️ 这里**必须**把失败原样抛给前端，不能降级成「空账号列表」。
+/// 2026-10-08 真事：账号解析里一个 UTF-8 字符边界的 panic 被
+/// `unwrap_or_else(|e| json!({ "accounts": [], "error": e }))` 吞掉，
+/// 前端又不读 `error` 字段 ⇒ 用户看到的是「账号库还是空的」，以为**账号丢了**。
+/// 空的账号列表和「读不出来」是两件完全不同的事，绝不能长得一样。
 #[tauri::command]
-pub async fn workbuddy_account_list() -> Value {
+pub async fn workbuddy_account_list() -> Result<Value, String> {
     off_main(workbuddy_vault::list)
         .await
-        .unwrap_or_else(|e| json!({ "accounts": [], "error": e }))
+        .map_err(|e| format!("读取账号库失败：{e}"))
 }
 
 /// 切换前的门禁检查（只读）：进程状态、登录态、目标账号凭据。
