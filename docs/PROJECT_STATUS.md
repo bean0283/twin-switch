@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-08 / **v0.2.12 未发版**，含 T39 + T40 + T41；上一个正式版 **v0.2.11 已发布**）
+> 分析时间：2026-10-04（最近更新：2026-10-08 / **v0.2.12 已发版**，含 T39 + T40 + T41；前一个正式版 **v0.2.11**）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -571,6 +571,42 @@ React 抛 `Objects are not valid as a React child`，**整棵树被 ErrorBoundar
 
 **这轮脚手架新增的判据**：**判断某个溢出是不是本次改动引入的，就加一个「去掉该元素」的对照形态再量一次。**
 比「我觉得跟这个改动没关系」可靠得多。
+
+---
+
+### 发布核验（2026-10-08，**v0.2.12 已发版**）
+
+> 与 v0.2.11 不同的地方：**T39 / T40 / T41 三件事是一起发的**，所以版本号从 0.2.11 进到 0.2.12
+> （补丁号只进一位，符合「每次只进一位」的约定）。
+
+| 核验项 | 结果 |
+| --- | --- |
+| 提交 | **`b391d53`**（父 `56d9684`），18 文件 / **+1474 / −674** |
+| 推送方式 | Git Data API（`github.com` 主域仍阻断 ⇒ `git push` 不可用） |
+| 远端 SHA | `b391d533e4ac922a261450e00375e2516b6b770f` —— **与本地完全相同，无分叉** |
+| 逐条自检 | 17 个 blob 的 SHA 全部一致；tree 一致（`84608bd5…`）；`origin/main` 已 `update-ref` 对齐 |
+| tag | `refs/tags/v0.2.12` → `b391d53`（轻量 tag；`v0.1.0` / `v0.2.0` / `v0.2.11` 不动） |
+| 构建 | `npm run tauri build`（带 `TAURI_SIGNING_PRIVATE_KEY` **内容**）→ release 编译 5m32s，2 bundle + 2 签名 |
+| Release | `v0.2.12`，非 draft / 非 prerelease，id `406926699` |
+| 资产 | `TwinSwitch_0.2.12_x64-setup.exe` 5 872 888 B · 同名 `.sig` 424 B · `latest.json` 1 285 B |
+| 清单回读 | `version=0.2.12`、两个 platform 均指向 `releases/latest/download/…`、`signature` 与 `.sig` **逐字符一致** |
+| 工作区 | 干净（`latest.json` 是发布产物，传完即删） |
+
+⚠️⚠️ **本轮最大的坑不是「怎么推」，而是「谁来做 HTTP」**：同一个 `api.github.com`，
+Node `fetch`（undici / BoringSSL）直连被断，Python `urllib`（OpenSSL）直连 `UNEXPECTED_EOF_WHILE_READING`、
+走环境代理 `RemoteDisconnected`，**只有 curl（Windows Schannel）稳定 200**（直连与走同一条代理都行）。
+最终形态是「**Python 管逻辑 + curl 管传输**」。
+
+⚠️ **同时修正一条旧结论**：Node 里 `spawnSync` 一律 `EBUSY`，**但 Python 的 `subprocess` 可用** ——
+需要「脚本里调外部命令」时优先用 Python。
+
+⚠️ **`scripts/release.mjs` 本次未能直接使用**（234 / 291 行用的是 Node `fetch`，建 Release 与上传资产
+都会撞同一堵 TLS 墙），已按它的语义**逐条复刻**为 Python + curl：清单字段、`signature` 取 `.sig`
+**完整原文**、同名资产**先删再传**（GitHub 不允许覆盖，直接传 422）、传完删掉本地 `latest.json`。
+**下次发版：要么先给 `release.mjs` 换传输层，要么继续用这份复刻件。**
+
+⚠️ 这条代理链**偶发**握手失败（同一端点手动重跑就 200）⇒ curl 一律带
+`--retry 3 --retry-all-errors`，**加** Python 侧的指数退避；一次失败不等于网络不可用。
 
 ---
 
