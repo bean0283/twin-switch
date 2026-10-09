@@ -203,9 +203,22 @@ export default function WorkbuddyCleanupPage() {
     setBusyLabel("清空回收站");
     try {
       const r = await api.traeWbCleanupEmptyTrash();
-      toast.success(`回收站已清空，释放 ${humanSize(r.bytes)}`, {
-        description: `移除了 ${r.removed} 个条目`,
-      });
+      // ⚠️「清空」是**允许部分成功**的：后端逐项删 + 短退避重试 + 先清只读，真正删不掉的
+      //（被某个进程长期占用）才会进 `failed`。这时候报「失败」是错的（能释放的已经释放了），
+      // 报「成功」也是错的（会让人以为全清了、卡片却还占着地方）。所以单独一条 warning，
+      // 并把前几条失败原因写出来 —— 2026-10-09 那次「清空回收站失败: 拒绝访问。 (os error 5)」
+      // 就是整棵树一把梭导致的：一个条目撞上瞬时占用 ⇒ 一个都没删掉。
+      if (r.failed_count > 0) {
+        toast.warning(`已释放 ${humanSize(r.bytes)}，但有 ${r.failed_count} 项删不掉`, {
+          description: `${r.failed.slice(0, 3).join("；")}${
+            r.failed.length > 3 ? " …" : ""
+          }（多半被其他程序占用，关掉对应程序后再点一次）`,
+        });
+      } else {
+        toast.success(`回收站已清空，释放 ${humanSize(r.bytes)}`, {
+          description: `移除了 ${r.removed} 个条目`,
+        });
+      }
       // force=true：刚清完，缓存里的数字已经不准了（后端也已失效缓存），必须重扫。
       await load(true, true);
     } catch (cause) {

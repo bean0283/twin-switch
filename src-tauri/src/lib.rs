@@ -163,6 +163,7 @@ pub fn run() {
             commands::workbuddy_switch_to,
             commands::workbuddy_rollback,
             commands::workbuddy_import_local,
+            commands::workbuddy_import_reference_accounts,
             commands::workbuddy_remove_account,
             commands::workbuddy_rename_account,
             commands::workbuddy_export_accounts,

@@ -10,13 +10,16 @@
 //! - 归一化：把五花八门的容量字段收敛成 `total` / `remaining` / `used` / `expireAt`，
 //!   并算出「总额度、总剩余、近期到期、已过期」。
 //!
-//! ## 账号来源
+//! ## 账号来源：**只用本工具账号库**
 //!
-//! 本工具账号库（`~/.twin-switch/workbuddy-accounts.json`）为主，另**只读**借用参考
-//! 工具留下的 `~/.wb-switch/accounts.json`。
+//! 账号一律取自 `~/.twin-switch/workbuddy-accounts.json`（`workbuddy_vault`），刷新出来的
+//! 新 token 也就只有这一个落点。
 //!
-//! **从参考工具读到的东西一个字节都不写**：刷新出来的新 token 只留在内存里供本次查询
-//! 使用，绝不回写别人的文件。只有来自本工具账号库的账号，刷新成功后才会落盘。
+//! ⚠️ 这里**不许**再去读别的工具的账号库（T42 之前曾经借读过，已整段删除）：
+//! 一旦查询结果依赖外部文件，本工具就永远说不清「这个数字是我查的还是别人查的」，
+//! 而且那个文件什么时候消失、内容是谁写的都不由我们决定。要别的库里的明文凭据，
+//! 走 `workbuddy_vault::import_reference_accounts()` **一次性搬进来**，搬完就不再有关系。
+//! 护栏 `credits_never_reference_the_other_tool_store` 会盯着这一条。
 //!
 //! ## 加密信封
 //!
@@ -106,24 +109,14 @@ impl TokenState {
     }
 }
 
-/// 账号从哪来（决定刷新出来的 token 能不能落盘）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// 本工具账号库 —— 可写。
-    Own,
-    /// 参考工具的账号库 —— **只读**，刷新结果只留在内存。
-    Ref,
-}
-
 /// 一个可查询积分的账号（含凭据，只在内存中流转，不进前端）。
 #[derive(Debug, Clone)]
 pub struct CreditAccount {
-    /// 稳定键：本工具账号库用自己的 `id`，参考工具库用 `ref:<uid>`。
+    /// 稳定键：本工具账号库的 `id`。
     pub id: String,
     pub uid: String,
     /// 展示名（解析不出来时是 `uid …尾号`）。
     pub name: String,
-    pub origin: Origin,
     pub domain: String,
     pub token_state: TokenState,
     /// 待发请求的账号对象（含 `access_token` / `refresh_token` / `uid` / `domain`）。
@@ -140,9 +133,13 @@ impl CreditAccount {
     pub fn blocked_reason(&self) -> Option<String> {
         match self.token_state {
             TokenState::Plain => None,
+            // ⚠️ 这里**只能**指向真的会发生的动作。曾经写的是「去点『导入参考工具账号』」，
+            // 而那个按钮后来被删掉了（改成启动时自动导入，2026-10-09）—— 提示指着一个
+            // 不存在的入口，用户就只能白白找一圈。现在两条路都是「用户不用点」或「用户点得到」。
             TokenState::Envelope => Some(
-                "该账号凭据是 WorkBuddy 加密信封，无法直接调用积分接口；\
-                 请用「发起网页登录」重新扫码添加以获得明文凭据"
+                "该账号凭据是 WorkBuddy 加密信封，本地解不出明文，无法直接调用积分接口；\
+                 本工具会在每次启动时自动尝试从参考工具账号库搬入该账号的明文凭据，\
+                 若那边也没有，用「扫码添加账号」重新扫码即可"
                     .to_string(),
             ),
             TokenState::Missing => Some("该账号没有采集到凭据，无法查询积分".to_string()),
@@ -155,20 +152,11 @@ impl CreditAccount {
             "id": self.id,
             "uid": self.uid,
             "name": self.name,
-            "origin": if self.origin == Origin::Own { "own" } else { "ref" },
             "tokenState": self.token_state.as_str(),
             "queryable": self.queryable(),
             "blockedReason": self.blocked_reason(),
         })
     }
-}
-
-/// 参考工具账号库路径（`~/.wb-switch/accounts.json`）。**只读**。
-fn reference_accounts_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".wb-switch")
-        .join("accounts.json")
 }
 
 fn str_at(v: &Value, key: &str) -> String {
@@ -195,154 +183,30 @@ fn token_state_of(acc: &Value) -> TokenState {
     }
 }
 
-/// 同一个 uid 出现两份凭据时，新的那份要不要顶掉旧的。
+/// 账号清单：**只取本工具账号库**，按 uid 去重（同 uid 只留第一条）。
 ///
-/// 规则（**唯一出口**——`collect_accounts` 与 [`merged_queryable_count`] 都走这里）：
-/// 1. **明文凭据优先**——信封根本调不了接口；
-/// 2. 同档位时**本工具账号库优先**（只有 `Origin::Own` 的刷新结果能落盘）。
-///
-/// ⚠️ 别在别处再抄一遍这个 `match`：同一条去重规则被两处独立推导，迟早有一处跑偏。
-fn prefer_over(
-    old_origin: Origin,
-    old_state: TokenState,
-    new_origin: Origin,
-    new_state: TokenState,
-) -> bool {
-    match (old_state == TokenState::Plain, new_state == TokenState::Plain) {
-        (false, true) => true,
-        (true, false) => false,
-        _ => old_origin == Origin::Ref && new_origin == Origin::Own,
-    }
-}
-
-/// 合并账号来源，按 uid 去重。
-///
-/// 去重规则见 [`prefer_over`]。
+/// 账号库写入侧（`workbuddy_vault::upsert_into`）已经按 uid 合并，正常不会出现重复；
+/// 这里再去一次重是为了防手改 JSON 留下的脏数据，判据「先到先得」——**不对同一份数据
+/// 做第二次解释**（T42 之前这里还要跨两个库比「谁的凭据更优」，那套规则已随借读一起删掉）。
 fn collect_accounts() -> Vec<CreditAccount> {
-    let mut by_uid: HashMap<String, CreditAccount> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<CreditAccount> = Vec::new();
 
-    let mut consider = |acc: CreditAccount| {
-        match by_uid.get(&acc.uid) {
-            None => {
-                order.push(acc.uid.clone());
-                by_uid.insert(acc.uid.clone(), acc);
-            }
-            Some(old) => {
-                if prefer_over(old.origin, old.token_state, acc.origin, acc.token_state) {
-                    by_uid.insert(acc.uid.clone(), acc);
-                }
-            }
-        }
-    };
-
-    // 先放本工具账号库（后放的参考工具库在「凭据更优」时会替换掉它）
     for a in workbuddy_vault::load_accounts() {
         let uid = str_at(&a, "uid");
-        if uid.is_empty() {
+        if uid.is_empty() || !seen.insert(uid.clone()) {
             continue;
         }
-        consider(CreditAccount {
+        out.push(CreditAccount {
             id: str_at(&a, "id"),
             name: workbuddy_vault::display_name(&a),
             uid,
-            origin: Origin::Own,
             domain: str_at(&a, "domain"),
             token_state: token_state_of(&a),
             raw: a,
         });
     }
-
-    for a in reference_accounts() {
-        let uid = str_at(&a, "uid");
-        if uid.is_empty() {
-            continue;
-        }
-        let name = {
-            let n = str_at(&a, "nickname");
-            if n.is_empty() {
-                crate::modules::workbuddy_accounts::label_for(&uid)
-            } else {
-                n
-            }
-        };
-        consider(CreditAccount {
-            id: format!("ref:{uid}"),
-            name,
-            uid,
-            origin: Origin::Ref,
-            domain: str_at(&a, "domain"),
-            token_state: token_state_of(&a),
-            raw: a,
-        });
-    }
-
-    order
-        .into_iter()
-        .filter_map(|uid| by_uid.remove(&uid))
-        .collect()
-}
-
-/// 读参考工具账号库（只读；缺失或损坏返回空）。
-fn reference_accounts() -> Vec<Value> {
-    let path = reference_accounts_path();
-    let Some(text) = std::fs::read_to_string(&path).ok() else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Array(a)) => a,
-        Ok(Value::Object(o)) => o
-            .get("accounts")
-            .and_then(|x| x.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// 合并「本工具账号库 + 参考工具库」后，**可以直接发请求查积分**的账号数。
-///
-/// 去重规则与 `collect_accounts` 共用 [`prefer_over`]，但**不解析展示名**——
-/// `label_for` 要扫 `~/.workbuddy/logs/*.log`（4 MB 级），而首页总览每次刷新都会同步
-/// 跑一遍，不能在这里付出解析日志的代价。
-///
-/// ⚠️ 首页那条「账号库里没有明文凭据账号，积分查询不可用」的提示**必须**用这个合并
-/// 结果判定，不能只看 `workbuddy_vault::load_accounts()`：本工具账号库里的凭据一律是
-/// 加密信封（「导入本机登录态」就是这么落的），而参考工具库通常存的是明文——
-/// 只看前者会**稳定误报**「积分查询不可用」，可同一屏的积分卡又明明有数
-/// （2026-10-08 真事：账号库 3 个 / 0 个可查积分，积分却显示 3/3 个账号查询成功）。
-pub fn merged_queryable_count() -> usize {
-    let mut by_uid: HashMap<String, (Origin, TokenState)> = HashMap::new();
-    let mut consider = |uid: String, origin: Origin, state: TokenState| match by_uid.get(&uid).copied() {
-        None => {
-            by_uid.insert(uid, (origin, state));
-        }
-        Some((old_origin, old_state)) => {
-            if prefer_over(old_origin, old_state, origin, state) {
-                by_uid.insert(uid, (origin, state));
-            }
-        }
-    };
-
-    for a in workbuddy_vault::load_accounts() {
-        let uid = str_at(&a, "uid");
-        if uid.is_empty() {
-            continue;
-        }
-        consider(uid, Origin::Own, token_state_of(&a));
-    }
-    for a in reference_accounts() {
-        let uid = str_at(&a, "uid");
-        if uid.is_empty() {
-            continue;
-        }
-        consider(uid, Origin::Ref, token_state_of(&a));
-    }
-
-    by_uid
-        .values()
-        .filter(|(_, state)| *state == TokenState::Plain)
-        .count()
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -760,13 +624,12 @@ async fn ensure_fresh_token(account: Value) -> Value {
     refresh_account_token(account).await.0
 }
 
-/// 刷新结果落盘——**只对来自本工具账号库的账号做**。
+/// 刷新结果落盘。
 ///
-/// 参考工具账号库是别人的文件，刷新出来的新 token 只留在内存里供本次查询使用。
+/// 能落盘的原因只有一条：这些账号本来就取自 `workbuddy_vault`（本工具自己的库）。
+/// T42 之前这里还要判 `origin != Own` 才写——那是为了不碰别人的文件，现在唯一的来源
+/// 就是自己的库，判断也随之消失（账号仍是唯一来源，见模块头）。
 fn persist_if_owned(account: &CreditAccount, refreshed: &Value) {
-    if account.origin != Origin::Own {
-        return;
-    }
     let _ = workbuddy_vault::update_tokens(&account.id, refreshed);
 }
 
@@ -1126,6 +989,18 @@ fn persist_disk(c: &Cache) {
     );
 }
 
+/// 作废积分缓存（内存 + 磁盘）。
+///
+/// ⚠️ 判据只有一个：**账号库变了**。缓存存的是「当时那批账号的查询结果」，不同源就会出现
+/// T41 那种自相矛盾 —— 自动搬完明文，卡片还挂着 5 分钟前的「加密信封、查询失败」。
+///
+/// 调用点集中在一处：`workbuddy_vault::save_accounts`（账号库的唯一写出口），
+/// 所以导入/删除/改名/自动搬家都会自动跟上，不需要各调用点自己记。
+pub fn clear_cache() {
+    *cache().lock().unwrap() = None;
+    config::clear_cache_json(CACHE_NAME);
+}
+
 /// 取当前缓存：内存优先，内存空则回落到磁盘并顺手灌进内存。
 fn current_cache() -> Option<Cache> {
     {
@@ -1177,7 +1052,6 @@ pub fn accounts() -> Value {
         "count": list.len(),
         "queryable": list.iter().filter(|a| a["queryable"] == json!(true)).count(),
         "accounts": list,
-        "referenceStore": reference_accounts_path().to_string_lossy(),
     })
 }
 
@@ -1404,7 +1278,6 @@ mod tests {
             id: "x".into(),
             uid: "u".into(),
             name: "n".into(),
-            origin: Origin::Own,
             domain: String::new(),
             token_state: TokenState::Envelope,
             raw: envelope,
@@ -1413,49 +1286,42 @@ mod tests {
         assert!(acc.blocked_reason().is_some());
         // 阻塞原因不能泄露凭据内容
         assert!(!acc.blocked_reason().unwrap().contains("zzz"));
+        // 屏蔽原因要给得出下一步（自动导入 / 扫码），且**不许**指向已经不存在的按钮
+        let reason = acc.blocked_reason().unwrap();
+        assert!(reason.contains("扫码"), "要点明扫码这条路：{reason}");
+        assert!(reason.contains("自动"), "要点明启动时会自动搬明文：{reason}");
+        assert!(
+            !reason.contains("导入参考工具账号"),
+            "「导入参考工具账号」按钮已删除（T43 改为启动自动导入），提示不许指着它：{reason}"
+        );
     }
 
+    /// 护栏（T42）：积分链路**不许**再出现别的工具的账号库。
+    ///
+    /// 这条不是「顺便查一下」——2026-10-09 之前积分是跨库借读的，借读的代价是同一屏上
+    /// 「提示说查不了」和「积分卡有数」两个数字打架，而且那个文件什么时候没由不得我们。
+    /// 现在明文凭据只能靠 `workbuddy_vault::import_reference_accounts()` 一次性搬进来，
+    /// 所以积分模块的源码里连那个路径的字样都不该有。
     #[test]
-    fn plaintext_credentials_win_over_envelope_regardless_of_origin() {
-        // 本工具库是信封、参考工具库是明文 → 取明文
-        assert!(prefer_over(
-            Origin::Own,
-            TokenState::Envelope,
-            Origin::Ref,
-            TokenState::Plain
-        ));
-        // 反过来（本工具库已经明文）→ 不许被参考库顶掉
-        assert!(!prefer_over(
-            Origin::Own,
-            TokenState::Plain,
-            Origin::Ref,
-            TokenState::Envelope
-        ));
-        assert!(!prefer_over(
-            Origin::Own,
-            TokenState::Plain,
-            Origin::Ref,
-            TokenState::Plain
-        ));
-        // 同档位时本工具账号库优先；参考库之间不互相顶
-        assert!(prefer_over(
-            Origin::Ref,
-            TokenState::Envelope,
-            Origin::Own,
-            TokenState::Envelope
-        ));
-        assert!(!prefer_over(
-            Origin::Own,
-            TokenState::Missing,
-            Origin::Ref,
-            TokenState::Envelope
-        ));
-        assert!(prefer_over(
-            Origin::Ref,
-            TokenState::Missing,
-            Origin::Own,
-            TokenState::Missing
-        ));
+    fn credits_never_reference_the_other_tool_store() {
+        let src = include_str!("workbuddy_credits.rs");
+        // ⚠️ 判据串必须拼接，不能写成字面量：本测试的代码自己也在 `src` 里，
+        // 写成字面量一定自命中（第一次就是这么红掉的）。
+        let store = [".wb", "-switch"].concat();
+        let helper = ["reference", "_accounts_path"].concat();
+        assert!(
+            !src.contains(&store),
+            "积分模块不许再读别的工具的账号库（要明文请走一次性导入）"
+        );
+        assert!(
+            !src.contains(&helper),
+            "参考账号库路径只能出现在 workbuddy_vault 的一次性导入里"
+        );
+        // 反向自检：判据串得真的能在别处命中，否则这条护栏只是在自我安慰。
+        assert!(
+            include_str!("workbuddy_vault.rs").contains(&store),
+            "判据串写错了：连合法读它的 vault 模块都命中不了"
+        );
     }
 
     #[test]

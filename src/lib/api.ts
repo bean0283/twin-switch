@@ -637,11 +637,20 @@ export function traeWbCleanupPurge(
   return call("trae_wb_cleanup_purge", { ids, hard });
 }
 
-/** 清空工具回收站，彻底释放被清理文件占用的空间。 */
+/**
+ * 清空工具回收站，彻底释放被清理文件占用的空间。
+ *
+ * ⚠️ 后端是**逐项删 + 短退避重试 + 先清只读**的，所以这里可能拿到**部分成功**：
+ * `failed_count > 0` 表示还有条目删不掉（多半是被某个进程长期占用），
+ * `failed` 里是「条目名（失败原因）」。**别把这种情况当整体失败** —— 能释放的已经释放了。
+ */
 export function traeWbCleanupEmptyTrash(): Promise<{
   removed: number;
   bytes: number;
   dir: string;
+  /** 删不掉的条目：「名称（原因）」。 */
+  failed: string[];
+  failed_count: number;
 }> {
   return call("trae_wb_cleanup_empty_trash");
 }
@@ -698,6 +707,9 @@ export function traeCleanupEmptyTrash(): Promise<{
   before_mb: number;
   freed_bytes: number;
   freed_mb: number;
+  /** 删不掉的条目：「名称（原因）」。⚠️ 原来失败是静默的，用户看到「已清空」却仍有残留。 */
+  failed: string[];
+  failed_count: number;
 }> {
   return call("trae_cleanup_empty_trash");
 }
@@ -724,6 +736,37 @@ export function workbuddyRollback(): Promise<{ ok: boolean; uid: string | null; 
 
 export function workbuddyImportLocal(): Promise<Record<string, unknown>> {
   return call("workbuddy_import_local");
+}
+
+/**
+ * 搬家：把参考工具账号库里**有明文凭据**的账号并进本工具账号库。
+ *
+ * 为什么需要它：本工具账号库里的凭据是 WorkBuddy 加密信封，本地解不出明文，查不了积分；
+ * 搬一次明文进来之后就与外部账号库再无关系（积分链路已完全不读它）。
+ *
+ * ⚠️ **由 `main.tsx` 的启动编排自动调用**，界面上没有按钮（2026-10-09 起）。
+ * 所以这个函数**失败不该弹错**：对方没装那个工具、文件损坏都是常态。
+ * 重复调用是幂等的（本地已是明文就落入 `kept`，不重写）。
+ */
+export function workbuddyImportReferenceAccounts(): Promise<{
+  ok: boolean;
+  /** 参考工具账号库读到了**且**能解析。false = 对方没装/没登录过/文件坏了，**不是错误**。 */
+  available: boolean;
+  created: number;
+  updated: number;
+  /** 来源记录本身不可用（加密信封 / 空 token / 无 uid）。 */
+  skipped: number;
+  /** 本地已经是可用的明文凭据，**刻意保留**（本地那份通常更新），不是失败。 */
+  kept: number;
+  /** 用户**亲手删过**的身份，刻意不搬回来（护栏生效，不是失败）。 */
+  blocked: number;
+  /** `created + updated`：前端只需要这一个数就能决定要不要提示、要不要刷新。 */
+  imported: number;
+  total: number;
+  /** `available === false` 时给出的原因。 */
+  note: string | null;
+}> {
+  return call("workbuddy_import_reference_accounts");
 }
 
 export function workbuddyRemoveAccount(accountId: string): Promise<{ ok: boolean }> {

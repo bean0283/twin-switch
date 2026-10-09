@@ -1241,8 +1241,6 @@ export interface WbCreditAccountInfo {
   id: string;
   uid: string;
   name: string;
-  /** own = 本工具账号库（可写）；ref = 参考工具账号库（只读借用）。 */
-  origin: "own" | "ref";
   /** plain = 明文可查；envelope = 加密信封查不了；missing = 无凭据。 */
   tokenState: "plain" | "envelope" | "missing";
   queryable: boolean;
@@ -1294,8 +1292,6 @@ export interface WbCreditsAccounts {
   count: number;
   queryable: number;
   accounts: WbCreditAccountInfo[];
-  /** 只读借用的参考工具账号库路径。 */
-  referenceStore: string;
 }
 
 // ---------------------------------------------------------------------------

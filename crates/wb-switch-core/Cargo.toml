@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 description = "TwinSwitch（双栖）核心逻辑（账号 / 切换 / 会话 / 解密 / 导入 / 清理），不依赖 Tauri，可被桌面端与 CLI 复用"
 

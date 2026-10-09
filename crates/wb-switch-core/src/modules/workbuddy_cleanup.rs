@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::modules::config::{self, now_ms, store_dir};
+use crate::modules::fs_remove::remove_tree_with_retry;
 use crate::modules::workbuddy_accounts;
 use crate::modules::workbuddy_export::{
     open_wb_db_ro, resolve_wb_exe, wb_is_running, wb_launch, wb_quit,
@@ -1006,21 +1007,76 @@ pub fn purge(
 }
 
 /// 清空回收站（彻底释放空间）。
+///
+/// ⚠️ 2026-10-09 修（T45）：原来是一句 `std::fs::remove_dir_all(&root)` —— **整棵树一把梭，
+/// 任何一个条目失败就整体 `Err`**。于是用户点「清空回收站」拿到的是
+/// 「清空回收站失败: 拒绝访问。 (os error 5)」，而且**一个条目都没删掉**。
+/// 触发点非常日常：`purge` 收尾会**重启 WorkBuddy 客户端**（客户端一启动就重新打开
+/// 日志目录），再叠加刚移入的 GB 级文件正被实时防护扫描 ⇒ 删除那一刻撞上瞬时占用。
+///
+/// 现在的做法与 [`super::trae_cleanup::empty_trash`] **对齐（两端同构）**：
+/// - **逐项删**：一个条目失败不影响其他条目，能释放的先释放；
+/// - **短退避重试**：瞬时占用（杀软扫描 / 客户端刚重启）重试几次就过去了；
+/// - **先清只读**：Windows 上只读文件会让 `remove_dir_all` 直接 access denied；
+/// - **如实上报**：返回 `failed` / `failed_count`，前端据此提示「部分完成」而不是整体失败。
+///
+/// 判据：「清空」要的是「能删的都删掉」，不是「一次全成、否则全不成」。
+/// 只清根目录**内容**、保留根目录本身（下次清理直接往里放）。
 pub fn empty_trash() -> Result<Value, String> {
-    let root = trash_root();
+    empty_trash_at(&trash_root())
+}
+
+/// [`empty_trash`] 的实现主体。路径可注入 ⇒ 单测走临时目录，**不碰真回收站**。
+fn empty_trash_at(root: &Path) -> Result<Value, String> {
     if !root.exists() {
-        return Ok(json!({ "removed": 0, "bytes": 0, "dir": root.to_string_lossy() }));
+        return Ok(json!({
+            "ok": true,
+            "removed": 0,
+            "bytes": 0,
+            "dir": root.to_string_lossy(),
+            "failed": [],
+            "failed_count": 0,
+        }));
     }
-    let bytes = dir_size(&root);
-    let before = std::fs::read_dir(&root).map(|rd| rd.count()).unwrap_or(0);
-    std::fs::remove_dir_all(&root).map_err(|e| format!("清空回收站失败: {e}"))?;
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    let mut failed: Vec<String> = Vec::new();
+
+    let rd = std::fs::read_dir(root).map_err(|e| format!("读取回收站失败: {e}"))?;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        // 先量体积（删掉之后就算不出来了）
+        let sz = dir_size(&p);
+        match remove_tree_with_retry(&p) {
+            Ok(()) => {
+                removed += 1;
+                freed += sz;
+            }
+            Err(e) => failed.push(format!(
+                "{}（{e}）",
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            )),
+        }
+    }
+
+    // 盘面刚变了，扫描缓存立刻作废。
     config::clear_cache_json(CACHE_NAME);
     Ok(json!({
-        "removed": before,
-        "bytes": bytes,
+        "ok": true,
+        "removed": removed,
+        "bytes": freed,
         "dir": root.to_string_lossy(),
+        "failed": failed,
+        "failed_count": failed.len(),
     }))
 }
+
+// 删条目（先清只读 + 短退避重试）的实现在 `crate::modules::fs_remove` ——
+// 与 `trae_cleanup` **共用同一份**。为什么不再各写一份：2026-10-09 的真事，同一个应用里
+// 两个「清空回收站」，Trae 侧逐项、WorkBuddy 侧整棵树一把梭，用户只在后者撞上
+// 「拒绝访问。 (os error 5)」而且一个条目都没删掉。
 
 fn human(bytes: u64) -> String {
     if bytes < 1024 {
@@ -1087,5 +1143,51 @@ mod tests {
         // 不存在的表要静默跳过，而不是报错
         assert_eq!(purge_db_rows(&p, &sids, "no_such_table", "id").unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 清空回收站：**逐项删**，只读文件也要能删掉，且根目录本身保留。
+    ///
+    /// ⚠️ 判据来自 2026-10-09 的真事：原实现一句 `remove_dir_all(&root)`，任何一个条目
+    /// 失败就整体 `Err` ⇒ 用户看到「清空回收站失败: 拒绝访问。 (os error 5)」却一个条目
+    /// 都没删。这条测试钉死「只读不是借口、逐项互不牵连」。
+    #[test]
+    fn empty_trash_at_removes_every_entry_including_readonly() {
+        let base = std::env::temp_dir().join(format!("wbcl-trash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 批次一：带子目录 + 只读文件（Windows 上只读会让 remove_dir_all 直接 access denied）
+        let b1 = base.join("20261009-000000");
+        std::fs::create_dir_all(b1.join("sub")).unwrap();
+        std::fs::write(b1.join("a.txt"), "a").unwrap();
+        let ro = b1.join("sub").join("ro.txt");
+        std::fs::write(&ro, "ro").unwrap();
+        let mut perm = std::fs::metadata(&ro).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&ro, perm).unwrap();
+
+        // 批次二：普通目录
+        let b2 = base.join("20261009-000001");
+        std::fs::create_dir_all(&b2).unwrap();
+        std::fs::write(b2.join("b.txt"), "b").unwrap();
+
+        let r = empty_trash_at(&base).unwrap();
+        assert_eq!(r["removed"], json!(2), "两个批次都该被删掉：{r}");
+        assert_eq!(r["failed_count"], json!(0), "不该有失败项：{r}");
+        assert!(!b1.exists(), "含只读文件的批次也要删干净");
+        assert!(!b2.exists());
+        assert!(base.exists(), "只清内容，根目录本身保留");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回收站不存在时是**正常的空操作**，不是错误（启动/首次使用都会走到）。
+    #[test]
+    fn empty_trash_at_is_a_noop_when_root_missing() {
+        let base = std::env::temp_dir().join(format!("wbcl-trash-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let r = empty_trash_at(&base).unwrap();
+        assert_eq!(r["removed"], json!(0));
+        assert_eq!(r["failed_count"], json!(0));
+        assert_eq!(r["bytes"], json!(0));
     }
 }

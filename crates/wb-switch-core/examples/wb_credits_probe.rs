@@ -15,16 +15,14 @@ async fn main() {
     let force = std::env::args().any(|a| a == "force");
 
     let list = workbuddy_credits::accounts();
-    println!("=== 账号清单（合并本工具账号库 + 只读参考工具账号库）===");
-    println!("路径 : {}", list["referenceStore"].as_str().unwrap_or(""));
+    println!("=== 账号清单（只用本工具账号库）===");
     println!("总数 : {} 个，其中可查询 {}", list["count"], list["queryable"]);
     for a in list["accounts"].as_array().unwrap() {
         println!(
-            "  - id={} uid={} name={} origin={} token={} queryable={}",
+            "  - id={} uid={} name={} token={} queryable={}",
             a["id"].as_str().unwrap_or(""),
             a["uid"].as_str().unwrap_or(""),
             a["name"].as_str().unwrap_or(""),
-            a["origin"].as_str().unwrap_or(""),
             a["tokenState"].as_str().unwrap_or(""),
             a["queryable"],
         );

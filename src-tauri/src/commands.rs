@@ -1300,6 +1300,17 @@ pub async fn workbuddy_import_accounts(payload: Value, mode: Option<String>) -> 
     off_main(move || workbuddy_vault::import_accounts(&payload, mode.as_deref())).await?
 }
 
+/// 一次性搬家：把参考工具账号库里**有明文凭据**的账号并进本工具账号库。
+///
+/// ⚠️ 这是全仓**唯一**会去读那份外部账号库的动作，用户点一次即可；之后积分、切换、
+/// 会话一律只看本工具账号库。返回 `{created, updated, skipped, total}`，
+/// 失败（文件不存在 / 不是合法 JSON）**原样上抛**，别降级成「搬了 0 个」——
+/// 那会把「读不到」伪装成「没有可搬的」（T40 的教训）。
+#[tauri::command]
+pub async fn workbuddy_import_reference_accounts() -> Result<Value, String> {
+    off_main(workbuddy_vault::import_reference_accounts).await?
+}
+
 /// 发起 OAuth 扫码登录，返回授权页 URL 与 loginId。
 #[tauri::command]
 pub async fn workbuddy_oauth_start() -> Result<Value, String> {

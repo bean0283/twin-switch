@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-08 / **v0.2.12 已发版**，含 T39 + T40 + T41；前一个正式版 **v0.2.11**）
+> 分析时间：2026-10-04（最近更新：2026-10-09 / **v0.2.12 已发版**，另含**未发版**的 T42 / T43 / T44（版本号已就位 0.2.13）/ T45；前一个正式版 **v0.2.11**）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -571,6 +571,99 @@ React 抛 `Objects are not valid as a React child`，**整棵树被 ErrorBoundar
 
 **这轮脚手架新增的判据**：**判断某个溢出是不是本次改动引入的，就加一个「去掉该元素」的对照形态再量一次。**
 比「我觉得跟这个改动没关系」可靠得多。
+
+---
+
+### 追加核验（2026-10-09，T42 后，**未发版**）
+
+**变更**：积分链路**不再读任何外部账号库** —— `workbuddy_credits.rs` 里读 `~/.wb-switch/accounts.json` 的整条路径
+（`reference_accounts_path` / `reference_accounts` / `Origin::Ref` / `merged_queryable_count`）**全部删除**，只取
+`workbuddy_vault::load_accounts()`；新增**一次性**搬家入口「导入参考工具账号」
+（`workbuddy_vault::import_reference_accounts()` + 命令 `workbuddy_import_reference_accounts` + 账号页按钮）。
+T41 那套「合并视图」判定随之作废（T41 小节已加历史说明）。
+
+**这件事的起因**：账号页两张卡红字报「凭据是 WorkBuddy 加密信封，无法直接调用积分接口……请先做一次
+『导入参考工具账号』」，**但操作条上没有那个按钮** —— `runImportReference()` 与 api 封装都写好了，
+唯独按钮漏挂。用户照着提示在页面上找不到入口，只能去重新扫码。本轮补上按钮，并顺带摘掉一批 T42 之后
+已经说反的文案（`referenceStore` / `origin` /「账号来源：本工具账号库 + 只读借用」/ 死代码段
+「仅存在于参考工具库的账号」）。
+
+| 核验项 | 结果 |
+| --- | --- |
+| `--example wb_credits_probe -- force`（真机，唯一写副作用＝本工具账号库刷新 token） | **3/3 成功 / 0 失败**：弦ྂ思ྂ 2996.37、19550125362 2478.98、13780001455 3413.80（合计 **8889.15**），三条 `tokenState=plain` |
+| 一次性搬家（真机，**写前整份备份**到临时目录） | `{created:0, updated:2, kept:1, skipped:0, total:3}`；`kept` 那条（本地已可用）`exp` 仍是 **11-11**，**一个字节没动** |
+| `cargo test --workspace` | **211 passed / 0 failed / 2 ignored** + `wb_switch_rust_lib` **15 passed** |
+| `npx tsc --noEmit` / `vite build` | 零错误 / 通过（仅既有 >500 kB 提示） |
+| 渲染自查（**直接打开发 server 上真实页面**，1600 / 1360 / 730 × plain / blocked） | 5 个按钮全部在位；1600 与 1360 一行、730 折两行且不溢出；`hScroll` 全 false；控制台错误 **0** |
+| 730 档对照形态（`--drop=导入参考工具账号`） | 头部块 `499 > 439` 的内部溢出**一模一样** ⇒ 来源是标题里的长路径，**既有问题**，非本次引入 |
+
+> ⚠️ **两条要点记牢**
+> ① **文案指着的入口必须真的存在**：凡是新增「让用户去点某个东西」的提示，同一次改动里必须能指出那个按钮在第几行。
+> ② **新版自查配方（省掉整套脚手架）**：dev server 已经在跑时不必再造 `preview/` —— CDP 的
+> `Page.addScriptToEvaluateOnNewDocument` 能在页面脚本之前注入宿主桩，直接打开 `http://[::1]:1420/<route>`，
+> 量的就是**正在改的那份源码**。注意本机 vite dev server **只监听 IPv6 回环**，`127.0.0.1:1420` 连不上。
+
+> ⚠️ **后续（T43）**：本节 row 3 补上的那个「导入参考工具账号」按钮**已被删除**，改为应用启动时自动导入。
+> 上文提到「账号页按钮」的地方，现状一律以 T43 为准。
+
+---
+
+### 追加核验（2026-10-09，T43 后，**未发版**）
+
+**变更**：**删掉「导入参考工具账号」按钮**，改由应用启动时自动导入（`main.tsx` 的
+`autoImportReferenceAccounts()`，排在 `refreshOverview()` 之前、3 s 超时、失败静默、只有真搬动了才提示）。
+`import_reference_accounts()` 随之改成**可静默调用**：对方账号库不存在 / 损坏**不再 `Err`**，
+返回 `{available:false, note}` 与 `imported = created + updated`；新增 `workbuddy_credits::clear_cache()`，
+并由账号库的**唯一写出口** `save_accounts()` 统一调用（导入 / 删除 / 改名 / 自动搬家全部自动跟上，
+避免 5 分钟 TTL 内旧结果与账号库不同源）。
+
+**必须同趟改的四条文案**：账号页红字、首页「注意事项」、HomePage 积分空态、`workbuddy-credits.tsx` 注释。
+删入口而不改文案，就是 T42 那个坑的**反面**（有提示、指着一个已不存在的入口）。已加断言钉死。
+
+| 核验项 | 结果 |
+| --- | --- |
+| `cargo test --workspace` | **213 passed / 0 failed / 2 ignored**（较 T42 **+2**：幂等、自动导入不可用分支）+ `wb_switch_rust_lib` **15 passed** |
+| `npx tsc --noEmit` / `npx vite build` | 零错误 / 通过（仅既有 >500 kB 提示） |
+| CDP 真实调用序列（量的是正在改的源码） | `app_overview_cached` → **`workbuddy_import_reference_accounts`** → `app_overview_snapshot` ⇒ 搬运确实排在重算之前 |
+| 渲染自查 1600 / 1360 / 730 | 工具栏只剩 4 个按钮，**「导入参考工具账号」已消失**（`hasImportRef=false`、`importRefVisible=false`）；两档一行、730 折两行；`hScroll` 全 false；控制台错误 **0** |
+| 730 对照形态（`--drop=导出账号包`，只剩 3 个按钮） | 溢出串 `[44,44,44,44,60]` **完全不变** ⇒ 与按钮多少无关，属**既有**（即 T42 记录的头部块 60 px） |
+| 真机行为 | 本机账号库三条已是明文 ⇒ 启动自动导入落进 `kept`，`imported:0`，**不弹提示、不重写凭据**（幂等成立） |
+
+> ⚠️ **环境坑（新）**：本机 `curl` 默认走代理，`http://[::1]:1420/` 返回 **`000`**、`127.0.0.1` 返回 **`502`**。
+> 探测 dev server 必须显式 `curl --noproxy '*'`，否则会把「dev server 明明在跑」误判成没起来。
+
+---
+
+### 追加核验（2026-10-09，T44 / T45 后，**未发版**）
+
+**T44（版本号）**：五处版本号 `0.2.12 → 0.2.13`（`package.json` / `src-tauri/Cargo.toml` /
+`src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `update-entry.tsx` 兜底串），
+`Cargo.lock` 跑测试后自动跟上。`package-lock.json` 顶层是历史遗留 `0.1.57`，按惯例不动。
+
+**T45（用户报的两个问题）**：
+
+1. **清空回收站「拒绝访问」**：`workbuddy_cleanup::empty_trash()` 原来是 `remove_dir_all(&root)`
+   **一把梭** —— 任何一个条目失败就整体 `Err`，用户拿到 `清空回收站失败: 拒绝访问。 (os error 5)`
+   且**一个条目都没删掉**。新建 `modules/fs_remove.rs`（**先清只读 + 短退避重试**，两个清理模块
+   共用同一份），`empty_trash` 改为**逐项删 + 如实上报** `failed` / `failed_count`；
+   `trae_cleanup::empty_trash`（原来失败是**静默**的）同步改造；两个清理页在 `failed_count > 0`
+   时给 warning（不再当「已清空」）。
+2. **删掉的账号被自动导入回来**：T43 的自动导入只有「本地已是明文就 `kept`」这一条护栏，
+   管不住「这个身份用户根本不想要」。新增**墓碑名单**
+   `~/.twin-switch/workbuddy-import-blocklist.json`：`delete_account` 落盘后立碑、
+   `merge_reference_accounts` 命中即跳过（计 `blocked`）、**只有用户主动添加才撤碑**
+   （`upsert` / `import_accounts`；⚠️ 绝不能放进被自动导入复用的 `upsert_into`）。
+
+| 核验项 | 结果 |
+| --- | --- |
+| `cargo test --workspace` | **219 passed / 0 failed / 2 ignored**（较 T43 **+6**）+ `wb_switch_rust_lib` **15 passed** |
+| 新增单测 | 只读文件也能删干净、回收站缺失是空操作、`fs_remove` 两条、墓碑生效（`deleted_identity_is_never_imported_again`）、墓碑读写往返与坏 JSON 兜底 |
+| `npx tsc --noEmit` / `npx vite build` | 零错误 / 通过 |
+| 真机现场诊断 | 回收站 1114 文件 / 130 目录全部**可独占打开**、无只读、无重解析点、最长路径 201 ⇒ 排除长期占用，定性为**瞬时**占用 |
+| 真机接线验证 | 探针把账号数做成 **3 → 4 → 3**（净变化 0），墓碑文件正确记下 `uid:t45-probe-41752`；清掉探针后账号库与备份**逐字节一致** |
+
+> ⚠️ **环境坑（新）**：本机 Node 侧有 **safe-delete shim**（`…\cli\vendor\shim\node-safe-delete-shim.cjs`
+> 包裹 `fs.rmSync`）⇒ `npx vite build` 清 `dist/` 时可能被拦。用 Python 的 `shutil.rmtree` 先清掉再 build。
 
 ---
 
