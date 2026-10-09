@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::modules::config::{self, store_dir};
+use crate::modules::fs_remove::remove_tree_with_retry;
 use crate::modules::trae_delete::delete_sessions;
 use crate::modules::trae_discover::{get_client, list_installed_clients, user_data_dir};
 use crate::modules::trae_export::{
@@ -747,19 +748,31 @@ pub fn purge(ids: &[String], hard: bool, on_log: Option<&dyn Fn(&str)>) -> Resul
 }
 
 /// 清空本页回收站（真删，不可恢复）。
+///
+/// ⚠️ 2026-10-09（T45）：与 `workbuddy_cleanup::empty_trash` **改成同构** ——
+/// 逐项删 + 先清只读 + 短退避重试（都走 [`remove_tree_with_retry`]），并把**删不掉的
+/// 条目如实上报**（`failed` / `failed_count`）。
+///
+/// 原来的失败是**静默**的：`hard_remove(&p).is_ok()` 一 `continue` 就等于没发生 ——
+/// 用户点「清空回收站」看到的是「已清空 N 项」，实际还留着几个删不掉的目录。
+/// 判据：**「清空」要能说清「还剩什么没清掉」。**
 pub fn empty_trash() -> Result<Value, String> {
     let root = trash_root();
     let before = path_size(&root);
     let mut removed = 0usize;
     let mut freed = 0u64;
+    let mut failed: Vec<String> = Vec::new();
     if root.is_dir() {
         let rd = std::fs::read_dir(&root).map_err(|e| format!("读取回收站失败: {e}"))?;
         for ent in rd.flatten() {
             let p = ent.path();
             let sz = path_size(&p);
-            if hard_remove(&p).is_ok() {
-                removed += 1;
-                freed += sz;
+            match remove_tree_with_retry(&p) {
+                Ok(()) => {
+                    removed += 1;
+                    freed += sz;
+                }
+                Err(e) => failed.push(format!("{}（{e}）", ent.file_name().to_string_lossy())),
             }
         }
     }
@@ -771,6 +784,8 @@ pub fn empty_trash() -> Result<Value, String> {
         "before_mb": mb(before),
         "freed_bytes": freed,
         "freed_mb": mb(freed),
+        "failed": failed,
+        "failed_count": failed.len(),
     }))
 }
 

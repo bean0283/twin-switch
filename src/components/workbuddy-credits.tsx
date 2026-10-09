@@ -37,7 +37,8 @@ export function wbItemToView(it: WbCreditItem): CreditView {
   }));
 
   const notes: string[] = [];
-  if (it.account.origin === "ref") notes.push("积分来自参考工具库");
+  // ⚠️ 这里以前有一条「积分来自参考工具库」——T42 之后积分只用自己的账号库查，
+  // 那条提示连同 `account.origin` 字段一起删了。别再按来源区分，已经没有第二种来源。
   if (it.source === "legacy") notes.push("旧接口回退（三路新接口不可用），时间字段可能不全");
 
   return {
@@ -58,7 +59,7 @@ export function wbItemToView(it: WbCreditItem): CreditView {
 // ---------------------------------------------------------------------------
 
 export interface CreditsState {
-  meta: { count: number; queryable: number; referenceStore: string } | null;
+  meta: { count: number; queryable: number } | null;
   result: WbCreditsResult | null;
   error: string | null;
   busy: boolean;
@@ -71,13 +72,12 @@ export interface CreditsState {
  * 积分数据状态：首屏只读缓存（不发请求，含上次运行落盘的磁盘缓存），
  * 进页面后自动查一次（未命中 5 分钟缓存才真的联网）。
  *
- * 账号来源 = 本工具账号库（可写）+ **只读**借用的参考工具账号库。
+ * 账号来源 = **本工具账号库**。T42 起不再读别的工具的账号库；加密信封账号靠启动时
+ * 自动导入的明文凭据来查（T43，界面上没有按钮，见 `main.tsx` 与 `workbuddy_vault`）。
  */
 export function useWorkbuddyCredits(): CreditsState {
   const [result, setResult] = useState<WbCreditsResult | null>(null);
-  const [meta, setMeta] = useState<{ count: number; queryable: number; referenceStore: string } | null>(
-    null,
-  );
+  const [meta, setMeta] = useState<{ count: number; queryable: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expand, setExpand] = useState<WbCreditItem | null>(null);
@@ -85,7 +85,7 @@ export function useWorkbuddyCredits(): CreditsState {
   const loadMeta = useCallback(async () => {
     try {
       const m = await api.workbuddyCreditsAccounts();
-      setMeta({ count: m.count, queryable: m.queryable, referenceStore: m.referenceStore });
+      setMeta({ count: m.count, queryable: m.queryable });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -148,14 +148,7 @@ export function CreditsHeader({
       summary={loaded ? loaded.summary : meta ? { succeeded: 0, queried: meta.count, failed: 0, totalRemaining: 0 } : null}
       updatedAt={loaded?.updatedAt ?? null}
       cached={loaded?.cached}
-      hint={
-        meta ? (
-          <>
-            账号来源：本工具账号库 + 只读借用{" "}
-            <code className="rounded bg-muted px-1 break-all">{meta.referenceStore}</code>
-          </>
-        ) : null
-      }
+      hint={meta ? <>账号来源：本工具账号库</> : null}
       busy={busy}
       onRefresh={() => void refresh()}
       refreshHint="逐个账号拉取积分包明细；刚查过的账号会直接复用缓存。"

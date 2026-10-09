@@ -219,9 +219,20 @@ export default function TraeCleanupPage() {
     setBusyLabel("清空回收站");
     try {
       const r = await api.traeCleanupEmptyTrash();
-      toast.success(`回收站已清空，释放 ${humanSize(r.freed_bytes)}`, {
-        description: `移除了 ${r.removed} 个条目`,
-      });
+      // ⚠️ 与 WorkBuddy 清理页同构：后端逐项删 + 先清只读 + 短退避重试，
+      // `failed_count > 0` 说明还有条目被占用删不掉 —— 既不能报「失败」（能删的已删掉），
+      // 也不能报「已清空」（会让人以为干净了）。原来这里是**静默**吞掉的。
+      if (r.failed_count > 0) {
+        toast.warning(`已释放 ${humanSize(r.freed_bytes)}，但有 ${r.failed_count} 项删不掉`, {
+          description: `${r.failed.slice(0, 3).join("；")}${
+            r.failed.length > 3 ? " …" : ""
+          }（多半被其他程序占用，关掉对应程序后再点一次）`,
+        });
+      } else {
+        toast.success(`回收站已清空，释放 ${humanSize(r.freed_bytes)}`, {
+          description: `移除了 ${r.removed} 个条目`,
+        });
+      }
       // force=true：刚清完，缓存里的数字已经不准了，这里必须重扫一遍。
       await load(true, true);
     } catch (cause) {

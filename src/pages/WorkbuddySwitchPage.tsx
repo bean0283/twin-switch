@@ -285,7 +285,13 @@ export default function WorkbuddySwitchPage() {
     if (!acc) return;
     try {
       await api.workbuddyRemoveAccount(acc.id);
-      toast.success(`已删除 ${acc.name}`);
+      // ⚠️ 这句是给用户的定心丸：后端删完会**立墓碑**（`workbuddy-import-blocklist.json`），
+      // 启动时的自动导入不会再把这个身份搬回来。2026-10-09 之前没有这条护栏，用户删掉一个
+      // 账号、重启后它自己从参考库回来了 —— **删除等于没删**。
+      //（之后用户主动扫码 / 导入账号包把它加回来时，墓碑会自动撤掉。）
+      toast.success(`已删除 ${acc.name}`, {
+        description: "以后启动时不会再自动导入这个账号",
+      });
       setDeleteTarget(null);
       await load();
     } catch (e) {
@@ -343,6 +349,9 @@ export default function WorkbuddySwitchPage() {
     }
   };
 
+  // 注：原来这里有个 `runImportReference()`（手动搬家）。2026-10-09 起搬家里程移到
+  // `main.tsx` 的启动编排里自动跑，界面上不再有入口，所以这个函数整段删掉了。
+
   // ---- OAuth 扫码 ----
   const startOauth = async () => {
     setBusyId("oauth");
@@ -395,7 +404,7 @@ export default function WorkbuddySwitchPage() {
   // ---- 积分：与账号卡片融合显示 ----
   const credits = useWorkbuddyCredits();
 
-  /** uid → 积分结果。按 uid 匹配：本工具库的 `id` 与账号库一致，参考库的 id 形如 `ref:<uid>`。 */
+  /** uid → 积分查询失败原因。按 uid 匹配：积分账号本来就是本工具账号库里的账号。 */
   const creditByUid = useMemo(() => {
     const m = new Map<string, WbCreditItem>();
     for (const it of credits.result?.accounts ?? []) {
@@ -412,14 +421,6 @@ export default function WorkbuddySwitchPage() {
     }
     return m;
   }, [credits.result]);
-
-  /** 参考工具库里独有、本工具账号库里没有的账号（只读列出，不能切换）。 */
-  const foreignCredits = useMemo(() => {
-    const own = new Set(accounts.map((a) => a.uid.toLowerCase()).filter(Boolean));
-    return (credits.result?.accounts ?? []).filter(
-      (it) => it.account.uid && !own.has(it.account.uid.toLowerCase()),
-    );
-  }, [accounts, credits.result]);
 
   const creditsLoading = credits.result === null && credits.error === null;
 
@@ -444,6 +445,10 @@ export default function WorkbuddySwitchPage() {
             {busyId === "oauth" ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
             扫码添加账号
           </Button>
+          {/* ⚠️ 这里曾经有个「导入参考工具账号」按钮，2026-10-09 起**删掉了** ——
+              改为 `main.tsx` 启动时自动导入（幂等，只搬明文，本地已可用的不覆盖）。
+              删按钮时**必须**同步改掉指着它的文案（积分卡片红字 + 首页注意事项），
+              否则就是 T42 那个坑的反面：入口没了、提示还在叫用户去点。 */}
           <Button variant="outline" size="sm" onClick={() => void runExport()} disabled={busyId !== null}>
             <FileDown className="size-4" />
             导出账号包
@@ -547,33 +552,6 @@ export default function WorkbuddySwitchPage() {
           })}
         </div>
       )}
-
-      {/* 只在参考工具库里、本工具账号库没有的账号：只读展示积分，不能切换 */}
-      {!loading && foreignCredits.length > 0 ? (
-        <section className="mt-8 space-y-3">
-          <div>
-            <h2 className="text-base font-semibold">仅存在于参考工具库的账号</h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              这些账号只在 <code className="rounded bg-muted px-1">~/.wb-switch/accounts.json</code> 里，
-              本工具账号库没有 —— 只读展示积分，不能在这里切换。需要的话先「导入本机登录态」或「扫码添加账号」。
-            </p>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {foreignCredits.map((it) => (
-              <AccountCard
-                key={it.account.id}
-                name={it.account.name}
-                identity={`uid ${shortUid(it.account.uid)}`}
-                identityTitle={it.account.uid}
-                identityMono
-                chips={<Chip tone="outline">参考工具库 · 只读</Chip>}
-              >
-                <CreditBlock item={it} loading={creditsLoading} onExpand={() => credits.setExpand(it)} />
-              </AccountCard>
-            ))}
-          </div>
-        </section>
-      ) : null}
 
       <div className="mt-8">
         <Card>

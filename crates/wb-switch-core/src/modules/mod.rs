@@ -2,6 +2,7 @@ pub mod app_overview;
 pub mod client_usage;
 pub mod config;
 pub mod error_log;
+pub mod fs_remove;
 pub mod process_list;
 pub mod trae_carriers;
 pub mod trae_cleanup;
