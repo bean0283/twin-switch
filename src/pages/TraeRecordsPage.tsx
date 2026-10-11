@@ -9,7 +9,6 @@ import {
   ChevronRight,
   Copy,
   Database,
-  Eye,
   FileDown,
   FolderOpen,
   HardDrive,
@@ -17,6 +16,7 @@ import {
   KeyRound,
   Link2Off,
   Loader2,
+  Pencil,
   RefreshCw,
   ScanSearch,
   Search,
@@ -26,6 +26,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
+import { TraeSessionEditor } from "@/components/trae-session-editor";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -56,7 +57,6 @@ import type {
   TraeInstalledClient,
   TraeLinkGroup,
   TraeLinksPreview,
-  TraeSessionDetail,
   TraeSessionInfo,
 } from "@/lib/trae-types";
 
@@ -118,8 +118,10 @@ export default function TraeRecordsPage() {
     [status],
   );
 
-  // 会话详情 / 删除 对话框
-  const [detail, setDetail] = useState<TraeSessionDetail | null>(null);
+  // 删除 对话框
+  // T46 会话编辑器：`editSeed` = 要点编辑的会话（列表行上点「编辑」时带过来）。
+  const [editOpen, setEditOpen] = useState(false);
+  const [editSeed, setEditSeed] = useState<string | null>(null);
   /**
    * 待删除的会话。
    *
@@ -405,16 +407,6 @@ export default function TraeRecordsPage() {
         toast.error("清理失败", { description: api.asError(cause) });
       }
     });
-  }
-
-  async function openDetail(s: TraeSessionInfo) {
-    if (!clientKey) return;
-    try {
-      const d = await api.traeSessionDetail(clientKey, s.id);
-      setDetail(d);
-    } catch (cause) {
-      toast.error("加载详情失败", { description: api.asError(cause) });
-    }
   }
 
   /**
@@ -951,20 +943,22 @@ export default function TraeRecordsPage() {
                     : "正在读取…"}
                 </CardDescription>
               </div>
-              {ownerOptions.length > 1 ? (
-                <select
-                  value={ownerFilter}
-                  onChange={(e) => setOwnerFilter(e.target.value)}
-                  className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-                >
-                  <option value="">全部账号</option>
-                  {ownerOptions.map((o) => (
-                    <option key={o} value={o}>
-                      {o}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
+              <div className="flex flex-wrap items-center gap-2">
+                {ownerOptions.length > 1 ? (
+                  <select
+                    value={ownerFilter}
+                    onChange={(e) => setOwnerFilter(e.target.value)}
+                    className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                  >
+                    <option value="">全部账号</option>
+                    {ownerOptions.map((o) => (
+                      <option key={o} value={o}>
+                        {o}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+              </div>
             </div>
           </CardHeader>
           <CardContent>
@@ -1024,8 +1018,19 @@ export default function TraeRecordsPage() {
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center justify-end gap-1">
-                              <Button size="sm" variant="ghost" onClick={() => void openDetail(s)} title="查看详情">
-                                <Eye className="size-4" />
+                              {/* 「查看详情」已按要求换成**编辑会话**：点哪条就编哪条。
+                                  编辑器里能看到的内容本来就和详情一样（左栏回合 / 右栏会话式正文），
+                                  再单独留一个只读详情弹窗就是两个入口指向同一件事。 */}
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => {
+                                  setEditSeed(s.id);
+                                  setEditOpen(true);
+                                }}
+                                title="编辑这条会话（左栏回合 / 右栏会话式正文，可改任意字段、增删回合与消息）"
+                              >
+                                <Pencil className="size-4" />
                               </Button>
                               <Button size="sm" variant="ghost" onClick={() => void onExportSession(s)} disabled={busy} title="导出 MD">
                                 <FileDown className="size-4" />
@@ -1564,108 +1569,11 @@ export default function TraeRecordsPage() {
         </TabsContent>
       </Tabs>
 
-      {/* 会话详情：正文较长，默认放大并可拖拽调节（与 WorkBuddy 详情同款外壳）。
-          元信息（归属账号 / 轮数 / 时间）从列表列挪到这里；下方逐回合展示正文。 */}
-      <Dialog open={detail !== null} onOpenChange={(v) => !v && setDetail(null)}>
-        <ResizableDialogContent storageKey="trae-session-detail">
-          <DialogHeader>
-            <DialogTitle className="truncate" title={detail?.title}>
-              {detail?.title || "（无标题）"}
-            </DialogTitle>
-            <DialogDescription className="break-all font-mono text-xs">
-              {detail?.session_id}
-            </DialogDescription>
-          </DialogHeader>
-
-          {/* 中间滚动区：`ResizableDialogContent` 是 `grid-rows-[auto_minmax(0,1fr)_auto]`
-              三段布局，元信息与正文**必须同处一个中间格**，否则会多出一行把布局顶乱。
-              元信息随正文一起滚动，长会话时不会一直占着顶部。 */}
-          <div className="min-h-0 space-y-3 overflow-auto pr-1 text-sm">
-            {/* 元信息条：来源 / 归属账号 / 消息数 / 用户轮次 / 创建 / 最后活动 */}
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">来源</div>
-                <div className="truncate font-medium" title={detail?.source}>{detail?.source || "—"}</div>
-              </div>
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">归属账号</div>
-                <div className="truncate font-medium" title={detail?.owner_uid ? `uid: ${detail.owner_uid}` : undefined}>
-                  {detail?.owner_label || "（无归属）"}
-                </div>
-              </div>
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">用户轮次</div>
-                <div className="font-medium">{detail?.turns ?? 0} 轮</div>
-              </div>
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">消息数</div>
-                <div className="font-medium">{detail?.messages ?? 0} 条</div>
-              </div>
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">创建时间</div>
-                <div className="whitespace-nowrap font-medium">{detail?.created || "—"}</div>
-              </div>
-              <div className="rounded-lg bg-muted/50 p-3">
-                <div className="text-xs text-muted-foreground">最后活动</div>
-                <div className="whitespace-nowrap font-medium">{detail?.updated || "—"}</div>
-              </div>
-            </div>
-
-            {/* 正文：逐回合展示（最多 50 回合，与 WorkBuddy 一致） */}
-            {(detail?.rounds ?? []).length === 0 ? (
-              <p className="py-6 text-center text-sm text-muted-foreground">该会话没有可展示的正文</p>
-            ) : (
-              (detail?.rounds ?? []).slice(0, 50).map((r, i) => (
-                <div key={i} className="rounded-md border p-3">
-                  <div className="mb-1 text-xs font-medium text-muted-foreground">回合 {i + 1}</div>
-                  <div className="mb-2 whitespace-pre-wrap break-words">
-                    <span className="text-xs text-muted-foreground">提问：</span>
-                    {r.userText || "(无正文)"}
-                  </div>
-                  <div className="whitespace-pre-wrap break-words">
-                    <span className="text-xs text-muted-foreground">回答：</span>
-                    {r.assistantText || "(无正文)"}
-                  </div>
-                  {r.toolCalls > 0 && (
-                    <div className="mt-2 text-xs text-muted-foreground">
-                      过程工具调用 {r.toolCalls} 次
-                    </div>
-                  )}
-                </div>
-              ))
-            )}
-            {(detail?.rounds?.length ?? 0) > 50 && (
-              <p className="text-xs text-muted-foreground">
-                仅显示前 50 个回合，完整内容请用导出 Markdown。
-              </p>
-            )}
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDetail(null)}>关闭</Button>
-            {detail ? (
-              <Button
-                onClick={() => {
-                  const d = detail;
-                  setDetail(null);
-                  void onExportSession({
-                    id: d.session_id,
-                    title: d.title,
-                    owner_uid: d.owner_uid,
-                    owner_label: d.owner_label,
-                    created: d.created,
-                    updated: d.updated,
-                    turns: d.turns,
-                    messages: d.messages,
-                  });
-                }}
-              >
-                <FileDown className="size-4" />导出 MD
-              </Button>
-            ) : null}
-          </DialogFooter>
-        </ResizableDialogContent>
-      </Dialog>
+      {/* ⚠️ 这里原来有个**只读的「会话详情」弹窗**（元信息 + 逐回合正文 + 「编辑这条会话」）。
+          它的唯一入口是列表里的「查看详情」按钮，而那个按钮已按要求改成**编辑会话** ⇒
+          详情弹窗再无入口，留着就是死代码（而且它展示的内容编辑器里全都有）。
+          删掉的是：本弹窗、`detail` state、`openDetail()`、`Eye` / `TraeSessionDetail` 两个 import。
+          导出 MD 的能力没丢 —— 列表行上那个按钮还在。 */}
 
       {/* 彻底删除（单次确认；1 条走逐表预检，多条走整批说明） */}
       <Dialog
@@ -2035,6 +1943,22 @@ export default function TraeRecordsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* T46 会话编辑器：**只编 `editSeed` 指向的那一条**（列表行上点「编辑」带过来）。
+          ⚠️ 原来还会把整份 `sessions` 传进去、让编辑器左栏下拉切换会话 —— 已按要求取消：
+          入口是「点哪条编哪条」，再传一份列表只会多一个跟当前动作没关系的出口。 */}
+      {clientKey ? (
+        <TraeSessionEditor
+          open={editOpen}
+          onOpenChange={setEditOpen}
+          clientKey={clientKey}
+          clientLabel={clientOptions.find((c) => c.key === clientKey)?.label ?? clientKey}
+          sessionId={editSeed}
+          onChanged={() => {
+            if (clientKey) void refresh(clientKey);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

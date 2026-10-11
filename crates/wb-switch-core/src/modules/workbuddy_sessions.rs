@@ -55,7 +55,7 @@ fn open_ro(path: &Path) -> Option<Connection> {
     Some(conn)
 }
 
-fn open_rw(path: &Path) -> Result<Connection, String> {
+pub(crate) fn open_rw(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| format!("打开会话库失败: {e}"))?;
     conn.busy_timeout(Duration::from_secs(10))
         .map_err(|e| format!("设置数据库超时失败: {e}"))?;
@@ -104,7 +104,7 @@ pub fn edge_sync_databases() -> Vec<Value> {
 }
 
 /// 会话行的归属 uid（未删除的行才计数）。
-fn row_owner(conn: &Connection, cid: &str) -> Option<String> {
+pub(crate) fn row_owner(conn: &Connection, cid: &str) -> Option<String> {
     conn.query_row(
         "SELECT user_id FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
         [cid],
@@ -123,7 +123,7 @@ fn row_deleted_at(conn: &Connection, cid: &str) -> Option<i64> {
 }
 
 /// 读整行（列名 + 值），供复制时按目标表列取交集。
-fn read_source_row(
+pub(crate) fn read_source_row(
     conn: &Connection,
     cid: &str,
 ) -> Result<Option<Vec<(String, SqlValue)>>, String> {
@@ -146,7 +146,7 @@ fn read_source_row(
     Ok(Some(values))
 }
 
-fn target_columns(conn: &Connection) -> Result<Vec<String>, String> {
+pub(crate) fn target_columns(conn: &Connection) -> Result<Vec<String>, String> {
     let stmt = conn
         .prepare("SELECT * FROM sessions LIMIT 0")
         .map_err(|e| format!("读取 sessions 列失败: {e}"))?;
@@ -178,7 +178,7 @@ fn override_value(
 /// 把源行按「目标表列 ∩ 源行列」写成新行。
 ///
 /// 目标存在而源没有的列不写，交给库的默认值补齐——写 NULL 会破坏 NOT NULL 约束。
-fn insert_copy_row(
+pub(crate) fn insert_copy_row(
     conn: &Connection,
     source: &[(String, SqlValue)],
     new_cid: &str,
@@ -227,7 +227,7 @@ fn soft_delete_row(
 /// 备份会话库（含 `-wal` / `-shm`），返回备份目录。
 ///
 /// 任何一步失败都返回 Err：备份不可信时后续写入必须先停下来。
-fn backup_db(tag: &str) -> Result<PathBuf, String> {
+pub(crate) fn backup_db(tag: &str) -> Result<PathBuf, String> {
     let db = db_path();
     assert_not_edge_sync(&db)?;
     if !db.is_file() {
@@ -603,7 +603,7 @@ pub fn delete_sessions(uid: &str, ids: &[String]) -> Result<Value, String> {
 ///
 /// 客户端按会话行的 `cwd` 推导工作区目录名，而 `cwd` 在复制时原样保留，
 /// 所以目录名必须保持一致，否则客户端找不到正文。
-fn target_body_path(source_path: &Path, new_cid: &str) -> PathBuf {
+pub(crate) fn target_body_path(source_path: &Path, new_cid: &str) -> PathBuf {
     let file_name = format!("{new_cid}.jsonl");
     let projects = workbuddy_auth::projects_dir();
     let relative = source_path

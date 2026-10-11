@@ -8,6 +8,7 @@ import {
   HardDriveDownload,
   KeyRound,
   Loader2,
+  Pencil,
   RefreshCw,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -33,9 +34,11 @@ import {
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
+import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type {
+  CrossWriteTarget,
   TraeImportCandidate,
   TraeImportInspect,
   TraeInstalledClient,
@@ -44,6 +47,7 @@ import type {
   TraeWorkbuddyReport,
   TraeWorkbuddySession,
 } from "@/lib/trae-types";
+import { crossKeyOf } from "@/lib/trae-types";
 
 /** 「3 分钟前」「昨天 22:03」这类相对时间——重复副本的时间差只有几分钟，绝对时间看不出先后。 */
 function relativeTime(ms: number): string {
@@ -112,6 +116,10 @@ export default function WorkbuddyImportPage() {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [preview, setPreview] = useState<TraeWorkbuddyPreviewItem[] | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  // T46 · S5：迁移前先改一改。这里列的就是 WorkBuddy 会话，所以直接开 **WorkBuddy 侧**编辑器；
+  // 但页脚给的是**跨客户端**写入（目标是 Trae 账号）—— 这个页面要的就是把会话搬到 Trae 去，
+  // 摆一份 WorkBuddy 账号清单在这儿等于把用户绕回去（用户报的「怎么还是 workbuddy 到 workbuddy」）。
+  const [editTarget, setEditTarget] = useState<{ uid: string; id: string } | null>(null);
 
   useEffect(() => {
     // `listen()` 是异步的：若在它 resolve 之前组件就卸载了（React StrictMode 在开发模式下
@@ -211,6 +219,38 @@ export default function WorkbuddyImportPage() {
       prev && dstCandidates.some((c) => `${c.client_key}::${c.account_id}` === prev) ? prev : key,
     );
   }, [dstCandidates]);
+
+  /**
+   * T46 · S5：编辑器页脚的**跨客户端**写入目标 = **Trae** 的账号（不是 WorkBuddy 的）。
+   *
+   * ⚠️ 这里把手上的**全部** Trae 账号都交出去（含 IDE 版与 SOLO 版），但**客户端与账号分开给**：
+   *    编辑器会按 `clientKey` 分组，先选客户端再选该客户端下的账号。
+   *    早先把两者拼成一个字符串（`Trae CN（IDE 国内版） · 张三`）塞进一个下拉，
+   *    用户报「trae 不应该多选账号，trae 和 trae solo 应当分离」说的就是这个 —— 而且同一个
+   *    uid 在两个客户端下各有一份，只按 uid 反查会命中错的那个客户端。
+   */
+  const crossWrite = useMemo<CrossWriteTarget>(
+    () => ({
+      toLabel: "Trae",
+      accounts: candidates.map((c) => ({
+        uid: c.uid,
+        clientKey: c.client_key,
+        clientLabel: c.client_label,
+        label: c.label,
+        noDb: !c.db_exists,
+      })),
+      accountsError: null,
+      blocked:
+        candidates.length === 0 ? "本机没有可导入的 Trae 账号：先用某个 Trae 账号登录一次" : null,
+      defaultKey: target ? crossKeyOf({ clientKey: target.client_key, uid: target.uid }) : null,
+      push: async (acc) => {
+        if (!editTarget) throw new Error("没有选中要搬走的会话");
+        const r = await api.traeWorkbuddyImport(acc.clientKey, acc.uid, [editTarget.id]);
+        return `${r.turns} 个回合 / ${r.tool_steps} 个工具步骤 → 账号 ${r.target_label}`;
+      },
+    }),
+    [candidates, target, editTarget],
+  );
 
   // 目标就绪状态（只读探测）：运行中 / 有没有会话库 / 密钥在不在。
   // 「密钥不在且客户端也没跑」这一种情况导入必然失败，必须在点之前就说清楚。
@@ -554,6 +594,7 @@ export default function WorkbuddyImportPage() {
                   checked={selected.has(s.id)}
                   disabled={!s.has_body || busy}
                   onToggle={() => toggle(s.id)}
+                  onEdit={() => setEditTarget({ uid: s.user_id, id: s.id })}
                 />
               ))}
             </div>
@@ -726,6 +767,24 @@ export default function WorkbuddyImportPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* T46 · S5：WorkBuddy → Trae 迁移前，就地改这条 WorkBuddy 会话；页脚直接写入到 **Trae** 账号。 */}
+      <WorkbuddySessionEditor
+        open={editTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            setEditTarget(null);
+            void load();
+          }
+        }}
+        uid={editTarget?.uid ?? null}
+        sessionId={editTarget?.id ?? null}
+        cross={crossWrite}
+        onDeleted={() => {
+          // 会话已被整条删除：清掉编辑种子，列表重读（onOpenChange(false) 那条路已经 load 过）。
+          setEditTarget(null);
+        }}
+      />
     </div>
   );
 }
@@ -736,6 +795,7 @@ function SessionRow({
   checked,
   disabled,
   onToggle,
+  onEdit,
 }: {
   session: TraeWorkbuddySession;
   /** 归属账号的显示名（`昵称（uid …97eac1）`）。 */
@@ -743,6 +803,8 @@ function SessionRow({
   checked: boolean;
   disabled: boolean;
   onToggle: () => void;
+  /** 打开会话编辑器（迁移前先改一改）。 */
+  onEdit: () => void;
 }) {
   const dup = Boolean(session.dup_group);
   // 重复组里的旧副本整体压暗一档，让「最新」那份一眼看见
@@ -806,6 +868,22 @@ function SessionRow({
           </span>
         ) : null}
       </span>
+      {/* ⚠️ 这一行整体是个 <label>（点哪儿都切换勾选）：编辑按钮必须
+          `preventDefault` + `stopPropagation`，否则点它会顺手把勾选翻掉。 */}
+      <button
+        type="button"
+        title="编辑这条会话（导入前可先改）"
+        aria-label="编辑这条会话"
+        className="text-muted-foreground hover:text-foreground mt-0.5 shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
+        disabled={!session.has_body || disabled}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onEdit();
+        }}
+      >
+        <Pencil className="size-3.5" />
+      </button>
     </label>
   );
 }

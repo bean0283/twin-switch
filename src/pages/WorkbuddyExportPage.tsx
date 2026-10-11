@@ -8,6 +8,7 @@ import {
   HardDriveUpload,
   KeyRound,
   Loader2,
+  Pencil,
   RefreshCw,
   ScanSearch,
 } from "lucide-react";
@@ -16,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { TraeSessionEditor } from "@/components/trae-session-editor";
 import {
   Card,
   CardContent,
@@ -37,12 +39,14 @@ import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-cli
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type {
+  CrossWriteTarget,
   TraeInstalledClient,
   TraeWbExportReport,
   TraeWbPreview,
   TraeWbSourceSession,
   TraeWbTarget,
 } from "@/lib/trae-types";
+import { crossKeyOf } from "@/lib/trae-types";
 
 function formatTime(ms: number): string {
   if (!ms) return "—";
@@ -88,6 +92,9 @@ export default function WorkbuddyExportPage() {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [preview, setPreview] = useState<TraeWbPreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  // T46 · S5：导出前先改一改。这里列的是 **Trae** 会话，所以开 Trae 侧编辑器
+  // （WorkBuddy 侧的编辑器在「WorkBuddy 会话记录」与「WorkBuddy → Trae」两处）。
+  const [editSeed, setEditSeed] = useState<string | null>(null);
 
   useEffect(() => {
     // 与 workbuddy-import-card 同样的 `listen()` 竞态：异步注册期间若组件已卸载，
@@ -263,7 +270,43 @@ export default function WorkbuddyExportPage() {
     }
   }
 
-  const accounts = target?.accounts ?? [];
+  // ⚠️ `target?.accounts ?? []` 每次渲染都是新数组 ⇒ `crossWrite` 的 useMemo 会白算，
+  //    而且会让编辑器的目标账号 effect 每渲染都跑一遍。这里钉住引用。
+  const accounts = useMemo(() => target?.accounts ?? [], [target]);
+
+  /**
+   * T46 · S5：编辑器页脚的**跨客户端**写入目标 = **WorkBuddy** 的账号（不是 Trae 的）。
+   *
+   * 这个页面要的是把 Trae 会话导出到 WorkBuddy；摆一份 Trae 账号清单在这儿等于把用户绕回去
+   * （用户报的「怎么还是 trae 到 trae」）。
+   */
+  const crossWrite = useMemo<CrossWriteTarget>(
+    () => ({
+      toLabel: "WorkBuddy",
+      // WorkBuddy 只有一个客户端（`clientKey` 用空串），所以编辑器页脚不会出现「选客户端」那一行。
+      accounts: accounts.map((a) => ({
+        uid: a.uid,
+        clientKey: "",
+        clientLabel: "WorkBuddy",
+        label: a.label,
+      })),
+      accountsError: null,
+      blocked: !target?.available
+        ? "本机没有 WorkBuddy 数据（先安装并登录一次 WorkBuddy）"
+        : accounts.length === 0
+          ? "本机没有可写入的 WorkBuddy 账号"
+          : null,
+      defaultKey: uid ? crossKeyOf({ clientKey: "", uid }) : null,
+      push: async (acc) => {
+        if (!clientKey || !editSeed) throw new Error("没有选中要搬走的会话");
+        const r = await api.traeWbExportRun(clientKey, acc.uid, [editSeed]);
+        return `${r.turns} 个回合 / ${r.tool_steps} 个工具步骤 → 账号 ${r.target_label}${
+          r.relaunched ? " · 已自动重启 WorkBuddy" : ""
+        }`;
+      },
+    }),
+    [accounts, target?.available, uid, clientKey, editSeed],
+  );
 
   /**
    * 客户端切换条的入参：本页只做一次字段名翻译（`has_login` → `hasLogin`、
@@ -485,6 +528,22 @@ export default function WorkbuddyExportPage() {
                       {s.cwd || "(无工作目录)"} → 工作区 {s.workspace_key || "?"}
                     </span>
                   </span>
+                  {/* ⚠️ 这一行整体是个 <label>：编辑按钮必须 preventDefault + stopPropagation，
+                      否则点它会顺手把勾选翻掉。 */}
+                  <button
+                    type="button"
+                    title="编辑这条 Trae 会话（导出前可先改）"
+                    aria-label="编辑这条 Trae 会话"
+                    className="text-muted-foreground hover:text-foreground mt-0.5 shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
+                    disabled={busy || !clientKey}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setEditSeed(s.id);
+                    }}
+                  >
+                    <Pencil className="size-3.5" />
+                  </button>
                 </label>
               ))}
             </div>
@@ -651,6 +710,22 @@ export default function WorkbuddyExportPage() {
         </DialogContent>
       </Dialog>
 
+      {/* T46 · S5：Trae → WorkBuddy 导出前，就地改这条 Trae 会话；页脚直接写入到 **WorkBuddy** 账号。 */}
+      {clientKey ? (
+        <TraeSessionEditor
+          open={editSeed !== null}
+          onOpenChange={(o) => {
+            if (!o) setEditSeed(null);
+          }}
+          clientKey={clientKey}
+          clientLabel={clients.find((c) => c.key === clientKey)?.label ?? clientKey}
+          sessionId={editSeed}
+          onChanged={() => {
+            if (clientKey) void loadSessions(clientKey);
+          }}
+          cross={crossWrite}
+        />
+      ) : null}
     </div>
   );
 }

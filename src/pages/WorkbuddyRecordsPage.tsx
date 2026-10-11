@@ -7,6 +7,7 @@ import {
   FileDown,
   Link2Off,
   Loader2,
+  Pencil,
   RefreshCw,
   ScrollText,
   Trash2,
@@ -31,6 +32,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ResizableDialogContent } from "@/components/ui/resizable-dialog-content";
+import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -94,6 +96,10 @@ export default function WorkbuddyRecordsPage() {
   const [detail, setDetail] = useState<WbSessionDetail | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<WbSessionItem[] | null>(null);
   const [deleteReport, setDeleteReport] = useState<WbSessionDeleteReport | null>(null);
+  // T46 · S4：会话编辑器。入口就是下面表格行里的 ✏️ —— `editSeed` 直接给该行的会话 id，
+  // 编辑器打开即载入（不再有「先开空编辑器再挑会话」那一步）。
+  const [editSeed, setEditSeed] = useState<string | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
 
   // 复制与关联
   const [srcUid, setSrcUid] = useState("");
@@ -375,6 +381,18 @@ export default function WorkbuddyRecordsPage() {
                           </td>
                           <td className="px-3 py-2 text-right">
                             <div className="flex justify-end gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                title="编辑这条会话"
+                                disabled={!s.hasBody || busy === s.id}
+                                onClick={() => {
+                                  setEditSeed(s.id);
+                                  setEditOpen(true);
+                                }}
+                              >
+                                <Pencil className="size-4" />
+                              </Button>
                               <Button
                                 variant="ghost"
                                 size="sm"
@@ -745,6 +763,24 @@ export default function WorkbuddyRecordsPage() {
           </div>
         </ResizableDialogContent>
       </Dialog>
+
+      {/* T46 · S4：WorkBuddy 会话编辑器（与 Trae 侧同构，但模型完全不同：
+          元数据是 sessions 一张表，正文是一行一个事件的 JSONL）。 */}
+      <WorkbuddySessionEditor
+        open={editOpen}
+        onOpenChange={(o) => {
+          setEditOpen(o);
+          // 关闭时重读列表：可能有覆写/新增，标题与行数都变了。
+          if (!o) void load();
+        }}
+        uid={uid || null}
+        sessionId={editSeed}
+        onDeleted={() => {
+          // 走到这里说明会话已经被整条删掉了（删「最后一条用户提问」所在回合时的改道）。
+          // 种子里那条 id 已经不存在，必须清掉；列表由 onOpenChange(false) 那条路重读。
+          setEditSeed(null);
+        }}
+      />
 
       {/* 删除确认 */}
       <Dialog open={!!confirmDelete} onOpenChange={(o) => !o && setConfirmDelete(null)}>

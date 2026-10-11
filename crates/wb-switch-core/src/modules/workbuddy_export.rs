@@ -18,7 +18,9 @@
 //!
 //! ```text
 //! session-meta ×2         （进程/宿主元信息，成对出现）
-//! message(user)           content=[{type:"input_text", text}]
+//! message(user)           content=[{type:"input_text", text:"<user_query>真实提问</user_query>"}]
+//!                         ⚠️ 壳不能省：没壳的 role=user 会被当成「客户端自己生成的内容」
+//!                         （客户端与我们的会话编辑器都这样判），导入回来的会话会是 0 个回合。
 //! file-history-snapshot   （每条用户消息后跟一条，trackedFileBackups 可为空对象）
 //! reasoning               rawContent=[{type:"reasoning_text", text}]
 //! message(assistant)      content=[{type:"output_text", text, providerData:{annotations:[]}}]
@@ -531,13 +533,22 @@ impl TurnBuilder {
 
     fn push_user(&mut self, text: &str, ms: i64) {
         let id = event_id(ms);
+        let mut pd = self.provider_data(ms);
+        // 原生用户行的 `providerData` 里带这个标记（助手行没有），客户端靠它认「这是用户发起的提问」。
+        if let Some(o) = pd.as_object_mut() {
+            o.insert("startsNewUserRequest".into(), json!(true));
+        }
         self.events.push(json!({
             "id": id,
             "timestamp": ms,
             "type": "message",
             "role": "user",
-            "content": [{ "type": "input_text", "text": text }],
-            "providerData": self.provider_data(ms),
+            // ⚠️⚠️ 正文**必须**包在 `<user_query>…</user_query>` 里（原生格式就是这样）。
+            //    没壳的 `role=user` 在两边都会被判成「自动指令 / 客户端自己生成的内容」：
+            //    WorkBuddy 客户端不把它当提问渲染，我们的会话编辑器也切不出回合
+            //    （v0.2.22 修：原先这里写的是裸文本，导入回来的会话显示成 0 个回合）。
+            "content": [{ "type": "input_text", "text": format!("<user_query>{text}</user_query>") }],
+            "providerData": pd,
             "__codebuddyLocal": { "sensitiveUserInputReviewed": true },
             "sessionId": self.session_id,
             "cwd": self.cwd,
@@ -1397,6 +1408,62 @@ mod tests {
             vec!["reasoning", "assistant_text", "function_call", "function_call_result", "assistant_text"]
         );
         assert_eq!(count_answered(&b.events), 1);
+    }
+
+    /// ⚠️ 回归（v0.2.22）：同样的构造事件，**会话编辑器**也必须能切出回合。
+    ///
+    /// 编辑器不像 `parse_body` 那样先剥注入块，它是逐行 `classify_line` 判种类 ——
+    /// `push_user` 少写一个 `<user_query>` 壳，导入回来的会话在编辑器里就是「0 个回合」
+    /// （用户报的「从 trae 导入到 workbuddy 的会话，会话回合无法正常识别」）。
+    /// 这里把「导出 → 编辑器分类 → 回合索引」整条链钉死。
+    #[test]
+    fn exported_lines_are_recognized_by_the_session_editor() {
+        use crate::modules::workbuddy_session_edit as wse;
+        const SID: &str = "22222222-2222-4222-8222-222222222222";
+        let mut b = TurnBuilder::new(SID, "d:\\htw\\test", 1_791_110_000_000);
+        b.push_user("这个是百度文库的文件，给我下载原版文件", 1_791_110_000_100);
+        b.push_assistant("好的，我去本机运行脚本", 1_791_110_000_200);
+        b.push_user("你写了什么程序给我", 1_791_110_000_300);
+        b.push_assistant("写了一个下载脚本", 1_791_110_000_400);
+        b.turns = 2;
+
+        let raws: Vec<String> = b
+            .events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let descs: Vec<Value> = raws
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let info = wse::classify_line(r).expect("导出的事件必须能被编辑器解析");
+                json!({
+                    "index": i,
+                    "kind": info.kind,
+                    "wrapped": info.wrapped,
+                    "text": info.text,
+                    "textPath": info.text_path,
+                })
+            })
+            .collect();
+
+        let user_lines: Vec<&Value> = descs
+            .iter()
+            .filter(|d| d["kind"].as_str() == Some("user"))
+            .collect();
+        assert_eq!(user_lines.len(), 2, "两条提问都要被认成 user：{descs:?}");
+        // 原生格式：有壳 ⇒ 编辑器改的时候只换壳内层，护住 system-reminder。
+        assert!(user_lines.iter().all(|d| d["wrapped"] == true));
+        assert_eq!(user_lines[0]["text"], "这个是百度文库的文件，给我下载原版文件");
+
+        let (turns, head) = wse::build_turn_index(&descs);
+        // 「会话开头」= 第一条提问之前的行：这里就是开头那两条 session-meta。
+        assert_eq!(head, vec![0, 1]);
+        assert_eq!(turns.len(), 2);
+        // 行序：0/1 session-meta · 2 user · 3 file-history-snapshot · 4 assistant
+        //      · 5 user · 6 file-history-snapshot · 7 assistant
+        assert_eq!(turns[0]["start"], 2);
+        assert_eq!(turns[1]["start"], 5, "第二个回合要从第二条提问那一行开始");
     }
 
     #[test]

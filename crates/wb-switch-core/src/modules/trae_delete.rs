@@ -34,7 +34,7 @@ const WAL_FRAME_HDR_SZ: usize = 24;
 
 /// 实时库密钥解析：存盘密钥优先（按首页 HMAC 校验），过期时若客户端进程
 /// 运行中则从内存自动重扫并保存（Trae 重启后密钥变化场景，免手动重新扫描）。
-fn resolve_live_key(client_key: &str, live: &Path) -> Result<String, String> {
+pub(crate) fn resolve_live_key(client_key: &str, live: &Path) -> Result<String, String> {
     if let Some(k) = load_saved_key(client_key) {
         if k.trim().len() == 64 {
             let page1 = read_page1(live)?;
@@ -226,7 +226,7 @@ pub fn merge_wal_into_plain(plain: &Path, wal: &Path, enc_key_hex: &str) -> Resu
 }
 
 /// 把库里的表分成两组：(带 session_id 列的表, 仅带 message_id 列的表)。
-fn classify_tables(conn: &Connection) -> Result<(Vec<String>, Vec<String>), String> {
+pub(crate) fn classify_tables(conn: &Connection) -> Result<(Vec<String>, Vec<String>), String> {
     let names: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
         .map_err(|e| e.to_string())?
@@ -302,7 +302,7 @@ fn rows_for(
 }
 
 /// 该会话在磁盘上的文件/目录：snapshot git 目录 + 全局附加目录里的同名子目录。
-fn collect_session_files(client_key: &str, sid: &str) -> Vec<PathBuf> {
+pub(crate) fn collect_session_files(client_key: &str, sid: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let client = match get_client(client_key) {
         Some(c) => c,
@@ -346,7 +346,7 @@ fn dir_size_mb(p: &Path) -> f64 {
 }
 
 /// 会话标题（解密库内查询；不存在返回错误）。
-fn check_session_exists(client_key: &str, sid: &str) -> Result<String, String> {
+pub(crate) fn check_session_exists(client_key: &str, sid: &str) -> Result<String, String> {
     let conn = open_decrypted(client_key)?;
     let title = conn
         .query_row(
