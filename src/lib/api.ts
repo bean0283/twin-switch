@@ -27,6 +27,11 @@ import type {
   TraeScanResult,
   TraeSessionDetail,
   TraeSessionInfo,
+  TraeEditCellResult,
+  TraeEditDoc,
+  TraeEditReport,
+  TraeEditSaveResult,
+  TraeEditTargets,
   TraeSwitchResult,
   TraeLinksPreview,
   TraeDivergedLinks,
@@ -51,6 +56,13 @@ import type {
   WbSessionCopyReport,
   WbLinksPreview,
   WbSessionDeleteReport,
+  WbEditColumn,
+  WbEditDoc,
+  WbEditLinesResult,
+  WbEditOp,
+  WbEditReport,
+  WbEditSaveResult,
+  WbEditTargets,
   Overview,
   OverviewCache,
   OverviewReclaimCache,
@@ -227,7 +239,14 @@ export function traeListSessions(
   return call("trae_list_sessions", { clientKey });
 }
 
-/** 单会话详情（标题 / 轮数 / 完整对话，供记录页预览）。 */
+/**
+ * 单会话详情（标题 / 轮数 / 完整对话）。
+ *
+ * ⚠️ 记录页那个**只读的「会话详情」弹窗已撤掉**（「查看详情」按钮改成了「编辑会话」），
+ * 所以这个包装函数**当前没有调用方**。保留它、而不是连后端命令一起删，是因为它是
+ * 唯一一个「不进编辑态、不碰库」就能整条读会话内容的入口，排障时用得上。
+ * 若哪天确认不需要，删这里的同时记得删 `src-tauri` 的 `trae_session_detail` 注册。
+ */
 export function traeSessionDetail(
   clientKey: string,
   sessionId: string,
@@ -241,6 +260,88 @@ export function traeExportSession(
   sessionId: string,
 ): Promise<TraeExportedFile> {
   return call("trae_export_session", { clientKey, sessionId });
+}
+
+// ---------------------------------------------------------------------------
+// T46 · 会话编辑器
+// ---------------------------------------------------------------------------
+
+/** 会话编辑器：读出该会话在全部相关表里的行（**只读**，不碰任何文件）。 */
+export function traeSessionEditDoc(
+  clientKey: string,
+  sessionId: string,
+): Promise<TraeEditDoc> {
+  return call("trae_session_edit_doc", { clientKey, sessionId });
+}
+
+/**
+ * 会话编辑器：分级校验（纯计算，不碰库）。
+ *
+ * ⚠️ 规则只有后端这一份实现 —— 前端只负责显示 `errors` / `warnings`，
+ * **绝不在前端重写一遍**（同一套规则两处独立推导，必然跑偏一次）。
+ */
+export function traeSessionEditValidate(doc: unknown): Promise<TraeEditReport> {
+  return call("trae_session_edit_validate", { doc });
+}
+
+/**
+ * 会话编辑器：写回。
+ *
+ * ⚠️ 写库操作（结束客户端 → 备份 → 解密 → 合并 WAL → 改 → 增量回写 → 校验 → 重启），
+ * 全程几十秒，界面要给足进度反馈。
+ *
+ * `mode`：`overwrite` 就地覆写（保持 session_id）；`insert` 同库新增（自动重映射全部 id）。
+ *
+ * `dirtyTables`：只有这些表会被重写，其余原样保留。**不传 = 全部重写**（旧行为，最保险）。
+ * 这只是性能提示，标错不会写坏数据：少标 = 少写一张表（库里保持原样）。
+ *
+ * `targetUid`（S2 跨账号）：把**新增**的会话写进另一个账号。只对 `mode = "insert"` 生效，
+ * 且必须是 `traeSessionEditTargets()` 列出的 uid。后端会一并改写
+ * `chat_session.project_id` / `session_project.project_id` / `context.last_real_project_id`。
+ */
+export function traeSessionEditSave(
+  doc: unknown,
+  mode: "overwrite" | "insert",
+  dirtyTables?: string[],
+  targetUid?: string,
+): Promise<TraeEditSaveResult> {
+  return call("trae_session_edit_save", { doc, mode, dirtyTables, targetUid });
+}
+
+/**
+ * 会话编辑器：可写入的目标账号清单（**只读**）。
+ *
+ * 数据源是库里的 `project.user_id`（= Trae 判定会话归属的那一列），显示名由后端
+ * 统一走 `trae_vault::account_label` —— 前端**别自己截 uid 尾号**。
+ */
+export function traeSessionEditTargets(clientKey: string): Promise<TraeEditTargets> {
+  return call("trae_session_edit_targets", { clientKey });
+}
+
+/**
+ * 会话编辑器：生成一批新的 24 位 hex id（「新增回合 / 复制消息」用）。
+ *
+ * ⚠️ 别在前端自己造 id —— 生成规则只有一处实现。形态一旦跑偏，症状是
+ * 「写入成功但客户端打不开这条会话」，属于最难查的一类问题。
+ */
+export function traeSessionEditNewIds(count: number): Promise<string[]> {
+  return call("trae_session_edit_new_ids", { count });
+}
+
+/**
+ * 会话编辑器：按需拉取一个**大字段**的完整内容（点「展开」时调）。
+ *
+ * 超过 32 KB 的 JSON 单元格在 `edit_doc` 里只回了 `$jsonRef` 引用
+ * —— 一条会话实测 90 MB，全量塞给前端会把渲染冻死。
+ */
+export function traeSessionEditCell(
+  clientKey: string,
+  sessionId: string,
+  table: string,
+  column: string,
+  pk: number | string,
+): Promise<TraeEditCellResult> {
+  return call("trae_session_edit_cell", { clientKey, sessionId, table, column, pk });
 }
 
 /** 一键导出全部会话为 zip（可跨数据源）。 */
@@ -864,6 +965,89 @@ export function workbuddySessionEdgeSyncDbs(): Promise<{
   note: string;
 }> {
   return call("workbuddy_session_edge_sync_dbs");
+}
+
+// ---------------------------------------------------------------------------
+// T46 · S4 WorkBuddy 会话编辑器
+// ---------------------------------------------------------------------------
+
+/**
+ * 会话编辑器（WorkBuddy）：读出元数据 + **回合索引**（只读、轻量）。
+ *
+ * ⚠️ 正文**不在这里**回：真机单个正文 19 MB、最大的 136 MB，整份过 IPC 会把界面冻死。
+ * 每个回合的完整行走 `workbuddySessionEditLines`，只取当前看的那一个回合。
+ */
+export function workbuddySessionEditDoc(uid: string, cid: string): Promise<WbEditDoc> {
+  return call("workbuddy_session_edit_doc", { uid, cid });
+}
+
+/** 会话编辑器（WorkBuddy）：按行区间 `[from, to)` 取完整行（后端上限一次 400 行）。 */
+export function workbuddySessionEditLines(
+  uid: string,
+  cid: string,
+  from: number,
+  to: number,
+): Promise<WbEditLinesResult> {
+  return call("workbuddy_session_edit_lines", { uid, cid, from, to });
+}
+
+/**
+ * 会话编辑器（WorkBuddy）：可写入的目标账号清单（只读）。
+ *
+ * 数据源与「WorkBuddy 会话记录」页一致（`sessions.user_id` 去重），显示名统一走
+ * `workbuddy_accounts::label_for` —— 前端**别自己截 uid 尾号**。
+ */
+export function workbuddySessionEditTargets(): Promise<WbEditTargets> {
+  return call("workbuddy_session_edit_targets");
+}
+
+/**
+ * 会话编辑器（WorkBuddy）：分级校验（**不读文件、不开库**，毫秒级）。
+ *
+ * ⚠️ 规则只有后端这一份实现；前端只显示 `errors` / `warnings`。
+ * `summary` 传 `edit_doc` 带回来的 `{lineCount, counts, lineKinds}`，后端靠它算
+ * 「改完之后还剩几条用户提问」（空会话硬拦）。`lineKinds` 是**行号 → 种类**的数组，
+ * 用于判断被删掉的行里有没有用户提问。
+ *
+ * 这只是快速反馈：写入前 `workbuddySessionEditSave` 还会跑一次全量校验。
+ */
+export function workbuddySessionEditValidate(
+  ops: WbEditOp[],
+  rowPatch: Record<string, unknown>,
+  columns: WbEditColumn[],
+  summary: Record<string, unknown>,
+  sessionId: string,
+): Promise<WbEditReport> {
+  return call("workbuddy_session_edit_validate", {
+    ops,
+    rowPatch,
+    columns,
+    summary,
+    sessionId,
+  });
+}
+
+/**
+ * 会话编辑器（WorkBuddy）：写回。
+ *
+ * ⚠️ 写盘 + 开库 + 可能结束/重启客户端，几十秒 ⇒ 界面要给足进度反馈。
+ *
+ * `mode`：`overwrite` 就地改这条会话；`insert` 新 UUID 造一条新会话（源会话一行不动）。
+ * `targetUid`：只在 `insert` 时可用（同 Trae 侧的决定：覆写顺带换账号＝把会话悄悄搬走）。
+ * `ops`：**只含改动过的那几行**，未改动的行逐字节原样保留。
+ *
+ * ⚠️ 后端把「写入前的全量校验」错误以 `ok=false` + `errors` **正常返回**（不是抛错），
+ * 所以这里能拿到明细并展示。
+ */
+export function workbuddySessionEditSave(
+  uid: string,
+  cid: string,
+  mode: "overwrite" | "insert",
+  ops: WbEditOp[],
+  rowPatch: Record<string, unknown>,
+  targetUid?: string,
+): Promise<WbEditSaveResult> {
+  return call("workbuddy_session_edit_save", { uid, cid, mode, ops, rowPatch, targetUid });
 }
 
 // ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
 /// 生成与客户端原生一致的 24 位十六进制 id（12 随机字节）。
 /// 客户端原生 session_id / message_id / project_id 均为 24 位 hex；
 /// 32 位 UUID 会触发工具内 `is_session_id`（20~24 位）校验失败，导致详情/MD/删除不可用。
-fn native_hex_id() -> String {
+pub(crate) fn native_hex_id() -> String {
     let b = random_bytes::<12>().unwrap_or([0u8; 12]);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -79,7 +79,7 @@ fn native_hex_id() -> String {
 ///
 /// 返回 `None` 表示「无需改写」（不是 JSON 对象、本来就没有该键、或值已等于 `new_pid`），
 /// 调用方保持原值。解析失败同样返回 `None` —— 宁可不动也不能把客户的 context 写坏。
-fn rewrite_last_real_project_id(context: &str, new_pid: &str) -> Option<String> {
+pub(crate) fn rewrite_last_real_project_id(context: &str, new_pid: &str) -> Option<String> {
     let mut v: Value = serde_json::from_str(context).ok()?;
     let obj = v.as_object_mut()?;
     let cur = obj.get("last_real_project_id")?.as_str()?;
@@ -1411,7 +1411,9 @@ fn minimal_project_row(cols: &[&String], pid: &str) -> Vec<rusqlite::types::Valu
 
 /// 为目标 uid 在目标库查找或新建 project（会话归属改写）。
 /// 查找规则：同 absolute_path 且未删除的 project 优先；找不到则复制源 project 行并换新 id。
-fn ensure_project_for(
+///
+/// `pub(crate)`：T46「跨账号写入」直接复用（`trae_session_edit::edit_save`）。
+pub(crate) fn ensure_project_for(
     src: &Connection,
     dst: &Connection,
     sid: &str,

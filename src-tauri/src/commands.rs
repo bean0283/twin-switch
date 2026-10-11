@@ -9,9 +9,9 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     app_overview, client_usage, config, error_log, trae_cleanup, trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
-    trae_profile, trae_remote, trae_switch, trae_vault, workbuddy_cleanup, workbuddy_credits,
-    workbuddy_export, workbuddy_import, workbuddy_oauth, workbuddy_sessions, workbuddy_switch,
-    workbuddy_vault,
+    trae_profile, trae_remote, trae_session_edit, trae_switch, trae_vault, workbuddy_cleanup,
+    workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
+    workbuddy_session_edit, workbuddy_sessions, workbuddy_switch, workbuddy_vault,
 };
 
 // ---------------------------------------------------------------------------
@@ -583,6 +583,104 @@ pub async fn trae_session_detail(client_key: String, session_id: String) -> Resu
     tauri::async_runtime::spawn_blocking(move || trae_export::session_detail(&client_key, &session_id))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// 会话编辑器：读出该会话在全部相关表里的行（结构化 JSON，含列元数据）。**只读。**
+#[tauri::command]
+pub async fn trae_session_edit_doc(client_key: String, session_id: String) -> Result<Value, String> {
+    off_main(move || trae_session_edit::edit_doc(&client_key, &session_id)).await?
+}
+
+/// 会话编辑器：可写入的目标账号清单（**只读**）。
+///
+/// 「跨账号写入」用它在弹窗里列出可选的归属账号；显示名走 `trae_vault::account_label`
+/// （与账号页同一出口，别在前端自己截 uid 尾号）。
+#[tauri::command]
+pub async fn trae_session_edit_targets(client_key: String) -> Result<Value, String> {
+    off_main(move || trae_session_edit::list_target_uids(&client_key)).await?
+}
+
+/// 会话编辑器：生成一批新的 24 位 hex id（T46「新增回合 / 复制消息」用）。
+///
+/// 纯计算（12 字节随机数 → hex），不碰库、不碰盘、微秒级 ⇒ 同步命令，
+/// 已登记进 `SYNC_ALLOWLIST`。
+///
+/// ⚠️ 前端**不要**自己造 id：id 的生成规则只能有一处实现
+/// （见 `trae_session_edit::new_ids` 的注释 —— 两套生成规则必然在某次调整里跑偏，
+/// 而「id 形态不对」的症状是「写完客户端打不开」）。
+#[tauri::command]
+pub fn trae_session_edit_new_ids(count: usize) -> Result<Value, String> {
+    Ok(trae_session_edit::new_ids(count))
+}
+
+/// 会话编辑器：分级校验（纯计算，不碰库、不写盘）。
+///
+/// ⚠️ 规则只有这一份实现 —— 前端只负责显示 `errors` / `warnings`，**绝不在前端重写一遍**
+/// （同一套规则被两处独立推导，必然跑偏一次）。
+#[tauri::command]
+pub async fn trae_session_edit_validate(doc: Value) -> Result<Value, String> {
+    off_main(move || trae_session_edit::validate(&doc)).await
+}
+
+/// 会话编辑器：写回。
+///
+/// ⚠️ 写库操作：结束客户端 → 备份 → 解密 → 合并 WAL → 改 → 增量回写 → 校验 → 重启，
+/// 全程几十秒，**必须走 `spawn_blocking`**。
+///
+/// `mode`：`overwrite`（就地覆写，保持 session_id）/ `insert`（同库新增，自动重映射全部 id）。
+///
+/// `dirtyTables`：前端标出的「真的改过的表」，只重写这些表。省略 = 全部重写。
+/// 这只是性能提示（只改标题就不必重写那 74 MB 的 `chat_message_task`），
+/// **标错也不会写坏数据** —— 少标只是少写一张表，库里保持原样。
+///
+/// `targetUid`（S2）：把新增的会话写进**另一个账号**。只允许 `mode = "insert"`；
+/// 传了它就必须是该客户端里已有工程的 uid（见 `trae_session_edit_targets`）。
+/// 归属改写会同时覆盖 `chat_session.project_id` / `session_project.project_id` /
+/// `context.last_real_project_id` 三处（漏一处 = 客户端删不掉 + 重启后复活）。
+#[tauri::command]
+pub async fn trae_session_edit_save(
+    doc: Value,
+    mode: String,
+    dirty_tables: Option<Vec<String>>,
+    target_uid: Option<String>,
+) -> Result<Value, String> {
+    let progress: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buf = progress.clone();
+    let out = off_main(move || {
+        trae_session_edit::edit_save(
+            &doc,
+            &mode,
+            dirty_tables.as_deref(),
+            target_uid.as_deref(),
+            Some(&|m| {
+                buf.lock().unwrap().push(m.to_string());
+            }),
+        )
+    })
+    .await?;
+    match out {
+        Ok(v) => Ok(v),
+        Err(e) => Err(format!("{e}\n\n--- 执行日志 ---\n{}", progress.lock().unwrap().join("\n"))),
+    }
+}
+
+/// 会话编辑器：按需拉取一个**大字段**的完整内容（点「展开」时调）。
+///
+/// 大字段（单个 > 32 KB，例如 `chat_message_task.content` 单行 9.8 MB）在 `edit_doc` 里
+/// 只回了 `$jsonRef` 引用 —— 一条会话实测能到 90 MB，全量塞给前端会把渲染冻死。
+#[tauri::command]
+pub async fn trae_session_edit_cell(
+    client_key: String,
+    session_id: String,
+    table: String,
+    column: String,
+    pk: Value,
+) -> Result<Value, String> {
+    off_main(move || {
+        trae_session_edit::edit_cell(&client_key, &session_id, &table, &column, &pk)
+    })
+    .await?
 }
 
 /// 导出单个会话为 MD 文件（导出目录内自动去重命名）。
@@ -1531,6 +1629,108 @@ pub async fn workbuddy_session_edge_sync_dbs() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// WorkBuddy 会话编辑器（T46 · S4）
+//
+// 与 Trae 侧（`trae_session_edit_*`）同构，但数据模型完全不同：WorkBuddy 的正文是
+// 「一个 JSONL 文件里的若干行」，所以读分两步（回合索引 / 按区间取完整行），
+// 写走「操作数组」（只回传改动过的行）—— 真机单个正文 19 MB，最大的 136 MB，
+// 整份 doc 过 IPC 会把前端冻死。
+// ---------------------------------------------------------------------------
+
+/// 会话编辑器（WorkBuddy）：读出元数据 + 回合索引（**只读**、轻量）。
+#[tauri::command]
+pub async fn workbuddy_session_edit_doc(uid: String, cid: String) -> Result<Value, String> {
+    off_main(move || workbuddy_session_edit::edit_doc(&uid, &cid)).await?
+}
+
+/// 会话编辑器（WorkBuddy）：按行区间取**完整行**（含该行解析后的 JSON）。
+///
+/// 一次最多 400 行（后端也会再拦一次）—— 前端一次只取当前回合的范围。
+#[tauri::command]
+pub async fn workbuddy_session_edit_lines(
+    uid: String,
+    cid: String,
+    from: usize,
+    to: usize,
+) -> Result<Value, String> {
+    off_main(move || workbuddy_session_edit::edit_lines(&uid, &cid, from, to)).await?
+}
+
+/// 会话编辑器（WorkBuddy）：可写入的目标账号清单（**只读**）。
+#[tauri::command]
+pub async fn workbuddy_session_edit_targets() -> Value {
+    off_main(workbuddy_session_edit::list_target_uids)
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e, "accounts": [] }))
+}
+
+/// 会话编辑器（WorkBuddy）：分级校验（**不读文件、不开库**，毫秒级）。
+///
+/// ⚠️ 规则只有这一份实现（`workbuddy_session_edit::validate_submit`）——前端只显示
+/// `errors` / `warnings`，**绝不在前端重写一遍**。`summary` 由 `edit_doc` 带回，
+/// 有了它才能在不读整份正文的前提下算「改完之后还剩几条用户提问」（空会话硬拦）。
+///
+/// 这一层是**快速反馈**；写入前 `edit_save` 还会跑一次全量校验，那时的错误会原样回给前端。
+#[tauri::command]
+pub async fn workbuddy_session_edit_validate(
+    ops: Value,
+    row_patch: Value,
+    columns: Value,
+    summary: Value,
+    session_id: String,
+) -> Result<Value, String> {
+    off_main(move || {
+        workbuddy_session_edit::validate_submit(&ops, &row_patch, &columns, &summary, &session_id)
+    })
+    .await
+}
+
+/// 会话编辑器（WorkBuddy）：写回。
+///
+/// ⚠️ 写盘 + 开库 + 可能结束/重启客户端，几十秒 ⇒ 必须 `spawn_blocking`。
+///
+/// `mode`：`overwrite`（就地改这条会话）/ `insert`（新 UUID 造一条新会话，源会话一行不动）。
+/// `target_uid`（S5 跨账号）：只在 `insert` 时可用；只接受本机已有会话的账号 uid。
+/// `ops`：只含**改动过的那几行**（replace / delete / insert），未改动的行逐字节原样保留。
+///
+/// 返回：任何 `error` 都会带 `ok=false` 原样返回（不是 Err），好让前端把「写入前的全量校验」
+/// 明细展示出来 —— 见 `workbuddy_session_edit::edit_save` 的注释。
+#[tauri::command]
+pub async fn workbuddy_session_edit_save(
+    uid: String,
+    cid: String,
+    mode: String,
+    ops: Value,
+    row_patch: Value,
+    target_uid: Option<String>,
+) -> Result<Value, String> {
+    let progress: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buf = progress.clone();
+    let out = off_main(move || {
+        workbuddy_session_edit::edit_save(
+            &uid,
+            &cid,
+            &mode,
+            &ops,
+            &row_patch,
+            target_uid.as_deref(),
+            Some(&|m| {
+                buf.lock().unwrap().push(m.to_string());
+            }),
+        )
+    })
+    .await?;
+    match out {
+        Ok(v) => Ok(v),
+        Err(e) => Err(format!(
+            "{e}\n\n--- 执行日志 ---\n{}",
+            progress.lock().unwrap().join("\n")
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 首页总览（只读）
 // ---------------------------------------------------------------------------
 
@@ -1655,6 +1855,7 @@ mod main_thread_guard {
         "reveal_error_log",    // 拉起资源管理器后立即返回
         "reveal_path",         // 同上
         "trae_export_dir",     // 纯路径计算
+        "trae_session_edit_new_ids", // 纯随机数 → hex，微秒级
         "trae_saved_key",      // 读一个几十字节的保存键
         "update_state",        // 只读一个进程内互斥体，微秒级
         "trae_oauth_start",    // 绑一个回环端口

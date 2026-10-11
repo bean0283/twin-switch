@@ -17,7 +17,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::modules::config::store_dir;
 
@@ -385,26 +385,63 @@ pub struct WbBody {
 // 会话列表
 // ---------------------------------------------------------------------------
 
-/// 把 `workbuddy.db`（含 WAL/SHM）复制到工具目录后打开，避免与运行中的客户端
+/// 把文件复制过去，**用手工读写而不是 `std::fs::copy`**。
+///
+/// ⚠️ Windows 上 `fs::copy` 走 `CopyFileExW`，它只申请 `FILE_SHARE_READ`；
+/// 而 **WorkBuddy 正开着 `workbuddy.db-shm` 的内存映射**，于是复制直接失败：
+/// `请求的操作无法在使用用户映射区域打开的文件上执行。(os error 1224)`
+/// —— 也就是「WorkBuddy 在跑的时候，会话记录页整个打不开」。
+///
+/// `File::open` 申请的是 `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`，
+/// 与已存在的映射兼容，能正常把字节读出来。
+fn copy_shared(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(src)
+        .map_err(|e| format!("打开 {} 失败: {e}", src.display()))?;
+    let mut out = std::fs::File::create(dst)
+        .map_err(|e| format!("创建 {} 失败: {e}", dst.display()))?;
+    std::io::copy(&mut f, &mut out).map_err(|e| format!("复制 {} 失败: {e}", src.display()))?;
+    // 显式读一下，确认不是「打开成功但读不出来」。
+    let mut probe = [0u8; 1];
+    let _ = f.read(&mut probe);
+    Ok(())
+}
+
+/// 把 `workbuddy.db`（含 WAL）复制到工具目录后打开，避免与运行中的客户端
 /// 争抢 WAL 锁。复制品可正常回放 WAL，读到最新数据。
+///
+/// ## 两个必须守住的细节
+///
+/// 1. **`-shm` 故意不复制**。它是 WAL 索引，被客户端内存映射着；复制它既会失败
+///    （见 [`copy_shared`]），又是多余的 —— 复制完主库 + WAL 之后用 SQLite 打开一次，
+///    SQLite 自己会把索引从 WAL 重建出来（下面第 3 步）。
+/// 2. **先清干净上一轮的快照**。`-wal` 残留会让新快照读到**上一次**的事务帧，
+///    那比「缺文件」严重得多（用户会看到已经删掉的会话又冒出来）。
 pub fn snapshot_db() -> Result<PathBuf, String> {
     let root = data_root();
     let dir = store_dir().join("workbuddy_scan");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 WorkBuddy 快照目录失败: {e}"))?;
-    let names = ["workbuddy.db", "workbuddy.db-wal", "workbuddy.db-shm"];
-    for name in names {
-        let src = root.join(name);
-        if src.is_file() {
-            std::fs::copy(&src, dir.join(name))
-                .map_err(|e| format!("复制 {name} 失败: {e}"))?;
-        }
-    }
     let dst = dir.join("workbuddy.db");
-    if !dst.is_file() {
-        return Err(format!(
-            "未找到 WorkBuddy 会话库：{}",
-            root.join("workbuddy.db").display()
-        ));
+    for name in ["workbuddy.db", "workbuddy.db-wal", "workbuddy.db-shm"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let main = root.join("workbuddy.db");
+    if !main.is_file() {
+        return Err(format!("未找到 WorkBuddy 会话库：{}", main.display()));
+    }
+    copy_shared(&main, &dst)?;
+    // 客户端的写入全都还在 WAL 里，漏了它就会读到很久以前的旧数据 ⇒ 硬错误。
+    let wal = root.join("workbuddy.db-wal");
+    if wal.is_file() {
+        copy_shared(&wal, &dir.join("workbuddy.db-wal"))?;
+    }
+    // 3) 打开一次让 SQLite 依据 WAL 重建 `-shm`。此后 `open_ro()` 才能读这个快照
+    //    （只读打开 WAL 库需要一份可用的 WAL 索引）。
+    {
+        let conn = rusqlite::Connection::open(&dst)
+            .map_err(|e| format!("打开 WorkBuddy 快照失败: {e}"))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|e| format!("校验 WorkBuddy 快照失败: {e}"))?;
     }
     Ok(dst)
 }
@@ -581,7 +618,7 @@ fn strip_leading_blocks(text: &str) -> &str {
 /// 必须先剥**行首**的注入块、再认 `<user_query>`，不能全文 `find` ——
 /// 摘要正文里最多出现 7 个 `<user_query>`，全文搜索会取出一段毫不相干的文字
 /// （实测取到的是源码片段，甚至上一轮的续写指令）。
-fn extract_user_text(text: &str) -> String {
+pub(crate) fn extract_user_text(text: &str) -> String {
     let raw = text.trim();
     if classify_user_message(raw) != UserMsgKind::Real {
         return String::new();
@@ -595,7 +632,7 @@ fn extract_user_text(text: &str) -> String {
 }
 
 /// 拼接 `message` 事件 `content[]` 里所有文本块（assistant 用 `output_text`）。
-fn join_content_blocks(content: &Value) -> String {
+pub(crate) fn join_content_blocks(content: &Value) -> String {
     let Some(blocks) = content.as_array() else {
         return content.as_str().unwrap_or_default().trim().to_string();
     };

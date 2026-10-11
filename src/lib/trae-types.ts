@@ -1072,6 +1072,177 @@ export interface WorkbuddyImportPreview {
 }
 
 // ---------------------------------------------------------------------------
+// T46 · S4 WorkBuddy 会话编辑器
+//
+// 数据模型与 Trae **完全不同**：元数据是 `workbuddy.db` 的 `sessions` 一张表，
+// 正文是 `projects/<工作区>/<cid>.jsonl`（**一行一个事件**）。
+// 所以读分两步（回合索引 / 按行区间取完整行），写走「操作数组」（只回传改动过的行）。
+// ---------------------------------------------------------------------------
+
+/** `sessions` 表的一列（`PRAGMA table_info`）。 */
+export interface WbEditColumn {
+  name: string;
+  type: string;
+  notNull: boolean;
+  pk: boolean;
+  dflt: string | null;
+  /** 库里是 TEXT、存的是 JSON。sessions 表目前恒为 false。 */
+  json: boolean;
+  /** 主键（`id`）：不可改，也不参与写回。 */
+  readOnly: boolean;
+}
+
+/**
+ * 正文一行派生出的种类。**由后端判定**（`workbuddy_session_edit::classify_line`），
+ * 前端只按它决定画成什么卡片 —— 分类规则只有一处实现。
+ */
+export type WbLineKind =
+  | "user" // 真实用户提问（正文包在 <user_query> 里）
+  | "auto" // 客户端自动续写 / 后台任务通知（role=user 但不是用户敲的）
+  | "summary" // 纯内部上下文摘要（界面上看不见）
+  | "assistant" // 助手回答
+  | "reasoning" // 思考
+  | "tool_call" // 工具调用
+  | "tool_result" // 工具结果
+  | "meta" // ai-title / session-meta / file-history-snapshot
+  | "message" // 其它 role 的 message
+  | "unknown"
+  | "bad";
+
+/** 轻量行描述（`edit_doc` 的回合索引里用；`text` 可能被截断）。 */
+export interface WbLineSummary {
+  index: number;
+  type: string;
+  kind: WbLineKind;
+  label: string;
+  name: string;
+  status: string;
+  timestamp: number;
+  bytes: number;
+  textBytes: number;
+  text: string;
+  textTruncated: boolean;
+  /** `text` 在该行 JSON 里的路径；null = 不能就地改（只能改原始 JSON）。 */
+  textPath: (string | number)[] | null;
+  /** 用户提问是否包在 `<user_query>…</user_query>` 里。 */
+  wrapped: boolean;
+  parseError: string | null;
+}
+
+/** 完整行（`edit_lines` 返回）：带解析后的 `json` 与原始文本 `raw`。 */
+export interface WbEditLine extends WbLineSummary {
+  raw: string;
+  json: Record<string, unknown> | null;
+}
+
+/** 一个回合：从一条真实用户提问到下一条之前。 */
+export interface WbEditTurn {
+  index: number;
+  start: number;
+  /** 结束行号（不含）。 */
+  end: number;
+  lines: number;
+  userText: string;
+  replyText: string;
+  tools: string[];
+  time: number;
+  status: string;
+}
+
+export interface WbEditBody {
+  path: string;
+  /** 相对 `projects/` 的工作区目录名。 */
+  workspace: string;
+  exists: boolean;
+  bytes: number;
+  lineCount: number;
+}
+
+/** 会话编辑器读模型。 */
+export interface WbEditDoc {
+  clientKey: string;
+  sessionId: string;
+  ownerUid: string;
+  ownerLabel: string;
+  title: string;
+  /** `sessions` 行全字段（BLOB 用 `{"$blob": …}` 标记，可逆往返）。 */
+  row: Record<string, unknown>;
+  columns: WbEditColumn[];
+  body: WbEditBody;
+  turns: WbEditTurn[];
+  /** 第一条用户提问之前的行号（`session-meta` / `ai-title` 常落在这里）。 */
+  head: number[];
+  /** 种类 → 行数（键：user / auto / summary / assistant / reasoning / toolCall / toolResult / meta / bad / message / unknown）。 */
+  counts: Record<string, number>;
+  /**
+   * **行号 → 种类**（长度 = `body.lineCount`）。
+   *
+   * 前端把它回传给校验命令，后端才能在不读整份正文的前提下算出
+   * 「删掉的行里有几条用户提问」（空会话硬拦）—— 判据只有后端一份。
+   */
+  lineKinds: WbLineKind[];
+  warnings: string[];
+}
+
+/** 一次行取回的返回。 */
+export interface WbEditLinesResult {
+  ok: boolean;
+  sessionId: string;
+  from: number;
+  to: number;
+  lines: WbEditLine[];
+}
+
+/** 分级校验结果（后端 `validate_submit`）。 */
+export interface WbEditReport {
+  errors: string[];
+  warnings: string[];
+  errorCount: number;
+  warnCount: number;
+  stats: Record<string, unknown>;
+}
+
+/** 写入目标账号。 */
+export interface WbEditTargetAccount {
+  uid: string;
+  label: string;
+  sessions: number;
+}
+
+export interface WbEditTargets {
+  ok: boolean;
+  error?: string;
+  accounts: WbEditTargetAccount[];
+}
+
+/** 写入结果。校验没过时 `ok=false` + `errors`，**不是 Err**。 */
+export interface WbEditSaveResult {
+  ok: boolean;
+  mode?: "overwrite" | "insert";
+  /** 源会话 id。 */
+  sourceId?: string;
+  /** 最终写入的会话 id（`insert` 模式下是新 UUID）。 */
+  sessionId?: string;
+  ownerUid?: string;
+  ownerLabel?: string;
+  lines?: number;
+  bodyPath?: string;
+  bodyBackup?: string;
+  dbBackup?: string;
+  warnings?: string[];
+  /** `ok=false` 时：校验阶段说明。 */
+  stage?: string;
+  errors?: string[];
+}
+
+/** 正文改动操作（只回传**改动过**的那几行）。 */
+export type WbEditOp =
+  | { op: "replace"; index: number; json: unknown }
+  | { op: "delete"; indexes: number[] }
+  | { op: "insert"; at: number; json: unknown }
+  | { op: "append"; json: unknown };
+
+// ---------------------------------------------------------------------------
 // WorkBuddy 会话记录 / 复制 / 关联（国内版）
 // ---------------------------------------------------------------------------
 
@@ -1414,3 +1585,214 @@ export interface OverviewCache {
   reclaim: OverviewReclaimCache | null;
 }
 
+
+// ---------------------------------------------------------------------------
+// T46 · 会话编辑器
+// ---------------------------------------------------------------------------
+
+/** 会话编辑器：一列的元数据（来自 `PRAGMA table_info` + JSON 文本列判定）。 */
+export interface TraeEditColumn {
+  name: string;
+  /** 声明类型（TEXT / INTEGER / …；可能为空）。 */
+  type: string;
+  notNull: boolean;
+  pk: boolean;
+  /**
+   * 该列带 UNIQUE 索引 —— 也就是这张表的**身份列**。
+   *
+   * 光看 `pk` 不够：真机上 `chat_message` 的主键是自增 `id`，真正唯一的是
+   * `message_id`（TEXT + UNIQUE），漏掉它就撞 `UNIQUE constraint failed`。
+   * 「新增 / 复制一行」时这些列必须换成新值，映射漏一列就会被后端校验当场拦下。
+   */
+  unique: boolean;
+  dflt: string | null;
+  /**
+   * 该列在库里是 TEXT，存的却是一段 JSON —— 读取时已解成真正的树，
+   * 写入时再序列化回文本。前端因此可以按结构化表单渲染 `content` / `context`。
+   */
+  json: boolean;
+  /** 自增主键（`id`）：不显示为可改，也不参与写回（交给 SQLite 分配）。 */
+  readOnly: boolean;
+}
+
+/** 会话编辑器：一张表在该会话里的全部行。 */
+export interface TraeEditTable {
+  name: string;
+  /** `session` = 用 session_id 取行；`message` = 用 message_id 间接取行。 */
+  scope: "session" | "message";
+  editable: boolean;
+  /** `fts_*` 检索镜像：改动只影响搜索命中，不影响会话内容。 */
+  derived: boolean;
+  /**
+   * 本表有多少个单元格被折叠成了「大字段引用」（`$jsonRef`）。
+   * 真机实测：`chat_message_task.content` 单行可达 9.8 MB，一条会话合计 74 MB，
+   * 全量塞给前端会把渲染冻死 —— 超过 32 KB 的单元格只回引用，点「展开」才拉内容。
+   */
+  refCount: number;
+  columns: TraeEditColumn[];
+  rows: Record<string, unknown>[];
+}
+
+/**
+ * 大字段引用：超过阈值的 JSON 单元格不回内容，只回这个对象。
+ *
+ * ⚠️ 不展开就**原样保留**（写回时后端按 `pk` 回查原文），展开后才能改。
+ * 所以前端可以放心地把它当「值」原样传来传去。
+ */
+export interface TraeJsonRef {
+  $jsonRef: {
+    /** 原行主键（SQLite INTEGER 主键，回查用）。 */
+    pk: number | string;
+    /** 原文字节数，用于提示体积、判断「没动过」。 */
+    bytes: number;
+    /** 开头一小段，让用户看得出这是什么。 */
+    preview: string;
+  };
+}
+
+/** 按需展开一个大字段的返回。 */
+export interface TraeEditCellResult {
+  ok: boolean;
+  bytes: number;
+  /** 解析好的 JSON 树（不是 JSON 文本时原样返回字符串）。 */
+  value: unknown;
+}
+
+/** 会话编辑器：一条会话的完整可编辑文档。 */
+export interface TraeEditDoc {
+  clientKey: string;
+  clientLabel: string;
+  sessionId: string;
+  title: string;
+  /** 归属账号 uid（无归属为 null）。 */
+  ownerUid: string | null;
+  tables: TraeEditTable[];
+  /** 表名 → 行数。 */
+  counts: Record<string, number>;
+  /** 全会话折叠成引用的单元格总数。 */
+  refCount: number;
+  /** 读取阶段的告警（例如库里缺 chat_message 表导致某些表被跳过）。 */
+  warnings: string[];
+}
+
+/** 分级校验结果：`errors` 硬拦（不修好不让写），`warnings` 只提醒。 */
+export interface TraeEditReport {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+/** 跨账号写入时的一个候选目标账号。 */
+export interface TraeEditTargetAccount {
+  uid: string;
+  /** 显示名（后端统一走 `trae_vault::account_label`，前端别自己截 uid）。 */
+  label: string;
+  /** 该账号在库里的工程数。 */
+  projects: number;
+  /** 该账号在库里的会话数。 */
+  sessions: number;
+}
+
+/** 「跨账号写入」可选的目标账号清单。 */
+export interface TraeEditTargets {
+  clientKey: string;
+  accounts: TraeEditTargetAccount[];
+}
+
+/** 写入结果。 */
+export interface TraeEditSaveResult {
+  ok: boolean;
+  mode: "overwrite" | "insert";
+  /** 源会话 id。 */
+  sourceSessionId: string;
+  /** 最终写入的会话 id（`insert` 模式下是新生成的）。 */
+  sessionId: string;
+  /** 是否做了 id 重映射（`insert` 模式为 true）。 */
+  idRemapped: boolean;
+  /** 跨账号写入的目标账号 uid（没跨账号时为 null）。 */
+  targetUid: string | null;
+  /** 表名 → 写入行数。 */
+  tables: Record<string, number>;
+  rows: number;
+  /** 覆写模式下清掉的旧行数。 */
+  removedRows: number;
+  /**
+   * 覆写模式下**原样保留**（用户没改）的表名。
+   * 只改标题时这里会是除 `chat_session` 外的全部表 —— 也就是说那 74 MB 一行都没动。
+   */
+  skippedTables: string[];
+  walMerged: number;
+  pages: number;
+  changedPages: number;
+  /** 写入前的整库备份文件。 */
+  backup: string[];
+  relaunched: boolean;
+  warnings: string[];
+}
+
+/**
+ * 跨**客户端**写入的一个候选目标账号（T46 · S5，只给两个「数据迁移」页用）。
+ *
+ * ⚠️ 与 `TraeEditTargetAccount` / `WbEditTargetAccount` 的区别：那两个是**同客户端**的
+ * 另一个账号；这个是**对面客户端**的账号。
+ */
+export interface CrossWriteAccount {
+  uid: string;
+  /** 目标 Trae 客户端的 key；WorkBuddy 侧是空串。 */
+  clientKey: string;
+  /**
+   * `clientKey` 对应的**客户端显示名**（`Trae CN（IDE 国内版）` / `TRAE SOLO CN` / `WorkBuddy`）。
+   *
+   * ⚠️ 必须与账号名分开给：**Trae CN 与 TRAE SOLO CN 是两个客户端**，本机 3 个 uid 在两个
+   * 客户端下各有一份（实测），混在一个账号下拉里既分不清、也选不对（见 [`crossKeyOf`]）。
+   */
+  clientLabel: string;
+  /** 账号显示名，形如 `张三（uid …97eac1）`；**不含客户端名**（客户端由 `clientLabel` 单独给）。 */
+  label: string;
+  /** 该账号在本机没有会话库 ⇒ 写进去必然失败，界面上标注出来。 */
+  noDb?: boolean;
+}
+
+/**
+ * 跨端写入目标的**唯一标识**：`${clientKey}::${uid}`。
+ *
+ * ⚠️⚠️ 绝不能只用 `uid`：同一个 uid 会同时出现在 Trae CN 与 TRAE SOLO CN 两个客户端下
+ * （实测本机 `…223728` / `…717036`… 都是两套）。老实现按 `uid` 反查账号，
+ * `find()` 命中的是列表里第一个同名账号 ⇒ **选了 SOLO 却写到 IDE 库**。
+ */
+export function crossKeyOf(a: { clientKey: string; uid: string }): string {
+  return `${a.clientKey}::${a.uid}`;
+}
+
+/**
+ * 编辑器页脚的「跨客户端写入」能力（T46 · S5）。
+ *
+ * 数据迁移页传了它之后，页脚的同客户端「写入方式 / 写入到账号」会被替换成
+ * 「写入到 <`toLabel`> 账号」—— 因为那两个页面要的就是**把这条会话搬到对面**。
+ *
+ * 落地方式遵循设计文档 §6 的约定「跨端写入复用现有导入链路」：
+ * ① 有改动先把改动写回**源**会话（导入链路读的是源库里的内容，绕不过去）；
+ * ② 再调用目标方向的既有迁移命令把它搬过去。**源会话不会被删。**
+ */
+export interface CrossWriteTarget {
+  /** 目标客户端显示名："Trae" / "WorkBuddy"。 */
+  toLabel: string;
+  /**
+   * 候选目标账号（平铺）。
+   *
+   * ⚠️ 账号清单里可能有**多个客户端**（Trae 侧就有 IDE 版与 SOLO 版）——编辑器会按
+   * `clientKey` 自动分组，先让用户选客户端、再列该客户端下的账号，不会混在一个下拉里。
+   */
+  accounts: CrossWriteAccount[];
+  /** 目标账号清单读取失败的原因（非空只提示）。 */
+  accountsError?: string | null;
+  /** 目标侧当前不可写的原因（本机没有该客户端 / 没有数据），非空即禁用。 */
+  blocked?: string | null;
+  /** 默认选中的目标账号（[`crossKeyOf`] 形态）。 */
+  defaultKey?: string | null;
+  /**
+   * 把这条会话搬到目标账号。返回一行结果说明（写进编辑器的写入日志）。
+   * ⚠️ 调用**之前**编辑器已经把改动写回源会话了。
+   */
+  push: (target: CrossWriteAccount) => Promise<string>;
+}

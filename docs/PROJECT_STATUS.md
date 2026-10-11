@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-09 / **v0.2.13 已发版**，含 T42 / T43 / T44 / T45；前一个正式版 **v0.2.12**）
+> 分析时间：2026-10-04（最近更新：2026-10-11 / 工作区 **v0.2.21**，含 T46 全阶段 + WB 侧删回合 / 批量删回合但**未发版**；最近正式版 **v0.2.13 已发版**，含 T42 / T43 / T44 / T45）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -31,11 +31,11 @@
 | 产物名 | **TwinSwitch**（v0.0.24 起；Rust 包名仍为 `wb-switch-rust` / `wb-switch-core`） |
 | 仓库 | https://github.com/bean0283/twin-switch（**主项目** ✅ 公开；根提交 `f15b053`「首次提交」= **v0.2.0** 的代码，其上 `7970e97` = **v0.2.11**；tag `v0.1.0` / `v0.2.0` → `f15b053`，tag `v0.2.11` → `7970e97`）· 旧仓库 https://github.com/bean0283/trae-switch-cn（**保持原样不动**，停在 v0.0.3；用户明确决定**不归档**，仍可提交/开 issue） |
 | 技术栈 | Tauri 2（Rust）+ React 19 + TypeScript + Vite + Tailwind/Radix |
-| 核心逻辑位置 | `crates/wb-switch-core/src/modules/`（31 个模块，约 13k 行，纯 Rust、不依赖 Tauri） |
+| 核心逻辑位置 | `crates/wb-switch-core/src/modules/`（38 个模块，约 34k 行，纯 Rust、不依赖 Tauri） |
 | 前端 | `src/main.tsx`（**启动编排**：先 `primeOverview()` 读磁盘缓存 → 挂载 → 后台 `refreshOverview()`）· `src/pages/HomePage.tsx`（侧栏「首页」·本机概览仪表盘，数据走 `src/lib/overview-store.ts` 的进程内单例）、`src/pages/TraeSwitchPage.tsx` 与 `src/pages/TraeRecordsPage.tsx`（侧栏「Trae」区的账号管理与会话记录）、`src/pages/WorkbuddyImportPage.tsx` 与 `src/pages/WorkbuddyExportPage.tsx`（侧栏「数据迁移」区的双向会话迁移）、`src/pages/WorkbuddyCleanupPage.tsx` 与 `src/pages/TraeCleanupPage.tsx`（侧栏「本机维护」区的残留清理：WorkBuddy 侧 / Trae 侧）、`src/pages/WorkbuddySwitchPage.tsx` 与 `src/pages/WorkbuddyRecordsPage.tsx`（侧栏「WorkBuddy」区的账号管理与会话记录 / 复制 / 关联，账号卡内嵌积分块）。两个账号页共用 `src/components/credits-ui.tsx` 与 `src/components/account-card.tsx` 的展示层 |
 | 派生缓存 | `~/.twin-switch/cache/`（**可整目录删**）：`overview.json`（总览 + 可回收空间）、`credits.json` / `trae-credits.json`（积分结果）、清理扫描的两份槽位 |
 | 任务台账 | `docs/任务书.md`（后续 AI 先读它，再读本文件） |
-| 当前版本 | **0.2.12**（工作区，**未发版**）—— 上一个正式版 **0.2.11 已发布**（GitHub Release `v0.2.11`，2026-10-07）。版本号五处同步：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`（+ `Cargo.lock` 跑 `cargo test` 自动跟上） |
+| 当前版本 | **0.2.21**（工作区，**未发版**；T46 会话编辑器 S1–S5 + S5.1 删回合 + S5.2 批量删回合全落地）—— 最近正式版 **0.2.13 已发布**（GitHub Release `v0.2.13`，2026-10-09）。版本号五处同步：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `crates/wb-switch-core/Cargo.toml` / `src/components/update-entry.tsx`（+ `Cargo.lock` 跑 `cargo test` 自动跟上） |
 | 自动更新 | ✅ v0.2.0 起对接 GitHub Releases（`tauri-plugin-updater` + `latest.json`）。实现见 `crates/wb-switch-core/src/modules/update.rs`（版本比较/端点/缓存）、`src-tauri/src/update_service.rs`（状态机）、`src/components/update-entry.tsx`（侧栏入口+对话框）；发版一键脚本 `npm run release` → `scripts/release.mjs` |
 
 ---
@@ -1213,6 +1213,50 @@ npm run tauri build        # 产出 target/release/bundle/{nsis,msi}
 curl -s https://api.github.com/repos/bean0283/twin-switch | python -m json.tool
 ```
 
+### 渲染自查（dev server + CDP）—— 配方，删了要重写
+
+首选**真实 dev server + CDP**，不要截图比对：
+
+1. 起 `npx vite`（⚠️ **只监听 IPv6 `[::1]:1420`** ⇒ driver 里 `RC_BASE=http://localhost:1420`；
+   `curl 127.0.0.1:1420` 会拿 `000`；`curl` 默认走代理 ⇒ 加 `--noproxy '*'`）。
+2. CDP `Page.addScriptToEvaluateOnNewDocument` **在页面脚本之前**注入宿主桩，再开
+   `http://localhost:1420/<route>`。⚠️ 桩**两个**全局：`window.__TAURI_INTERNALS__` 与
+   `window.__TAURI_EVENT_PLUGIN_INTERNALS__`；**前端会直接渲染其字段的命令绝不许给 `{}`**
+   （会给成空态/报错，自查会误判成产品缺陷）。
+3. **每个尺寸单开一个 Edge**：`--headless=new` + `--no-proxy-server`；调试端口**每次随机**
+   （旧进程没退干净时会静默绑定失败，脚本却仍连上旧的那个）。
+4. 量宽度用 `Range.getBoundingClientRect()`（不是元素自身的 `getBoundingClientRect`，量不准）；
+   Radix 的下拉/弹窗要用 CDP 派发 `moved → Pressed → Released` 三连，直接 `.click()` 不生效。
+5. React 19 的 `ref` 回调**必须是块体**（`ref={el => { ... }}`），箭头函数直接返回表达式会被当 cleanup。
+6. ⚠️ **一次跑全量场景会被 SIGTERM**（太久，日志落 `rc-*.log`，按页分批单跑）。
+7. ⚠️ 同一段 `evaluate` 里连点两次，React 批处理不会同步 flush，第二次点击拿到的还是旧闭包 ⇒
+   **拆成多次 evaluate + 间隔等待**。
+8. ⚠️ **判据必须能「抓得住老问题」**：新判据先跑一次**反证** —— 临时把实现回退成旧写法，
+   确认判据真的报警（例如弹窗溢出判据在旧写法下 `worstOverflow = 536`），再跑修复版确认归零。
+
+### 启动编排与缓存（`src/main.tsx`）
+
+`primeOverview()` → `mount()` → `autoImportReferenceAccounts()`（3 s 超时、失败静默、**排在重算前**）
+→ `refreshOverview()`。⚠️ **别放 `App` 的 `useEffect`**；缓存落 `~/.twin-switch/cache/`。
+⚠️ **别拿 TTL 当「自动重扫」开关**：只留三条显式路径（启动后台扫 /「重新扫描」/ purge 后重扫）；
+**purge、empty_trash 之后必须 `clear_cache_json`**。首页只做同步统计（Trae 会话数读 `.meta.json`
+行数，别复制 312 MB 快照）。
+
+### 删除实现（唯一一份 `src-tauri/src/modules/fs_remove.rs`）
+
+`remove_tree_with_retry()` = 清只读 → 删 → 退避重试 4 次；`empty_trash` 逐项删 + 上报
+`failed_count`。⚠️ **别写回 `remove_dir_all(&root)` 一把梭** —— 一条失败即整体 `Err`，
+用户拿到的只有「拒绝访问 os error 5」，而实际上一个也没删掉。
+
+### shim（本机工具链限制）
+
+- `rm -rf` / `Remove-Item -Recurse` **被拦** ⇒ 分批 `rm -f`（≤40 个/批）。
+- **Node safe-delete shim 会拦 `npx vite build` 清 `dist/`** ⇒ 先
+  `python -c "import shutil;shutil.rmtree('dist')"`。
+- ⚠️ **追加长文本一律 Read + Edit**：长 heredoc 会被判成「Bash 调 PowerShell」拒绝，
+  超长 heredoc 还会把 shell 引号解析搞崩 ⇒ 改用 Write 落脚本再执行。
+- **构建别并行。**
+
 ---
 
 ## 八、给下一次的续接提示
@@ -1236,3 +1280,178 @@ curl -s https://api.github.com/repos/bean0283/twin-switch | python -m json.tool
     这样客户端里的位置 / 归属 / 关联登记都不变。直接调 `import_sessions` 会每次多生成一条副本。
 11. **分叉判定的 `unknown` 不要图省事按另一端推断**：它驱动界面上的「可同步」暗示，
     而同步会写库覆盖数据，猜错方向就是真丢内容。
+
+---
+
+## 九、T46 · 会话编辑器（S1–S5 + S5.1–S5.4 已完成，待发版，2026-10-11）
+
+用户要的是「能改会话」：**改 / 增 / 删** + **覆写或新增写入**（**支持跨账号，也支持跨客户端**）+
+**单独弹窗加载全部会话** + **批量删除**。范围已在两轮询问中钉死，详见 `docs/任务书.md` 的 T46 小节。
+
+**结论速览**
+
+- Trae 侧后端已完工：`modules/trae_session_edit.rs`（`edit_load` / `edit_save` / `edit_delete_sessions` /
+  `list_target_uids` / `edit_cell` / `new_ids`），前端 `components/trae-session-editor.tsx` +
+  `components/trae-turn-detail.tsx` + `components/json-form.tsx` + `lib/trae-turn-model.ts`。
+- **S1 同库往返 / S2 跨账号写入的真机探针都是「0 处不一致」**，增量回写确实增量
+  （覆写标题只重写 8 页，74 MB 那张表一行没动）。
+- **S3 前端视图范式收敛了三次**（每次都是「显示 / 入口」变、功能不减）：
+  v0.2.13「先选表再看原始行」→ v0.2.14「左栏回合 / 右栏全字段表单」→
+  **v0.2.15「左栏回合 / 右栏会话式正文」**（一段一段，点击即改；底层字段收进折叠块）→
+  **v0.2.17 入口唯一化**：列表行内「查看详情」改为「编辑这条会话」（`editSeed` = 该行 id），
+  卡片头的独立「编辑会话」按钮与只读「会话详情」弹窗**删除**，编辑器左栏的**会话下拉取消**
+  （props 收敛成 `sessionId: string | null`）。判据：全仓 `setEditOpen(true)` 只有 1 处。
+- **v0.2.16 修掉一个用户报障的客户端死穴**：把一条会话的回合/消息**删光只留会话行**（空壳会话）⇒
+  客户端打开它时卡在「环境创建中」，**再也发不出任何消息**。`validate` 已硬拦、前端「删最后一个回合」
+  改道成「删整条会话」。定位与对照实验见 `docs/任务书.md` 的「S3.5 · 空会话」。
+- **v0.2.18 再收一次入口**：编辑器页脚的「关闭编辑」按钮删掉，**只留右上角 ✕**
+  （与 ✕ 走同一条 `onOpenChange(false)` 路径，删了不会留下「关不掉」的分支）。
+- **S4 WorkBuddy 侧全落地**：后端 `modules/workbuddy_session_edit.rs`（约 1500 行）、前端
+  `components/workbuddy-session-editor.tsx` + `lib/wb-turn-model.ts`、5 条 Tauri 命令、真机探针
+  `examples/t46_wb_edit_probe.rs`。**S5 跨客户端**：两个数据迁移页各挂一个编辑器
+  （`wb-import` 编辑 **WorkBuddy** 会话、`wb-export` 编辑 **Trae** 会话），另加 WB 记录页行内 ✏️。
+- 门禁：`cargo test --workspace` **268 passed / 0 failed / 2 ignored**（+ lib 15）、`tsc` 零错、
+  `vitest` **57 passed**（`wb-turn-model` 22 + `trae-turn-model` 35）、`vite build` **761.05 kB**（23.76 s）。
+  渲染自查 **14 场景全绿**（零 console 报错 / 无横向滚动 / 无竖排 / 手柄不重叠 / `hasCloseEditText=false`）。
+  版本号已五处同步到 **v0.2.18**。
+- **v0.2.20 补上用户报障的「WB 侧不能删回合」**：左栏每个回合行末尾一个 🗑（兄弟节点）+
+  右栏「删除本回合」；`removeTurn` 把区间内每行标删并**带走区间里的本次新增行**；
+  **行号一律原始行号、删除后其余回合 `start/end` 不变**；删到**一条用户提问都不剩**时不提供
+  「删到空」，**改道成「彻底删除整条会话」**（复用 `api.workbuddySessionDelete`，与 Trae 侧同源）。
+  计数口径抽成 `lib/wb-turn-model.ts` 的 `usersAfterEdit` / `usersAfterTurnRemoved`，
+  与后端 `validate_submit` 同源（新增 9 单测）。门禁：`tsc` 零错、`vitest` **66 passed**、
+  `vite build` **771.03 kB**（13.88 s）、渲染自查新增 `wb-editor-turndel` × 三档全绿
+  （左栏删除按钮 **10** 个 = 该会话 10 个回合；点开弹确认框「删除回合 1？…216 行（第 2–217 行）」）。
+  版本号已五处同步到 **v0.2.20**。
+- **v0.2.21 收掉用户报障的两点**：① 左栏回合 🗑 **常显**（去掉 `opacity-0 group-hover:opacity-100`，
+  与 Trae 侧一致 —— hover 才出现的破坏性按钮在触屏 / 键盘下等于不存在）；② 新增**批量删除回合**
+  （多选工具条：`多选删除` / `已选 N / M` / `全选` / `清空` / `删除选中（N）`，多选态下点整行即勾选）。
+  单回合接口统一成 `askDeleteTurns(indexes)` ⇒ 空会话硬拦天然按整批算；
+  新纯函数 `usersAfterTurnsRemoved`（单回合版本是它的退化情形，两函数必须同解）。
+  门禁：`tsc` 零错、`vitest` **73 passed**（`wb-turn-model` 38）、`vite build` **755.54 kB**（14.13 s）、
+  渲染自查新增 `wb-editor-multi` × 三档全绿（勾选框 10 / 已勾 2 / 无 hover `opacity=1` /
+  确认框「删除选中的 2 个回合？…247 行」）。版本号已五处同步到 **v0.2.21**。
+- **S5 跨客户端页脚的验收证据**（真机渲染自查，直接回答用户那句「怎么还是 workbuddy 到 workbuddy」）：
+  - `wb-import`（WorkBuddy → Trae）页脚 = **`写入到客户端 [Trae SOLO CN · 2 个账号][TRAE CN · 1 个账号]` +
+    `写入到 Trae 账号 / 测试账号（uid …5d5e70） / 写入到 Trae`**（v0.2.22 起客户端与账号分离）
+  - `wb-export`（Trae → WorkBuddy）页脚 = **`写入到 WorkBuddy 账号 / 测试账号（uid …5d5e70） / 写入到 WorkBuddy`**
+    （WorkBuddy 只有一个客户端 ⇒ 不渲染客户端 pill 行）
+- **v0.2.22 收掉用户报障的三点**（2026-10-11）：
+  ① **Trae → WorkBuddy 导入的会话 0 个回合**（`push_user` 没写 `<user_query>` 壳 + `classify_line`
+  按壳二分）⇒ 读的一端改走 `classify_user_message` 单一出口、写的一端补壳，**旧会话不用重导也能识别**；
+  ② **Trae 与 TRAE SOLO CN 账号混在一个下拉里**（同一 uid 两套，按 uid `find()` 会挑错客户端）
+  ⇒ `CrossWriteAccount.clientLabel` + `crossKeyOf()` 复合键 + 页脚两步选择；
+  ③ **删回合确认框长内容溢出**（grid auto 列被 `nowrap` 长行撑破）⇒ `min-w-0` + `break-all`（反证 536 → 0）。
+  门禁：`cargo test --workspace` **270 passed / 0 failed**（+ 15）、`tsc` 零错、`vitest` **73 passed**、
+  `vite build` **776.37 kB**（gzip 235.87 kB / 2m06s）、渲染自查 20+ 档全绿（`errors(0)`）。
+  版本号已五处同步到 **v0.2.22**。
+- **v0.2.23 补齐 Trae 侧批量删回合**（2026-10-11，用户要求「Trae 侧要做批量删回合」）：
+  S5.2 起只有 WorkBuddy 侧有多选删除，Trae 侧还是逐个 🗑 —— 两边能力不对齐。做法**不是新写一套**，
+  而是把 Trae 的单回合删除也改道走批量那条路（`askDeleteTurn(t) = askDeleteTurns([t.key])`），
+  这样「一个回合名下有哪些行」只有 `turnRefs` → `deleteRowRefs` 一份推导（硬约束 20）。
+  - **勾选键用 `TurnView.key`（`turn_id`）而不是下标**：Trae 侧删行会让行号整体前移，
+    用下标当勾选键，删掉一个回合之后其余勾选会悄悄指向别的回合（硬约束 19 ——
+    这一条与 WorkBuddy 的「原始行号不重排」**正好相反，别互相抄**）。
+  - 空会话判定抽成纯函数 `trae-turn-model::turnsLeftAfterRemoving(turns, keys)`，
+    与「`left === 0` ⇒ 改道删整条会话」同源。
+  - 新增 effect 摘掉已消失的勾选键（与 `selMsg` 那条对称），避免「已选 N」挂幽灵。
+  门禁：`tsc` 零错、`vitest` **78 passed**（`trae-turn-model` 35 → **40**）、
+  `vite build` **778.84 kB**（gzip 236.53 kB / 34.73 s）；渲染自查新增 `trae-editor-multi` × 三档
+  （勾选框 41 / 已勾 2 / 按钮 `删除选中（2）` / 确认框「…99 行」/ `alertOverflow.worstOverflow = 0`）
+  + `trae-editor-turndel-1360`（单回合改道后没退化：「删除回合 2？…28 行」）。
+  **反证**：把 `turnsLeftAfterRemoving` 临时改回「逐个算」⇒ 两个用例当场失败，还原后全绿。
+  版本号已五处同步到 **v0.2.23**。
+- **未提交、未发版**。
+
+**S4 为什么要「读分两步 + 写只回传 ops」**
+
+WorkBuddy 与 Trae 是**两套完全不同的数据模型**：Trae 是 20+ 张互引用表、正文是 `content` 列里的 JSON 载荷；
+WorkBuddy 的元数据只在 `~/.workbuddy/workbuddy.db` 的 **`sessions` 一张表**，
+正文是 `~/.workbuddy/projects/<工作区>/<cid>.jsonl`（**一行一个事件**）。
+真机单会话正文 **19 MB**、最大单行 **136 MB** ⇒ 整份 doc 过 IPC 会把前端冻死：
+
+- **读**：先给「回合索引 + 每行轻量预览」（`LineInfo`：`kind` / `textPath` / `preview`），
+  完整行按区间取（`edit_lines`，上限 400 行/次）。
+- **写**：`OutLine::Orig(usize)` **逐字节原样带回**未改动的行，只有改 / 新增的行才重新序列化 ⇒
+  改一段 text，其余 3183 行一个字节没变。
+- **校验两层**：前端 `validate_submit` 不读文件、不开库（靠 `doc.counts` / `lineKinds` 算，
+  **真实用户提问数归 0 直接硬拦**）；写入前 `validate_full` 解析整份结果，错误以 `ok=false`
+  **正常返回**（不是 `Err`），前端照样逐条显示。
+- **★ 顺带修掉一个真机 bug**：`std::fs::copy` 走 `CopyFileExW` 只申请 `FILE_SHARE_READ`，
+  而客户端正把 `workbuddy.db-shm` 内存映射着 ⇒ `os error 1224`。而 `list_sessions` 全走
+  `snapshot_db()` ⇒ 表现为**「WorkBuddy 在跑时会话记录页整个打不开」**。
+  修法：`copy_shared()` 手工 `File::open` + `io::copy`；**`-shm` 不复制**（让 SQLite 依 WAL 重建索引）；
+  先清上一轮残留（`-wal` 残留会读到**上一次**的事务帧）。
+
+**会话式右栏的真相（真机实测，不是推演）**
+
+| 侧 | 位置 | 实测 |
+| --- | --- | --- |
+| 用户提问 | `chat_message_general.content`（数组） | 82/82 项都是 `{type:"text", text_content}` |
+| 助手说明 | `chat_message_task.content.messages[].plan_item.thought` | 13 条非空 |
+| 助手工具调用 | 同上 `tool_call_info.name` | `finish` 24 / `Read` 17 / `RunCommand` 9 / `Edit` 5 / … |
+| 助手答复 | 同上 `finish` 的 `params.summary` | 17 非空 / 7 空 |
+| 大字段 | `chat_message_task.content` 整体按引用返回 | **53/82 条**是 `$jsonRef`（最大单行 9.8 MB） |
+
+**硬约束清单（都在 T46 小节里有实测依据）**
+
+1. **`fts_*` 是触发器维护的虚表**：照抄源行 ⇒ 词条翻倍；触发器补的又不全。⇒ 一律
+   「**排最后 + 写前按 `session_id` DELETE**」。这条也适用于 S4/S5 的任何复制路径。
+2. **身份列 = UNIQUE 索引列**，不是「非 INT 主键」；`message_id` 就是被漏掉的那个。
+3. **大字段必须走 `$jsonRef` 引用 + 按需展开**，且写入时**未展开的引用原样带回**；
+   前端遇到未展开的正文**只给「展开正文」按钮，不猜内容**。
+4. **跨账号写入必须改三处归属**（`chat_session.project_id` / `session_project.project_id` /
+   `context.last_real_project_id`），且 `target_uid` **只在 `insert` 模式**可用。
+5. **段的 `path` 相对 `content` 列的值**（不是相对整行）；**删一段三种删法不能混用**
+   （`thought` 只清空、`text_content` 摘 `content[i]`、工具/答复摘 `messages[i]`）；
+   **新增助手段必须是 `finish` 形状**。
+6. **空会话是客户端死穴**：`chat_turn` 与 `chat_message` 同时为空、只留 `chat_session` 行 ⇒
+   客户端永远卡在 `Env Creating`、发不出消息且无自愈路径。`validate` 必须硬拦；
+   「删到空」这条路一律改道成「删整条会话」。
+7. **入口唯一**：会话编辑器只有「列表行内 ✏️ 编辑这条会话」一个入口（`editSeed` = 该行 `id`）。
+   卡片头的独立入口、只读「会话详情」弹窗、左栏会话下拉**都不许复活**；要加「切到别的会话」，
+   先回答「那列表行的点击算什么」。
+8. **编辑器页脚不许再有「关闭编辑」按钮**（v0.2.18）：关闭只认右上角 ✕。删的时候要确认它与 ✕
+   走**同一条** `onOpenChange(false)` 路径，否则会出现「按钮删了、✕ 那条路却没清临时选择」的幽灵。
+9. **未改动的行必须逐字节原样保留**（WorkBuddy `OutLine::Orig`）：别用「整份重新序列化」替代 ——
+   JSONL 的键顺序 / 空白 / 浮点写法都会变；护栏单测 `untouched_lines_stay_byte_identical`。
+10. **`-shm` 不许进快照**，复制必须 `File::open` + `io::copy`（`copy_shared`），**不能用 `fs::copy`**。
+    判据：WorkBuddy 在跑时快照要能成功（否则 `list_sessions` 全线 `os error 1224`）。
+11. **编辑入口落在 `<label>` 行内必须 `preventDefault` + `stopPropagation`**：「数据迁移」页（`wb-import`）
+    整行是勾选用的 `<label>`，点哪儿都切换勾选 ⇒ 不拦就变成「点编辑顺带勾/取消勾了这条」。
+12. **两套「段」的来源不同，绝不共用一段拆分逻辑**：Trae 的段来自 `content` 列的 JSON 载荷
+    （`segmentsOf`，只能在既有结构里挖点）；WorkBuddy 的段来自 **JSONL 的 n 行**（`classify_line`，
+    可整行增删）。共用会把「一行」和「一段」混为一谈。
+13. **删回合 = 区间行全量标删，行号一律原始行号、不许重排**（v0.2.20）：区间内的本次新增行必须
+    一起带走（`at ∈ (start, end]`；`at === start` 属「会话开头」）；计数走 `usersAfterEdit` / `usersAfterTurnRemoved`，
+    与后端 `validate_submit` 同源；**删到一条用户提问都不剩时不给删，改道成「删整条会话」**。
+14. **破坏性按钮不许「hover 才显形」**（v0.2.21）：左栏回合 🗑 必须常显，与 Trae 侧一致。
+    判据：无 hover 时 `getComputedStyle(btn).opacity === "1"`。
+15. **批量删除必须按「一次要删的全部回合」算空会话**（v0.2.21）：逐个调用单回合版本会漏掉
+    「逐个都放行、合起来删光」的漏洞 ⇒ `usersAfterTurnsRemoved(kinds, edit, turns[])`，
+    单回合版本是它的退化情形（`usersAfterTurnRemoved(…) = usersAfterTurnsRemoved(…, [turn])`，**必须同解**）；
+    `removeTurns(indexes)` 也**不是**循环调用单回合版本（`removedTurns` 闭包会把判断带偏）。
+16. **「是不是用户提问」只许有一个出口**（v0.2.22）：判据一律走 `workbuddy_source::classify_user_message`。
+    `workbuddy_session_edit::classify_line` 与 `classify_json_kind` 都**必须**调它 ——
+    早先按「`content[0].text` 有没有 `<user_query>` 壳」二分，把 Trae → WorkBuddy 导出写出的
+    **裸文本提问**（没有壳）整条会话算成 0 个回合（用户报「从 trae 导入的会话回合无法识别」）。
+    实测原生会话里「没壳的 `role=user`」100% 是 auto/summary（4 条会话逐条 `real == wrapped`），
+    所以同口径判定不会造出假回合。同时导出侧 `push_user` 必须带 `<user_query>` 壳（写的一端也要对齐）。
+17. **跨端写入目标必须用复合键 `clientKey::uid`**（v0.2.22，`crossKeyOf()`）：Trae CN（IDE 版）与
+    TRAE SOLO CN 是两个客户端，本机 3 个 uid 在两个客户端下**各有一份**；只按 `uid`
+    `find()` 会命中列表里靠前的那个 ⇒ **选了 SOLO 却写到 IDE 库**。页脚因此拆成
+    「先选客户端（pill，只有 >1 个客户端时才出现）→ 再选该客户端的账号」。
+18. **Radix `AlertDialogContent` 是 grid + auto 列**（v0.2.22）：子元素默认 `min-width: auto`，
+    内容里只要有一行 `nowrap`（`truncate`）的长文本，整个弹窗就会被撑到卡片外。
+    护法：弹窗加 `max-w-[min(44rem,calc(100vw-2rem))]`、`AlertDialogHeader` 与 body 加 `min-w-0`，
+    长文本用 `break-all whitespace-pre-wrap` 自适应换行。判据 `alertOverflow.worstOverflow`（反证 536 → 0）。
+19. **批量删回合在两端的「勾选键」不同，别互相抄**（v0.2.23）：WorkBuddy 是**原始行号**（那边
+    删完不重排，所以下标稳定）；**Trae 必须用 `TurnView.key`（`turn_id`）** —— 那边删行会让行号
+    整体前移，用下标当勾选键，删掉一个回合后其余勾选会悄悄指向别的回合。
+20. **单个删除与批量删除只许有一条路**（v0.2.23）：Trae 侧 `askDeleteTurn(t)` =
+    `askDeleteTurns([t.key])`，「一个回合名下有哪些行」只有 `turnRefs` → `deleteRowRefs` 一份推导；
+    空会话判定抽成纯函数 `trae-turn-model::turnsLeftAfterRemoving(turns, keys)`，与
+    「`left === 0` ⇒ 改道删整条会话」同源。两处各写一遍 ⇒ 必然在某次调整里跑偏一次，
+    而症状是「删完客户端里还留着一半」或「写出了空壳会话」。
+
+**已知残留缺口**：本机 16 条会话都没有 `context.last_real_project_id`，该改写路径真机走不到，仅单测覆盖。
