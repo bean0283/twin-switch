@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-12 / 工作区 **v0.2.26**，含 T46 全阶段 + T48「SOLO 并入 Trae CN」+ T49「界面摘掉已并入客户端」+ T50「国际版 SOLO 一并摘掉」；最近正式版 **v0.2.24 已发版**，含 T42 / T43 / T44 / T45 / T48）
+> 分析时间：2026-10-04（最近更新：2026-10-12 / 工作区 **v0.2.26**，含 T46 全阶段 + T48「SOLO 并入 Trae CN」+ T49「界面摘掉已并入客户端」+ T50「国际版 SOLO 一并摘掉」；最近正式版 **v0.2.26 已发版**，含 T42 / T43 / T44 / T45 / T46 / T48 / T49 / T50）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -1763,3 +1763,27 @@ pills = ["Trae CN常用","Trae（国际版）"]   SOLO 项 = []   skeleton=0   o
 七档：账号管理 1600 / 1360 / 730 + 会话记录 / 首页 / 导入目标 / 导出源各 1360。
 与 T49 的差别：这一轮桩里**多了一个 `trae-intl`**，所以那条「只有 2 个标签」的画面上
 还多证明了一件事 —— **摘的是 SOLO，不是把国际版整条线一起抹掉**。
+
+### 12.6 发版核验（v0.2.26，2026-10-12）
+
+| 步骤 | 结果 |
+| --- | --- |
+| 提交 | `78e87b1`，20 文件 / +391 / −45 |
+| 推送 | Git Data API ⇒ 远端 SHA = 本地 = `78e87b1`，**tree 逐字节一致**；tag `v0.2.26` 已建 |
+| 构建 | `npm run tauri build` 3m08s ⇒ NSIS `TwinSwitch_0.2.26_x64-setup.exe`（6 067 024 B）+ MSI，**两套都带 `.sig`** |
+| 发布 | `Release v0.2.26`，`draft=false` / `prerelease=false`，正文 856 字符，三份资产全部 `uploaded` |
+| 清单 | `releases/latest/download/latest.json`：**200 / 1 285 B**，`version=0.2.26`，两个 platform 都指向安装包，`signature` 与 `.sig` 逐字符一致 |
+| 资产 | `curl -r 0-4095` GET ⇒ **206 + `MZ`**（**不是** HEAD，HEAD 拿 `000`） |
+| 地址 | https://github.com/bean0283/twin-switch/releases/tag/v0.2.26 |
+
+**发版期新踩的两个坑（已写进 `.workbuddy/memory/MEMORY.md`）：**
+
+1. **补 tag 不能第二次跑 `push-gitdata.py`**：它先比「本地父提交 == 远端 main」，而推送已经让远端 main
+   追平本地 ⇒ 必报「已分叉，中止」。正解 = 直接 `POST /repos/…/git/refs`，
+   body `{"ref":"refs/tags/vX.Y.Z","sha":"<commit>"}`（`--data-binary @文件`，得 **201**）。
+2. **`cargo check` 与 `cargo test` 写进同一条命令 ⇒ `cargo test` 直接 `os error 5（拒绝访问）`**：
+   前者刚写完 Windows 的 `.fingerprint/…/invoked.timestamp`，后者被占用。看着像代码坏了，其实是工具时序
+   ⇒ **分两条命令跑**。
+
+**另记一条不成文的现状**：`publish-release.py` 生成的 `latest.json` 里 `notes` 是**写死的空串**
+（正文只进 Release body）。别把它当漏写；要改就同趟改脚本。
