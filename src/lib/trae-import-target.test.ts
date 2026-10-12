@@ -63,6 +63,17 @@ describe("defaultTargetClient", () => {
     expect(defaultTargetClient("solo-intl", [orphan, hostCn])).toBe("trae-cn");
   });
 
+  test("国际版 SOLO 走同一条路：落到国际版 Trae，不落回国内版", () => {
+    const mergedIntl = client("solo-intl", {
+      installed: false,
+      runnable: false,
+      merged_into: "trae-intl",
+    });
+    const hostIntl = client("trae-intl");
+    // 承载方必须**是它自己那条线的**（trae-intl），落到 trae-cn 就是把国际版会话写进国内版库。
+    expect(defaultTargetClient("solo-intl", [mergedIntl, hostIntl, hostCn])).toBe("trae-intl");
+  });
+
   test("一个能用的都没有 ⇒ null（界面按「没有目标」处理）", () => {
     expect(defaultTargetClient("solo-cn", [mergedSolo])).toBeNull();
   });

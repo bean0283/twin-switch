@@ -419,8 +419,9 @@ export function traeImportRun(
 /**
  * 把「已并入该客户端」的客户端账号库里的账号一并带入。
  *
- * 2026-10 官方把 TRAE SOLO 并进 Trae CN 时只搬了程序与会话，**本工具自己的账号库
- * 官方不会碰** ⇒ SOLO 下备份过的账号在 Trae CN 下看不见、切不过去。
+ * 2026-10 官方把 TRAE SOLO 并进 Trae 时（国内版 → `trae-cn`，国际版 → `trae-intl`）
+ * 只搬了程序与会话，**本工具自己的账号库官方不会碰** ⇒ SOLO 下备份过的账号在承载方
+ * 下看不见、切不过去。
  * `dryRun` 只预演（列出会搬哪些），一个字节都不写。
  */
 export function traeVaultAdoptMerged(
