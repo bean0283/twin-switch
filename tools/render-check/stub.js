@@ -8,7 +8,9 @@
   const D = window.__RC_DATA__ || {};
 
   const handlers = {
-    "plugin:app|version": () => "0.2.24",
+    // ⚠️ 每次发版都要跟着改 —— 截图页脚会照实显示桩里的版本，忘了改就会出现
+    //    「代码是 vX、截图是 vY」的假证据。
+    "plugin:app|version": () => "0.2.25",
     "plugin:event|listen": () => 1,
     "plugin:event|unlisten": () => null,
     "plugin:event|emit": () => null,
