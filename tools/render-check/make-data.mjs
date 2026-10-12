@@ -45,8 +45,8 @@ const data = {
     clients: [
       // ⚠️ 顺序必须复刻**后端排序之后**的结果，不是 `CLIENTS` 的声明顺序。
       //
-      // 2026-10 官方把 SOLO 并进 Trae CN 之后，`solo-cn` 的使用分仍然最高
-      // （真机 127 次 / 切号 22 次），但它的主程序已经没了 —— 后端的
+      // 2026-10 官方把 SOLO 并进 Trae（国内版 → `trae-cn`，国际版 → `trae-intl`），
+      // `solo-cn` 的使用分仍然最高（真机 127 次 / 切号 22 次），但它的主程序已经没了 —— 后端的
       // `client_usage::sort_with_order` 会把「跑不起来」的客户端整体沉到末尾，
       // 所以界面取 `installed[0]` 拿到的是 `trae-cn`。
       //
@@ -70,6 +70,30 @@ const data = {
         exe: null,
         has_login: true,
         merged_into: "trae-cn",
+        runnable: false,
+      },
+      // 国际版两条线（2026-10 同一次动作：`solo-intl → trae-intl`）。
+      // 本机连数据目录都没有 ⇒ `installed: false`。
+      // ⚠️ `trae-intl` 必须一起放进来：否则「两条 SOLO 都不在标签条上」可能是被
+      //    「国际版整条线都没有」混过去的 —— 那验不出「只摘 SOLO、不连坐承载方」。
+      {
+        key: "solo-intl",
+        label: "TRAE SOLO（国际版）",
+        user_data_dir: "C:/x/TRAE SOLO",
+        installed: false,
+        exe: null,
+        has_login: false,
+        merged_into: "trae-intl",
+        runnable: false,
+      },
+      {
+        key: "trae-intl",
+        label: "Trae（国际版）",
+        user_data_dir: "C:/x/Trae",
+        installed: false,
+        exe: null,
+        has_login: false,
+        merged_into: null,
         runnable: false,
       },
     ],
@@ -372,6 +396,59 @@ const data = {
             dbBytes: 327155712,
           },
         },
+        // 国际版两条线：本机连数据目录都没有（`installed: false`）。
+        // ⚠️ 必须把 `trae-intl` 一起放进来 —— 只放 SOLO 会让「标签条上没 SOLO」
+        //    这条判据分辨不出「摘对了」和「整条线都没了」。
+        {
+          key: "solo-intl",
+          label: "TRAE SOLO（国际版）",
+          installed: false,
+          exe: null,
+          userDataDir: "C:/x/TRAE SOLO",
+          hasLogin: false,
+          mergedInto: "trae-intl",
+          runnable: false,
+          loginLabel: null,
+          running: false,
+          processCount: 0,
+          accounts: 0,
+          credits: { accountCount: 0, queryable: 0, withData: 0, totalRemaining: 0, updatedAt: null },
+          decrypted: {
+            exists: false,
+            current: false,
+            path: "C:/x/decrypted/solo-intl.db",
+            pages: 0,
+            tableCount: 0,
+            createdMs: 0,
+            sessionCount: 0,
+            dbBytes: 0,
+          },
+        },
+        {
+          key: "trae-intl",
+          label: "Trae（国际版）",
+          installed: false,
+          exe: null,
+          userDataDir: "C:/x/Trae",
+          hasLogin: false,
+          mergedInto: null,
+          runnable: false,
+          loginLabel: null,
+          running: false,
+          processCount: 0,
+          accounts: 0,
+          credits: { accountCount: 0, queryable: 0, withData: 0, totalRemaining: 0, updatedAt: null },
+          decrypted: {
+            exists: false,
+            current: false,
+            path: "C:/x/decrypted/trae-intl.db",
+            pages: 0,
+            tableCount: 0,
+            createdMs: 0,
+            sessionCount: 0,
+            dbBytes: 0,
+          },
+        },
       ],
       installedClients: 2,
       runningClients: 1,
@@ -410,8 +487,8 @@ const data = {
 
   // 更新状态：给一份「已是最新」，免得更新入口卡在检查中。
   updateState: {
-    currentVersion: "0.2.24",
-    latestVersion: "0.2.24",
+    currentVersion: "0.2.26",
+    latestVersion: "0.2.26",
     hasUpdate: false,
     checking: false,
     downloading: false,

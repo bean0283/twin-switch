@@ -430,8 +430,9 @@ pub async fn trae_import_account(client_key: String, payload: Value, prefer_name
 
 /// 把「已并入 `client_key` 的客户端」账号库里的账号全部并入它。
 ///
-/// 2026-10 官方把 TRAE SOLO 并进 Trae CN 时只搬了程序与会话，**本工具自己的账号库
-/// 官方不会碰** ⇒ SOLO 下备份过的账号在 Trae CN 下看不见、切不过去。
+/// 2026-10 官方把 TRAE SOLO 并进 Trae 时（国内版 → `trae-cn`，国际版 → `trae-intl`）
+/// 只搬了程序与会话，**本工具自己的账号库**官方不会碰 ⇒ SOLO 下备份过的账号在承载方
+/// 下看不见、切不过去。
 /// `dry_run = true` 只预演（列出将搬哪些），一个字节都不写。
 #[tauri::command]
 pub async fn trae_vault_adopt_merged(client_key: String, dry_run: Option<bool>) -> Result<Value, String> {

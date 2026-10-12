@@ -1,7 +1,8 @@
 /**
  * 「界面上该出现哪些 Trae 客户端」的**唯一判据**。
  *
- * 2026-10 官方把 TRAE SOLO 并进 Trae CN：只剩一个程序，SOLO 的数据目录留在原处。
+ * 2026-10 官方把 TRAE SOLO 并进 Trae：**国内版 `solo-cn → trae-cn`、国际版 `solo-intl → trae-intl`**
+ * （两条线同一次动作）。只剩一个程序，SOLO 的数据目录留在原处。
  * 本机（已合并）的 SOLO 因此是 `installed = true`（旧数据还在）+ `runnable = false`
  * （程序已卸载）——它仍然**能读**（旧会话要看得见、账号要能带过来），
  * 但**不能再作为一个可切换的客户端出现在界面上**：选中它只会让人以为切了号，
@@ -9,9 +10,12 @@
  *
  * ⚠️ 判据是「**已并入 且 本机跑不起来**」，不是「已并入」：老机器上 SOLO 还独立装着
  *    （`runnable = true`），那时它是个正常的可用客户端，摘掉反而是砍功能。
+ * ⚠️ 判据与后端完全同源：`runnable` 就是 `trae_discover::has_own_exe` + 数据目录在，
+ *    切号护栏（`ensure_switchable`）和导入目标护栏（`import_sessions`）也走这一条。
+ *    两端各写一份规则，早晚会出现「界面显示能选、后端报错」这类自相矛盾。
  * ⚠️ **未安装**的客户端照旧出现（置灰）—— 那是「本机存在这个概念」的提示，
  *    与「已并入」是两件事（见 `TraeClientSwitcher` 里 `installed` 与 `runnable` 的注释）。
- * ⚠️ 后端**不动** `trae_list_clients` 的返回：`solo-cn` 这个 key 还得能查到
+ * ⚠️ 后端**不动** `trae_list_clients` 的返回：`solo-cn` / `solo-intl` 这两个 key 还得能查到
  *    （`merged_into` 反查承载方、已有连线数据里存的 `client_key`、账号并入的源扫描都靠它）。
  *    这里只管「画不画出来」。
  */

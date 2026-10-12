@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-12 / 工作区 **v0.2.25**，含 T46 全阶段 + T48「SOLO 并入 Trae CN」+ T49「界面摘掉已并入客户端」；最近正式版 **v0.2.24 已发版**，含 T42 / T43 / T44 / T45 / T48）
+> 分析时间：2026-10-04（最近更新：2026-10-12 / 工作区 **v0.2.26**，含 T46 全阶段 + T48「SOLO 并入 Trae CN」+ T49「界面摘掉已并入客户端」+ T50「国际版 SOLO 一并摘掉」；最近正式版 **v0.2.24 已发版**，含 T42 / T43 / T44 / T45 / T48）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -1678,3 +1678,88 @@ T48（v0.2.24）修的是**行为**——切号 / 导入别落到 SOLO；这一�
 
 **教训**：**跑了新页面就得把该页要的命令补齐** —— 与「缺桩导致骨架常驻 25 秒」是同一类问题。
 自查环境里一条 `unhandledrejection` 就能把页面判成坏，所以补页面时要连着补桩。
+
+---
+
+## 十二、T50 · 国际版 SOLO 也要并进国际版 Trae（v0.2.26）
+
+### 12.1 这件事是什么
+
+2026-10-12 第三轮，用户：「国际版的 solo 也要删除」。
+
+上一轮（T49）只摘掉了国内版 `solo-cn` —— 因为 `merged_into` 只在国内版那条记录上写了。
+官方的合并是**两条线同时**发生的：**`solo-cn → trae-cn`、`solo-intl → trae-intl`**。
+T49 的判据本身没错（「已并入 且 本机跑不起来」），错的是**输入**：
+`solo-intl` 当时还是 `merged_into: None` ⇒ 判据压根没被触发 ⇒ 国际版 SOLO 照旧挂在标签条上。
+
+**这是典型的「同一件事只做了一半」**：另一半本机可能根本没装（本机 `TRAE SOLO` 连数据目录
+都没有），界面上看不出是漏改，只会在**别人**的机器上被当成怪事报上来。
+
+### 12.2 新增硬约束（编号接 §11）
+
+34. **合并是两条线，`solo-cn` / `solo-intl` 必须各有 `merged_into`**（分别指向 `trae-cn` /
+    `trae-intl`）。改一条线时**必须同趟检查另一条**。护栏（单测）
+    `trae_discover::tests::both_solo_lines_are_merged_into_their_own_ide`
+    + `merged_into_points_at_a_real_client`（承载方必须真实存在、不能是自己）。
+35. **`ensure_switchable` 的判据必须与「界面画不画」同源**：走
+    `trae_discover::has_own_exe(client)`（**本机**还找得到它自己的主程序），
+    **不能**只判 `merged_into`。反例：老机器上 SOLO 与 IDE 各自独立装着，
+    界面把它显示成可点、后端却一律拒绝 ⇒ 自相矛盾，而且砍掉了仍能用的路径。
+    承载方回退（`detect_exe` / `process_names`）**照旧**保留 —— 那是「杀进程 / 读网关」要用的。
+36. **产品事实（`merged_into`）与本机事实（`runnable`）是两个维度，不许互相替代**：
+    `merged_into` 决定「它还是不是一个独立产品」，`runnable` 决定「这台机器上它还能不能跑」。
+    界面摘不摘 = `merged_into.is_some() && runnable === false`。
+37. **账号并入的源是按 `merged_into == 目标` 反查的**（`adopt_merged_accounts`）⇒
+    漏写一条并入关系，那条线的账号就**永远没有入口**搬到承载方（用户只会在承载方下
+    「少了几个账号」，没有任何报错）。这也是 34 的第二个理由。
+38. **自查桩必须把两条线都放进去，且承载方也要放**：只放 `solo-intl` 会让
+    「标签条上没有 SOLO」这条判据分辨不出「摘对了」和「整条线都没了」；
+    放上 `trae-intl`（未安装、置灰）才能同时证明**不连坐承载方**。
+
+### 12.3 改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `crates/wb-switch-core/src/modules/trae_discover.rs` | `solo-intl` 的 `merged_into` ⇒ `Some("trae-intl")`；新增 `pub fn has_own_exe()`（唯一判据）；模块头/字段注释改成两条线；新增 2 条单测（承载方真实性 + 两条线都并入） |
+| `crates/wb-switch-core/src/modules/trae_switch.rs` | `ensure_switchable`：`merged_into` 有值**且** `has_own_exe == false` 才拦（原先只判前者） |
+| `crates/wb-switch-core/src/modules/trae_import.rs` | 目标护栏的注释与判据说明对齐（判据本就是 `runnable`，无需改码） |
+| `crates/wb-switch-core/src/modules/app_overview.rs` | `mergedInto` / `runnable` 注释写明两者不可互替 |
+| `crates/wb-switch-core/src/modules/trae_vault.rs` | `adopt_merged_accounts` 的说明补上「两条线」与「漏写 = 账号没有入口」 |
+| `src-tauri/src/commands.rs` / `src/lib/api.ts` | `trae_vault_adopt_merged` 的注释补上两条线 |
+| `src/lib/trae-client-list.ts` | 判据注释补上「合并是两条线」与「与后端同源（`has_own_exe` / `ensure_switchable` / `import_sessions` 三处同源）」 |
+| `src/lib/trae-client-list.test.ts` | 19 条（新增：国际版 SOLO 同判据 / 国际版 Trae 不连坐 / 真机四客户端只剩两个 IDE） |
+| `src/lib/trae-import-target.test.ts` | 11 条（新增：国际版 SOLO 落到 `trae-intl`，**不能落回国内版**） |
+| `tools/render-check/make-data.mjs` | 桩加入 `solo-intl`（`merged_into: "trae-intl"`）与 `trae-intl`（未安装、不并入），并同步 `appOverview.trae.clients`；版本号跟随发版 |
+| `tools/render-check/stub.js` | `plugin:app|version` ⇒ 0.2.26 |
+
+### 12.4 反证（两侧各做一次，先证判据抓得住）
+
+**① 界面侧**（把桩里 `solo-intl.merged_into` 临时改回 `null`）：
+
+```
+pills : 3 个标签 = ["Trae CN常用","TRAE SOLO（国际版）","Trae（国际版）"]
+pills : SOLO 项 = ["TRAE SOLO（国际版） @ Trae 客户端（账号管理）"]
+【判定】… ❌ SOLO 仍在标签条上：trae-pill-switch-1360 → TRAE SOLO（国际版） …
+```
+
+⇒ 国际版 SOLO 是否出现**确实**由那条并入关系决定，不是被别的东西挡住的。
+
+**② 后端侧**（把 `solo-intl` 的 `merged_into` 临时改回 `None`，跑 `cargo test -p wb-switch-core --lib trae_discover::tests`）：
+
+```
+test modules::trae_discover::tests::both_solo_lines_are_merged_into_their_own_ide ... FAILED
+  left: None   right: Some("trae-intl")
+```
+
+⇒ 这条护栏确实能抓住「只改一条线」。两侧还原后均归零。
+
+### 12.5 自查结论（v0.2.26）
+
+```
+【判定】客户端标签条 7/7 档画出来了  ✅  ✅ 标签条上没有 SOLO  ✅ 版式干净
+pills = ["Trae CN常用","Trae（国际版）"]   SOLO 项 = []   skeleton=0   overflowX=0   竖排=0   errors=0
+```
+
+七档：账号管理 1600 / 1360 / 730 + 会话记录 / 首页 / 导入目标 / 导出源各 1360。
+与 T49 的差别：这一轮桩里**多了一个 `trae-intl`**，所以那条「只有 2 个标签」的画面上
+还多证明了一件事 —— **摘的是 SOLO，不是把国际版整条线一起抹掉**。

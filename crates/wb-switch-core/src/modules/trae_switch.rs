@@ -480,16 +480,25 @@ fn make_rollback_dir() -> PathBuf {
 }
 
 /// 执行冷切换到目标账号。
-/// 切号前置检查：**已合并的客户端不许再切**。
+/// 切号前置检查：**已合并、且本机已经没有它自己的程序的客户端**不许再切。
 ///
-/// ⚠️ 为什么必须硬拦：2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，SOLO 自己的程序没了、
-/// 它的 `storage.json` 停在合并那一刻（真机实测：SOLO 的库与登录态自 2026-10-12 17:51
-/// 起再无任何写入）。继续往那个目录写不会**报错**，只会**不生效** —— 用户看到的是
-/// 「切了但没反应」，比直接拒绝更难排查。所以这里把话说清楚：去承载方切，账号是同一批。
+/// ⚠️ 为什么必须硬拦：2026-10 官方把 TRAE SOLO 并进 Trae 之后（国内版 `solo-cn → trae-cn`、
+/// 国际版 `solo-intl → trae-intl`），SOLO 自己的程序没了、它的 `storage.json` 停在合并那一刻
+/// （真机实测：SOLO 的库与登录态自 2026-10-12 17:51 起再无任何写入）。继续往那个目录写
+/// 不会**报错**，只会**不生效** —— 用户看到的是「切了但没反应」，比直接拒绝更难排查。
+/// 所以这里把话说清楚：去承载方切，账号是同一批。
+///
+/// ⚠️ 判据必须是「**本机自己也跑不起来**」（[`crate::modules::trae_discover::has_own_exe`]），
+/// **不能**只判 `merged_into`：老机器上 SOLO 与 IDE 还各自独立装着，那时 SOLO 是个
+/// 正常可用的客户端，一刀切拒绝 = 砍功能（而且界面把它显示成可选、后端却报错，自相矛盾）。
+/// 同一判据的另一处用法见 `trae_import::import_sessions` 的目标护栏。
 fn ensure_switchable(client: &TraeClient) -> Result<(), String> {
     let Some(host) = client.merged_into else {
         return Ok(());
     };
+    if crate::modules::trae_discover::has_own_exe(client) {
+        return Ok(());
+    }
     let host_label = get_client(host).map(|c| c.label).unwrap_or(host);
     Err(format!(
         "{} 已并入「{host_label}」：本机只剩一个程序，它的数据目录已停用。\n\

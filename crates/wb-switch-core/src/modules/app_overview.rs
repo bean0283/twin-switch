@@ -82,8 +82,12 @@ fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
         "exe": c.exe,
         "userDataDir": c.user_data_dir,
         "hasLogin": c.has_login,
-        // 2026-10 官方把 SOLO 并进 Trae CN：`mergedInto` 非空表示「这个客户端已经没有
-        // 自己的程序了，功能由它承载」，`runnable` 才是「本机能不能跑起来」的判据。
+        // 2026-10 官方把 SOLO 并进 Trae：`mergedInto` 非空表示「这个客户端已经没有
+        // 自己的程序了，功能由它承载」（国内版 → `trae-cn`，国际版 → `trae-intl`），
+        // `runnable` 才是「本机能不能跑起来」的判据。
+        // ⚠️ 两者**不可互相替代**：合并是产品事实，runnable 是本机事实。
+        //    界面「画不画」= mergedInto 非空 **且** runnable === false
+        //    （见前端 `@/lib/trae-client-list`，两端同一条）。
         "mergedInto": c.merged_into,
         "runnable": c.runnable,
         // 当前登录账号（真实昵称 + uid 尾号）。未登录 / 读不出登录态 ⇒ null。

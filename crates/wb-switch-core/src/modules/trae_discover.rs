@@ -1,7 +1,11 @@
 //! Trae 客户端发现：定位各版本的用户数据目录、可执行文件与进程名（移植自 trae-switch src/discover.js）。
 //!
-//! 同一台机器可能同时装 Trae CN 与 TRAE SOLO CN，二者账号库相互独立；
-//! 登录态只认 `storage.json` 的 `iCubeAuthInfo://*`。
+//! 同一台机器可能同时装多个 Trae 客户端（国内版 / 国际版，以及合并前遗留的 SOLO），
+//! 它们的账号库相互独立；登录态只认 `storage.json` 的 `iCubeAuthInfo://*`。
+//!
+//! 2026-10 官方把 TRAE SOLO 并进 Trae（国内版 `solo-cn → trae-cn`、国际版 `solo-intl → trae-intl`）
+//! ⇒ 这两条 SOLO 记录仍留在这个表里（旧数据要能读），但**不再是可独立使用的客户端**，
+//! 判据见 [`has_own_exe`]。
 
 use std::path::{Path, PathBuf};
 
@@ -18,12 +22,17 @@ pub struct TraeClient {
     pub remote_host: &'static str,
     /// **已并入哪个客户端**（`None` = 仍是独立客户端）。
     ///
-    /// 2026-10 官方把 TRAE SOLO 并进了 Trae CN：装 `Trae CN` 一处，双击先开 SOLO 界面、
-    /// 再双击开 IDE，`Programs\TRAE SOLO CN` 下的主程序被卸载（只剩日志）。
-    /// 所以 SOLO 的**程序与进程都归 Trae CN**，只有数据目录留在原处（成为历史数据）。
+    /// 2026-10 官方把 TRAE SOLO 并进了 Trae：国内版 `solo-cn → trae-cn`、
+    /// 国际版 `solo-intl → trae-intl`（两条线同一次动作）。装一个客户端，双击先开 SOLO
+    /// 界面、再双击开 IDE，SOLO 自己的主程序被卸载（只剩日志）。
+    /// 所以 SOLO 的**程序与进程都归承载方**，只有数据目录留在原处（成为历史数据）。
     ///
-    /// ⚠️ 这个字段只影响「去哪找程序 / 杀哪个进程」，**不动 `user_data`** —— 老数据仍要能读，
-    /// 否则用户原来的会话就彻底看不见了。
+    /// ⚠️ 这个字段只影响「去哪找程序 / 杀哪个进程 / 界面上还算不算一个可选项」，
+    /// **不动 `user_data`** —— 老数据仍要能读，否则用户原来的会话就彻底看不见了。
+    ///
+    /// ⚠️ 判据本身**不带「本机」信息**：合并是产品事实，与这台机器装没装无关。
+    /// 「这台机器上还该不该出现」由 `runnable`（有没有它自己的主程序）决定，
+    /// 见 `InstalledClient::runnable` 与前端 `@/lib/trae-client-list` 的两段判据。
     pub merged_into: Option<&'static str>,
 }
 
@@ -58,7 +67,7 @@ pub const CLIENTS: [TraeClient; 4] = [
         user_data: "TRAE SOLO",
         api_host: "https://api.trae.ai",
         remote_host: "https://api.trae.ai",
-        merged_into: None,
+        merged_into: Some("trae-intl"),
     },
 ];
 
@@ -89,7 +98,7 @@ pub fn storage_json_path(client: &TraeClient) -> PathBuf {
 /// 探测客户端主程序路径；未装返回 None。
 ///
 /// 已合并的客户端（见 [`TraeClient::merged_into`]）在自己找不到程序时**回退到承载方** ——
-/// SOLO 并入 Trae CN 之后，SOLO 界面就是 `Trae CN.exe` 开出来的，回退是对「它现在住在哪」的
+/// SOLO 并入 Trae 之后，SOLO 界面就是承载方那个 `.exe` 开出来的，回退是对「它现在住在哪」的
 /// 如实描述。老机器上 SOLO 还独立装着，`detect_exe_own` 会先命中，回退不会生效。
 pub fn detect_exe(client: &TraeClient) -> Option<PathBuf> {
     if let Some(p) = detect_exe_own(client) {
@@ -99,6 +108,18 @@ pub fn detect_exe(client: &TraeClient) -> Option<PathBuf> {
         return detect_exe_own(host);
     }
     None
+}
+
+/// 本机还找得到**它自己的**主程序（不含合并回退）—— 即「它仍是一个能独立使用的客户端」。
+///
+/// 这是「这台机器上它还该不该被当成一个可选项」的唯一判据，**别拿 `detect_exe()` 代替**：
+/// 后者对合并后的 SOLO 会回退到承载方的 exe（读网关、杀进程都需要），
+/// 于是「已并入」的 SOLO 会被算成「可运行」，首屏又会默认落到它身上。
+///
+/// 它与合并事实是两件事：合并是产品事实（`merged_into`），能不能跑是本机事实（这里）。
+/// 老机器上 SOLO 还独立装着 ⇒ `true` ⇒ 界面照常显示、切号照常放行（别砍功能）。
+pub fn has_own_exe(client: &TraeClient) -> bool {
+    detect_exe_own(client).is_some()
 }
 
 /// 只按**本客户端自己的名字**找主程序（不含合并回退）。
@@ -242,13 +263,16 @@ pub struct InstalledClient {
     pub merged_into: Option<&'static str>,
     /// **本机能不能「独立」把它跑起来**：数据目录在 **且** **它自己的**主程序在。
     ///
-    /// ⚠️ 判据必须是「自己的主程序」，**不能算合并回退**：SOLO 并入 Trae CN 之后，
-    /// `detect_exe(solo-cn)` 仍能回退到 `Trae CN.exe`（那是对的 —— 退出进程、读网关都要用它），
+    /// ⚠️ 判据必须是「自己的主程序」，**不能算合并回退**：SOLO 并入 Trae 之后，
+    /// `detect_exe(solo-cn)` 仍能回退到承载方的 exe（那是对的 —— 退出进程、读网关都要用它），
     /// 但 SOLO 已经**不是一个能独立使用的客户端**了（切号被拦、也没有自己的界面）。
     /// 若这里跟着回退走，`solo-cn` 的使用分最高，首屏又会默认落到它身上 —— 白修。
     ///
     /// 它和 `installed` **不是一回事**，别互相替代：界面拿 `runnable` 决定
     /// 「默认打开谁 / 能不能切号」，拿 `installed` 决定「要不要把这一项显示出来」。
+    ///
+    /// 判据与 [`has_own_exe`] 是同一条（数据目录在 **且** 自己的主程序在），
+    /// 切号护栏 `trae_switch::ensure_switchable` 也走它 —— 三处必须同源。
     pub runnable: bool,
 }
 
@@ -297,4 +321,33 @@ pub fn extra_roots() -> Vec<PathBuf> {
 /// 判断路径是否是某客户端的数据目录（供校验）。
 pub fn is_client_root(client: &TraeClient, dir: &Path) -> bool {
     dir == user_data_dir(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 承载方必须真实存在，而且不能是自己（否则 `detect_exe` / `process_names` 的回退会绕死）。
+    #[test]
+    fn merged_into_points_at_a_real_client() {
+        for c in CLIENTS.iter() {
+            let Some(host) = c.merged_into else { continue };
+            assert!(get_client(host).is_some(), "{} 的承载方「{host}」不存在", c.key);
+            assert_ne!(host, c.key, "{} 不能并入自己", c.key);
+        }
+    }
+
+    /// ⚠️ 合并是**两条线同时**发生的，这条把「改了一半」钉死。
+    ///
+    /// 反例（真机踩过）：只写了 `solo-cn → trae-cn`，于是国内版 SOLO 从标签条上消失了，
+    /// 国际版 SOLO 还挂在上面 —— 用户看到的就是「国际版的那个怎么还在」。
+    /// 这类「同一件事只做一半」的漏改在界面上很难看出是漏改（另一条线本机可能压根没装）。
+    #[test]
+    fn both_solo_lines_are_merged_into_their_own_ide() {
+        assert_eq!(get_client("solo-cn").unwrap().merged_into, Some("trae-cn"));
+        assert_eq!(get_client("solo-intl").unwrap().merged_into, Some("trae-intl"));
+        // 承载方本身必须仍是独立客户端 —— 否则回退链没有终点。
+        assert!(get_client("trae-cn").unwrap().merged_into.is_none());
+        assert!(get_client("trae-intl").unwrap().merged_into.is_none());
+    }
 }
