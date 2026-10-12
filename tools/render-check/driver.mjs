@@ -64,6 +64,51 @@ const MERGE_PROBE = `(async () => {
   };
 })()`;
 
+/**
+ * 「合并后的 SOLO 不该再出现在客户端标签条上」。
+ *
+ * 判据落在**真实的标签条 DOM** 上，不是看源码：客户端切换条是一个 `role="group"`、
+ * `aria-label` 以「Trae 客户端」开头的容器，里面每个 `<button>` 就是一个客户端。
+ * 官方把 SOLO 并进 Trae CN 之后本机没有 SOLO 自己的程序（`runnable = false`）
+ * ⇒ 它必须从标签条上消失，承载方 Trae CN 必须还在。
+ *
+ * ⚠️ 只认**标签条内部**的按钮。页面上别处也会出现「TRAE SOLO CN」字样（账号页的
+ *    「一并带入」提示条就会写来源客户端名），那不算漏出来 —— 所以不能全文搜字符串。
+ * ⚠️ 自带轮询：页面挂载后还要拉一次 `trae_list_clients` 才有标签条。
+ */
+const CLIENT_PILL_PROBE = `(async () => {
+  const readPills = () => {
+    const out = [];
+    for (const g of document.querySelectorAll('[role="group"]')) {
+      const label = g.getAttribute('aria-label') || '';
+      if (!label.startsWith('Trae 客户端')) continue;
+      for (const b of g.querySelectorAll('button')) {
+        out.push({ group: label, text: (b.textContent || '').replace(/\\s+/g, ' ').trim() });
+      }
+    }
+    return out;
+  };
+  const deadline = Date.now() + 15000;
+  let pills = readPills();
+  while (pills.length === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    pills = readPills();
+  }
+  const solo = pills.filter((p) => /SOLO/i.test(p.text));
+  const groups = [...document.querySelectorAll('[role="group"]')]
+    .map((g) => g.getAttribute('aria-label') || '')
+    .filter((l) => l.startsWith('Trae 客户端'));
+  return {
+    // 有标签条 **且** 一条 SOLO 都没有，才算过。
+    ok: pills.length > 0 && solo.length === 0,
+    pillCount: pills.length,
+    labels: pills.map((p) => p.text),
+    soloPills: solo.map((p) => p.text + ' @ ' + p.group),
+    groups,
+    skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+  };
+})()`;
+
 const MEASURE = `(() => {
   const de = document.documentElement;
   const overflowX = de.scrollWidth - window.innerWidth;
@@ -624,6 +669,16 @@ const CASES = [
   { name: "trae-switch-1600", route: "/trae-switch", width: 1600, height: 900, probe: MERGE_PROBE },
   { name: "trae-switch-1360", route: "/trae-switch", width: 1360, height: 800, probe: MERGE_PROBE },
   { name: "trae-switch-730", route: "/trae-switch", width: 730, height: 800, probe: MERGE_PROBE },
+
+  // 「合并后的 SOLO 不该再出现在客户端标签条上」：五个有客户端选择器的页面全都要覆盖
+  // （v0.2.25 之前账号管理页自己内联了一套标签条，正是它漏了）。
+  { name: "trae-pill-switch-1600", route: "/trae-switch", width: 1600, height: 900, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-switch-1360", route: "/trae-switch", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-switch-730", route: "/trae-switch", width: 730, height: 800, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-records-1360", route: "/trae-records", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-home-1360", route: "/", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-import-1360", route: "/workbuddy-import", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
+  { name: "trae-pill-export-1360", route: "/workbuddy-export", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
 ];
 
 const only = process.argv[2];
@@ -680,13 +735,21 @@ for (const c of list) {
       `\n  errors(${(r.errors || []).length}): ${(r.errors || []).slice(0, 4).join(" | ")}`,
   );
   if (r.probe) {
-    console.log(
-      r.probe.found
-        ? `  merge : found=true 按钮=${JSON.stringify(r.probe.btn)} 提示条=${JSON.stringify(r.probe.banner)} 视口=${r.probe.viewportW}` +
-            `\n  merge : 文案=${JSON.stringify(r.probe.text)}`
-        : `  merge : found=false alerts=${r.probe.alerts} skeleton=${r.probe.skeletons} buttons=${r.probe.buttons}` +
-            `\n  merge : 正文=${JSON.stringify(r.probe.text)}`,
-    );
+    if ("soloPills" in r.probe) {
+      console.log(
+        `  pills : ${r.probe.pillCount} 个标签 = ${JSON.stringify(r.probe.labels)}` +
+          `\n  pills : SOLO 项 = ${JSON.stringify(r.probe.soloPills)}  skeleton=${r.probe.skeletons}` +
+          `\n  pills : 容器 = ${JSON.stringify(r.probe.groups)}`,
+      );
+    } else {
+      console.log(
+        r.probe.found
+          ? `  merge : found=true 按钮=${JSON.stringify(r.probe.btn)} 提示条=${JSON.stringify(r.probe.banner)} 视口=${r.probe.viewportW}` +
+              `\n  merge : 文案=${JSON.stringify(r.probe.text)}`
+          : `  merge : found=false alerts=${r.probe.alerts} skeleton=${r.probe.skeletons} buttons=${r.probe.buttons}` +
+              `\n  merge : 正文=${JSON.stringify(r.probe.text)}`,
+      );
+    }
   }
   if (b.vertical?.length) console.log("  before 竖排样本:", JSON.stringify(b.vertical));
   if (a.vertical?.length) console.log("  after 竖排样本:", JSON.stringify(a.vertical));
@@ -720,6 +783,26 @@ if (mergeCases.length) {
       (remounted.length
         ? `  ℹ️ 走过一次冷启动重试：${remounted.map((r) => r.case).join(", ")}`
         : ""),
+  );
+}
+
+// 汇总判据二：客户端标签条上**一条 SOLO 都不能有**（它已被摘掉），且标签条得画出来。
+// ⚠️ 判据用 `/SOLO/i` 匹配标签文字，不是全文搜「TRAE SOLO CN」—— 账号页的「一并带入」
+//    提示条会写来源客户端名，全文搜会把那条正确文案判成漏。
+const pillCases = out.filter((r) => r.probe && "soloPills" in r.probe);
+if (pillCases.length) {
+  const noBar = pillCases.filter((r) => (r.probe.pillCount ?? 0) === 0);
+  const leaked = pillCases.filter((r) => (r.probe.soloPills || []).length > 0);
+  const messy = pillCases.filter(
+    (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
+  );
+  console.log(
+    `\n【判定】客户端标签条 ${pillCases.length - noBar.length}/${pillCases.length} 档画出来了` +
+      (noBar.length ? `  ❌ 没标签条：${noBar.map((r) => r.case).join(", ")}` : "  ✅") +
+      (leaked.length
+        ? `  ❌ SOLO 仍在标签条上：${leaked.map((r) => `${r.case} → ${r.probe.soloPills.join(" / ")}`).join("; ")}`
+        : "  ✅ 标签条上没有 SOLO") +
+      (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净"),
   );
 }
 

@@ -8,7 +8,7 @@
 > **下文凡出现 `trae-switch-cn` 之处，多为当时的实况记录，刻意保留不改**（例如 GitHub 仓库名
 > 与发布产物名仍是旧的）；涉及**当前**路径与版本的行，已在行内标注或更新。
 
-> 分析时间：2026-10-04（最近更新：2026-10-11 / 工作区 **v0.2.21**，含 T46 全阶段 + WB 侧删回合 / 批量删回合但**未发版**；最近正式版 **v0.2.13 已发版**，含 T42 / T43 / T44 / T45）
+> 分析时间：2026-10-04（最近更新：2026-10-12 / 工作区 **v0.2.25**，含 T46 全阶段 + T48「SOLO 并入 Trae CN」+ T49「界面摘掉已并入客户端」；最近正式版 **v0.2.24 已发版**，含 T42 / T43 / T44 / T45 / T48）
 > 分析依据：`D:\htw\签到\trae-session_这份是之前执行的记录…_6abf7aed_1.md`（28161 行 / 1.46 MB / 73 轮交互）
 > 核验方式：除通读记录外，另对 **git 历史、工作区、版本一致性、Rust 编译、GitHub Release** 做了实际核查，下文凡标 ✅ 者为本次实检结论，非照抄记录。
 > 当前进度以 **第五节「本轮新闭环」** 与 `docs/任务书.md` 的任务识别表为准。
@@ -1597,3 +1597,84 @@ WorkBuddy 的元数据只在 `~/.workbuddy/workbuddy.db` 的 **`sessions` 一张
    **列这类目录别接 `head`。** 私钥是**加密**的（`rsign encrypted secret key`），口令必须给。
 3. **Git Bash 的 `/tmp` ≠ Python 眼中的 `/tmp`**：`curl -o /tmp/x.json` 落在 MSYS 目录，
    Python `open('/tmp/x.json')` 直接 `FileNotFoundError`。两边**都用 Windows 路径**。
+
+---
+
+## 十一、T49 · 客户端选择器摘掉「已并入且本机跑不起来」的（v0.2.25）
+
+### 11.1 这件事是什么
+
+2026-10-12 第二轮，用户：「trae solo 已经不存在了，程序界面这个选项可以删除了」。
+T48（v0.2.24）修的是**行为**——切号 / 导入别落到 SOLO；这一轮修**外观**——把 SOLO 从界面上摘掉。
+
+判据 = **已并入 且 `runnable === false`**（**不是**「已并入」）：
+
+| | 本机（已合并） | 老机器（SOLO 还独立装着） |
+| --- | --- | --- |
+| `installed` / `runnable` | `true` / `false` | `true` / `true` |
+| 界面 | **摘掉** | 照常显示（它能单独跑） |
+
+⚠️ 后端 `trae_list_clients` **照旧返回** `solo-cn`：`merged_into` 反查承载方、已有连线数据里的
+`client_key`、账号并入的源扫描都要这个 key。这里只管「画不画」。
+
+### 11.2 新增硬约束（编号接 §10）
+
+28. **「界面上该出现哪些客户端」只有一处判据** `src/lib/trae-client-list.ts`：
+    `isSelectableClient` / `selectableClients` / `resolveSelectableKey` / `firstSelectableKey`。
+    5 处选择器（首页 / 账号管理 / 会话记录 / 导入目标 / 导出源）与 4 处默认值**全走它**。
+29. **摘的判据是「已并入 **且** 本机跑不起来」**，不是「已并入」：老机器上 SOLO 还独立装着
+    （`runnable === true`），摘掉 = 砍功能。
+30. **选中项回落不许写 `prev ?? first`**：`localStorage` 里可能留着已被摘掉的 key
+    （`solo-cn` 的使用分最高）⇒ 选中态悬空。一律 `resolveSelectableKey(prev, clients)`。
+31. **`selectableClients` 与 `targetClientOptions` 是两条判据，别合并**：前者管「画不画」
+    （**未安装的仍画、置灰**），后者管「能不能当导入目标」（必须已安装且能跑）。
+32. **`TraeClientSwitcher` 内部先过滤再画**：调用方不用各自 filter；空判断也要用过滤后的列表
+    （`visible.length === 0 ⇒ return null`，不是 `clients.length === 0`）。
+33. **页面文案与入口必须同趟落地**：摘掉 SOLO 之后，「重置排序」等文案不许再提 `TRAE SOLO CN`；
+    遗留的 `trae-session-editor` / 记录页帮助文案里的举例也一并改准。
+
+### 11.3 改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/lib/trae-client-list.ts`（新） | 唯一判据 + 4 个导出 |
+| `src/lib/trae-client-list.test.ts`（新） | 16 条单测（老后端缺 `runnable` 不误伤 / 空串不算已并入 / camelCase / 回落） |
+| `src/components/trae-client-switcher.tsx` | 内部过滤；「已并入」tooltip 改为老机器语境 |
+| `src/pages/TraeSwitchPage.tsx` | **改用共用标签条**（原先是自己内联的，漏徽标与置灰）、`visibleClients` / `clientOptions`、文案去 SOLO、删无用的 `cn` 导入 |
+| `src/pages/TraeRecordsPage.tsx` / `src/pages/WorkbuddyExportPage.tsx` | 默认值走 `resolveSelectableKey` |
+| `src/pages/WorkbuddyImportPage.tsx` | `clientOptions` 补 `merged_into` / `runnable`；兜底改「可见且已安装」 |
+| `src/pages/HomePage.tsx` | 新增 `visibleTraeClients`；选中项与兜底 `useEffect` 全看它 |
+| `src/lib/api.ts` | 排序/重置注释按「排序键首段是能不能跑起来」改写 |
+| `tools/render-check/driver.mjs` | 新增 `CLIENT_PILL_PROBE` + 7 档 + 判定段（probe 打印按形状分派） |
+| `tools/render-check/stub.js` | 补 `trae_cleanup_scan` / `trae_wb_cleanup_scan`（见 11.5） |
+
+**为什么账号管理页那处要单独说**：它**没有**用共用组件，而是自己内联了一套 `<button>` 循环
+（没有「已并入」徽标、置灰用 `!installed`）——T48 的「已并入」改造漏了它。
+正是「同一件事两处实现必然有一处跑偏」的又一例，本轮统一掉。
+
+### 11.4 渲染自查（新增 `CLIENT_PILL_PROBE`）
+
+判据落在**真实标签条 DOM** 上：只读 `role="group"` 且 `aria-label` 以「Trae 客户端」开头的容器内的
+`<button>`，**有标签条 且 一条 SOLO 都没有**才算过。
+
+⚠️ **不能全文搜「TRAE SOLO CN」**：账号页的「一并带入」提示条本来就写着来源客户端名
+（那是正确文案），全文搜会把对的说成错的。
+
+```
+【判定】客户端标签条 7/7 档画出来了  ✅  ✅ 标签条上没有 SOLO  ✅ 版式干净
+```
+- 账号管理 1600 / 1360 / 730 + 会话记录 / 首页 / 导入目标 / 导出源各 1360
+- 七档 `pills = ["Trae CN常用"]`、`SOLO 项 = []`、`skeleton=0`、`overflowX=0`、`竖排=0`、`errors=0`
+- 反证：`isSelectableClient` 临时 `return true` ⇒ `pills = ["Trae CN常用","TRAE SOLO CN已并入"]`、
+  探针报 `❌ SOLO 仍在标签条上`；还原后全绿
+
+### 11.5 自查工具缺陷第 4 条：桩缺命令 ⇒ 页面抛「读 null 属性」
+
+首页第一次进自查就报 2 条 `unhandledrejection`：
+`Cannot read properties of null (reading 'categories')`（`HomePage.tsx` 的 `trae.value.categories`）。
+
+**根因不是页面**：`trae_cleanup_scan` / `trae_wb_cleanup_scan` 没桩 ⇒ unstubbed 兜底返回 `null`，
+而 `HomePage` 写的是 `(trae.value.categories ?? [])`（假设 `value` 非 null）。补两条桩后 `errors(0)`。
+
+**教训**：**跑了新页面就得把该页要的命令补齐** —— 与「缺桩导致骨架常驻 25 秒」是同一类问题。
+自查环境里一条 `unhandledrejection` 就能把页面判成坏，所以补页面时要连着补桩。

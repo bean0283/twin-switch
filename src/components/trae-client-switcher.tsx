@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { selectableClients } from "@/lib/trae-client-list";
 
 /**
  * 客户端切换条的一项。只保留两个页面都能提供的字段，
@@ -17,8 +18,10 @@ export interface TraeClientOption {
    * 已并入哪个客户端（key）。`null`/缺省 = 仍是独立客户端。
    *
    * 2026-10 官方把 TRAE SOLO 并进 Trae CN：只剩一个程序，SOLO 的数据目录留在原处。
-   * 这类客户端**仍然可以选**（旧会话要能看、能迁），但要明确告诉用户
-   * 「切号请到承载方那边去」—— 否则用户会以为切了 SOLO，其实动的是另一个库。
+   *
+   * ⚠️ **本机已经跑不起来的那种（如合并后的 SOLO）根本不会走到这里** ——
+   *    `selectableClients()` 会先把它摘掉（见 `@/lib/trae-client-list`）。
+   *    能走到这里的只剩「已并入、但本机还装着它自己的程序」的老机器形态。
    */
   mergedInto?: string | null;
   /**
@@ -40,6 +43,9 @@ export interface TraeClientOption {
  *
  * ⚠️ 切换只决定「看哪一个客户端」，**绝不合并任何数字**：每个客户端的账号库、会话库、
  *    积分都只从它自己的 key 算。
+ *
+ * ⚠️ 「已并入且本机跑不起来」的客户端（合并后的 SOLO）**不进选择器** —— 判据只有
+ *    `selectableClients()` 一处，各调用点别自己再 filter 一遍（那样早晚有一处漏掉）。
  */
 export function TraeClientSwitcher({
   clients,
@@ -55,15 +61,16 @@ export function TraeClientSwitcher({
   disabled?: boolean;
   label?: string;
 }) {
-  if (clients.length === 0) return null;
+  const visible = selectableClients(clients);
+  if (visible.length === 0) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2" role="group" aria-label={label}>
-      {clients.map((c) => {
+      {visible.map((c) => {
         const active = c.key === value;
         // 承载方的显示名（"已并入 X" 里的 X）。
         const hostLabel = c.mergedInto
-          ? (clients.find((x) => x.key === c.mergedInto)?.label ?? c.mergedInto)
+          ? (visible.find((x) => x.key === c.mergedInto)?.label ?? c.mergedInto)
           : "";
         return (
           <button
@@ -73,7 +80,7 @@ export function TraeClientSwitcher({
             aria-pressed={active}
             title={
               c.mergedInto
-                ? `已并入 ${hostLabel}：本机只剩一个程序，数据目录仍各自保留。切换账号请到「${hostLabel}」下操作。`
+                ? `官方已把「${c.label}」并进「${hostLabel}」，但本机仍装着它自己的程序，所以这里还能单独选。`
                 : c.top
                   ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
                   : c.installed
