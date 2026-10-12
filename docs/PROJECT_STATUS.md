@@ -1257,6 +1257,31 @@ curl -s https://api.github.com/repos/bean0283/twin-switch | python -m json.tool
   超长 heredoc 还会把 shell 引号解析搞崩 ⇒ 改用 Write 落脚本再执行。
 - **构建别并行。**
 
+### GitHub 发版（v0.2.24 实测校准）
+
+- **⚠️⚠️ 发版三段一律加 `env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY` 走直连。**
+  环境注入的代理会让 `https://api.github.com/` 返回 **403**（首轮还连吃 6 次
+  `CONNECT tunnel failed, response 502`，而 `push-gitdata.py` 自带的 6 次退避重试**全打在同一个坏代理上**，
+  白等一轮才失败）；**直连 = 200**。
+  ⚠️ `push-gitdata.py` 里的 `PROXY` 变量**只用于打印**，curl 继承的是**环境变量**
+  ⇒ 命令里不写 `env -u` 就等于没改。
+- 三段命令（在仓库根跑，令牌现取，GCM 里存着 40 字符的 PAT）：
+  ```bash
+  export GITHUB_TOKEN="$(printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=wincred credential fill | grep '^password=' | sed 's/^password=//' | tr -d '\r\n')"
+  bash /d/htw/签到/deploy/prepare-push.sh "$PWD" v0.2.24
+  TWIN_TAG=v0.2.24 env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY python /d/htw/签到/deploy/push-gitdata.py
+  TWIN_NOTES=/d/htw/签到/deploy/notes-v0.2.24.md env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY python /d/htw/签到/deploy/publish-release.py
+  ```
+  ⚠️ `git credential fill` 必须带 `-c credential.helper=wincred`（默认 `helper-selector` 会弹 Windows 窗口）。
+- **`~/.twin-switch-keys/` 下是三个文件**：`twin-switch-updater.key`（**加密**，`rsign encrypted secret key`，
+  348 B 单行）/ `.key.pub` / **`.password`（21 字符，必需）**。
+  ⇒ `export TAURI_SIGNING_PRIVATE_KEY="$(cat …key)"` + `…_PASSWORD="$(cat …password)"`。
+  **⚠️ 列这个目录别接 `head`** —— `ls -la | head -5` 正好把 `.password` 截掉，
+  会误判成「口令丢了、老客户端要永久失联」。
+- **⚠️ Git Bash 的 `/tmp` ≠ Python 眼中的 `/tmp`**：`curl -o /tmp/x.json` 落在 MSYS 临时目录，
+  Python `open('/tmp/x.json')` 报 `FileNotFoundError`。curl 的 `-o` 与 Python 读**都用 Windows 路径**
+  （`/c/Users/…/AppData/Local/Temp/x.json` ↔ `C:\Users\…\AppData\Local\Temp\x.json`）。
+
 ---
 
 ## 八、给下一次的续接提示
@@ -1547,3 +1572,28 @@ WorkBuddy 的元数据只在 `~/.workbuddy/workbuddy.db` 的 **`sessions` 一张
   并把这个动作记进报告（`remounted`），免得「工具重试」被当成「页面正常」。
 
 
+### 10.4 发版核验（v0.2.24，2026-10-12）
+
+| 步骤 | 结果 |
+| --- | --- |
+| 提交 | `cd5895e`，32 文件 / +1917 / −32 |
+| 推送 | 走 Git Data API（`deploy/prepare-push.sh` → `push-gitdata.py`），远端 SHA = 本地 SHA = `cd5895e`，**tree 一致、无分叉**；tag `v0.2.24` 已建 |
+| 构建 | `npm run tauri build` 2m52s ⇒ NSIS `TwinSwitch_0.2.24_x64-setup.exe`（6 063 929 B）+ MSI `TwinSwitch_0.2.24_x64_en-US.msi`（8 683 520 B），**两套都带 `.sig`** |
+| 发布 | `Release v0.2.24`，`draft=false` / `prerelease=false`，正文 857 字符，三份资产全部 `uploaded` |
+| 清单 | `releases/latest/download/latest.json`：**200 / 1 285 B**，`version=0.2.24`，两个 platform（`windows-x86_64-nsis` / `windows-x86_64`）都指向 `TwinSwitch_0.2.24_x64-setup.exe`，`signature` 与 `.sig` 逐字符一致 |
+| 资产可下载性 | `curl -r 0-4095` GET ⇒ **206**，`bytes=4096`，首两字节 `MZ`（**不是** HEAD，HEAD 会拿 `000`） |
+| Release 地址 | https://github.com/bean0283/twin-switch/releases/tag/v0.2.24 |
+
+**发版期新踩的三个坑（已写进 §七 环境备忘与 `.workbuddy/memory/MEMORY.md`）：**
+
+1. **代理链会把推送/发布全挡掉，而且脚本自带的 6 次退避重试全打在同一个坏代理上、白等一轮。**
+   实测：走环境注入的代理（`https_proxy=http://127.0.0.1:60704`）访问 `https://api.github.com/` 得 **403**；
+   `env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY` **直连**得 **200**。
+   ⇒ 发版三段一律带 `env -u`。
+   ⚠️ `push-gitdata.py` 里的 `PROXY` 只用于打印，curl 继承的是**环境变量** ⇒ 不写 `env -u` 等于没改。
+   （旧备忘「同一端点手动重跑就好」不够用 —— 稳的是直连。）
+2. **`~/.twin-switch-keys/` 下有三个文件**（`.key` / `.key.pub` / `.password`）。
+   用 `ls -la` 接 `head -5` 会把 `.password` 截掉，容易误判成「口令丢了、老客户端要永久失联」。
+   **列这类目录别接 `head`。** 私钥是**加密**的（`rsign encrypted secret key`），口令必须给。
+3. **Git Bash 的 `/tmp` ≠ Python 眼中的 `/tmp`**：`curl -o /tmp/x.json` 落在 MSYS 目录，
+   Python `open('/tmp/x.json')` 直接 `FileNotFoundError`。两边**都用 Windows 路径**。
