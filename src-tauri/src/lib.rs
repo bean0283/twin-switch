@@ -110,6 +110,7 @@ pub fn run() {
             commands::trae_rename_account,
             commands::trae_export_account,
             commands::trae_import_account,
+            commands::trae_vault_adopt_merged,
             commands::trae_saved_key,
             commands::trae_scan_and_decrypt,
             commands::trae_decrypt_with_saved_key,

@@ -1578,6 +1578,7 @@ fn oauth_display(client_key: &str, id: &str) -> Option<String> {
 /// 账号维度候选：**全部本机账号**——vault 账号 + 解密库出现的账号（local）+
 /// 当前登录态，按 (客户端, uid) 去重，可自由切换目标账号。
 /// 不排除所选会话的归属账号，而是用 `is_source` 标记它（前端禁用同客户端同归属的候选）。
+#[allow(clippy::too_many_arguments)]
 fn push_candidate(
     out: &mut Vec<Value>,
     client_label: &str,
@@ -1590,6 +1591,7 @@ fn push_candidate(
     db_exists: bool,
     is_current: bool,
     is_source: bool,
+    as_target: bool,
 ) {
     out.push(json!({
         "client_key": ck,
@@ -1602,6 +1604,11 @@ fn push_candidate(
         "db_exists": db_exists,
         "is_current": is_current,
         "is_source": is_source,
+        // ⚠️ 「这个客户端能不能当导入**目标**」与 `db_exists`（有没有库）是两件事：
+        //    2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，SOLO 的库还在、账号也还在
+        //    （`db_exists` / `is_current` 都成立），但它已经没有自己的程序了 ——
+        //    会话写进去**不会报错**，只是客户端永远不读，用户看到的是「导进去但找不到」。
+        "as_target": as_target,
     }));
 }
 
@@ -1643,6 +1650,7 @@ pub fn list_account_candidates(src_client_key: &str, owner_uid: Option<&str>) ->
                 db_exists,
                 live_uid.as_deref() == Some(uid.as_str()),
                 ck == src_client_key && owner_uid == Some(uid.as_str()),
+                c.runnable,
             );
         }
         // 2) 解密库账号（local：库内 chat_session 归属的全部 user_id，
@@ -1673,6 +1681,7 @@ pub fn list_account_candidates(src_client_key: &str, owner_uid: Option<&str>) ->
                                 true,
                                 live_uid.as_deref() == Some(uid.as_str()),
                                 ck == src_client_key && owner_uid == Some(uid.as_str()),
+                                c.runnable,
                             );
                         }
                     }
@@ -1694,6 +1703,7 @@ pub fn list_account_candidates(src_client_key: &str, owner_uid: Option<&str>) ->
                     db_exists,
                     true,
                     ck == src_client_key && owner_uid == Some(uid.as_str()),
+                    c.runnable,
                 );
             }
         }
@@ -2074,6 +2084,30 @@ pub fn import_sessions(
             cb(m);
         }
     };
+
+    // ⚠️ 目标客户端必须「本机自己能跑起来」。
+    //
+    // 2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，SOLO 的数据目录与登录态**都还在**
+    // （列表里照常显示、照常有账号候选、`database_path` 也检查得到库），但它已经没有
+    // 自己的程序了 —— 会话写进那个库**不会报任何错**，只是客户端永远不会去读它。
+    // 用户看到的是「导入成功，但在客户端里找不到」，比直接拒绝难排查得多。
+    //
+    // 没被列出（本机没装 / 没找到）的客户端**不拦**：那种情况下紧跟其后的
+    // `database_path` 检查会先给出更准确的提示（「请先用它登录一次」）。
+    if let Some(c) = list_installed_clients().iter().find(|c| c.key == dst_client_key) {
+        if !c.runnable {
+            let host = c
+                .merged_into
+                .and_then(get_client)
+                .map(|x| x.label)
+                .unwrap_or("承载它的客户端");
+            return Err(format!(
+                "「{}」已并入「{host}」：本机没有它自己的程序，写进去的会话它永远不会读。\n\
+                 请改选「{host}」作为目标 —— 两边用的是同一批账号，导入过去一样用。",
+                c.label
+            ));
+        }
+    }
 
     // 0) 源库必须是已解密状态
     let src_db = decrypted_db_path(src_client_key);

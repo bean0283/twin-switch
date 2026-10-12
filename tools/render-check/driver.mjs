@@ -24,6 +24,46 @@ const CLICK_EDIT = `(() => {
   return 'clicked';
 })()`;
 
+// ★ 本轮新增判据：Trae 账号页顶部的「已并入 → 一并带入」提示条。
+//
+// ⚠️ 判据必须抓得住「老问题」：SOLO 并入 Trae CN 之后，账号页**根本没有这条提示**
+// —— 用户只看到切号失败，不知道另外几个账号还留在 SOLO 的账号库里。所以一旦找不到
+// 按钮就返回 `found: false`，回退验证时必须是这个结果（否则判据是空的）。
+//
+// ⚠️⚠️ 它是 **async 且自己轮询**（配合 `awaitPromise: true`）：页面什么时候「数据到位」
+// 由页面自己说了算，比在外层猜一个 sleep 可靠得多 —— 本轮就是在外层猜时长上连栽三次
+// （冷启动拿到占位页、`<script>` 源码被当正文、挂载了但还在 `<Skeleton>`）。
+const MERGE_PROBE = `(async () => {
+  const find = () => [...document.querySelectorAll('button')]
+    .find((x) => (x.textContent || '').includes('一并带入'));
+  const deadline = Date.now() + 15000;
+  let btn = find();
+  while (!btn && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    btn = find();
+  }
+  if (!btn) {
+    // 找不到时带上**诊断**：光一个 found=false 分不清「页面没就绪」和「真没这条」。
+    return {
+      found: false,
+      alerts: document.querySelectorAll('[data-slot="alert"]').length,
+      skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+      buttons: [...document.querySelectorAll('button')].length,
+      text: document.body.textContent.replace(/\\s+/g, ' ').trim().slice(0, 260),
+    };
+  }
+  const alert = btn.closest('[data-slot="alert"]');
+  const r = btn.getBoundingClientRect();
+  const a = alert ? alert.getBoundingClientRect() : null;
+  return {
+    found: true,
+    btn: { w: Math.round(r.width), h: Math.round(r.height), right: Math.round(r.right) },
+    banner: a ? { w: Math.round(a.width), right: Math.round(a.right) } : null,
+    viewportW: window.innerWidth,
+    text: (alert ? alert.textContent || '' : '').replace(/\\s+/g, ' ').trim().slice(0, 140),
+  };
+})()`;
+
 const MEASURE = `(() => {
   const de = document.documentElement;
   const overflowX = de.scrollWidth - window.innerWidth;
@@ -279,6 +319,60 @@ class Cdp {
   }
 }
 
+/**
+ * 等页面**就绪**（挂载 **且** 数据到位），而不是睡固定时长。
+ *
+ * ⚠️ 为什么必须有它：`vite dev` 首次 transform 一个页面要几秒（服务端缓存热了之后就快了），
+ * 首档永远最慢。固定 `sleep(3000)` 只会拿到 `index.html` 的「正在启动…」占位，
+ * probe 便报「提示条没渲染」——**是工具的时序问题，不是页面问题**。
+ *
+ * ⚠️⚠️ 判据有两道，缺一不可：
+ *
+ * ① **挂载**不能用 `document.body.textContent.length` —— `<script>` 标签的内容也算
+ *    `textContent`，而 `index.html` 里那段自救脚本的源码就有几百字符，于是「React 还没挂载」
+ *    会被判成「已挂载」（实测：正文里赫然带着 `var timeoutMs = 10000; window.setTimeout(...)`）。
+ *    改用 `#root` 有子元素（**不用** `window.__WB_MOUNTED__`，见 ②）。
+ * ② **挂载 ≠ 就绪**：挂载之后页面才开始拉数据，此时渲染的是 `<Skeleton>` 占位。
+ *    只看挂载会拿到「还在加载」的中间态，probe 照样找不到东西
+ *    （实测：正文已经完整、`TwinSwitch v0.2.24` 都出来了，但 `skeleton=2` ⇒ 提示条还没渲染）。
+ *    所以还要等 `data-slot="skeleton"` 归零。
+ *
+ * ⚠️⚠️ `index.html` 里有个 **10 秒看门狗**：超时未置位 `window.__WB_MOUNTED__` 就把占位
+ * 换成「应用启动失败」，之后 React **再也挂不上**（实测首档就栽在这上面）。
+ * 所以注入脚本会提前把它置位（见 runCase 里的 `source`）—— 相应地，这里**不能**拿它当判据。
+ * ③ **失败判据更不能用 `document.body.textContent`**（第 331 行那个坑的翻版，本轮又踩了一次）：
+ *    看门狗那段脚本就在 `<body>` 里，它**自己的源码**写着 `title.textContent = "应用启动失败"`
+ *    —— 于是 `body.textContent.includes('应用启动失败')` **从第一毫秒起就恒为真**，
+ *    这个函数一进门就 `return false`，**整个驱动其实从未等待过任何一档**。
+ *    实测症状：三档 `mounted` 全是 false，但其中一档的 probe 明明已经找到了目标元素。
+ *    ⇒ 判据必须看 **DOM 结构**（占位块 `.wb-boot` 还在不在、它的标题写了什么），不看文本。
+ * ④ **就绪 = 占位块没了**：`#root` 里那个 `.wb-boot` 是 `index.html` 的内联占位，React
+ *    挂载时会把它清掉。所以「占位块消失 + 骨架归零」才是真的画完了。
+ */
+async function waitForMount(cdp, timeoutMs = 45000) {
+  const expr = `(() => {
+    const root = document.getElementById('root');
+    const boot = root ? root.querySelector('.wb-boot') : null;
+    const bootTitle = root ? root.querySelector('.wb-boot-title') : null;
+    return {
+      kids: root ? root.childElementCount : 0,
+      skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+      boot: !!boot,
+      failed: !!bootTitle && (bootTitle.textContent || '').includes('应用启动失败'),
+    };
+  })()`;
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const r = await cdp.send("Runtime.evaluate", { expression: expr, returnByValue: true });
+    const v = r.result.value || {};
+    // 看门狗已经点火（占位标题被换成「应用启动失败」）⇒ 这个页面废了，早点退出别白等。
+    if (v.failed) return false;
+    if (v.kids > 0 && !v.boot && v.skeletons === 0) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
 async function runCase(c) {
   const port = 9000 + Math.floor(Math.random() * 1500);
   const profile = path.join(os.tmpdir(), `rc-edge-${Date.now()}-${port}`);
@@ -331,13 +425,40 @@ async function runCase(c) {
       deviceScaleFactor: 1,
       mobile: false,
     });
-    const source = `window.__RC_DATA__ = ${data};\n${stub}`;
+    // ⚠️ 提前置位 `__WB_MOUNTED__`：`index.html` 里有个 10 秒看门狗，超时未置位就把占位
+    //    换成「应用启动失败」—— 而 `vite dev` 首次 transform 一整个页面常常超过 10 秒，
+    //    于是**首档永远看到失败页、React 再也挂不上**（实测踩到）。自查环境里先骗过看门狗，
+    //    真正的「就绪」由 `waitForMount()` 判（`#root` 有子元素 + 没有 `<Skeleton>`）。
+    const source = `window.__RC_DATA__ = ${data};\nwindow.__WB_MOUNTED__ = true;\n${stub}`;
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source });
     await cdp.send("Page.navigate", { url: `${BASE}${c.route}` });
-    await sleep(c.wait ?? 3000);
+    await sleep(c.wait ?? 1500);
+    // 等就绪（见 `waitForMount` 的四条注释）。⚠️ 不能只看「睡够了几秒」。
+    result.mounted = await waitForMount(cdp);
+    if (!result.mounted) {
+      // ⚠️ 冷启动兜底：`vite dev` 第一次 transform 整页模块图常常要十几秒，这段时间页面
+      //    一直停在 `.wb-boot` 占位上。**再导航一次**就命中已经热好的模块图（实测：不补
+      //    这一下，每轮的第一档必栽、后面几档全过 —— 那纯粹是自查工具的冷启动，不是页面问题）。
+      //    ⚠️ 只补**一次**：真失败（页面自身报错）时第二次照样过不了，不会把失败刷成通过。
+      result.remounted = true;
+      await cdp.send("Page.navigate", { url: `${BASE}${c.route}` });
+      await sleep(1500);
+      result.mounted = await waitForMount(cdp);
+    }
 
     const first = await cdp.send("Runtime.evaluate", { expression: MEASURE, returnByValue: true });
     result.before = first.result.value;
+
+    // 通用自定义探针：`probe` 是一段 JS 表达式，结果原样记进 `result.probe`。
+    // `awaitPromise`：探针可以自己轮询到页面就绪（见 MERGE_PROBE 的注释）。
+    if (c.probe) {
+      const pr = await cdp.send("Runtime.evaluate", {
+        expression: c.probe,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      result.probe = pr.result.value ?? null;
+    }
 
     if (c.click) {
       const cl = await cdp.send("Runtime.evaluate", { expression: CLICK_EDIT, returnByValue: true });
@@ -495,10 +616,27 @@ const CASES = [
   { name: "trae-editor-multi-730", route: "/trae-records", width: 730, height: 800, click: true, multi: true },
   // Trae 侧单回合 🗑（同一条第 2 个回合）—— 与批量走同一条路，顺带验确认框不撑破卡片。
   { name: "trae-editor-turndel-1360", route: "/trae-records", width: 1360, height: 800, click: true, delTurn: 1 },
+  // ★ 本轮重点：Trae **账号页**顶部的「已并入的客户端还有账号没带过来」提示条。
+  //
+  // 2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，工具自己的账号库不会跟着并
+  // ⇒ 用户在 Trae CN 下看不到、也切不过 SOLO 下备份过的账号，只看到「切号失败」。
+  // 这条提示就是那个缺口唯一的出口，三档都要站得住。
+  { name: "trae-switch-1600", route: "/trae-switch", width: 1600, height: 900, probe: MERGE_PROBE },
+  { name: "trae-switch-1360", route: "/trae-switch", width: 1360, height: 800, probe: MERGE_PROBE },
+  { name: "trae-switch-730", route: "/trae-switch", width: 730, height: 800, probe: MERGE_PROBE },
 ];
 
 const only = process.argv[2];
 const list = only ? CASES.filter((c) => c.name.includes(only)) : CASES;
+
+// ⚠️ 先热一次 `vite dev`：它第一次 transform 整页模块图要十几秒，这段时间首档只能看到
+//    `index.html` 的启动占位 —— 量到的是「工具冷启动」而不是「页面画没画出来」。
+//    这里先跑一档丢弃结果的预热（`runCase` 内部还有一次「没就绪就重导航」的兜底）。
+{
+  const warm = await runCase({ name: "prewarm", route: list[0]?.route || "/", width: 1360, height: 800 });
+  console.log(`预热 ${warm.mounted ? "✅ 已就绪" : "⚠️ 未就绪（后续各档仍会各自重试一次）"}`);
+}
+
 const out = [];
 for (const c of list) {
   const r = await runCase(c);
@@ -508,6 +646,7 @@ for (const c of list) {
   console.log(
     `\n[${r.case}] ${r.width}x${r.height} ${r.route}` +
       (r.fatal ? `\n  ❌ FATAL ${r.fatal}` : "") +
+      `\n  mounted=${r.mounted}${r.remounted ? "（冷启动重试过一次）" : ""}` +
       `\n  before: overflowX=${b.overflowX} 竖排=${b.verticalCount} dialog=${b.hasDialog}` +
       (r.click ? `\n  click: ${r.click}` : "") +
       (r.after
@@ -540,6 +679,15 @@ for (const c of list) {
         : "") +
       `\n  errors(${(r.errors || []).length}): ${(r.errors || []).slice(0, 4).join(" | ")}`,
   );
+  if (r.probe) {
+    console.log(
+      r.probe.found
+        ? `  merge : found=true 按钮=${JSON.stringify(r.probe.btn)} 提示条=${JSON.stringify(r.probe.banner)} 视口=${r.probe.viewportW}` +
+            `\n  merge : 文案=${JSON.stringify(r.probe.text)}`
+        : `  merge : found=false alerts=${r.probe.alerts} skeleton=${r.probe.skeletons} buttons=${r.probe.buttons}` +
+            `\n  merge : 正文=${JSON.stringify(r.probe.text)}`,
+    );
+  }
   if (b.vertical?.length) console.log("  before 竖排样本:", JSON.stringify(b.vertical));
   if (a.vertical?.length) console.log("  after 竖排样本:", JSON.stringify(a.vertical));
   if (b.bodyText && (r.click && r.click !== "clicked")) {
@@ -549,4 +697,30 @@ for (const c of list) {
 }
 
 fs.writeFileSync(path.join(OUTDIR, "report.json"), JSON.stringify(out, null, 2), "utf8");
+
+// 汇总判据：本轮新增的「一并带入」提示条必须**三档都渲染出来**，且版式干净。
+// 单独给结论，免得要从一屏 before/after 里自己找。
+const mergeCases = out.filter((r) => r.case.startsWith("trae-switch-"));
+if (mergeCases.length) {
+  const missing = mergeCases.filter((r) => !r.probe?.found);
+  const messy = mergeCases.filter(
+    (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
+  );
+  const errs = mergeCases.filter((r) => (r.errors || []).length > 0);
+  const unmounted = mergeCases.filter((r) => r.mounted === false);
+  const remounted = mergeCases.filter((r) => r.remounted);
+  console.log(
+    `\n【判定】trae-switch 提示条 ${mergeCases.length - missing.length}/${mergeCases.length} 档渲染出来` +
+      (missing.length ? `  ❌ 未渲染：${missing.map((r) => r.case).join(", ")}` : "  ✅") +
+      (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净") +
+      (errs.length ? `  ❌ 有 console 报错：${errs.map((r) => r.case).join(", ")}` : "  ✅ 无报错") +
+      (unmounted.length
+        ? `  ❌ 有档没挂载完（工具时序，不是页面问题）：${unmounted.map((r) => r.case).join(", ")}`
+        : "  ✅ 三档都挂载完") +
+      (remounted.length
+        ? `  ℹ️ 走过一次冷启动重试：${remounted.map((r) => r.case).join(", ")}`
+        : ""),
+  );
+}
+
 console.log(`\n报告：${path.join(OUTDIR, "report.json")}`);

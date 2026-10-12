@@ -535,6 +535,166 @@ pub fn import_account(client_key: &str, payload: &Value, prefer_name: Option<&st
     Ok((id, file_count))
 }
 
+/// 一条「待搬入」计划。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdoptionPlan {
+    pub from: String,
+    pub source_id: String,
+    pub uid: String,
+}
+
+/// 一条「跳过」记录（带原因，供界面如实说明为什么没搬）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdoptionSkip {
+    pub from: String,
+    pub source_id: String,
+    pub uid: Option<String>,
+    pub reason: &'static str,
+}
+
+/// 「哪些账号该搬过去」的**纯判定** —— 去重与跳过规则只此一处实现。
+///
+/// `have` = 目标账号库现有的 uid 集合。**会被就地补进**：这样同一个 uid 即使在
+/// 多个源客户端下各有一份（SOLO 与 IDE 都备份过同一账号），也只会出现在计划里一次。
+/// `sources` = 按顺序的 `(源客户端 key, [(账号 id, 归属 uid)])`，`uid = None` 表示档案不可解析。
+pub fn plan_adoptions(
+    have: &mut HashSet<String>,
+    sources: &[(String, Vec<(String, Option<String>)>)],
+) -> (Vec<AdoptionPlan>, Vec<AdoptionSkip>) {
+    let mut plan = Vec::new();
+    let mut skip = Vec::new();
+    for (from, accounts) in sources {
+        for (id, uid) in accounts {
+            let Some(uid) = uid.clone() else {
+                skip.push(AdoptionSkip {
+                    from: from.clone(),
+                    source_id: id.clone(),
+                    uid: None,
+                    reason: "读不出归属 uid（账号档案不可解析）",
+                });
+                continue;
+            };
+            if have.contains(&uid) {
+                skip.push(AdoptionSkip {
+                    from: from.clone(),
+                    source_id: id.clone(),
+                    uid: Some(uid),
+                    reason: "目标账号库里已有这个账号（同一 uid）",
+                });
+                continue;
+            }
+            have.insert(uid.clone());
+            plan.push(AdoptionPlan {
+                from: from.clone(),
+                source_id: id.clone(),
+                uid,
+            });
+        }
+    }
+    (plan, skip)
+}
+
+/// 把「已并入 `target_key` 的客户端」账号库里的账号，全部并入 `target_key` 自己的账号库。
+///
+/// 为什么需要它：2026-10 官方把 TRAE SOLO 并进 Trae CN 时**只搬了程序与会话**
+/// （实测：SOLO 的 7 条会话已原样出现在 Trae CN 库里，消息数逐条相等）——
+/// 本工具自己的账号库（`<工具目录>/trae/vault/<clientKey>/`）官方不会碰。于是 SOLO 下
+/// 备份过的账号在 Trae CN 下**看不见、也切不过去**：用户在 SOLO 里存了 3 个账号，
+/// 合并后 Trae CN 这边只剩 1 个，另外两个像是凭空消失了。
+///
+/// 三条安全约定：
+/// - **按 uid 去重、绝不覆盖**：目标已有同一 uid 的账号就跳过。判据是 **uid 而非账号 id** ——
+///   同一账号在两边可能落在不同 id 下，只看 id 会重复搬第二份（规则见 [`plan_adoptions`]）；
+/// - **不动源**：只是一份复制，SOLO 的账号库原样保留（老数据仍要能看、能导）；
+/// - 两端 `api_host` 相同（`https://api.trae.cn` / `trae-api-cn.mchost.guru`），
+///   载体可直接使用，无需重新登录。
+///
+/// `dry_run = true` 时只列出「会搬哪些」，**一个字节都不写**。
+pub fn adopt_merged_accounts(target_key: &str, dry_run: bool) -> Result<Value, String> {
+    let target = crate::modules::trae_discover::get_client(target_key)
+        .ok_or_else(|| format!("未知客户端: {target_key}"))?;
+
+    // 目标已有的 uid（去重判据）
+    let mut have: HashSet<String> = list_vault_accounts(target_key)
+        .iter()
+        .filter_map(|id| uid_of_account(target_key, id))
+        .collect();
+
+    // 已并入 `target_key` 的源客户端 → (key, [(id, uid)])
+    let sources: Vec<(String, Vec<(String, Option<String>)>)> =
+        crate::modules::trae_discover::CLIENTS
+            .iter()
+            .filter(|c| c.merged_into == Some(target_key))
+            .map(|c| {
+                let src = c.key;
+                (
+                    src.to_string(),
+                    list_vault_accounts(src)
+                        .into_iter()
+                        .map(|id| {
+                            let uid = uid_of_account(src, &id);
+                            (id, uid)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+    let (plan, skips) = plan_adoptions(&mut have, &sources);
+
+    // 返回 `String` 而不是 `&str`：`TraeClient::label` 是 `&'static str`，而 `k` 是调用方的
+    // 短生命周期引用，混在同一个返回位置会让编译器要求 `'1: '2`。
+    let label_of = |k: &str| -> String {
+        crate::modules::trae_discover::get_client(k)
+            .map(|c| c.label.to_string())
+            .unwrap_or_else(|| k.to_string())
+    };
+
+    let mut adopted: Vec<Value> = Vec::new();
+    for p in &plan {
+        if dry_run {
+            adopted.push(json!({
+                "from": p.from,
+                "from_label": label_of(&p.from),
+                "source_id": p.source_id,
+                "id": p.source_id,
+                "uid": p.uid,
+            }));
+            continue;
+        }
+        let payload = export_account(&p.from, &p.source_id)?;
+        let (new_id, files) = import_account(target_key, &payload, Some(p.source_id.as_str()))?;
+        adopted.push(json!({
+            "from": p.from,
+            "from_label": label_of(&p.from),
+            "source_id": p.source_id,
+            "id": new_id,
+            "uid": p.uid,
+            "files": files,
+        }));
+    }
+    let skipped: Vec<Value> = skips
+        .iter()
+        .map(|s| {
+            json!({
+                "from": s.from,
+                "from_label": label_of(&s.from),
+                "source_id": s.source_id,
+                "uid": s.uid,
+                "reason": s.reason,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "target": target_key,
+        "target_label": target.label,
+        "dry_run": dry_run,
+        "adopted": adopted,
+        "skipped": skipped,
+    }))
+}
+
 /// 便捷：uid 字段取值。
 pub fn value_uid(v: &Value) -> Option<String> {
     v.as_i64().map(|i| i.to_string()).or_else(|| v.as_str().map(String::from))
@@ -542,3 +702,79 @@ pub fn value_uid(v: &Value) -> Option<String> {
 
 #[allow(unused)]
 fn unused_trae_client_guard(_c: &TraeClient) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn src(key: &str, accounts: &[(&str, Option<&str>)]) -> (String, Vec<(String, Option<String>)>) {
+        (
+            key.to_string(),
+            accounts
+                .iter()
+                .map(|(i, u)| (i.to_string(), u.map(String::from)))
+                .collect(),
+        )
+    }
+
+    /// 目标已有的 uid 一律跳过 —— 这是「绝不覆盖」的唯一实现处。
+    #[test]
+    fn plan_skips_uids_target_already_has() {
+        let mut have: HashSet<String> = ["u1".to_string()].into();
+        let sources = vec![src(
+            "solo-cn",
+            &[("oauth_a", Some("u1")), ("oauth_b", Some("u2"))],
+        )];
+        let (plan, skip) = plan_adoptions(&mut have, &sources);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source_id, "oauth_b");
+        assert_eq!(plan[0].uid, "u2");
+        assert_eq!(skip.len(), 1);
+        assert_eq!(skip[0].source_id, "oauth_a");
+        assert_eq!(skip[0].uid.as_deref(), Some("u1"));
+    }
+
+    /// 同一 uid 在多个源客户端下各有一份（SOLO 与 IDE 都备份过同一账号）⇒ 只搬第一份。
+    #[test]
+    fn plan_dedupes_same_uid_across_sources() {
+        let mut have = HashSet::new();
+        let sources = vec![
+            src("solo-cn", &[("oauth_x", Some("u9"))]),
+            src("solo-intl", &[("oauth_y", Some("u9"))]),
+        ];
+        let (plan, skip) = plan_adoptions(&mut have, &sources);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].from, "solo-cn");
+        assert_eq!(skip.len(), 1);
+        assert_eq!(skip[0].from, "solo-intl");
+        assert_eq!(skip[0].uid.as_deref(), Some("u9"));
+    }
+
+    /// 档案不可解析（uid 读不出）⇒ 跳过并给出原因，**不能猜一个 uid 搬过去**。
+    #[test]
+    fn plan_skips_unreadable_profiles() {
+        let mut have = HashSet::new();
+        let sources = vec![src("solo-cn", &[("oauth_bad", None)])];
+        let (plan, skip) = plan_adoptions(&mut have, &sources);
+        assert!(plan.is_empty());
+        assert_eq!(skip.len(), 1);
+        assert!(skip[0].uid.is_none());
+    }
+
+    /// 判定会就地补 `have`：同一批连跑两次，第二次一条都不搬（幂等）。
+    ///
+    /// 这条保护的是「搬完不刷新就再点一次」——重复搬运会在账号库里堆出同名副本。
+    #[test]
+    fn plan_is_idempotent_when_reused() {
+        let mut have = HashSet::new();
+        let sources = vec![src(
+            "solo-cn",
+            &[("oauth_a", Some("u1")), ("oauth_b", Some("u2"))],
+        )];
+        let (first, _) = plan_adoptions(&mut have, &sources);
+        assert_eq!(first.len(), 2);
+        let (second, skip) = plan_adoptions(&mut have, &sources);
+        assert!(second.is_empty(), "第二次不该再搬同一批");
+        assert_eq!(skip.len(), 2);
+    }
+}

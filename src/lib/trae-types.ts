@@ -9,6 +9,10 @@ export interface TraeInstalledClient {
   installed: boolean;
   exe: string | null;
   has_login: boolean;
+  /** 已并入哪个客户端（key）；null = 仍是独立客户端。 */
+  merged_into?: string | null;
+  /** 本机能不能真把它跑起来（数据目录在 **且** 找得到主程序）。 */
+  runnable?: boolean;
 }
 
 /** 单个客户端的「使用记忆」（对应 `client_usage::ClientUsage`）。 */
@@ -334,6 +338,14 @@ export interface TraeImportCandidate {
   is_current?: boolean;
   /** 是否为本记录所属账号（同客户端同归属，导入无意义，前端禁用）。 */
   is_source?: boolean;
+  /**
+   * 这个客户端能不能当导入**目标**（本机有它自己的主程序）。
+   *
+   * ⚠️ 与 `db_exists` 无关：2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，SOLO 的库与
+   * 登录态都还在（`db_exists` / `is_current` 都成立），但它已经没有自己的程序了 ——
+   * 写进去**不报错**，只是客户端永远不读，用户看到的是「导进去但找不到」。
+   */
+  as_target?: boolean;
 }
 
 export interface TraeImportInspect {
@@ -346,6 +358,46 @@ export interface TraeImportInspect {
   key_ready: boolean;
   key_source: "saved" | "scan_available" | "missing";
   sessions_now: number;
+}
+
+/**
+ * `trae_vault_adopt_merged` 里一条「已搬入」的账号。
+ *
+ * 背景：2026-10 官方把 TRAE SOLO 并进 Trae CN 时只搬了程序与会话，
+ * **本工具自己的账号库**（`<工具目录>/trae/vault/`）官方不会碰 ⇒ SOLO 下备份过的账号
+ * 在 Trae CN 下看不见、切不过去。这条记录描述搬进来的是哪一个。
+ */
+export interface TraeAdoptMergedItem {
+  /** 源客户端 key（`solo-cn`）。 */
+  from: string;
+  /** 源客户端显示名。 */
+  from_label: string;
+  /** 源账号库里的账号 id。 */
+  source_id: string;
+  /** 落进目标账号库后的账号 id（预演时等于 `source_id`）。 */
+  id: string;
+  /** 归属 uid。 */
+  uid: string | null;
+  /** 实际写入的文件数（预演时无此字段）。 */
+  files?: number;
+}
+
+/** 一条「没搬」的记录及原因（不要静默丢弃，界面要如实说明）。 */
+export interface TraeAdoptMergedSkip {
+  from: string;
+  from_label: string;
+  source_id: string;
+  uid: string | null;
+  reason: string;
+}
+
+export interface TraeAdoptMergedResult {
+  target: string;
+  target_label: string;
+  /** true = 只预演，一个字节都没写。 */
+  dry_run: boolean;
+  adopted: TraeAdoptMergedItem[];
+  skipped: TraeAdoptMergedSkip[];
 }
 
 export interface TraeImportReport {
@@ -1500,6 +1552,10 @@ export interface OverviewTraeClient {
   exe: string | null;
   userDataDir: string;
   hasLogin: boolean;
+  /** 已并入哪个客户端（key）；null = 仍是独立客户端。 */
+  mergedInto?: string | null;
+  /** 本机能不能真把它跑起来（数据目录在 **且** 找得到主程序）。 */
+  runnable?: boolean;
   /** 当前登录账号显示名（真实昵称 + uid 尾号）；未登录或读不出是 null。 */
   loginLabel: string | null;
   running: boolean;

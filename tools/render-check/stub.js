@@ -8,13 +8,19 @@
   const D = window.__RC_DATA__ || {};
 
   const handlers = {
-    "plugin:app|version": () => "0.2.22",
+    "plugin:app|version": () => "0.2.24",
     "plugin:event|listen": () => 1,
     "plugin:event|unlisten": () => null,
     "plugin:event|emit": () => null,
 
     // ---- 首页 / 通用 ----
     app_overview_cached: () => ({ empty: true, overview: null }),
+    // ⚠️ 这两个以前**没桩**，兜底返回 `null` ⇒ 启动编排里的 `refreshOverview()` 永远拿不到
+    //    数据，页面骨架常驻（实测 `skeleton=3` 25 秒不动）。补齐后页面才真的画完。
+    app_overview_snapshot: () => D.appOverview,
+    update_state: () => D.updateState,
+    workbuddy_import_reference_accounts: () => D.refAccounts,
+    trae_credits_query: () => D.traeCredits,
     trae_list_clients: () => D.clients,
     get_error_log_path: () => "C:/tmp/error.log",
 
@@ -87,6 +93,27 @@
     }),
     trae_session_edit_new_ids: () => [],
     trae_session_edit_cell: () => ({ ok: false, bytes: 0, value: null }),
+
+    // ---- Trae 账号页（`/trae-switch`）----
+    // ★ 本轮新增：账号页顶部的「已并入的客户端还有账号没带过来」提示条。
+    //   这里必须给**非空的 adopted** —— 给空数组等于把「提示条没渲染」当成通过。
+    trae_account_overview: () => D.traeOverview,
+    trae_credits_cached: () => D.traeCredits,
+    // ⚠️ 必须**按客户端区分**，不能无条件返回同一份：
+    //    后端是「按 `merged_into == clientKey` 找源」，所以在 `solo-cn` 页面上（它不是
+    //    承载方）结果**必然为空**。桩若无条件返回非空，页面就会出现真机上不会有的提示条，
+    //    而且文案会把承载方写成源自己（「TRAE SOLO CN 已经并入 TRAE SOLO CN」）。
+    trae_vault_adopt_merged: (args) =>
+      args?.clientKey === "trae-cn"
+        ? D.traeVaultAdoptMerged
+        : {
+            target: args?.clientKey ?? "",
+            target_label: "",
+            dry_run: Boolean(args?.dryRun),
+            adopted: [],
+            skipped: [],
+          },
+    trae_session_links_diverged: () => ({ ok: true, count: 0, groups: [] }),
   };
 
   window.__TAURI_INTERNALS__ = {

@@ -13,6 +13,21 @@ export interface TraeClientOption {
   hasLogin: boolean;
   /** 是否戴「常用」徽标；只能有一个，且必须来自后端的使用记忆排序。 */
   top?: boolean;
+  /**
+   * 已并入哪个客户端（key）。`null`/缺省 = 仍是独立客户端。
+   *
+   * 2026-10 官方把 TRAE SOLO 并进 Trae CN：只剩一个程序，SOLO 的数据目录留在原处。
+   * 这类客户端**仍然可以选**（旧会话要能看、能迁），但要明确告诉用户
+   * 「切号请到承载方那边去」—— 否则用户会以为切了 SOLO，其实动的是另一个库。
+   */
+  mergedInto?: string | null;
+  /**
+   * 本机能不能真把它跑起来（数据目录在 **且** 找得到主程序）。
+   *
+   * ⚠️ 与 `installed` 不是一回事：合并后的 SOLO `installed=true`（旧数据还在）
+   * 但 `runnable=false`（程序已卸载）。别拿一个当另一个用。
+   */
+  runnable?: boolean;
 }
 
 /**
@@ -46,6 +61,10 @@ export function TraeClientSwitcher({
     <div className="flex flex-wrap items-center gap-2" role="group" aria-label={label}>
       {clients.map((c) => {
         const active = c.key === value;
+        // 承载方的显示名（"已并入 X" 里的 X）。
+        const hostLabel = c.mergedInto
+          ? (clients.find((x) => x.key === c.mergedInto)?.label ?? c.mergedInto)
+          : "";
         return (
           <button
             key={c.key}
@@ -53,11 +72,13 @@ export function TraeClientSwitcher({
             disabled={disabled || !c.installed}
             aria-pressed={active}
             title={
-              c.top
-                ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
-                : c.installed
-                  ? undefined
-                  : "本机未安装这个客户端"
+              c.mergedInto
+                ? `已并入 ${hostLabel}：本机只剩一个程序，数据目录仍各自保留。切换账号请到「${hostLabel}」下操作。`
+                : c.top
+                  ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
+                  : c.installed
+                    ? undefined
+                    : "本机未安装这个客户端"
             }
             onClick={() => onChange(c.key)}
             className={cn(
@@ -69,6 +90,11 @@ export function TraeClientSwitcher({
             )}
           >
             {c.label}
+            {c.mergedInto ? (
+              <span className="rounded bg-amber-500/[0.15] px-1.5 py-0.5 text-[10px] font-normal text-amber-700">
+                已并入
+              </span>
+            ) : null}
             {c.top ? (
               <span className="rounded bg-foreground/[0.08] px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
                 常用

@@ -51,7 +51,13 @@ fn file_len(path: &Path) -> u64 {
 
 fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
     let Some(client) = trae_discover::get_client(c.key) else {
-        return json!({ "key": c.key, "label": c.label, "installed": false });
+        return json!({
+            "key": c.key,
+            "label": c.label,
+            "installed": false,
+            "mergedInto": c.merged_into,
+            "runnable": false,
+        });
     };
     let processes = trae_switch::list_processes(client);
     let accounts = trae_vault::list_vault_accounts(c.key);
@@ -76,6 +82,10 @@ fn trae_client_overview(c: &trae_discover::InstalledClient) -> Value {
         "exe": c.exe,
         "userDataDir": c.user_data_dir,
         "hasLogin": c.has_login,
+        // 2026-10 官方把 SOLO 并进 Trae CN：`mergedInto` 非空表示「这个客户端已经没有
+        // 自己的程序了，功能由它承载」，`runnable` 才是「本机能不能跑起来」的判据。
+        "mergedInto": c.merged_into,
+        "runnable": c.runnable,
         // 当前登录账号（真实昵称 + uid 尾号）。未登录 / 读不出登录态 ⇒ null。
         "loginLabel": if c.has_login { live_login_label(c.key, client) } else { None },
         "running": !processes.is_empty(),

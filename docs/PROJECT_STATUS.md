@@ -1455,3 +1455,95 @@ WorkBuddy 的元数据只在 `~/.workbuddy/workbuddy.db` 的 **`sessions` 一张
     而症状是「删完客户端里还留着一半」或「写出了空壳会话」。
 
 **已知残留缺口**：本机 16 条会话都没有 `context.last_real_project_id`，该改写路径真机走不到，仅单测覆盖。
+
+---
+
+## 十、T48 · TRAE SOLO 并入 Trae CN 的适配（v0.2.24）
+
+### 10.1 这件事是什么
+
+2026-10 官方把 **TRAE SOLO CN 并进 Trae CN**：装 `Trae CN` 一处、双击先开 SOLO 界面、
+再双击开 IDE；`%LOCALAPPDATA%\Programs\TRAE SOLO CN` 下的主程序被卸载（只剩 `debug.log`）。
+用户报的症状是「点切换账号没反应 / 报错、无法解密、显示 solo-cn 不存在」。
+
+真机取证（`examples/t48_clients_probe` / `t48_auth_probe` / `t48_merge_probe`，**三个都只读**）：
+
+| | Trae CN | TRAE SOLO CN |
+|---|---|---|
+| 数据目录 | 594 MB | 312 MB |
+| 登录态 | ✅ | ✅ |
+| 主程序 | ✅ `Trae CN.exe`（1.107.1） | ❌ **只剩 debug.log** |
+| `database.db` mtime | 持续写 | **冻结** |
+| 会话数 | **23**（= 原 16 + SOLO 的 7） | 7 |
+
+结论三条：
+
+1. **数据层没坏**（两库 `quick_check = ok`）；**账号体系没坏**（两客户端 `usertag` 是同一批 uid）；
+2. **官方自己把 SOLO 的 7 条会话迁进 Trae CN 了**：`session_id` 逐一相同、消息数逐条相等、
+   Trae CN 侧 `session_project` 归属 0 条不一致 ⇒ **工具不要再搬一次**（重复导入只会造副本）；
+3. 坏的是**工具自己的默认落点**：`trae-client-usage.json` 里 `solo-cn` 使用分最高
+   （127 次 / 切号 22 次 vs `trae-cn` 13 次），首屏取 `installed[0]` 就落到一个**没有程序**的客户端上。
+
+### 10.2 新增硬约束（编号接 §9）
+
+21. **`merged_into` 只管「去哪找程序 / 杀哪个进程」，绝不动 `user_data`**。
+    SOLO 的数据目录必须继续可读 —— 否则用户原来的会话彻底看不见。
+    判据：`detect_exe()` **有**合并回退，`InstalledClient.exe` **不用**它。
+22. **`InstalledClient.runnable` 必须走 `detect_exe_own`，不许算合并回退**。
+    算了回退，SOLO 会因为拿到 `Trae CN.exe` 又变「可运行」，排序修复当场失效
+    （本轮真踩过：探针显示 `1. solo-cn runnable=true`，白修一轮）。
+23. **「能不能跑起来」比「用了多少次」优先**：排序键第一段是 `!runnable`，
+    使用记忆只决定**同一段位内**的顺序（`client_usage::sort_with_order`）。
+24. **进程名回退要先确认「本机真的已合并」**（自己的 exe 找不到）。老机器上 SOLO 与 Trae CN
+    都独立装着时无条件带上对方进程名 ⇒「退出 SOLO 客户端」会把 IDE 一起杀掉。
+25. **写目标必须是「本机自己能跑起来」的客户端**：`import_sessions` 对 `!runnable` 的目标直接报错；
+    前端目标列表与默认目标走同一条判据（`targetClientOptions` / `defaultTargetClient`）。
+    理由：往没有程序的客户端库里写**不报错、只是不生效**，比直接失败难排查得多。
+26. **切号对已并入的客户端必须硬拦**（`trae_switch::ensure_switchable`），给出「请先切到 X」的指引 ——
+    不拦的话用户看到的只是「切了没反应」。
+27. **账号库不会被官方迁移**：官方只搬程序与会话，`<工具目录>/trae/vault/<clientKey>/` 是我们自己的。
+    并入必须**按 uid 去重、绝不覆盖、不动源**（`plan_adoptions` 是唯一判定处，+4 条单测）。
+    ⚠️ 去重判据是 **uid 不是账号 id**：同一账号在两边可能落在不同 id 下。
+
+### 10.3 自查工具自身的缺陷（本轮才发现，比产品 bug 更值得记）
+
+- **`tools/render-check/make-data.mjs` 的输出早就写丢了**：它原本写到别处、再手工拷到
+  `tools/render-check/data.json`，而那个文件当时**不存在** ⇒ driver 直接读不到数据，
+  **整条渲染自查静默失效**（只是没人注意）。现已直接写到 driver 读取的位置。
+- **固定 `sleep(3000)` 在第一个 case 上不够**：那一档要同时等 vite 首次 transform 全部模块
+  （服务端缓存热了之后，后面几档就快）+ Edge 冷启动，只会拿到 `index.html` 的「正在启动…」占位。
+  于是 probe 报「没渲染」——**是工具的时序问题，不是页面问题**，而 1600 档每次都是第一个跑，
+  每次都误判。改用 `waitForMount()` 轮询，并**逼出两道判据**（两道缺一不可，本轮各误判过一次）：
+  1. **挂载**不能用 `document.body.textContent.length` —— `<script>` 源码也算 `textContent`，
+     `index.html` 里那段自救脚本就有几百字符 ⇒「React 还没挂载」被判成「已挂载」。
+     要用 `#root` 有子元素（**不能用** `window.__WB_MOUNTED__`，见第 3 条）；
+  2. **挂载 ≠ 就绪**：挂载后页面才开始拉数据、此时渲染的是 `<Skeleton>` 占位。
+     实测正文已完整（`TwinSwitch v0.2.24` 都出来了）但 `skeleton=2` ⇒ 提示条还没渲染。
+     还要等 `[data-slot="skeleton"]` 归零；
+  3. **`index.html` 里有个 10 秒看门狗**：超时未置位 `window.__WB_MOUNTED__` 就把占位换成
+     「应用启动失败」，之后 React **再也挂不上**。而 `vite dev` 首次 transform 一整个页面
+     常常超过 10 秒 ⇒ **首档必然看到失败页**（本轮实测正文变成「应用启动失败界面未能正常加载」）。
+     自查环境必须**提前置位** `window.__WB_MOUNTED__` 绕过它；相应地 `waitForMount` 的判据
+     也就**不能**用这个标记。
+- **⚠️⚠️ 「失败」判据同样不能看 `document.body.textContent`**（第 1 条那个坑的**翻版**，本轮又踩一次）：
+  看门狗那段脚本就在 `<body>` 里，它**自己的源码**写着 `title.textContent = "应用启动失败"`
+  ⇒ `body.textContent.includes('应用启动失败')` **从第一毫秒起恒为真**，
+  `waitForMount` 一进门就 `return false`，**驱动实际从未等待过任何一档**。
+  症状极具误导性：三档 `mounted` 全部 `false`，但其中一档的 probe 明明已经找到了目标元素
+  （结论行显示「1/3 档渲染出来」，看起来像页面问题）。
+  ⇒ 失败判据必须看 **DOM 结构**：占位块 `.wb-boot` 在不在、它的**标题元素**写了什么。
+  同理「就绪」= **占位块消失**（React 挂载会清掉 `#root` 里的内联占位）+ 骨架归零。
+  **教训**：同一份 `textContent` 里既有页面正文又有脚本源码，用它做任何「含不含某串」的判定
+  都是在判**脚本源码**，不是判页面。
+- **桩缺命令 = 页面永远画不完**：`app_overview_snapshot` / `update_state` /
+  `workbuddy_import_reference_accounts` / `trae_credits_query` 没有桩，兜底返回 `null`
+  ⇒ 启动编排里的 `refreshOverview()` 拿不到数据，`skeleton=3` **常驻 25 秒不动**。
+  在半成品上量「版式干净」是没有意义的，四个桩本轮一并补上。
+- 桩数据必须**复刻后端排序之后**的客户端顺序，否则页面停在真机不会出现的客户端上
+  （本轮出现过文案「TRAE SOLO CN 已经并入 TRAE SOLO CN」）；
+  `trae_vault_adopt_merged` 的桩要**按 clientKey 区分** —— 源页面上它必然为空。
+- **冷启动从测量里摘掉**：driver 开跑前先跑一档丢弃结果的 `prewarm`；`runCase` 内再加一次
+  「没就绪就重导航」的兜底（**只补一次**，真失败第二次照样过不了，不会把失败刷成通过），
+  并把这个动作记进报告（`remounted`），免得「工具重试」被当成「页面正常」。
+
+

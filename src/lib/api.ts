@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
   TraeAccountOverview,
+  TraeAdoptMergedResult,
   TraeBrowserInfo,
   TraeCleanupReport,
   TraeCleanupScan,
@@ -409,6 +410,20 @@ export function traeImportRun(
   sessions: string[],
 ): Promise<TraeImportReport> {
   return call("trae_import_run", { src, dst, uid, sessions });
+}
+
+/**
+ * 把「已并入该客户端」的客户端账号库里的账号一并带入。
+ *
+ * 2026-10 官方把 TRAE SOLO 并进 Trae CN 时只搬了程序与会话，**本工具自己的账号库
+ * 官方不会碰** ⇒ SOLO 下备份过的账号在 Trae CN 下看不见、切不过去。
+ * `dryRun` 只预演（列出会搬哪些），一个字节都不写。
+ */
+export function traeVaultAdoptMerged(
+  clientKey: string,
+  dryRun?: boolean,
+): Promise<TraeAdoptMergedResult> {
+  return call("trae_vault_adopt_merged", { clientKey, dryRun });
 }
 
 /** 诊断：列出「会话的工程归属与关联表不一致」的会话（只读）。 */

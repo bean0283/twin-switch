@@ -10,6 +10,7 @@ import {
   FileUp,
   Globe,
   GitCompare,
+  Layers,
   Loader2,
   LogIn,
   PencilLine,
@@ -60,6 +61,7 @@ import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
   TraeAccountOverview,
+  TraeAdoptMergedResult,
   TraeBrowserInfo,
   TraeCreditEntry,
   TraeDivergedGroup,
@@ -260,6 +262,16 @@ export default function TraeSwitchPage() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string[]>([]);
 
+  /**
+   * 「已并入的客户端还有账号没带过来」的预演结果（`null` = 没探到 / 不用提示）。
+   *
+   * 2026-10 官方把 TRAE SOLO 并进 Trae CN 时**只搬了程序与会话**（会话实测已原样在
+   * Trae CN 库里）—— 本工具自己的账号库官方不会碰 ⇒ SOLO 下备份过的账号在 Trae CN 下
+   * 看不见、也切不过去。这里只预演，用户点了才动账号库。
+   */
+  const [mergePending, setMergePending] = useState<TraeAdoptMergedResult | null>(null);
+  const [mergeBusy, setMergeBusy] = useState(false);
+
   // 网页（OAuth）登录
   const [loginOpen, setLoginOpen] = useState(false);
   const [loginName, setLoginName] = useState("");
@@ -364,8 +376,43 @@ export default function TraeSwitchPage() {
   }
 
   useEffect(() => {
-    if (clientKey) void loadOverview(clientKey);
+    if (!clientKey) return;
+    void loadOverview(clientKey);
+    void loadMergePending(clientKey);
   }, [clientKey]);
+
+  /**
+   * 预演「已并入的客户端有哪些账号可以带过来」。
+   *
+   * ⚠️ 只对**承载方**有意义：后端按 `merged_into == clientKey` 找源，所以切换条选中
+   * `solo-cn` 时结果必然为空 —— 那正是对的（它自己就是被并进去的那个）。
+   */
+  async function loadMergePending(key: string) {
+    try {
+      const res = await api.traeVaultAdoptMerged(key, true);
+      setMergePending(res.adopted.length > 0 ? res : null);
+    } catch {
+      // 预演失败不该打扰用户：这只是顺带提醒，不是本页主功能。
+      setMergePending(null);
+    }
+  }
+
+  /** 用户确认后真正搬入（后端按 uid 去重、不覆盖、不动源）。 */
+  async function onAdoptMerged() {
+    if (!clientKey || mergeBusy || !mergePending) return;
+    setMergeBusy(true);
+    try {
+      const res = await api.traeVaultAdoptMerged(clientKey, false);
+      const sources = [...new Set(res.adopted.map((a) => a.from_label))].join(" / ");
+      toast.success(`已并入 ${res.adopted.length} 个账号`, { description: `来源：${sources}` });
+      setMergePending(null);
+      await loadOverview(clientKey);
+    } catch (cause) {
+      toast.error("并入账号失败", { description: api.asError(cause) });
+    } finally {
+      setMergeBusy(false);
+    }
+  }
 
   // 网页登录：发起时拉取本机浏览器列表（私密窗口用）
   useEffect(() => {
@@ -1114,6 +1161,40 @@ export default function TraeSwitchPage() {
                 {live?.username ?? live?.email ?? "当前账号"}
                 {live?.uid ? `（uid ${shortUid(live.uid)}）` : ""} 尚未备份。
                 点右上角「备份当前登录态」把它收进来，之后就能像 WorkBuddy 那样一卡一账号地看积分与切换。
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          {/* 「已并入的客户端还有账号没带过来」：只提示，用户点一下才动账号库。 */}
+          {mergePending ? (
+            <Alert className="border-amber-500/40 bg-amber-500/[0.06]">
+              <Layers className="size-4" />
+              <AlertTitle>还有 {mergePending.adopted.length} 个账号留在别处</AlertTitle>
+              <AlertDescription className="space-y-2">
+                <span className="block">
+                  {[...new Set(mergePending.adopted.map((a) => a.from_label))].join(" / ")}
+                  {" "}已经并入 {selected.label}，但<strong>账号库是分开存的</strong> ——
+                  不搬过来的话，在 {selected.label} 下看不到这几个账号、也切不过去。
+                  搬入按 uid 去重、不覆盖已有账号，源客户端的账号照样保留。
+                </span>
+                <span className="block font-mono text-[11px] text-muted-foreground/80">
+                  {mergePending.adopted
+                    .map((a) => `${a.source_id}${a.uid ? `（uid …${a.uid.slice(-6)}）` : ""}`)
+                    .join(" · ")}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={mergeBusy}
+                  onClick={() => void onAdoptMerged()}
+                >
+                  {mergeBusy ? (
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                  ) : (
+                    <Layers className="mr-2 size-4" />
+                  )}
+                  一并带入 {selected.label}
+                </Button>
               </AlertDescription>
             </Alert>
           ) : null}

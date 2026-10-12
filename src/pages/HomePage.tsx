@@ -395,6 +395,9 @@ export default function HomePage() {
         label: c.label,
         installed: c.installed,
         hasLogin: c.hasLogin,
+        // 合并后的客户端（如 SOLO → Trae CN）要戴「已并入」徽标。
+        mergedInto: c.mergedInto,
+        runnable: c.runnable,
         top: c.key === trae?.topPick,
       })),
     [traeClients, trae?.topPick],
