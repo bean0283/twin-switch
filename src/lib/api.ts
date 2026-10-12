@@ -102,9 +102,13 @@ function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 /**
  * 列出已安装的 Trae 客户端（含登录态与安装路径）。
  *
- * **顺序已由后端按「使用记忆」排好**：切换次数 ×3 + 打开页面次数，降序；
- * 没有历史时退回内置偏好（`solo-cn` 第一）。前端不要再自己排序，
- * 否则换个页面顺序就变了。`usage.topPick` 供「常用」徽标使用。
+ * **顺序已由后端排好**：使用记忆（切换次数 ×3 + 打开页面次数）**降序**，
+ * 但排序键**第一段是「本机能不能把它跑起来」**—— 跑不起来的排在能跑的后面
+ * （2026-10 官方把 SOLO 并进 Trae CN 后，`solo-cn` 的使用分仍最高却没有自己的程序）。
+ * 前端不要再自己排序，否则换个页面顺序就变了。`usage.topPick` 供「常用」徽标使用。
+ *
+ * ⚠️ 界面**不显示**「已并入且本机跑不起来」的客户端 —— 那层过滤在
+ * `@/lib/trae-client-list`，别在这里或组件里各写一份。
  */
 export function traeListClients(): Promise<{
   clients: TraeInstalledClient[];
@@ -113,7 +117,7 @@ export function traeListClients(): Promise<{
   return call("trae_list_clients");
 }
 
-/** 清空「客户端使用记忆」（排序回到内置偏好：`solo-cn` 第一）。 */
+/** 清空「客户端使用记忆」（排序回到内置偏好；界面上仍看不到已被摘掉的客户端）。 */
 export function traeClientUsageReset(): Promise<{ ok: boolean }> {
   return call("trae_client_usage_reset");
 }

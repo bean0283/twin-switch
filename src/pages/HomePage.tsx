@@ -27,6 +27,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import * as api from "@/lib/api";
 import { creditResourceName } from "@/lib/credit-package-names";
+import { selectableClients } from "@/lib/trae-client-list";
 import { refreshOverview, rememberReclaim, useOverviewState } from "@/lib/overview-store";
 import { cn } from "@/lib/utils";
 import type { OverviewTraeClient, WbCreditResource, WbCreditsResult } from "@/lib/trae-types";
@@ -381,8 +382,18 @@ export default function HomePage() {
   const totalSessions = (trae?.sessionTotal ?? 0) + (wb?.sessionCount ?? 0);
   const reclaimTotal = reclaim?.totalBytes ?? 0;
 
-  /** 本机已安装的 Trae 客户端（后端已按使用记忆排序，`[0]` 就是默认要看的那一个）。 */
+  /** 本机已安装的 Trae 客户端（后端已排序：使用记忆 + 能不能跑起来，`[0]` 就是默认要看的那一个）。 */
   const traeClients = useMemo(() => trae?.clients ?? [], [trae]);
+
+  /**
+   * 界面上可见的客户端。**已被摘掉的不在其中** —— 2026-10 官方把 TRAE SOLO 并进 Trae CN
+   * 之后本机不再有它自己的程序，它不再作为一个可切换的客户端出现（判据只有
+   * `@/lib/trae-client-list` 一处）。
+   *
+   * ⚠️ 下面「选中项兜底」必须看这个列表，不能看 `traeClients` —— 后者仍含已被摘掉的项，
+   *    兜底会兜到它身上，于是选中态指向一个界面上根本没有的客户端。
+   */
+  const visibleTraeClients = useMemo(() => selectableClients(traeClients), [traeClients]);
 
   /**
    * 切换条的入参；`top` 只认后端下发的 `topPick`，前端不另算「谁最常用」。
@@ -404,23 +415,24 @@ export default function HomePage() {
   );
 
   /**
-   * 选中的客户端。列表首项兜底 + 已被卸载/消失时自动落回首项，
-   * 因此下拉不会出现「选中态指向一个不存在的客户端」。
+   * 选中的客户端。**可见列表**首项兜底 + 已被摘掉/消失时自动落回首项，
+   * 因此下拉不会出现「选中态指向一个界面上没有的客户端」。
    */
   const activeTraeClient = useMemo(
-    () => traeClients.find((c) => c.key === traeClientKey) ?? traeClients[0] ?? null,
-    [traeClients, traeClientKey],
+    () =>
+      visibleTraeClients.find((c) => c.key === traeClientKey) ?? visibleTraeClients[0] ?? null,
+    [visibleTraeClients, traeClientKey],
   );
 
   useEffect(() => {
-    if (traeClients.length === 0) {
+    if (visibleTraeClients.length === 0) {
       if (traeClientKey !== null) setTraeClientKey(null);
       return;
     }
-    if (!traeClients.some((c) => c.key === traeClientKey)) {
-      setTraeClientKey(traeClients[0].key);
+    if (!visibleTraeClients.some((c) => c.key === traeClientKey)) {
+      setTraeClientKey(visibleTraeClients[0].key);
     }
-  }, [traeClients, traeClientKey]);
+  }, [visibleTraeClients, traeClientKey]);
 
   /**
    * 查询**单个 Trae 客户端**账号库的积分。
@@ -559,7 +571,7 @@ export default function HomePage() {
           <CardContent className="flex flex-1 flex-col gap-3">
             {!trae ? (
               <Skeleton className="h-24 rounded-lg" />
-            ) : traeClients.length === 0 ? (
+            ) : visibleTraeClients.length === 0 ? (
               <p className="text-sm text-muted-foreground">本机没有检测到已安装的 Trae 客户端。</p>
             ) : (
               <>

@@ -37,6 +37,7 @@ import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-cli
 import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
+import { isSelectableClient } from "@/lib/trae-client-list";
 import type {
   CrossWriteTarget,
   TraeImportCandidate,
@@ -158,9 +159,15 @@ export default function WorkbuddyImportPage() {
       const alive = new Set(src.sessions.map((s) => s.id));
       setSelected((prev) => new Set([...prev].filter((id) => alive.has(id))));
       // 默认目标 = 候选里排最前的那个客户端（后端按「使用记忆」排序，且只产出**已安装**客户端）。
-      // 一个候选都没有时退回第一个已安装客户端，好让「该客户端下没有可用账号」的提示显出来。
+      // 一个候选都没有时退回**可见且已安装**的第一个客户端 —— 好让「该客户端下没有可用账号」
+      // 的提示能显出来。⚠️ 不能再用 `clients.find(c => c.installed)` 兜底：合并后的 SOLO
+      // 也是 `installed`，但它已不进标签条，选中它会得到一个界面上根本不存在的目标。
       setDstClient(
-        (prev) => prev ?? cand.candidates[0]?.client_key ?? cl.clients.find((c) => c.installed)?.key ?? null,
+        (prev) =>
+          prev ??
+          cand.candidates[0]?.client_key ??
+          cl.clients.find((c) => c.installed && isSelectableClient(c))?.key ??
+          null,
       );
     } catch (cause) {
       setError(api.asError(cause));
@@ -173,7 +180,7 @@ export default function WorkbuddyImportPage() {
     void load();
   }, [load]);
 
-  /** 客户端切换条（顺序 / 「常用」徽标 / 未安装置灰都只由后端与共用组件决定）。 */
+  /** 客户端切换条（顺序 /「常用」徽标 / 未安装置灰都只由后端与共用组件决定）。 */
   const clientOptions = useMemo<TraeClientOption[]>(
     () =>
       clients.map((c) => ({
@@ -181,6 +188,9 @@ export default function WorkbuddyImportPage() {
         label: c.label,
         installed: c.installed,
         hasLogin: c.has_login,
+        // 这两项是「已并入且本机跑不起来的不进标签条」判据的入参，漏了就会漏出来。
+        mergedInto: c.merged_into,
+        runnable: c.runnable,
         top: c.key === usageTopPick,
       })),
     [clients, usageTopPick],

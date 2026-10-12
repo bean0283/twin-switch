@@ -57,8 +57,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import * as api from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { resolveSelectableKey, selectableClients } from "@/lib/trae-client-list";
 import type {
   TraeAccountOverview,
   TraeAdoptMergedResult,
@@ -332,11 +333,12 @@ export default function TraeSwitchPage() {
       const { clients, usage } = await api.traeListClients();
       setClients(clients);
       setUsageTopPick(usage?.topPick ?? null);
-      // ⚠️ 顺序**已经由后端按「使用记忆」排好**（默认 `solo-cn` 第一）
-      //    ⇒ 默认选中第一个即可。前端**不要**再自己写一套「trae-cn 优先」的规则：
-      //    同一件事被两处独立推导，早晚会不一致（页面之间顺序不同就是这么来的）。
-      const installed = clients.filter((c) => c.installed);
-      setClientKey((prev) => prev ?? installed[0]?.key ?? null);
+      // ⚠️ 顺序**已经由后端排好**（使用记忆 + 能不能跑起来，降序）⇒ 取可见列表第一个。
+      //    前端**不要**再自己写一套「trae-cn 优先」的规则：同一件事被两处独立推导，
+      //    早晚会不一致（页面之间顺序不同就是这么来的）。
+      //    ⚠️ 必须走 `resolveSelectableKey`：记忆里可能还留着已被摘掉的客户端（合并后的
+      //    `solo-cn`），写 `prev ?? first` 会把它一直用下去，选中态与标签条对不上。
+      setClientKey((prev) => resolveSelectableKey(prev, clients));
     } catch (cause) {
       setError(api.asError(cause));
     }
@@ -347,7 +349,10 @@ export default function TraeSwitchPage() {
   }, []);
 
   /**
-   * 清空「使用记忆」，客户端顺序回到内置默认（TRAE SOLO CN 第一）。
+   * 清空「使用记忆」，客户端顺序回到内置默认。
+   *
+   * ⚠️ 内置默认里 `solo-cn` 仍排第一，但它已被摘掉（并入 Trae CN、本机没有它的程序）
+   * ⇒ 界面上看到的第一项就是 `trae-cn`。别在这里写 `solo-cn` 了，用户根本看不到它。
    *
    * 这个动作**只影响展示顺序**，不碰账号库、不碰任何会话数据，所以不需要二次确认。
    */
@@ -356,7 +361,7 @@ export default function TraeSwitchPage() {
       await api.traeClientUsageReset();
       setClientKey(null);
       await loadClients();
-      toast.success("已重置排序记忆", { description: "客户端顺序回到内置默认（TRAE SOLO CN 第一）" });
+      toast.success("已重置排序记忆", { description: "客户端顺序回到内置默认" });
     } catch (cause) {
       toast.error("重置排序记忆失败", { description: api.asError(cause) });
     }
@@ -901,7 +906,34 @@ export default function TraeSwitchPage() {
     }
   }
 
-  const selected = clients.find((c) => c.key === clientKey);
+  /**
+   * 界面上可见的客户端：**已被摘掉的不在其中**（2026-10 官方把 SOLO 并进 Trae CN 后，
+   * 本机不再有它自己的程序 ⇒ 不再作为一个可切换的客户端出现）。判据只有
+   * `@/lib/trae-client-list` 一处。
+   */
+  const visibleClients = useMemo(() => selectableClients(clients), [clients]);
+
+  /**
+   * 切换条的入参：只做一次「线上结构 → 组件结构」的字段翻译。
+   * 顺序 /「常用」徽标 /「已并入且跑不起来的不显示」全在共用组件与那个判据里，
+   * 本页不另写一套（页面之间顺序不同、徽标不同就是这么来的）。
+   */
+  const clientOptions = useMemo<TraeClientOption[]>(
+    () =>
+      clients.map((c) => ({
+        key: c.key,
+        label: c.label,
+        installed: c.installed,
+        hasLogin: c.has_login,
+        mergedInto: c.merged_into,
+        runnable: c.runnable,
+        top: c.key === usageTopPick,
+      })),
+    [clients, usageTopPick],
+  );
+
+  /** 当前客户端：选中项若已从界面撤掉就落到可见列表首项，免得选中态悬空。 */
+  const selected = visibleClients.find((c) => c.key === clientKey) ?? visibleClients[0] ?? null;
   const live = overview?.live;
 
   // ---- 积分：与账号卡片融合显示（展示层与 WorkBuddy 侧同一套）----
@@ -941,43 +973,20 @@ export default function TraeSwitchPage() {
         </p>
       </div>
 
-      {/* 客户端选择：顺序由「使用记忆」决定（切换次数 ×3 + 打开页面次数，降序；
-          没有历史时内置偏好 `solo-cn` 第一）。 */}
-      {clients.length > 0 && (
+      {/* 客户端选择：顺序只由后端排序决定（使用记忆 + 能不能跑起来）。
+          ⚠️ v0.2.25 起改用与首页 /「Trae 会话记录」**共用的** `<TraeClientSwitcher>`：
+          本页原先自己内联了一套，于是「已并入」徽标、置灰规则都没跟上（合并后的 SOLO
+          还留在标签条上），正是「同一件事两处实现必然有一处跑偏」。
+          「已并入且本机跑不起来的客户端不进标签条」的判据也只有那一处。 */}
+      {visibleClients.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
-          {clients.map((c) => {
-            const active = c.key === clientKey;
-            return (
-              <button
-                key={c.key}
-                type="button"
-                disabled={!c.installed}
-                title={
-                  c.key === usageTopPick
-                    ? "按使用记忆自动排在最前（切换账号次数 ×3 + 打开页面次数）"
-                    : undefined
-                }
-                onClick={() => setClientKey(c.key)}
-                className={cn(
-                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-                  active
-                    ? "border-foreground/20 bg-foreground/[0.06] font-medium"
-                    : "border-border bg-background hover:bg-foreground/[0.03]",
-                  !c.installed && "cursor-not-allowed opacity-40",
-                )}
-              >
-                {c.label}
-                {c.key === usageTopPick ? (
-                  <span className="rounded bg-foreground/[0.08] px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
-                    常用
-                  </span>
-                ) : null}
-                {c.installed && c.has_login ? (
-                  <span className="size-2 rounded-full bg-emerald-500" />
-                ) : null}
-              </button>
-            );
-          })}
+          <TraeClientSwitcher
+            clients={clientOptions}
+            value={clientKey}
+            onChange={setClientKey}
+            disabled={busy}
+            label="Trae 客户端（账号管理）"
+          />
           <Badge variant="secondary" className="ml-auto">
             {overview?.running ? "客户端运行中" : "客户端未运行"}
           </Badge>
@@ -985,7 +994,7 @@ export default function TraeSwitchPage() {
             size="sm"
             variant="ghost"
             className="text-muted-foreground"
-            title="清空使用记忆，排序回到内置默认（TRAE SOLO CN 第一）"
+            title="清空使用记忆，排序回到内置默认"
             onClick={() => void onResetUsageOrder()}
           >
             <RotateCcw className="size-4" />

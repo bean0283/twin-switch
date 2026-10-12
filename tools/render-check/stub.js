@@ -114,6 +114,14 @@
             skipped: [],
           },
     trae_session_links_diverged: () => ({ ok: true, count: 0, groups: [] }),
+
+    // ---- 首页（`/`）----
+    // ⚠️ 这两条不补就是「未桩命令 ⇒ 返回 null」，首页 `trae.value.categories` 会直接抛
+    //    `Cannot read properties of null (reading 'categories')` —— 自查里那条
+    //    unhandledrejection 就是它，**不是页面 bug**（后端真会返回对象）。
+    //    教训同「缺桩导致骨架常驻」：跑了新页面就得把该页要的命令补齐。
+    trae_cleanup_scan: () => ({ categories: [] }),
+    trae_wb_cleanup_scan: () => ({ totals: { recommended_bytes: 0 } }),
   };
 
   window.__TAURI_INTERNALS__ = {

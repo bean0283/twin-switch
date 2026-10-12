@@ -44,6 +44,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
+import { resolveSelectableKey } from "@/lib/trae-client-list";
 import { defaultTargetClient, targetClientOptions } from "@/lib/trae-import-target";
 import { readStored, STORAGE_PREFIX, writeStored } from "@/lib/storage-keys";
 import { cn } from "@/lib/utils";
@@ -262,12 +263,12 @@ export default function TraeRecordsPage() {
       const { clients, usage } = await api.traeListClients();
       setClients(clients);
       setUsageTopPick(usage?.topPick ?? null);
-      // ⚠️ 顺序**已经由后端按「使用记忆 + 能不能跑起来」排好** ⇒ 直接取第一个。
+      // ⚠️ 顺序**已经由后端排好**（使用记忆 + 能不能跑起来，降序）⇒ 取可见列表第一个。
       //    前端不要再自己写一套「trae-cn 优先」的规则：同一件事被两处推导必然不一致。
-      //    （2026-10 SOLO 并入 Trae CN 后，`solo-cn` 的使用分仍最高，但它没有自己的程序，
-      //    后端把它沉到末尾，这里才拿得到 `trae-cn`。）
-      const installed = clients.filter((c) => c.installed);
-      setClientKey((prev) => prev ?? installed[0]?.key ?? null);
+      //    ⚠️ 必须走 `resolveSelectableKey`：记忆里可能还留着已被摘掉的客户端
+      //    （2026-10 SOLO 并入 Trae CN 后 `solo-cn` 的使用分仍最高，但它没有自己的程序、
+      //    已不进标签条），写 `prev ?? first` 会把它一直用下去，选中态与标签条对不上。
+      setClientKey((prev) => resolveSelectableKey(prev, clients));
     } catch (cause) {
       setError(api.asError(cause));
     }
@@ -825,8 +826,9 @@ export default function TraeRecordsPage() {
         </div>
       ) : null}
 
-      {/* 客户端选择：本机有几个客户端就几个标签；顺序由「使用记忆」决定（默认 `solo-cn` 第一）。
-          ⚠️ 与首页共用 `<TraeClientSwitcher>` —— 顺序 /「常用」徽标 / 置灰规则只有那一处实现。
+      {/* 客户端选择：顺序只由后端排序决定（使用记忆 + 能不能跑起来）。
+          ⚠️ 与首页共用 `<TraeClientSwitcher>` —— 顺序 /「常用」徽标 / 置灰规则，
+          以及「已并入且本机跑不起来的客户端不进标签条」，都只有那一处实现。
           耗时写库期间整条禁用：切到一半换客户端会让进度与结果对不上。 */}
       <TraeClientSwitcher
         clients={clientOptions}
@@ -1861,7 +1863,7 @@ export default function TraeRecordsPage() {
                 <AlertTriangle className="size-4" />
                 <AlertDescription className="leading-5">
                   导入会把该会话写进目标账号的本地加密库（原库先自动备份到工具目录）。写入前会自动退出目标客户端；
-                  目标账号须已在本机登录过。同客户端跨账号（如 TRAE SOLO CN 的 A→B）会在库内复制会话并生成新 id，源账号记录保留。
+                  目标账号须已在本机登录过。同客户端跨账号（如 Trae CN 的 A→B）会在库内复制会话并生成新 id，源账号记录保留。
                   与云端任务列表的同步行为未定义，若云端清理本地孤儿行，导入的会话可能被覆盖。
                 </AlertDescription>
               </Alert>

@@ -38,6 +38,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
+import { resolveSelectableKey } from "@/lib/trae-client-list";
 import type {
   CrossWriteTarget,
   TraeInstalledClient,
@@ -128,10 +129,11 @@ export default function WorkbuddyExportPage() {
       const { clients, usage } = await api.traeListClients();
       setClients(clients);
       setUsageTopPick(usage?.topPick ?? null);
-      // ⚠️ 顺序**已经由后端按「使用记忆」排好**（默认 `solo-cn` 第一）⇒ 直接取第一个。
+      // ⚠️ 顺序**已经由后端排好**（使用记忆 + 能不能跑起来，降序）⇒ 取可见列表第一个。
       //    前端别再自己写一套「trae-cn 优先」的规则，否则各页面顺序会不一致。
-      const installed = clients.filter((c) => c.installed);
-      setClientKey((prev) => prev ?? installed[0]?.key ?? null);
+      //    ⚠️ 必须走 `resolveSelectableKey`：记忆里可能还留着已被摘掉的客户端
+      //    （合并后的 `solo-cn`），写 `prev ?? first` 会把它一直用下去。
+      setClientKey((prev) => resolveSelectableKey(prev, clients));
     } catch (cause) {
       setError(api.asError(cause));
     }
