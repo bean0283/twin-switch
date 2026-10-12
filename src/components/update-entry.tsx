@@ -81,7 +81,7 @@ export function UpdateEntry({ fallbackVersion }: { fallbackVersion?: string }) {
 
   const busy = snapshot.phase === "checking" || snapshot.phase === "downloading";
   const line = statusLine(snapshot);
-  const version = snapshot.current || fallbackVersion || "0.2.23";
+  const version = snapshot.current || fallbackVersion || "0.2.24";
 
   useEffect(() => {
     if (snapshot.phase !== "available" || !snapshot.latest) return;

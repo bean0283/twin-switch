@@ -20,6 +20,11 @@ src-tauri/gen/schemas/
 accounts.json
 backups/
 
+# 渲染自查的桩数据与产出：含真机会话正文（`data.json` 约 1.5 MB），是**本地产物**不是源码。
+# 由 `tools/render-check/make-data.mjs` 现场生成（它读的留档件本身也在 `.workbuddy/` 下、不入库）。
+tools/render-check/data.json
+tools/render-check/out/
+
 # 自动更新的签名私钥 —— 泄露等于任何人都能签出被本应用接受的更新包。
 # ⚠️ 永远不要提交；丢了就只能让用户手动重装（老客户端不认新公钥）。
 *.updater.key

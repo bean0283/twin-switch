@@ -480,6 +480,24 @@ fn make_rollback_dir() -> PathBuf {
 }
 
 /// 执行冷切换到目标账号。
+/// 切号前置检查：**已合并的客户端不许再切**。
+///
+/// ⚠️ 为什么必须硬拦：2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，SOLO 自己的程序没了、
+/// 它的 `storage.json` 停在合并那一刻（真机实测：SOLO 的库与登录态自 2026-10-12 17:51
+/// 起再无任何写入）。继续往那个目录写不会**报错**，只会**不生效** —— 用户看到的是
+/// 「切了但没反应」，比直接拒绝更难排查。所以这里把话说清楚：去承载方切，账号是同一批。
+fn ensure_switchable(client: &TraeClient) -> Result<(), String> {
+    let Some(host) = client.merged_into else {
+        return Ok(());
+    };
+    let host_label = get_client(host).map(|c| c.label).unwrap_or(host);
+    Err(format!(
+        "{} 已并入「{host_label}」：本机只剩一个程序，它的数据目录已停用。\n\
+         请先切到「{host_label}」再切号 —— 两边用的是同一批账号，切过去一样用。",
+        client.label
+    ))
+}
+
 pub fn switch_to(
     client_key: &str,
     account_id: &str,
@@ -487,6 +505,7 @@ pub fn switch_to(
 ) -> Result<SwitchResult, String> {
     let cfg = load_config();
     let client = get_client(client_key).ok_or("未知客户端")?;
+    ensure_switchable(client)?;
     let root_dir = user_data_dir(client);
     let entries = effective_entries(client_key, &root_dir);
     if entries.is_empty() {

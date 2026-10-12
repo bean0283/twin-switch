@@ -44,6 +44,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
+import { defaultTargetClient, targetClientOptions } from "@/lib/trae-import-target";
 import { readStored, STORAGE_PREFIX, writeStored } from "@/lib/storage-keys";
 import { cn } from "@/lib/utils";
 import type {
@@ -204,7 +205,10 @@ export default function TraeRecordsPage() {
 
   async function openImport(s: TraeSessionInfo) {
     if (!clientKey) return;
-    setImportDstClient(clientKey);
+    // ⚠️ 不能直接用「正在浏览的客户端」当目标：2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，
+    //    SOLO 已经没有自己的程序了，把会话导进它的库**不报错、也不会生效**
+    //    （客户端永远不会去读那个目录）。落到承载方，见 `defaultTargetClient`。
+    setImportDstClient(defaultTargetClient(clientKey, clients));
     setImportDst(null);
     setImportUid(null);
     setImportInspect(null);
@@ -258,8 +262,10 @@ export default function TraeRecordsPage() {
       const { clients, usage } = await api.traeListClients();
       setClients(clients);
       setUsageTopPick(usage?.topPick ?? null);
-      // ⚠️ 顺序**已经由后端按「使用记忆」排好**（默认 `solo-cn` 第一）⇒ 直接取第一个。
+      // ⚠️ 顺序**已经由后端按「使用记忆 + 能不能跑起来」排好** ⇒ 直接取第一个。
       //    前端不要再自己写一套「trae-cn 优先」的规则：同一件事被两处推导必然不一致。
+      //    （2026-10 SOLO 并入 Trae CN 后，`solo-cn` 的使用分仍最高，但它没有自己的程序，
+      //    后端把它沉到末尾，这里才拿得到 `trae-cn`。）
       const installed = clients.filter((c) => c.installed);
       setClientKey((prev) => prev ?? installed[0]?.key ?? null);
     } catch (cause) {
@@ -495,6 +501,9 @@ export default function TraeRecordsPage() {
         label: c.label,
         installed: c.installed,
         hasLogin: c.has_login,
+        // 合并后的客户端（如 SOLO → Trae CN）要戴「已并入」徽标。
+        mergedInto: c.merged_into,
+        runnable: c.runnable,
         top: c.key === usageTopPick,
       })),
     [clients, usageTopPick],
@@ -1747,8 +1756,7 @@ export default function TraeRecordsPage() {
                 <div>
                   <div className="mb-1 text-xs text-muted-foreground">目标客户端</div>
                   <div className="flex flex-wrap gap-1.5">
-                    {clients
-                      .filter((c) => c.installed)
+                    {targetClientOptions(clients)
                       .map((c) => {
                         const active = c.key === importDstClient;
                         return (

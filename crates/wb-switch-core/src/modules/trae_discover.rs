@@ -16,6 +16,15 @@ pub struct TraeClient {
     pub api_host: &'static str,
     /// 会话/任务类接口的 remote 网关（安装目录可读时以 product.json 为准）。
     pub remote_host: &'static str,
+    /// **已并入哪个客户端**（`None` = 仍是独立客户端）。
+    ///
+    /// 2026-10 官方把 TRAE SOLO 并进了 Trae CN：装 `Trae CN` 一处，双击先开 SOLO 界面、
+    /// 再双击开 IDE，`Programs\TRAE SOLO CN` 下的主程序被卸载（只剩日志）。
+    /// 所以 SOLO 的**程序与进程都归 Trae CN**，只有数据目录留在原处（成为历史数据）。
+    ///
+    /// ⚠️ 这个字段只影响「去哪找程序 / 杀哪个进程」，**不动 `user_data`** —— 老数据仍要能读，
+    /// 否则用户原来的会话就彻底看不见了。
+    pub merged_into: Option<&'static str>,
 }
 
 pub const CLIENTS: [TraeClient; 4] = [
@@ -25,6 +34,7 @@ pub const CLIENTS: [TraeClient; 4] = [
         user_data: "Trae CN",
         api_host: "https://api.trae.cn",
         remote_host: "https://trae-api-cn.mchost.guru",
+        merged_into: None,
     },
     TraeClient {
         key: "solo-cn",
@@ -32,6 +42,7 @@ pub const CLIENTS: [TraeClient; 4] = [
         user_data: "TRAE SOLO CN",
         api_host: "https://api.trae.cn",
         remote_host: "https://trae-api-cn.mchost.guru",
+        merged_into: Some("trae-cn"),
     },
     TraeClient {
         key: "trae-intl",
@@ -39,6 +50,7 @@ pub const CLIENTS: [TraeClient; 4] = [
         user_data: "Trae",
         api_host: "https://api.trae.ai",
         remote_host: "https://api.trae.ai",
+        merged_into: None,
     },
     TraeClient {
         key: "solo-intl",
@@ -46,6 +58,7 @@ pub const CLIENTS: [TraeClient; 4] = [
         user_data: "TRAE SOLO",
         api_host: "https://api.trae.ai",
         remote_host: "https://api.trae.ai",
+        merged_into: None,
     },
 ];
 
@@ -74,7 +87,22 @@ pub fn storage_json_path(client: &TraeClient) -> PathBuf {
 }
 
 /// 探测客户端主程序路径；未装返回 None。
+///
+/// 已合并的客户端（见 [`TraeClient::merged_into`]）在自己找不到程序时**回退到承载方** ——
+/// SOLO 并入 Trae CN 之后，SOLO 界面就是 `Trae CN.exe` 开出来的，回退是对「它现在住在哪」的
+/// 如实描述。老机器上 SOLO 还独立装着，`detect_exe_own` 会先命中，回退不会生效。
 pub fn detect_exe(client: &TraeClient) -> Option<PathBuf> {
+    if let Some(p) = detect_exe_own(client) {
+        return Some(p);
+    }
+    if let Some(host) = client.merged_into.and_then(get_client) {
+        return detect_exe_own(host);
+    }
+    None
+}
+
+/// 只按**本客户端自己的名字**找主程序（不含合并回退）。
+fn detect_exe_own(client: &TraeClient) -> Option<PathBuf> {
     let exe_names: [&str; 2] = match client.key {
         "trae-cn" => ["Trae CN.exe", "Trae.exe"],
         "solo-cn" => ["TRAE SOLO CN.exe", "Trae Solo.exe"],
@@ -133,14 +161,33 @@ pub fn detect_exe(client: &TraeClient) -> Option<PathBuf> {
     None
 }
 
-/// 进程名（tasklist 过滤用）。
-pub fn process_names(client: &TraeClient) -> &'static [&'static str] {
+/// 本客户端**自己的**进程名（不含合并回退）。
+fn own_process_names(client: &TraeClient) -> &'static [&'static str] {
     match client.key {
         "trae-cn" => &["Trae CN", "Trae"],
         "solo-cn" => &["TRAE SOLO CN"],
         "trae-intl" => &["Trae"],
         _ => &["TRAE SOLO"],
     }
+}
+
+/// 进程名（tasklist 过滤用）。
+///
+/// ⚠️ 合并回退要**先确认本机真的已合并**（自己的 exe 找不到）才加，不能无条件加：
+/// 在「SOLO 与 Trae CN 都还独立装着」的机器上，无条件带上 `Trae CN` 会让
+/// 「退出 SOLO 客户端」把 IDE 一起杀掉。
+pub fn process_names(client: &TraeClient) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = own_process_names(client).to_vec();
+    if client.merged_into.is_some() && detect_exe_own(client).is_none() {
+        if let Some(host) = client.merged_into.and_then(get_client) {
+            for n in own_process_names(host) {
+                if !out.contains(n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 读取安装目录 product.json 的 remote 网关；失败回落默认值。
@@ -191,6 +238,18 @@ pub struct InstalledClient {
     pub installed: bool,
     pub exe: Option<String>,
     pub has_login: bool,
+    /// 已并入哪个客户端（`None` = 独立客户端）。
+    pub merged_into: Option<&'static str>,
+    /// **本机能不能「独立」把它跑起来**：数据目录在 **且** **它自己的**主程序在。
+    ///
+    /// ⚠️ 判据必须是「自己的主程序」，**不能算合并回退**：SOLO 并入 Trae CN 之后，
+    /// `detect_exe(solo-cn)` 仍能回退到 `Trae CN.exe`（那是对的 —— 退出进程、读网关都要用它），
+    /// 但 SOLO 已经**不是一个能独立使用的客户端**了（切号被拦、也没有自己的界面）。
+    /// 若这里跟着回退走，`solo-cn` 的使用分最高，首屏又会默认落到它身上 —— 白修。
+    ///
+    /// 它和 `installed` **不是一回事**，别互相替代：界面拿 `runnable` 决定
+    /// 「默认打开谁 / 能不能切号」，拿 `installed` 决定「要不要把这一项显示出来」。
+    pub runnable: bool,
 }
 
 pub fn list_installed_clients() -> Vec<InstalledClient> {
@@ -199,13 +258,18 @@ pub fn list_installed_clients() -> Vec<InstalledClient> {
         .map(|c| {
             let dir = user_data_dir(c);
             let installed = dir.exists();
+            // ⚠️ `exe` 也报**它自己的**程序（不回退）：合并后如实显示「未找到」，
+            //    比显示一个其实启动了另一个客户端的路径要诚实。
+            let own_exe = detect_exe_own(c);
             InstalledClient {
                 key: c.key,
                 label: c.label,
                 user_data_dir: dir.to_string_lossy().into_owned(),
                 installed,
-                exe: detect_exe(c).map(|p| p.to_string_lossy().into_owned()),
+                runnable: installed && own_exe.is_some(),
+                exe: own_exe.map(|p| p.to_string_lossy().into_owned()),
                 has_login: installed && has_login_state(c),
+                merged_into: c.merged_into,
             }
         })
         .collect()

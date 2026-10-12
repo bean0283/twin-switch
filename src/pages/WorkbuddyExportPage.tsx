@@ -319,6 +319,9 @@ export default function WorkbuddyExportPage() {
         label: c.label,
         installed: c.installed,
         hasLogin: c.has_login,
+        // 合并后的客户端（如 SOLO → Trae CN）要戴「已并入」徽标。
+        mergedInto: c.merged_into,
+        runnable: c.runnable,
         top: c.key === usageTopPick,
       })),
     [clients, usageTopPick],

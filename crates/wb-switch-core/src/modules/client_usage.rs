@@ -213,13 +213,33 @@ pub fn sort_installed(clients: &mut [InstalledClient]) {
     let usage = usage_map();
     let keys: Vec<&str> = clients.iter().map(|c| c.key).collect();
     let order = order_keys(&keys, &usage);
+    sort_with_order(clients, &order);
+}
+
+/// 排序核心（纯函数，抽出来是为了可测 —— [`sort_installed`] 会去读真实的使用记录文件，
+/// 测试里没法控制那份数据）。
+///
+/// ⚠️ 排序键第一段是「**能不能独立跑起来**」，第二段才是使用习惯 —— 顺序不能反过来。
+///
+/// 为什么：`solo-cn` 的使用分（127 次打开 / 22 次切号）远高于 `trae-cn`，而官方
+/// 2026-10 把 SOLO 并进 Trae CN 之后，它已经没有自己的程序了。若只按使用习惯排，
+/// 首屏默认会落到一个**跑不起来**的客户端上 —— 用户看到的就是
+/// 「切号没反应 / 无法解密 / solo-cn 不存在」。
+///
+/// 只是**沉底**、不是剔除：数据目录还在的客户端仍要显示，旧会话要能读、能迁移。
+/// `sort_by_key` 是稳定排序，同一段内保持 `order` 的相对顺序。
+fn sort_with_order(clients: &mut [InstalledClient], order: &[String]) {
     let rank: BTreeMap<&str, usize> = order
         .iter()
         .enumerate()
         .map(|(i, k)| (k.as_str(), i))
         .collect();
-    // `sort_by_key` 是稳定排序；rank 已保证全序，稳定性在这里只是额外保险。
-    clients.sort_by_key(|c| rank.get(c.key).copied().unwrap_or(usize::MAX));
+    clients.sort_by_key(|c| {
+        (
+            !c.runnable,
+            rank.get(c.key).copied().unwrap_or(usize::MAX),
+        )
+    });
 }
 
 /// 给界面看的诊断快照：谁被排到最前、各项计数是多少。
@@ -350,5 +370,54 @@ mod tests {
     #[test]
     fn default_preference_starts_with_solo_cn() {
         assert_eq!(DEFAULT_PREFERENCE.first().copied(), Some("solo-cn"));
+    }
+
+    fn fake_client(key: &'static str, runnable: bool) -> InstalledClient {
+        InstalledClient {
+            key,
+            label: key,
+            user_data_dir: String::new(),
+            installed: true,
+            exe: if runnable { Some("x.exe".to_string()) } else { None },
+            has_login: true,
+            merged_into: None,
+            runnable,
+        }
+    }
+
+    /// ⚠️ 合并之后最容易踩的一条：`solo-cn` 的使用分远高于 `trae-cn`，但它已经没有自己的
+    /// 程序了。默认排序若只看使用习惯，首屏就会落到一个**跑不起来**的客户端上 ——
+    /// 用户看到的就是「切号没反应 / 无法解密 / solo-cn 不存在」。
+    #[test]
+    fn un_runnable_client_sinks_to_the_end() {
+        let mut cs = vec![fake_client("solo-cn", false), fake_client("trae-cn", true)];
+        // 使用习惯把 solo-cn 排在前面（复刻真机：127 次打开 / 22 次切号 vs 13 次 / 0 次）。
+        let order = vec!["solo-cn".to_string(), "trae-cn".to_string()];
+        sort_with_order(&mut cs, &order);
+        assert_eq!(cs[0].key, "trae-cn", "默认不能落到一个跑不起来的客户端上");
+        assert_eq!(cs[1].key, "solo-cn");
+    }
+
+    /// 沉底只是「换个段位」，不是「抹掉习惯」：都能跑时仍按使用习惯排。
+    #[test]
+    fn same_tier_keeps_usage_order() {
+        let mut cs = vec![fake_client("trae-cn", true), fake_client("solo-cn", true)];
+        let order = vec!["solo-cn".to_string(), "trae-cn".to_string()];
+        sort_with_order(&mut cs, &order);
+        let got: Vec<&str> = cs.iter().map(|c| c.key).collect();
+        assert_eq!(got, vec!["solo-cn", "trae-cn"]);
+    }
+
+    /// 两个都跑不起来时也要保持稳定顺序（别让排序把列表抖乱）。
+    #[test]
+    fn neither_runnable_still_stable() {
+        let mut cs = vec![
+            fake_client("solo-intl", false),
+            fake_client("trae-intl", false),
+        ];
+        let order = vec!["trae-intl".to_string(), "solo-intl".to_string()];
+        sort_with_order(&mut cs, &order);
+        let got: Vec<&str> = cs.iter().map(|c| c.key).collect();
+        assert_eq!(got, vec!["trae-intl", "solo-intl"]);
     }
 }
