@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    app_overview, client_usage, config, error_log, trae_cleanup, trae_credits, trae_delete,
+    app_overview, client_usage, config, error_log, settings, trae_cleanup, trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
     trae_profile, trae_remote, trae_session_edit, trae_switch, trae_vault, workbuddy_cleanup,
     workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
@@ -439,6 +439,46 @@ pub async fn trae_vault_adopt_merged(client_key: String, dry_run: Option<bool>) 
     // 会读目录树 + 解析账号档案，按主线程硬规则离开主线程。
     off_main(move || trae_vault::adopt_merged_accounts(&client_key, dry_run.unwrap_or(false)))
         .await?
+}
+
+/// 账号 token 弹窗的数据：jwt 本体 + 有效期 + 能不能续期。**只读、不联网。**
+#[tauri::command]
+pub async fn trae_account_token(client_key: String, account_id: String) -> Result<Value, String> {
+    // 要读账号目录里的 oauth.json / storage.json（含解密），按主线程硬规则离开主线程。
+    off_main(move || trae_remote::account_token_info(&client_key, &account_id)).await?
+}
+
+/// 刷新账号 token（界面上的「刷新 token 有效期」）。
+///
+/// `force = false` 时，access token 剩余 > 7 天**不算失败**：返回
+/// `{ ok: true, refreshed: false, reason: "fresh" }`，由界面弹窗让用户决定要不要强制刷新。
+/// 真失败（网络 / 服务端拒绝 / 写回自检不过）才返回 `Err`。
+#[tauri::command]
+pub async fn trae_account_token_refresh(
+    client_key: String,
+    account_id: String,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    trae_remote::refresh_account_token(&client_key, &account_id, force.unwrap_or(false)).await
+}
+
+/// WorkBuddy 账号 token 弹窗的数据：jwt 本体 + 有效期 + 能不能续期。**只读、不联网。**
+#[tauri::command]
+pub async fn workbuddy_account_token(account_id: String) -> Result<Value, String> {
+    // 要读账号库 JSON，按主线程硬规则离开主线程。
+    off_main(move || workbuddy_credits::account_token_info(&account_id)).await?
+}
+
+/// 刷新 WorkBuddy 账号 token（界面上的「刷新 token 有效期」）。
+///
+/// 语义与 Trae 侧完全一致：`force = false` 且剩余 > 7 天 ⇒ `{ refreshed: false, reason: "fresh" }`
+/// （不是失败），界面据此弹窗让用户决定要不要强制刷新；真失败才 `Err`。
+#[tauri::command]
+pub async fn workbuddy_account_token_refresh(
+    account_id: String,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    workbuddy_credits::refresh_account_token_info(&account_id, force.unwrap_or(false)).await
 }
 
 /// 已存盘的 SQLCipher 密钥（供状态展示）。
@@ -920,6 +960,68 @@ pub async fn trae_wb_cleanup_empty_trash() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(workbuddy_cleanup::empty_trash)
         .await
         .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 设置（`~/.twin-switch/settings.json`）
+// ---------------------------------------------------------------------------
+
+/// 读设置 —— 目前只有「整库备份保留策略」（时间 / 最大容量 / 保留份数三重触发）。
+///
+/// ⚠️ 走 `load_strict`：**「空」和「失败」绝不许长得一样**。
+/// - 文件不存在 = 全新安装 ⇒ 返回默认值（`ok: true`）；
+/// - 文件在但内容坏了 ⇒ **如实报错**，不让界面拿着默认值假装一切正常
+///   （用户会以为自己的设置「被重置了」，实际是文件坏了）。
+///
+/// 返回里带 `summary`（给人看的一行摘要）与 `path`（出问题时用户能自己去看），
+/// 两者都来自后端同一份结构 ⇒ 界面上的策略原文与真正执行判定的那份**同源**。
+#[tauri::command]
+pub async fn settings_get() -> Result<Value, String> {
+    off_main(|| {
+        let s = settings::load_strict()?;
+        Ok(json!({
+            "ok": true,
+            "backupRetention": {
+                "enabled": s.backup_retention.enabled,
+                "keepDays": s.backup_retention.keep_days,
+                "keepCount": s.backup_retention.keep_count,
+                "maxTotalMb": s.backup_retention.max_total_mb,
+            },
+            "summary": s.backup_retention.summary(),
+            "path": settings::settings_path().to_string_lossy(),
+        }))
+    })
+    .await?
+}
+
+/// 写设置（原子替换：先写 `.tmp` 再 rename，写到一半断电不会留下半个 JSON）。
+///
+/// 落在合理区间由后端再夹一次（`sanitized`）—— 手输 999999999 天不会造成数据风险，
+/// 但会让界面摘要没法看、`keep_days * 86_400_000` 还会溢出 `i64`。
+///
+/// 返回与 [`settings_get`] 同形，**前端可直接用它刷界面**（省掉一次读盘 ——
+/// 也就不会出现「写成功了但界面显示的是旧值」这种两处不同源的情况）。
+#[tauri::command]
+pub async fn settings_set(backup_retention: settings::BackupRetention) -> Result<Value, String> {
+    off_main(move || {
+        let mut next = settings::load();
+        next.backup_retention = backup_retention;
+        let path = settings::save(&next)?;
+        // 回读一次：把「实际落盘的值」返回给界面，而不是「用户刚提交的值」
+        let saved = settings::load_strict()?;
+        Ok(json!({
+            "ok": true,
+            "backupRetention": {
+                "enabled": saved.backup_retention.enabled,
+                "keepDays": saved.backup_retention.keep_days,
+                "keepCount": saved.backup_retention.keep_count,
+                "maxTotalMb": saved.backup_retention.max_total_mb,
+            },
+            "summary": saved.backup_retention.summary(),
+            "path": path.to_string_lossy(),
+        }))
+    })
+    .await?
 }
 
 // ---------------------------------------------------------------------------

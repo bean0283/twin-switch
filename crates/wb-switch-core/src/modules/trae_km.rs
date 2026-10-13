@@ -15,7 +15,7 @@
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha2::{Digest, Sha512};
 
@@ -198,32 +198,26 @@ pub fn client_accepts_km(b64: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// JWT 解析（不验签，只读 payload）
+// JWT 解析（不验签，只读 payload）—— 实现只有 `modules::jwt` 一份
 // ---------------------------------------------------------------------------
 
 /// 解 JWT 中间段（base64url）。失败返回 None。
 pub fn jwt_payload(token: &str) -> Option<serde_json::Value> {
-    let seg = token.trim().split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(seg).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    crate::modules::jwt::payload(token)
 }
 
-/// 取出 JWT 的过期时间戳（毫秒）；无 exp 返回 0。
+/// 取出 JWT 的过期时间戳（**毫秒**）；无 exp 返回 0。
+///
+/// ⚠️ 单位归一见 `modules::jwt`：`exp` 是秒还是毫秒由**量级**判定，调用方一律按毫秒用，
+///    **不许再自己乘 1000**（曾经这里写死 `exp * 1000`，毫秒 token 被乘两次 ⇒
+///    界面显示「有效期 58765 年、还剩 20723318 天」）。
 pub fn jwt_exp(token: &str) -> i64 {
-    jwt_payload(token)
-        .and_then(|p| p.get("exp")?.as_i64())
-        .map(|exp| exp * 1000)
-        .unwrap_or(0)
+    crate::modules::jwt::exp_ms(token)
 }
 
 /// 从一个 Cloud-IDE-JWT 里取出所属账号 id（payload.data.id）。
 pub fn jwt_user_id(token: &str) -> Option<String> {
-    let p = jwt_payload(token)?;
-    let d = p.get("data")?;
-    let uid = d.get("id").or_else(|| d.get("user_id"))?;
-    uid.as_i64()
-        .map(|v| v.to_string())
-        .or_else(|| uid.as_str().map(String::from))
+    crate::modules::jwt::user_id(token)
 }
 
 /// 去掉值上可能带的 "Cloud-IDE-JWT " 前缀。

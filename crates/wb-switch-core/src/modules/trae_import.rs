@@ -39,7 +39,9 @@ use crate::modules::trae_discover::{database_path, get_client, list_installed_cl
 use crate::modules::trae_export::{decrypted_db_path, open_decrypted};
 use crate::modules::trae_km::aes_cbc_encrypt;
 use crate::modules::trae_memory_scan::{load_saved_key, save_key, scan_for_key};
-use crate::modules::trae_switch::{is_running, kill_all, launch, wait_until_stopped};
+use crate::modules::trae_switch::{
+    is_running_own, launch, stop_for_maintenance, MaintenanceStop,
+};
 use crate::modules::trae_vault::{list_vault_accounts, read_meta, uid_of_account, uid_from_storage_text};
 use aes::Aes256;
 
@@ -1525,7 +1527,7 @@ pub fn inspect_account(client_key: &str, account_id: &str) -> Result<Value, Stri
     let uid = account_uid(client_key, account_id)?;
     let db = database_path(client);
     let exists = db.is_file();
-    let running = is_running(client);
+    let running = is_running_own(client);
     let key_ready = load_saved_key(client_key)
         .map(|k| {
             let mut page1 = [0u8; PAGE_SZ];
@@ -1726,7 +1728,7 @@ pub fn client_hints() -> Vec<String> {
         if !database_path(client).is_file() {
             continue;
         }
-        if load_saved_key(&ck).is_some() || is_running(client) {
+        if load_saved_key(&ck).is_some() || is_running_own(client) {
             continue;
         }
         out.push(format!(
@@ -1834,15 +1836,25 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
     // 1) 密钥 + 结束客户端（文件替换前提）
     let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
     log("结束客户端进程（文件替换前提）…");
-    let was_running = is_running(client);
-    if was_running {
-        let killed = kill_all(client);
-        if !killed.is_empty() {
-            log(&format!("已结束 {} 个进程", killed.len()));
+    // ⚠️⚠️ T61：走 `stop_for_maintenance`（只碰它自己的程序）。直接 `kill_all` 对「已并入且
+    //    本机已无自己程序」的 SOLO 会回退成承载方 `Trae CN` 的映像名 ⇒ 杀掉用户正在用的 IDE。
+    let was_running;
+    match stop_for_maintenance(client, 20_000) {
+        Ok(MaintenanceStop::NotRunning) => was_running = false,
+        Ok(MaintenanceStop::NoOwnProgram) => {
+            was_running = false;
+            log(&format!(
+                "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+                client.label
+            ));
         }
-        if !wait_until_stopped(client, 20_000) {
-            return Err("客户端未能在 20 秒内退出，已放弃（未改动任何文件）".into());
+        Ok(MaintenanceStop::Stopped(n)) => {
+            was_running = true;
+            if n > 0 {
+                log(&format!("已结束 {n} 个进程"));
+            }
         }
+        Err(e) => return Err(e),
     }
 
     // 2) 实时库 → 明文副本（合并 WAL，保证看到客户端刚写入的状态）
@@ -2047,7 +2059,7 @@ fn resolve_live_key_for_heal(client_key: &str, live: &Path) -> Result<String, St
     let Some(client) = get_client(client_key) else {
         return Err("未知客户端".into());
     };
-    if is_running(client) {
+    if is_running_own(client) {
         let scan = scan_for_key(client_key, live, None).map_err(|e| format!("重新扫描密钥失败：{e}"))?;
         if let Some(k) = scan.key {
             let _ = save_key(client_key, &k);
@@ -2159,13 +2171,17 @@ pub fn import_sessions(
     if !dst_db.is_file() {
         return Err(format!("目标账号 {} 在本机没有会话库，请先用它登录一次 Trae", dst_client.label));
     }
-    if is_running(&dst_client) {
-        log(&format!("目标客户端 {} 正在运行，先将其退出…", dst_client.label));
-        let killed = kill_all(&dst_client);
-        log(&format!("已结束 {} 个进程，等待退出…", killed.len()));
-        if !wait_until_stopped(&dst_client, 10_000) {
-            return Err("目标客户端未能退出，无法写入数据库".into());
+    // ⚠️⚠️ T61：走 `stop_for_maintenance`（只碰目标客户端自己的程序），别用 `kill_all`。
+    match stop_for_maintenance(&dst_client, 10_000) {
+        Ok(MaintenanceStop::NotRunning) => {}
+        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+            dst_client.label
+        )),
+        Ok(MaintenanceStop::Stopped(n)) => {
+            log(&format!("目标客户端 {} 正在运行，已结束 {n} 个进程，等待退出…", dst_client.label));
         }
+        Err(_) => return Err("目标客户端未能退出，无法写入数据库".into()),
     }
     let enc_key_hex = match load_saved_key(dst_client_key) {
         Some(k) => k,
@@ -2377,12 +2393,13 @@ pub fn import_sessions(
         new_size as f64 / 1_048_576.0
     ));
 
-    // 6b) 只保留最新 2 批导入备份：每批 ≈ 一个整库大小，留着会越攒越多。
+    // 6b) 按**用户设置里的保留策略**清理旧导入备份：每批 ≈ 一个整库大小，留着会越攒越多。
+    //     策略自带「每个客户端最新一批永不清」的安全网。
     let (pruned, pruned_bytes) =
-        crate::modules::trae_export::prune_backups(&crate::modules::trae_export::import_backup_dir(), 2);
+        crate::modules::trae_export::prune_with_policy(&crate::modules::trae_export::import_backup_dir());
     if pruned > 0 {
         log(&format!(
-            "已清理 {pruned} 个旧备份，回收 {:.1} MB（仅保留最新 2 批）",
+            "已清理 {pruned} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
             pruned_bytes as f64 / 1_048_576.0
         ));
     }
@@ -2694,14 +2711,17 @@ fn sync_groups_inner(
         return Err(format!("{} 在本机没有会话库", client.label));
     }
 
-    // 2) 结束客户端（写库前提）
-    if is_running(&client) {
-        log(&format!("{} 正在运行，先将其退出…", client.label));
-        let killed = kill_all(&client);
-        log(&format!("已结束 {} 个进程，等待退出…", killed.len()));
-        if !wait_until_stopped(&client, 20_000) {
-            return Err("客户端未能退出，无法写入数据库".into());
+    // 2) 结束客户端（写库前提）—— ⚠️⚠️ T61：只碰它自己的程序，绝不碰承载方。
+    match stop_for_maintenance(&client, 20_000) {
+        Ok(MaintenanceStop::NotRunning) => {}
+        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+            client.label
+        )),
+        Ok(MaintenanceStop::Stopped(n)) => {
+            log(&format!("{} 正在运行，已结束 {n} 个进程，等待退出…", client.label));
         }
+        Err(_) => return Err("客户端未能退出，无法写入数据库".into()),
     }
 
     // 3) 密钥
@@ -2895,9 +2915,12 @@ fn sync_groups_inner(
     log(&format!("自检通过：新库 {pages} 页，会话 {plain_sessions} 个"));
 
     let (pruned, pruned_bytes) =
-        crate::modules::trae_export::prune_backups(&crate::modules::trae_export::import_backup_dir(), 2);
+        crate::modules::trae_export::prune_with_policy(&crate::modules::trae_export::import_backup_dir());
     if pruned > 0 {
-        log(&format!("已清理 {pruned} 个旧备份，回收 {:.1} MB", pruned_bytes as f64 / 1_048_576.0));
+        log(&format!(
+            "已清理 {pruned} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
+            pruned_bytes as f64 / 1_048_576.0
+        ));
     }
 
     // 9) 重启客户端

@@ -1,7 +1,23 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 
 import { defaultTargetClient, targetClientOptions } from "@/lib/trae-import-target";
+import { INTL_GATE } from "@/lib/trae-client-list";
 import type { TraeInstalledClient } from "@/lib/trae-types";
+
+/** 每个用例后恢复出厂态（国际版不开放），免得互相污染。 */
+afterEach(() => {
+  INTL_GATE.enabled = false;
+});
+
+/** 临时把国际版放出来（验证「解开后落到 trae-intl」这条护栏）。 */
+function withIntl<T>(fn: () => T): T {
+  INTL_GATE.enabled = true;
+  try {
+    return fn();
+  } finally {
+    INTL_GATE.enabled = false;
+  }
+}
 
 /** 造一个客户端；只写关心的字段，其余按「能跑」的常态补齐。 */
 function client(
@@ -58,12 +74,24 @@ describe("defaultTargetClient", () => {
     expect(defaultTargetClient("solo-cn", [mergedSolo, hostCn])).toBe("trae-cn");
   });
 
-  test("源不可用且没有承载方 ⇒ 退到第一个能用的", () => {
-    const orphan = client("solo-intl", { runnable: false, merged_into: null });
-    expect(defaultTargetClient("solo-intl", [orphan, hostCn])).toBe("trae-cn");
+  test("源不可用且没有承载方 ⇒ 退到**同一条线**上第一个能用的", () => {
+    const orphan = client("solo-cn", { runnable: false, merged_into: null });
+    expect(defaultTargetClient("solo-cn", [orphan, hostCn])).toBe("trae-cn");
   });
 
-  test("国际版 SOLO 走同一条路：落到国际版 Trae，不落回国内版", () => {
+  test("国际版源 + 国际版被藏起来 ⇒ null，绝不落回国内版库", () => {
+    const mergedIntl = client("solo-intl", {
+      installed: false,
+      runnable: false,
+      merged_into: "trae-intl",
+    });
+    const hostIntl = client("trae-intl");
+    // 国际版本轮不开放（`INTL_GATE`）⇒ 承载方也不在候选里；
+    // 此时**宁可没有目标**，也不能把国际版会话写进国内版库（跨产品线，客户端读不到）。
+    expect(defaultTargetClient("solo-intl", [mergedIntl, hostIntl, hostCn])).toBeNull();
+  });
+
+  test("国际版 SOLO 走同一条路：解开国际版后落到国际版 Trae，不落回国内版", () => {
     const mergedIntl = client("solo-intl", {
       installed: false,
       runnable: false,
@@ -71,7 +99,8 @@ describe("defaultTargetClient", () => {
     });
     const hostIntl = client("trae-intl");
     // 承载方必须**是它自己那条线的**（trae-intl），落到 trae-cn 就是把国际版会话写进国内版库。
-    expect(defaultTargetClient("solo-intl", [mergedIntl, hostIntl, hostCn])).toBe("trae-intl");
+    const picked = withIntl(() => defaultTargetClient("solo-intl", [mergedIntl, hostIntl, hostCn]));
+    expect(picked).toBe("trae-intl");
   });
 
   test("一个能用的都没有 ⇒ null（界面按「没有目标」处理）", () => {
@@ -82,10 +111,18 @@ describe("defaultTargetClient", () => {
     expect(defaultTargetClient(null, [mergedSolo, hostCn])).toBe("trae-cn");
   });
 
-  test("承载方自己也不可用 ⇒ 不硬选它，退到下一个能用的", () => {
+  test("承载方自己也不可用 ⇒ 不硬选它，也不许跨线退到国际版 ⇒ null", () => {
     const deadHost = client("trae-cn", { runnable: false });
-    const other = client("trae-intl");
-    expect(defaultTargetClient("solo-cn", [mergedSolo, deadHost, other])).toBe("trae-intl");
+    const otherLine = client("trae-intl");
+    // 国内版这条线上一个能用的都没有（承载方也死了）⇒ 返回 null，
+    // **不是**退到 trae-intl：跨产品线写会话，客户端根本读不到。
+    expect(defaultTargetClient("solo-cn", [mergedSolo, deadHost, otherLine])).toBeNull();
+  });
+
+  test("承载方不可用但有别的国内版可用 ⇒ 退到那一个（不跨线）", () => {
+    const deadHost = client("trae-cn", { runnable: false });
+    const otherCn = client("trae-cn-2");
+    expect(defaultTargetClient("solo-cn", [mergedSolo, deadHost, otherCn])).toBe("trae-cn-2");
   });
 
   test("返回值一定在可选列表里 —— 两处判据同源", () => {

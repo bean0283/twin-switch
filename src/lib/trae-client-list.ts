@@ -18,6 +18,9 @@
  * ⚠️ 后端**不动** `trae_list_clients` 的返回：`solo-cn` / `solo-intl` 这两个 key 还得能查到
  *    （`merged_into` 反查承载方、已有连线数据里存的 `client_key`、账号并入的源扫描都靠它）。
  *    这里只管「画不画出来」。
+ *
+ * ⚠️ 另外还兼一个**临时**开关：国际版整体不开放（更新落后于国内版），见 [`INTL_GATE`]。
+ *    同样是「只管画不画」，后端返回与数据一个字不动。
  */
 export interface SelectableClientLike {
   key: string;
@@ -30,8 +33,32 @@ export interface SelectableClientLike {
   mergedInto?: string | null;
 }
 
+/**
+ * 「国际版整体不开放」的**临时**前端开关（唯一一处）。
+ *
+ * 背景（2026-10）：国际版的更新落后于国内版，本轮功能国际版还没跟上 ⇒ 先把它的
+ * **内容与功能都藏起来**，等后续跟上再解开。这是**前端**的开关 ——
+ * 后端照旧返回国际版客户端（`trae_list_clients` 一个字不改），数据、连线、
+ * 账号档案一个字节都不动，只是界面上不画、也选不到。
+ *
+ * ⚠️ 要解开：把 `enabled` 改回 `true` 即可。判据只在 `isSelectableClient` 一处，
+ *    别在各页面自己加过滤 —— 5 处选择器 / 4 处默认值都走这一个出口，漏一处就是
+ *    「标签条上没有了、但某个下拉里还选得到」。
+ * ⚠️ 用可变对象而不是 `const INTL_ENABLED = false`：单测要**两种状态都跑一遍**
+ *    （尤其「解开后国际版 SOLO 必须落到 `trae-intl`、不许落回国内版」这条护栏）。
+ *    生产代码只读它，不会写。
+ */
+export const INTL_GATE = { enabled: false };
+
+/** 该客户端是不是国际版（key 一律以 `-intl` 结尾，见后端的 `CLIENTS` 表）。 */
+export function isIntlClient(key: string): boolean {
+  return key.endsWith("-intl");
+}
+
 /** 该项该不该出现在客户端选择器里。 */
 export function isSelectableClient(c: SelectableClientLike): boolean {
+  // 国际版整体不开放（临时开关，见 `INTL_GATE`）。
+  if (!INTL_GATE.enabled && isIntlClient(c.key)) return false;
   // 用 `||` 而不是 `??`：`""` 这种空值也算「没并入」，不然会被误判成已并入。
   const host = c.merged_into || c.mergedInto || null;
   return !(host !== null && c.runnable === false);

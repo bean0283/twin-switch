@@ -8,7 +8,10 @@ import path from "node:path";
 import os from "node:os";
 
 const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
-const BASE = process.env.RC_BASE || "http://127.0.0.1:1420";
+// ⚠️ 默认必须是 `localhost`，不能是 `127.0.0.1`：`vite --host 127.0.0.1` 实际只监听 `[::1]`
+//    （IPv6），用 `127.0.0.1` 直接连不上（curl 拿 `000`）⇒ 整轮自查全是假数据。
+//    仍然可以用 `RC_BASE` 覆盖。
+const BASE = process.env.RC_BASE || "http://localhost:1420";
 const HERE = path.dirname(decodeURIComponent(new URL(import.meta.url).pathname.replace(/^\//, "")));
 const OUTDIR = path.join(HERE, "out");
 
@@ -60,7 +63,7 @@ const MERGE_PROBE = `(async () => {
     btn: { w: Math.round(r.width), h: Math.round(r.height), right: Math.round(r.right) },
     banner: a ? { w: Math.round(a.width), right: Math.round(a.right) } : null,
     viewportW: window.innerWidth,
-    text: (alert ? alert.textContent || '' : '').replace(/\\s+/g, ' ').trim().slice(0, 140),
+    text: (alert ? alert.textContent || '' : '').replace(/\\s+/g, ' ').trim().slice(0, 420),
   };
 })()`;
 
@@ -75,6 +78,10 @@ const MERGE_PROBE = `(async () => {
  * ⚠️ 只认**标签条内部**的按钮。页面上别处也会出现「TRAE SOLO CN」字样（账号页的
  *    「一并带入」提示条就会写来源客户端名），那不算漏出来 —— 所以不能全文搜字符串。
  * ⚠️ 自带轮询：页面挂载后还要拉一次 `trae_list_clients` 才有标签条。
+ *
+ * 同一份探针还顺手验**国际版临时开关**（`INTL_GATE = false`）：标签条上不许出现国际版。
+ * ⚠️ 桩里必须同时放 `trae-intl`（**已安装可用**的那种形态）—— 否则「国际版不在标签条上」
+ *    可能只是因为它本来就没装，验不出「开关真的把它藏了」。
  */
 const CLIENT_PILL_PROBE = `(async () => {
   const readPills = () => {
@@ -95,17 +102,318 @@ const CLIENT_PILL_PROBE = `(async () => {
     pills = readPills();
   }
   const solo = pills.filter((p) => /SOLO/i.test(p.text));
+  const intl = pills.filter((p) => /国际版|Trae（国际/i.test(p.text));
   const groups = [...document.querySelectorAll('[role="group"]')]
     .map((g) => g.getAttribute('aria-label') || '')
     .filter((l) => l.startsWith('Trae 客户端'));
   return {
-    // 有标签条 **且** 一条 SOLO 都没有，才算过。
-    ok: pills.length > 0 && solo.length === 0,
+    // 有标签条 **且** 一条 SOLO、一条国际版都没有，才算过。
+    ok: pills.length > 0 && solo.length === 0 && intl.length === 0,
     pillCount: pills.length,
     labels: pills.map((p) => p.text),
     soloPills: solo.map((p) => p.text + ' @ ' + p.group),
+    intlPills: intl.map((p) => p.text + ' @ ' + p.group),
     groups,
     skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+  };
+})()`;
+
+/**
+ * 账号卡片头像 → token 弹窗（T54 新增；T60 起多走一趟「刷新」）。
+ *
+ * 判据落在真实 DOM 上：点**第一张账号卡的头像按钮**（`aria-label="查看 token…"`），
+ * 弹窗里必须出现 —— token 块（含「复制 token」按钮）、有效期一行、「刷新 token 有效期」按钮。
+ *
+ * ★ T60 追加的第二段：点「刷新 token 有效期」→ 弹「强制刷新」确认窗 → 点「强制刷新」
+ *   → 断言弹窗里那条「本次刷新 前 → 后」对照条真的渲染出来，**并且判出「变短了」**。
+ *   这是「有效期由服务端签发、刷新不等于延长」这句文案唯一的抓手；光断言文案在不在，
+ *   挡不住「对照条根本没画」。
+ *
+ * ⚠️ 只认 `role="dialog"` 里的内容：页面上别处也有「token」字样（回滚卡、编辑器），
+ *    全文搜会把别处的文案算进来。
+ * ⚠️ 头像按钮必须**真的是 button**（`type=button` 的兄弟节点约定）：探针顺手断言这点，
+ *    因为「点不动」是这类改动最常见的回归。
+ * ⚠️ 对照条的判据读 **DOM 属性** `data-refresh-shift`，不看正文文本 —— `index.html`
+ *    的看门狗脚本源码也在 `<body>` 里，全文搜这类判定从第一毫秒起就恒真/恒假。
+ *
+ * ★ T60b 追加：读 `data-issued-validity-days`，断言文案里写出来的「官方签发的天数」
+ *   与产品一致（**Trae 14 / WorkBuddy 28**）。两个产品共用这一个组件，写死一个数字
+ *   就会让其中一个界面撒谎，光看「文案里有天数字」是抓不到的。
+ */
+const TOKEN_DIALOG_PROBE = `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const deadline = Date.now() + 20000;
+  let trigger = null;
+  while (!trigger && Date.now() < deadline) {
+    trigger = [...document.querySelectorAll('button[aria-label]')].find((b) =>
+      /查看 token/.test(b.getAttribute('aria-label') || ''),
+    );
+    if (!trigger) await wait(200);
+  }
+  if (!trigger) return { ok: false, reason: '没找到账号头像按钮（aria-label 含「查看 token」）', errors: [] };
+  trigger.click();
+  let dlg = null;
+  const d2 = Date.now() + 15000;
+  while (!dlg && Date.now() < d2) {
+    dlg = document.querySelector('[role="dialog"]');
+    if (!dlg) await wait(200);
+  }
+  if (!dlg) return { ok: false, reason: '点了头像没弹出弹窗', errors: [] };
+  const text = (dlg.textContent || '').replace(/\\s+/g, ' ').trim();
+  const buttons = [...dlg.querySelectorAll('button')].map((b) =>
+    (b.textContent || '').replace(/\\s+/g, ' ').trim(),
+  );
+  const hasCopy = buttons.some((t) => /复制 token/.test(t));
+  const hasRefresh = buttons.some((t) => /刷新 token 有效期/.test(t));
+  const hasExpiry = /有效期/.test(text);
+  const hasMasked = /…/.test(text);
+  // ⚠️ 单位回归（线上事故）：exp 是毫秒时被再乘 1000 ⇒ 界面显示「58765/4/20」。
+  //    只要有效期里出现 ≥ 3000 的年份就是单位算错了 —— 这条是 UI 层的唯一抓手。
+  const year = Number((text.match(/(\\d{4,6})\\/\\d{1,2}\\/\\d{1,2}/) || [])[1] || 0);
+  const saneYear = !year || (year >= 2000 && year < 3000);
+
+  // ---- T60 第二段：把「刷新 → 确认 → 强制刷新」这条链路真走一遍 ----
+  let refreshFlow = 'not-started';
+  let alertText = null;
+  let forceAlert = null;
+  const refreshBtn = [...dlg.querySelectorAll('button')].find((b) =>
+    /刷新 token 有效期/.test(b.textContent || ''),
+  );
+  if (!refreshBtn) {
+    refreshFlow = 'refresh-button-missing';
+  } else if (refreshBtn.disabled) {
+    refreshFlow = 'refresh-button-disabled';
+  } else {
+    refreshBtn.click();
+    let alert = null;
+    const d3 = Date.now() + 10000;
+    while (!alert && Date.now() < d3) {
+      alert = document.querySelector('[role="alertdialog"]');
+      if (!alert) await wait(150);
+    }
+    if (!alert) {
+      refreshFlow = 'force-confirm-missing';
+    } else {
+      forceAlert = alert;
+      alertText = (alert.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 220);
+      const go = [...alert.querySelectorAll('button')].find((b) =>
+        /强制刷新/.test(b.textContent || ''),
+      );
+      refreshFlow = 'force-button-missing';
+      if (go) {
+        go.click();
+        refreshFlow = 'clicked';
+        await wait(200);
+        // 确认窗关掉、对照条挂上来（刷新成功后还会重新读一遍档案 ⇒ 中间可能短暂 loading）。
+        const d4 = Date.now() + 12000;
+        while (!dlg.querySelector('[data-refresh-shift]') && Date.now() < d4) await wait(150);
+        if (!dlg.querySelector('[data-refresh-shift]')) refreshFlow = 'shift-bar-missing';
+        // ⚠️ 再等确认窗真的从 DOM 里消失：Radix 的退场动画要几百毫秒，不等等的话
+        //    alertGone 会恒为 false（时序噪音，看着像「弹窗关不掉」），截图里也会糊着两层弹窗。
+        //    ⚠️ 本段是**模板字符串的内容**，注释里不许出现反引号（会提前截断模板）。
+        const d5 = Date.now() + 4000;
+        while (document.querySelector('[role="alertdialog"]') && Date.now() < d5) await wait(100);
+      }
+    }
+  }
+  const shiftEl = dlg.querySelector('[data-refresh-shift]');
+  const hasShift = !!shiftEl;
+  const shiftValue = shiftEl ? shiftEl.getAttribute('data-refresh-shift') : null;
+  const shiftShortened = shiftValue === 'shortened';
+  const shiftText = shiftEl ? (shiftEl.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 220) : null;
+  const alertGone = !document.querySelector('[role="alertdialog"]');
+  // ★ T60b：界面文案里写出来的「官方签发的有效期天数」。对照条与强制刷新确认窗都带这个
+  //    属性，谁先出现就读谁 —— 两个产品不一样（Trae 14 / WorkBuddy 28），共用一个写死的
+  //    数字会让其中一个界面撒谎，这条判据就是抓这个。
+  const issuedRaw =
+    (shiftEl && shiftEl.getAttribute('data-issued-validity-days')) ||
+    (forceAlert && forceAlert.getAttribute('data-issued-validity-days')) ||
+    null;
+  const issuedDays = issuedRaw === null ? null : Number(issuedRaw);
+
+  return {
+    ok: hasCopy && hasRefresh && hasExpiry && hasMasked && saneYear && hasShift && shiftShortened,
+    hasCopy, hasRefresh, hasExpiry, hasMasked, saneYear, year,
+    hasShift, shiftValue, shiftShortened, shiftText, refreshFlow, alertText, alertGone,
+    issuedDays,
+    title: (dlg.querySelector('[data-slot="dialog-title"]')?.textContent || '').trim(),
+    buttons,
+    text: text.slice(0, 260),
+    skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+  };
+})()`;
+
+/**
+ * 设置页探针（T62）。
+ *
+ * 判三件事：
+ *  1. **表单挂上来了**（`data-settings-loaded`）—— 挂不上时还要分清是「读失败」
+ *     （`data-settings-error`）还是「白屏」，两种病不同药。
+ *  2. **三个输入框等宽 + 同一水平线** —— 用户报过「三个输入框没有对齐」。
+ *     这条只能量 `getBoundingClientRect()`：`天`/`份`/`GB` 宽度不同，谁把单位写成
+ *     行内 span，三个框就会各自缩成不同宽度（实测 144 / 135 / 213 px）。看正文抓不到。
+ *  3. **改一个值 → 保存 → 摘要跟着变** —— 否则「没存进去」和「存进去了但界面没刷新」
+ *     长得一模一样（后者会让用户以为设置没生效，反复点保存）。
+ *
+ * ⚠️ 页面上的策略原文来自后端（`data-policy-summary`）；这里只断言它「有内容且跟着新值变」，
+ *    不去逐字比对后端文案 —— 那样桩一漂就误报。
+ */
+const SETTINGS_PROBE = `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const deadline = Date.now() + 20000;
+  let card = null;
+  while (!card && Date.now() < deadline) {
+    card = document.querySelector('[data-settings-loaded]');
+    if (!card) await wait(200);
+  }
+  if (!card) {
+    const err = document.querySelector('[data-settings-error]');
+    // ⚠️ 失败分支也要带上 alignW 这些键：判定是按「有没有 alignW」分流用例的，
+    //    少了它们这一档会**静默掉出**判定范围 —— 最典型的「失败长得像通过」。
+    //    ⚠️ 本段是**模板字符串的内容**，注释里不许出现反引号（会提前截断模板）。
+    return {
+      ok: false,
+      alignW: false,
+      alignTop: false,
+      alignUnit: false,
+      savedOk: false,
+      widths: [],
+      tops: [],
+      reason: err ? '页面报了「读取设置失败」' : '设置表单没挂上来（data-settings-loaded 缺失）',
+      skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+      body: (document.body.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200),
+    };
+  }
+  const field = (n) => card.querySelector('[data-field="' + n + '"]');
+  const val = (n) => { const el = field(n); return el ? el.value : null; };
+  const keys = ['keepDays', 'keepCount', 'maxTotalGb'];
+  const boxes = keys.map((n) => {
+    const el = field(n);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const unit = el.parentElement ? el.parentElement.querySelector('span') : null;
+    const ur = unit ? unit.getBoundingClientRect() : null;
+    return {
+      n,
+      w: Math.round(r.width * 10) / 10,
+      left: Math.round(r.left * 10) / 10,
+      top: Math.round(r.top * 10) / 10,
+      unitLeft: ur ? Math.round(ur.left * 10) / 10 : null,
+    };
+  });
+  const present = boxes.filter(Boolean);
+  const widths = present.map((b) => b.w);
+  const tops = present.map((b) => b.top);
+  const unitLefts = present.map((b) => b.unitLeft).filter((v) => v !== null);
+  const alignW =
+    present.length === 3 && Math.max.apply(null, widths) - Math.min.apply(null, widths) <= 1;
+  const alignTop =
+    present.length === 3 && Math.max.apply(null, tops) - Math.min.apply(null, tops) <= 1;
+  // 单位槽宽度一致 ⇒ 「天 / 份 / GB」落在同一条竖线上
+  const alignUnit =
+    unitLefts.length !== 3 ||
+    Math.max.apply(null, unitLefts.map((v, i) => v - present[i].left)) -
+      Math.min.apply(null, unitLefts.map((v, i) => v - present[i].left)) <= 2;
+
+  const policyEl = card.querySelector('[data-policy-summary]');
+  const policyBefore = policyEl ? (policyEl.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+
+  // 改「份数」→ 保存 → 摘要必须跟着变
+  let savedOk = false;
+  let policyAfter = null;
+  let saveDisabled = null;
+  const count = field('keepCount');
+  if (count) {
+    count.focus();
+    // React 受控输入：必须走原型上的 value setter + 原生 input 事件，
+    // 直接 el.value = '2' 改不动 React 的 state（onChange 收不到）。
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(count, '2');
+    count.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(200);
+    const save = card.querySelector('[data-action="save"]');
+    saveDisabled = save ? !!save.disabled : null;
+    if (save && !save.disabled) {
+      save.click();
+      const d2 = Date.now() + 6000;
+      while (Date.now() < d2) {
+        const p = card.querySelector('[data-policy-summary]');
+        const txt = p ? (p.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+        if (txt && txt.indexOf('2 份') >= 0) { policyAfter = txt; savedOk = true; break; }
+        await wait(150);
+      }
+      if (!policyAfter) {
+        const p = card.querySelector('[data-policy-summary]');
+        policyAfter = p ? (p.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+      }
+    }
+  }
+  return {
+    ok: alignW && alignTop && !!policyBefore && savedOk,
+    alignW, alignTop, alignUnit, widths, tops, boxes, saveDisabled,
+    policyBefore, policyAfter, savedOk,
+    formBefore: { keepDays: val('keepDays'), keepCount: val('keepCount'), maxTotalGb: val('maxTotalGb') },
+    keepCountAfter: val('keepCount'),
+    skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+    title: (document.querySelector('h1')?.textContent || '').trim(),
+    text: (card.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300),
+  };
+})()`;
+
+/**
+ * 清理页的「保留策略 + 从最老的清」探针（T62）。
+ *
+ * 判三件事：
+ *  1. 工具残留那一类头上画出了**保留策略原文**（`data-backup-policy`，来自后端，与判定同源）；
+ *  2. 「超出策略」与「最旧」两个标记都画出来了；
+ *  3. **第一个批次就是最旧的那一批** —— 用户明确要求「优先清理最老的版本，而不是清理到只剩一份」。
+ *     这条只能靠 DOM 顺序判（`data-item-oldest` 落在第一个 `[data-item-title]` 上）。
+ */
+const CLEANUP_POLICY_PROBE = `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const deadline = Date.now() + 20000;
+  let banner = null;
+  while (!banner && Date.now() < deadline) {
+    banner = document.querySelector('[data-backup-policy]');
+    if (!banner) await wait(200);
+  }
+  const titles = [...document.querySelectorAll('[data-item-title]')];
+  const oldestIdx = titles
+    .map((t, i) => (t.getAttribute('data-item-oldest') === '1' ? i : -1))
+    .filter((i) => i >= 0);
+  const overIdx = titles
+    .map((t, i) => (t.getAttribute('data-item-over') === '1' ? i : -1))
+    .filter((i) => i >= 0);
+  const policy = banner ? (banner.getAttribute('data-backup-policy') || '').trim() : null;
+  // T61：影子客户端必须**折成一条**（真机上它本来会刷 17 行 TRAE SOLO CN · Cache…）。
+  // 判据只看 DOM 上的钩子，不看正文全文 —— 那会连 index.html 的看门狗源码一起扫到。
+  const mergedRows = titles.filter((t) => t.getAttribute('data-item-merged') === '1');
+  // 注意事项也要按结构取（每条 Alert 自带 data-cleanup-note）。
+  const noteTexts = [...document.querySelectorAll('[data-cleanup-note]')].map(
+    (el) => el.getAttribute('data-cleanup-note') || ''
+  );
+  const shadowNote = noteTexts.find((n) => n.includes('TRAE SOLO CN')) || '';
+  const shadowLies = noteTexts.some((n) => n.includes('TRAE SOLO CN') && n.includes('正在运行'));
+  return {
+    ok: !!banner && oldestIdx.length > 0 && overIdx.length > 0 && oldestIdx[0] === 0,
+    hasBanner: !!banner,
+    policy,
+    itemCount: titles.length,
+    oldestIdx, overIdx,
+    // 最旧那一批必须排在最前 —— 清理顺序 = 先从最老的清
+    firstIsOldest: oldestIdx[0] === 0,
+    // 「清理到只剩一份」的老毛病：把除最新之外全标成推荐
+    recommendedCount: overIdx.length,
+    order: titles.map((t) => t.getAttribute('data-item-oldest') + t.getAttribute('data-item-over')),
+    // ---- T61 ----
+    mergedCount: mergedRows.length,
+    mergedOnlyOnce: mergedRows.length === 1,
+    mergedTitle: mergedRows[0] ? mergedRows[0].getAttribute('data-item-title') || '' : '',
+    mergedTitleNamesHost: !!mergedRows[0] && (mergedRows[0].getAttribute('data-item-title') || '').includes('已并入'),
+    shadowNoteSaysMerged: shadowNote.includes('已并入'),
+    shadowNoteLiesRunning: shadowLies,
+    skeletons: document.querySelectorAll('[data-slot="skeleton"]').length,
+    text: (document.body.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
   };
 })()`;
 
@@ -679,10 +987,43 @@ const CASES = [
   { name: "trae-pill-home-1360", route: "/", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
   { name: "trae-pill-import-1360", route: "/workbuddy-import", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
   { name: "trae-pill-export-1360", route: "/workbuddy-export", width: 1360, height: 800, probe: CLIENT_PILL_PROBE },
+
+  // ★ 本轮新增（T54）：账号卡片头像 → token 弹窗（看 / 复制 / 有效期 / 续期）。
+  //   桩里 `oauth_717036` 是网页凭证账号（有 oauth.json）⇒ 点它的头像才拿得到 token。
+  //   ⚠️ 无头浏览器没有剪贴板权限 ⇒ 只断言「按钮在 + 文案对」，不真的点复制。
+  { name: "trae-token-dialog-1600", route: "/trae-switch", width: 1600, height: 900, probe: TOKEN_DIALOG_PROBE },
+  { name: "trae-token-dialog-1360", route: "/trae-switch", width: 1360, height: 800, probe: TOKEN_DIALOG_PROBE },
+  { name: "trae-token-dialog-730", route: "/trae-switch", width: 730, height: 800, probe: TOKEN_DIALOG_PROBE },
+
+  // ★ 本轮新增（T56）：WorkBuddy 账号页头像 → 同一套 token 弹窗。
+  //   两个产品共用一个组件，所以这里验的是「WB 页也接上了 + 数据来自 WB 那条命令」。
+  { name: "wb-token-dialog-1600", route: "/workbuddy-switch", width: 1600, height: 900, probe: TOKEN_DIALOG_PROBE },
+  { name: "wb-token-dialog-1360", route: "/workbuddy-switch", width: 1360, height: 800, probe: TOKEN_DIALOG_PROBE },
+  { name: "wb-token-dialog-730", route: "/workbuddy-switch", width: 730, height: 800, probe: TOKEN_DIALOG_PROBE },
+
+  // ★ T62 新增：设置页（整库备份保留策略）。
+  //   重点判「三个输入框等宽对齐」（用户报过没对齐）+「保存后摘要跟着变」。
+  { name: "settings-1600", route: "/settings", width: 1600, height: 900, probe: SETTINGS_PROBE },
+  { name: "settings-1360", route: "/settings", width: 1360, height: 800, probe: SETTINGS_PROBE },
+  { name: "settings-730", route: "/settings", width: 730, height: 800, probe: SETTINGS_PROBE },
+
+  // ★ T62 新增：清理页的保留策略条 + 「先从最老的清」排序。
+  { name: "cleanup-policy-1600", route: "/trae-cleanup", width: 1600, height: 900, probe: CLEANUP_POLICY_PROBE },
+  { name: "cleanup-policy-1360", route: "/trae-cleanup", width: 1360, height: 800, probe: CLEANUP_POLICY_PROBE },
+  { name: "cleanup-policy-730", route: "/trae-cleanup", width: 730, height: 800, probe: CLEANUP_POLICY_PROBE },
 ];
 
 const only = process.argv[2];
-const list = only ? CASES.filter((c) => c.name.includes(only)) : CASES;
+/**
+ * ⚠️ 省时开关：`RC_WIDTH=1360` 只跑指定宽度。
+ *
+ * 迭代期一个改动往往只影响一档（最常见是 1360），三档全跑要三倍时间（每档约 1.5~2.5 分钟，
+ * 大头是浏览器冷启动 + 页面挂载，不是断言）。**收尾仍然要三档全跑**，那时不传 `RC_WIDTH`。
+ */
+const onlyWidth = process.env.RC_WIDTH ? Number(process.env.RC_WIDTH) : 0;
+const list = (only ? CASES.filter((c) => c.name.includes(only)) : CASES).filter(
+  (c) => !onlyWidth || c.width === onlyWidth,
+);
 
 // ⚠️ 先热一次 `vite dev`：它第一次 transform 整页模块图要十几秒，这段时间首档只能看到
 //    `index.html` 的启动占位 —— 量到的是「工具冷启动」而不是「页面画没画出来」。
@@ -735,10 +1076,22 @@ for (const c of list) {
       `\n  errors(${(r.errors || []).length}): ${(r.errors || []).slice(0, 4).join(" | ")}`,
   );
   if (r.probe) {
-    if ("soloPills" in r.probe) {
+    // ⚠️ 按**键名**分流，不按「有没有 `ok`」 —— 三份探针都有 `ok`，会串到同一个分支去。
+    if ("hasCopy" in r.probe || !("soloPills" in r.probe) && !("found" in r.probe)) {
+      console.log(
+        r.probe.reason
+          ? `  token : ❌ ${r.probe.reason}`
+          : `  token : 复制=${r.probe.hasCopy} 刷新按钮=${r.probe.hasRefresh} 有效期=${r.probe.hasExpiry} 打码=${r.probe.hasMasked} 年份合理=${r.probe.saneYear}(${r.probe.year})` +
+              `\n  token : 对照条=${r.probe.hasShift}(${r.probe.shiftValue}) 判出变短=${r.probe.shiftShortened} 链路=${r.probe.refreshFlow} 确认窗已关=${r.probe.alertGone}` +
+              `\n  token : 对照条原文=${JSON.stringify(r.probe.shiftText)}` +
+              `\n  token : 确认窗原文=${JSON.stringify(r.probe.alertText)}` +
+              `\n  token : 标题=${JSON.stringify(r.probe.title)} 按钮=${JSON.stringify(r.probe.buttons)}` +
+              `\n  token : 正文=${JSON.stringify(r.probe.text)}`,
+      );
+    } else if ("soloPills" in r.probe) {
       console.log(
         `  pills : ${r.probe.pillCount} 个标签 = ${JSON.stringify(r.probe.labels)}` +
-          `\n  pills : SOLO 项 = ${JSON.stringify(r.probe.soloPills)}  skeleton=${r.probe.skeletons}` +
+          `\n  pills : SOLO 项 = ${JSON.stringify(r.probe.soloPills)}  国际版项 = ${JSON.stringify(r.probe.intlPills)}  skeleton=${r.probe.skeletons}` +
           `\n  pills : 容器 = ${JSON.stringify(r.probe.groups)}`,
       );
     } else {
@@ -786,13 +1139,14 @@ if (mergeCases.length) {
   );
 }
 
-// 汇总判据二：客户端标签条上**一条 SOLO 都不能有**（它已被摘掉），且标签条得画出来。
-// ⚠️ 判据用 `/SOLO/i` 匹配标签文字，不是全文搜「TRAE SOLO CN」—— 账号页的「一并带入」
-//    提示条会写来源客户端名，全文搜会把那条正确文案判成漏。
+// 汇总判据二：客户端标签条上**一条 SOLO、一条国际版都不能有**（T53 起国际版也临时藏了），
+// 且标签条得画出来。⚠️ 判据用 `/SOLO/i` 与 `/国际版/` 匹配标签文字，不是全文搜「TRAE SOLO CN」
+// —— 账号页的「一并带入」提示条会写来源客户端名，全文搜会把那条正确文案判成漏。
 const pillCases = out.filter((r) => r.probe && "soloPills" in r.probe);
 if (pillCases.length) {
   const noBar = pillCases.filter((r) => (r.probe.pillCount ?? 0) === 0);
   const leaked = pillCases.filter((r) => (r.probe.soloPills || []).length > 0);
+  const intlLeaked = pillCases.filter((r) => (r.probe.intlPills || []).length > 0);
   const messy = pillCases.filter(
     (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
   );
@@ -802,8 +1156,165 @@ if (pillCases.length) {
       (leaked.length
         ? `  ❌ SOLO 仍在标签条上：${leaked.map((r) => `${r.case} → ${r.probe.soloPills.join(" / ")}`).join("; ")}`
         : "  ✅ 标签条上没有 SOLO") +
+      (intlLeaked.length
+        ? `  ❌ 国际版仍在标签条上（T53 开关没生效）：${intlLeaked
+            .map((r) => `${r.case} → ${r.probe.intlPills.join(" / ")}`)
+            .join("; ")}`
+        : "  ✅ 标签条上没有国际版") +
       (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净"),
   );
+}
+
+// 汇总判据三（T54 / T56 / T60）：点头像弹出的 token 弹窗必须**三档都能开**、要素齐全，
+// 且「刷新 → 确认 → 强制刷新 → 前后对照条」这条链路真的走通、判出「变短」。
+// Trae 页与 WorkBuddy 页共用同一个组件，两个页面各有一组用例，这里一起判。
+const tokenCases = out.filter((r) => r.probe && "hasCopy" in r.probe);
+if (tokenCases.length) {
+  const bad = tokenCases.filter((r) => !r.probe.ok);
+  const messy = tokenCases.filter(
+    (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
+  );
+  const badYear = tokenCases.filter((r) => r.probe.saneYear === false);
+  // ★ T60：对照条没画 / 画了但没判出「变短」各算一类，别让它塌缩成同一句。
+  const noShift = tokenCases.filter((r) => r.probe.hasShift !== true);
+  const wrongShift = tokenCases.filter(
+    (r) => r.probe.hasShift === true && r.probe.shiftShortened !== true,
+  );
+  // ★ T60b：**两个产品官方签发的天数不一样**（Trae 14 天 / WorkBuddy 28 天）。用例名带产品
+  //    前缀，这里按前缀分别断言 —— T60 初版两边共用写死的 28 天，Trae 弹窗就在撒谎。
+  //    ⚠️ 反证：把 `ISSUED_VALIDITY_DAYS.trae` 改成 28，这一条必须报错。
+  const wantIssued = (name) => (name.startsWith("trae-token-dialog-") ? 14 : 28);
+  const wrongIssued = tokenCases.filter((r) => r.probe.issuedDays !== wantIssued(r.case));
+  console.log(
+    `\n【判定】token 弹窗 ${tokenCases.length - bad.length}/${tokenCases.length} 档开出来且要素齐全` +
+      (bad.length
+        ? `  ❌ ${bad
+            .map(
+              (r) =>
+                `${r.case}（${r.probe.reason || `复制=${r.probe.hasCopy} 刷新=${r.probe.hasRefresh} 有效期=${r.probe.hasExpiry} 打码=${r.probe.hasMasked} 年份=${r.probe.year} 对照条=${r.probe.hasShift} 变短=${r.probe.shiftShortened} 链路=${r.probe.refreshFlow}`}）`,
+            )
+            .join("; ")}`
+        : "  ✅ 复制 / 刷新按钮 / 有效期 / 打码 全在") +
+      (badYear.length
+        ? `  ❌ 有效期年份不合理（单位算错？）：${badYear.map((r) => `${r.case} → ${r.probe.year}`).join(", ")}`
+        : "  ✅ 有效期年份都在 2000~2999") +
+      (noShift.length
+        ? `  ❌ 没画出「本次刷新前 → 后」对照条：${noShift
+            .map((r) => `${r.case}（链路=${r.probe.refreshFlow}）`)
+            .join(", ")}`
+        : "  ✅ 各档都走通「刷新 → 确认 → 强制刷新 → 对照条」") +
+      (wrongShift.length
+        ? `  ❌ 对照条没判出「刷新后反而变短」：${wrongShift
+            .map((r) => `${r.case} → data-refresh-shift=${r.probe.shiftValue}`)
+            .join(", ")}`
+        : "  ✅ 对照条都把「变短」标了出来") +
+      (wrongIssued.length
+        ? `  ❌ 文案里的「官方签发天数」与产品不符：${wrongIssued
+            .map((r) => `${r.case} → 实际 ${r.probe.issuedDays} 天，应为 ${wantIssued(r.case)} 天`)
+            .join("; ")}`
+        : "  ✅ Trae 档写 14 天、WorkBuddy 档写 28 天") +
+      (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净"),
+  );
+  // 抽样打印一档的对照条原文，便于人工核对文案 —— 判据过 ≠ 文案说得对。
+  const sample = tokenCases.find((r) => r.probe.shiftText);
+  if (sample) {
+    console.log(`  样例（${sample.case}）：${sample.probe.shiftText}`);
+    console.log(`  强制刷新确认窗（${sample.case}）：${(sample.probe.alertText || "").slice(0, 160)}`);
+  }
+}
+
+// 汇总判据四（T62）：设置页必须能开、三个输入框**等宽对齐**、保存后摘要跟着变。
+const settingsCases = out.filter((r) => r.probe && "alignW" in r.probe);
+if (settingsCases.length) {
+  const bad = settingsCases.filter((r) => !r.probe.ok);
+  const misalignedW = settingsCases.filter((r) => r.probe.alignW === false);
+  const misalignedTop = settingsCases.filter((r) => r.probe.alignTop === false);
+  const misalignedUnit = settingsCases.filter((r) => r.probe.alignUnit === false);
+  const noSave = settingsCases.filter((r) => r.probe.savedOk !== true);
+  const messy = settingsCases.filter(
+    (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
+  );
+  console.log(
+    `\n【判定】设置页 ${settingsCases.length - bad.length}/${settingsCases.length} 档开出来` +
+      (bad.length
+        ? `  ❌ ${bad.map((r) => `${r.case}（${r.probe.reason || "见明细"}）`).join("; ")}`
+        : "  ✅ 策略表单 + 摘要都在") +
+      (misalignedW.length
+        ? `  ❌ 三个输入框不等宽：${misalignedW
+            .map((r) => `${r.case} → ${JSON.stringify(r.probe.widths)}`)
+            .join("; ")}`
+        : "  ✅ 三个输入框等宽") +
+      (misalignedTop.length
+        ? `  ❌ 三个输入框不在同一水平线：${misalignedTop
+            .map((r) => `${r.case} → top ${JSON.stringify(r.probe.tops)}`)
+            .join("; ")}`
+        : "  ✅ 三个输入框同一水平线") +
+      (misalignedUnit.length
+        ? `  ❌ 单位（天/份/GB）没落在同一条竖线上：${misalignedUnit.map((r) => r.case).join(", ")}`
+        : "  ✅ 单位槽对齐") +
+      (noSave.length
+        ? `  ❌ 改值→保存后摘要没跟着变：${noSave
+            .map((r) => `${r.case}（保存键 disabled=${r.probe.saveDisabled}，摘要=${JSON.stringify((r.probe.policyAfter || "").slice(0, 40))}）`)
+            .join("; ")}`
+        : "  ✅ 改值保存后摘要同步更新") +
+      (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净"),
+  );
+  const s2 = settingsCases.find((r) => r.probe.policyBefore);
+  if (s2) {
+    console.log(`  设置页策略原文（${s2.case}）：${s2.probe.policyBefore}`);
+    console.log(`  保存后（${s2.case}）：${s2.probe.policyAfter}`);
+  }
+}
+
+// 汇总判据五（T62）：清理页的保留策略条 + 「先从最老的清」排序。
+const policyCases = out.filter((r) => r.probe && "firstIsOldest" in r.probe);
+if (policyCases.length) {
+  const noBanner = policyCases.filter((r) => !r.probe.hasBanner);
+  const noMark = policyCases.filter(
+    (r) => (r.probe.oldestIdx || []).length === 0 || (r.probe.overIdx || []).length === 0,
+  );
+  const wrongOrder = policyCases.filter((r) => r.probe.firstIsOldest !== true);
+  // T61：影子客户端（已并入、本机已无自己程序）必须折成**一条**并写明「已并入」，
+  // 注意事项里**不许**再说它「正在运行」。反证：把后端改回 `is_running` + 逐目录列，
+  // 这里会立刻报「拆成了 N 行」或「注意事项还在谎报正在运行」。
+  const splitShadow = policyCases.filter((r) => r.probe.mergedCount !== 1);
+  const namelessShadow = policyCases.filter((r) => r.probe.mergedTitleNamesHost !== true);
+  const lyingShadow = policyCases.filter(
+    (r) => r.probe.shadowNoteLiesRunning === true || r.probe.shadowNoteSaysMerged !== true,
+  );
+  const messy = policyCases.filter(
+    (r) => (r.before?.overflowX ?? 0) > 0 || (r.before?.verticalCount ?? 0) > 0,
+  );
+  console.log(
+    `\n【判定】清理页保留策略 ${policyCases.length - noBanner.length}/${policyCases.length} 档画出来` +
+      (noBanner.length ? `  ❌ 没策略条：${noBanner.map((r) => r.case).join(", ")}` : "  ✅ 策略条都在") +
+      (noMark.length
+        ? `  ❌ 「超出策略」/「最旧」标记没画出来：${noMark
+            .map((r) => `${r.case}（最旧 ${JSON.stringify(r.probe.oldestIdx)}，超出 ${JSON.stringify(r.probe.overIdx)}）`)
+            .join("; ")}`
+        : "  ✅ 「最旧」「超出策略」两个标记都在") +
+      (wrongOrder.length
+        ? `  ❌ 最旧的一批没排在最前面（清理顺序不是先从最老的清）：${wrongOrder
+            .map((r) => `${r.case} → 标记序列 ${JSON.stringify(r.probe.order)}`)
+            .join("; ")}`
+        : "  ✅ 最旧的一批排在最前（先从最老的清）") +
+      (splitShadow.length
+        ? `  ❌ 影子客户端的残留没折成一条（看着像它还装着）：${splitShadow
+            .map((r) => `${r.case} → ${r.probe.mergedCount} 条`)
+            .join("; ")}`
+        : "  ✅ 影子客户端的残留折成一条") +
+      (namelessShadow.length
+        ? `  ❌ 影子那条没写明「已并入谁」：${namelessShadow.map((r) => `${r.case} → ${r.probe.mergedTitle}`).join("; ")}`
+        : "  ✅ 影子那条写明了「已并入谁」") +
+      (lyingShadow.length
+        ? `  ❌ 影子客户端的提示还在说谎（不许说「正在运行」）：${lyingShadow
+            .map((r) => `${r.case} → 说已并入=${r.probe.shadowNoteSaysMerged} / 说正在运行=${r.probe.shadowNoteLiesRunning}`)
+            .join("; ")}`
+        : "  ✅ 影子客户端只说「已并入、只剩历史数据」，没说「正在运行」") +
+      (messy.length ? `  ❌ 版式问题：${messy.map((r) => r.case).join(", ")}` : "  ✅ 版式干净"),
+  );
+  const s3 = policyCases.find((r) => r.probe.policy);
+  if (s3) console.log(`  清理页策略原文（${s3.case}）：${s3.probe.policy}`);
 }
 
 console.log(`\n报告：${path.join(OUTDIR, "report.json")}`);

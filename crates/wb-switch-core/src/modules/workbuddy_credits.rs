@@ -32,11 +32,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::config::{self, http_request, now_ms};
+use crate::modules::workbuddy_accounts;
 use crate::modules::workbuddy_auth::{self, API_ENDPOINT};
 use crate::modules::workbuddy_vault;
 
 /// 报表接口前缀（国内版与官方客户端一致）。
 const CHECKIN_API_PREFIX: &str = "/v2/billing/meter";
+/// 插件接口前缀 —— **续期走这条**（`{base}/v2/plugin/auth/token/refresh`）。
+///
+/// ⚠️⚠️ 别和上面那个混：`/v2/billing/meter` 是**账单 / 报表**前缀，
+///    `/v2/plugin` 才是 **OAuth 续期**前缀。T56 第一版把两者写成了同一个常量
+///    ⇒ 续期打到 `{base}/v2/billing/meter/auth/token/refresh`（服务端不认这条路径）
+///    ⇒ 界面永远「刷新失败」，且因为失败文案不区分原因，看不出是路径问题。
+///    参考实现 `modules/refresh.rs` 用的是 `variant.api_prefix()`
+///    = `WORKBUDDY_API_PREFIX = "/v2/plugin"`（其单测把 CN 的完整 URL 钉死在
+///    `https://www.codebuddy.cn/v2/plugin/auth/token/refresh`）。
+const PLUGIN_API_PREFIX: &str = "/v2/plugin";
 /// 旧资源接口后缀。
 const USER_RESOURCE_SUFFIX: &str = "/get-user-resource";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
@@ -539,8 +550,12 @@ fn resource_auth_headers(account: &Value, base: &str) -> HashMap<String, String>
 }
 
 /// 刷新接口 URL（国内版）。
+///
+/// ⚠️⚠️ 前缀是 `/v2/plugin`（OAuth 续期），**不是** `/v2/billing/meter`（账单/报表）。
+///    两者一字之差，打错时服务端不会说「路径错了」，只会回一个业务错误码 ⇒
+///    表现成「刷新永远失败」。见 [`PLUGIN_API_PREFIX`] 的注释。
 fn refresh_url(account: &Value) -> String {
-    format!("{}{CHECKIN_API_PREFIX}/auth/token/refresh", api_base_for(account))
+    format!("{}{PLUGIN_API_PREFIX}/auth/token/refresh", api_base_for(account))
 }
 
 /// 刷新请求头。
@@ -556,17 +571,36 @@ fn refresh_headers(account: &Value, refresh_token: &str) -> HashMap<String, Stri
 
 /// 刷新一次 token。
 ///
-/// 返回 `(刷新后的账号, 是否刷新成功)`。失败时保留原账号，由上层决定怎么报错。
-async fn refresh_account_token(mut account: Value) -> (Value, bool) {
+/// 返回 `(刷新后的账号, 失败原因)`：`None` = 成功；`Some(原因)` = 失败（账号原样返回）。
+///
+/// ⚠️ 失败原因必须带上**服务端的 code / message 与响应字段名**。以前这里只回一个 `bool`，
+///    于是两种完全不同的失败（服务端拒绝 vs 响应缺字段）共用同一句
+///    「服务端没有返回新的 accessToken」—— 既分不清是凭据失效还是我们打错了接口，
+///    也看不出响应到底长什么样（T57 的续期排查就是被这类「万能文案」拖慢的）。
+async fn refresh_account_token(mut account: Value) -> (Value, Option<String>) {
     let rt = str_at(&account, "refresh_token");
     if rt.is_empty() {
-        return (account, false);
+        return (account, Some("账号档里没有 refresh_token。".to_string()));
     }
     let url = refresh_url(&account);
     let resp = http_request(&url, "POST", Some(json!({})), Some(&refresh_headers(&account, &rt))).await;
+    if is_transport_error(&resp) {
+        return (
+            account,
+            Some(format!("请求没能与服务端完成交互（{url}）：{resp}")),
+        );
+    }
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
-        return (account, false);
+        let msg = resp
+            .get("message")
+            .or_else(|| resp.get("msg"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("（响应里没有 message / msg 字段）");
+        return (
+            account,
+            Some(format!("服务端拒绝（POST {url} → code={code}）：{msg}")),
+        );
     }
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
     let Some(new_at) = data
@@ -575,7 +609,22 @@ async fn refresh_account_token(mut account: Value) -> (Value, bool) {
         .or_else(|| data.get("access_token").and_then(|v| v.as_str()))
         .map(str::to_string)
     else {
-        return (account, false);
+        // 走到这儿 = 服务端说成功、但没有新 token。把**响应字段名**列出来，
+        // 否则下次只能靠猜（是字段改名了，还是 `data` 整个为空）。
+        let fields = |v: &Value| {
+            v.as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        return (
+            account,
+            Some(format!(
+                "服务端回了成功码（code={code}）但响应里没有新的 accessToken。\
+                 响应外层字段：[{}]；data 字段：[{}]。",
+                fields(&resp),
+                fields(&data)
+            )),
+        );
     };
     account["access_token"] = json!(new_at);
     if let Some(new_rt) = data
@@ -608,7 +657,7 @@ async fn refresh_account_token(mut account: Value) -> (Value, bool) {
         account["refreshExpiresAt"] = json!(v);
     }
     account["refreshedAt"] = json!(now_ms());
-    (account, true)
+    (account, None)
 }
 
 /// 惰性刷新：`expiresAt` 缺失或剩余 < `LAZY_REFRESH_HOURS` 就刷新。
@@ -631,6 +680,164 @@ async fn ensure_fresh_token(account: Value) -> Value {
 /// 就是自己的库，判断也随之消失（账号仍是唯一来源，见模块头）。
 fn persist_if_owned(account: &CreditAccount, refreshed: &Value) {
     let _ = workbuddy_vault::update_tokens(&account.id, refreshed);
+}
+
+// ---------------------------------------------------------------------------
+// 账号 token：看 / 复制 / 续期
+// ---------------------------------------------------------------------------
+//
+// 与 Trae 侧 `trae_remote::{account_token_info, refresh_account_token}` 是同一套语义，
+// 差别只在鉴权方式：
+//   - Trae：设备签名握手 `/trae/api/v3/oauth/ExchangeToken`；
+//   - WorkBuddy：`POST {base}/v2/billing/meter/auth/token/refresh`，带
+//     `X-Refresh-Token` + **`X-Auth-Refresh-Source: plugin`**（缺这个头网关会
+//     判成另一个 client 来源并回 invalid_grant，见参考实现 refresh.rs）。
+//
+// ⚠️ 两个产品的「还剩多少天 / 要不要刷」判定都走 `config::days_left_ms`
+//    与 `refresh_skip_days`，不许各写一份。
+
+/// 续期门槛：access token 剩余 **> 该天数**时默认不刷新（不消耗 refreshToken 轮换代次）。
+pub const TOKEN_REFRESH_THRESHOLD_DAYS: i64 = 7;
+
+/// 续期门槛的**纯判定**（与网络无关，便于单测）。
+///
+/// 入参 `exp_ms` = access token 到期时间（**毫秒**）。返回 `Some(剩余天数)` = 跳过刷新；
+/// `None` = 该刷新（已过期 / 剩余不足门槛 / `force`）。
+///
+/// ⚠️ 「跳过」不等于失败：调用方必须表达成 `Ok(refreshed = false)`，界面据此弹
+///    「要不要强制刷新」确认窗。
+pub fn refresh_skip_days(exp_ms: i64, force: bool) -> Option<i64> {
+    if force || exp_ms <= now_ms() + TOKEN_REFRESH_THRESHOLD_DAYS * 86_400_000 {
+        return None;
+    }
+    Some(config::days_left_ms(exp_ms))
+}
+
+/// 按账号 id 读**本工具账号库**里的原始账号档；不存在返回 `None`。
+fn raw_account(id: &str) -> Option<Value> {
+    workbuddy_vault::load_accounts()
+        .into_iter()
+        .find(|a| workbuddy_vault::account_id(a) == id)
+}
+
+/// access token 的到期时间（**毫秒**）：优先用账号库存的 `expiresAt`，
+/// 缺了才回头解 JWT 的 `exp`。解不出返回 `0`。
+fn access_exp_ms(acc: &Value) -> i64 {
+    if let Some(ms) = acc.get("expiresAt").and_then(|v| v.as_i64()) {
+        if ms > 0 {
+            return crate::modules::jwt::normalize_ms(ms);
+        }
+    }
+    crate::modules::jwt::exp_ms(&str_at(acc, "access_token"))
+}
+
+/// 刷新额度到期（`refreshExpiresAt`，毫秒）；没有返回 `0`。
+fn refresh_exp_ms(acc: &Value) -> i64 {
+    acc.get("refreshExpiresAt")
+        .and_then(|v| v.as_i64())
+        .map(crate::modules::jwt::normalize_ms)
+        .filter(|v| *v > 0)
+        .unwrap_or(0)
+}
+
+/// 界面「账号 token」弹窗要的数据：jwt 本体 + 有效期 + 能不能续期。**只读、不联网。**
+pub fn account_token_info(account_id: &str) -> Result<Value, String> {
+    let acc = raw_account(account_id).ok_or_else(|| {
+        format!("账号库里没有 id 为 {account_id} 的账号（可能已被删除，刷新列表看看）。")
+    })?;
+    let state = token_state_of(&acc);
+    let token = str_at(&acc, "access_token");
+    let exp = access_exp_ms(&acc);
+    let rt_exp = refresh_exp_ms(&acc);
+    let has_rt = !str_at(&acc, "refresh_token").is_empty();
+    Ok(json!({
+        "ok": true,
+        "id": account_id,
+        "uid": str_at(&acc, "uid"),
+        "name": workbuddy_accounts::label_for(&str_at(&acc, "uid")),
+        "token": token,
+        "tokenExp": if exp > 0 { json!(exp) } else { Value::Null },
+        "refreshExpiredAt": if rt_exp > 0 { json!(rt_exp) } else { Value::Null },
+        // 「来源」在这里是**凭据形态**，不是文件——WorkBuddy 的账号档就在我们自己的库里。
+        "source": state.as_str(),
+        "blockedReason": match state {
+            TokenState::Plain => Value::Null,
+            TokenState::Envelope => json!(
+                "该账号凭据是 WorkBuddy 加密信封（{\"$wbEncrypted\":…}），本地解不出明文，\
+                 任何接口都会返回 401。用「扫码添加账号」重新扫码即可拿到明文凭据。"
+            ),
+            TokenState::Missing => json!("该账号没有采集到凭据（access_token 为空）。"),
+        },
+        // 能刷新的前提：有 refresh_token **且** access_token 是明文（信封没法当鉴权头）。
+        "canRefresh": has_rt && state == TokenState::Plain,
+        "thresholdDays": TOKEN_REFRESH_THRESHOLD_DAYS,
+        "remainingDays": config::days_left_ms(exp),
+    }))
+}
+
+/// 刷新账号 token（界面上的「刷新 token 有效期」）。
+///
+/// 门槛与 Trae 侧一致：剩余 > [`TOKEN_REFRESH_THRESHOLD_DAYS`] 天时**默认不刷新**
+/// —— 但不是报错，而是 `{ ok: true, refreshed: false, reason: "fresh" }`，
+/// 界面据此弹窗让用户自己决定要不要**强制刷新**（`force = true`）。
+///
+/// ⚠️ 「跳过」与「失败」必须长得不一样：跳过 = `Ok` + `refreshed:false`；
+///    真失败（网络 / 服务端拒绝 / 落盘失败）一律 `Err`，界面照实原文显示。
+pub async fn refresh_account_token_info(account_id: &str, force: bool) -> Result<Value, String> {
+    let acc = raw_account(account_id).ok_or_else(|| {
+        format!("账号库里没有 id 为 {account_id} 的账号（可能已被删除，刷新列表看看）。")
+    })?;
+    if token_state_of(&acc) != TokenState::Plain {
+        return Err(match token_state_of(&acc) {
+            TokenState::Envelope => "该账号凭据是 WorkBuddy 加密信封，本地解不出明文，无法续期；\
+                 用「扫码添加账号」重新扫码即可"
+                .to_string(),
+            _ => "该账号没有采集到 access_token，无法续期".to_string(),
+        });
+    }
+    if str_at(&acc, "refresh_token").is_empty() {
+        return Err("该账号没有 refresh_token，无法续期；重新登录一次即可拿到。".to_string());
+    }
+
+    let exp = access_exp_ms(&acc);
+    if let Some(left) = refresh_skip_days(exp, force) {
+        return Ok(json!({
+            "ok": true,
+            "refreshed": false,
+            "reason": "fresh",
+            "remainingDays": left,
+            "thresholdDays": TOKEN_REFRESH_THRESHOLD_DAYS,
+            "token": str_at(&acc, "access_token"),
+            "tokenExp": if exp > 0 { json!(exp) } else { Value::Null },
+            "message": format!("token 还剩 {left} 天（> {TOKEN_REFRESH_THRESHOLD_DAYS} 天），本次不刷新。"),
+        }));
+    }
+
+    let (refreshed, why) = refresh_account_token(acc.clone()).await;
+    if let Some(why) = why {
+        return Err(format!("刷新失败：{why}"));
+    }
+    // 落盘失败必须报出来：界面显示「已刷新」而库里还是旧 token 是最坏的结果。
+    // ⚠️ 不用再手动清积分缓存：`update_tokens` → `save_accounts`（账号库唯一写出口）
+    //    已经顺手 `clear_cache()`，两处都写就成了两条判据（见 workbuddy_vault）。
+    workbuddy_vault::update_tokens(account_id, &refreshed)
+        .map_err(|e| format!("token 已刷新，但写回账号库失败：{e}"))?;
+
+    let new_exp = access_exp_ms(&refreshed);
+    let new_rt_exp = refresh_exp_ms(&refreshed);
+    let val = |ms: i64| if ms > 0 { json!(ms) } else { Value::Null };
+    Ok(json!({
+        "ok": true,
+        "refreshed": true,
+        "force": force,
+        "token": str_at(&refreshed, "access_token"),
+        "tokenExp": val(new_exp),
+        "tokenExpBefore": val(exp),
+        "refreshExpiredAt": val(new_rt_exp),
+        "remainingDays": config::days_left_ms(new_exp),
+        "updatedFiles": ["workbuddy-accounts.json"],
+        "message": "已刷新，新 token 已写回本工具账号库。",
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -881,8 +1088,8 @@ async fn query_account(account: &CreditAccount) -> Value {
 
     if is_unauthorized(&summary) || is_unauthorized(&paid) || is_unauthorized(&free) {
         if !str_at(&working, "refresh_token").is_empty() {
-            let (refreshed, ok) = refresh_account_token(working.clone()).await;
-            if ok {
+            let (refreshed, why) = refresh_account_token(working.clone()).await;
+            if why.is_none() {
                 working = refreshed;
                 refresh_attempted = true;
                 // 只重试失败的那几路，避免三路各自刷新互相覆盖 token。
@@ -1339,6 +1546,79 @@ mod tests {
         assert_eq!(h.get("X-Auth-Refresh-Source").map(String::as_str), Some("plugin"));
         assert_eq!(h.get("X-Refresh-Token").map(String::as_str), Some("rt"));
         assert_eq!(h.get("Authorization").map(String::as_str), Some("Bearer t"));
+    }
+
+    /// ⚠️⚠️ 续期必须打 **`/v2/plugin`**，不是 `/v2/billing/meter`。
+    ///
+    /// 这是 T59 的根因：两个前缀一字之差，打错时服务端只回业务错误码，
+    /// 表现成「刷新永远失败」。判据把**完整 URL** 钉死 —— 只断言「含某串」挡不住
+    /// 「前缀被换成另一个同样合法的常量」。
+    ///
+    /// 反证：把 [`refresh_url`] 里的 [`PLUGIN_API_PREFIX`] 换回 [`CHECKIN_API_PREFIX`]
+    /// ⇒ 三个断言当场全红。
+    #[test]
+    fn refresh_url_uses_the_plugin_prefix_not_the_billing_one() {
+        let acc = json!({"uid": "u-1", "domain": "www.codebuddy.cn"});
+        assert_eq!(
+            refresh_url(&acc),
+            "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
+        );
+        // 国内版另一个合法 origin 同样要落在 plugin 前缀上。
+        assert_eq!(
+            refresh_url(&json!({"uid": "u-2", "domain": "www.workbuddy.cn"})),
+            "https://www.workbuddy.cn/v2/plugin/auth/token/refresh"
+        );
+        // 反面对照：账单前缀**绝不许**出现在续期 URL 里。
+        assert!(
+            !refresh_url(&acc).contains(CHECKIN_API_PREFIX),
+            "续期 URL 里出现了账单前缀 {CHECKIN_API_PREFIX}"
+        );
+        assert!(refresh_url(&acc).contains(PLUGIN_API_PREFIX));
+    }
+
+    /// ⚠️ 单位一致性：`expiresAt` 是毫秒，判据也按毫秒 ⇒ 剩 5 天**必须**刷。
+    ///
+    /// 反证：把 `exp` 当秒用（`/ 1000` 之类）时剩余天数会变成 0，`Some(0)` ≠ `None` 当场失败。
+    #[test]
+    fn token_threshold_skips_only_when_still_fresh() {
+        let days = |n: i64| now_ms() + n * 86_400_000;
+        assert_eq!(refresh_skip_days(days(13), false), Some(13));
+        assert_eq!(refresh_skip_days(days(8), false), Some(8));
+        assert_eq!(refresh_skip_days(days(7), false), None, "正好 7 天不跳（判据是「大于 7 天」）");
+        assert_eq!(refresh_skip_days(days(5), false), None, "剩 5 天要刷");
+        assert_eq!(refresh_skip_days(days(-1), false), None, "已过期要刷");
+        assert_eq!(refresh_skip_days(0, false), None, "解不出到期时间也要刷（不能装作还很新鲜）");
+        assert_eq!(refresh_skip_days(days(365), true), None, "force 一律刷");
+    }
+
+    /// `expiresAt`（毫秒）优先；缺了才解 JWT 的 `exp`（秒）并归一化成毫秒。
+    #[test]
+    fn access_exp_prefers_stored_ms_then_falls_back_to_jwt() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let ms = 1_792_286_574_000_i64;
+        assert_eq!(access_exp_ms(&json!({"expiresAt": ms})), ms);
+        // 库存的秒级值也要归一化，不能原样当毫秒用
+        assert_eq!(access_exp_ms(&json!({"expiresAt": ms / 1000})), ms);
+
+        let head = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{}}}"#, ms / 1000).as_bytes());
+        let acc = json!({ "access_token": format!("{head}.{body}.sig") });
+        assert_eq!(access_exp_ms(&acc), ms);
+        // 两个都没有 ⇒ 0（界面显示「解不出」，不假装有值）
+        assert_eq!(access_exp_ms(&json!({"access_token": "nope"})), 0);
+    }
+
+    /// 信封 / 缺凭据的账号必须**看得出区别**：来源字段与阻断原因各说各的。
+    #[test]
+    fn token_state_of_distinguishes_envelope_from_missing() {
+        assert_eq!(token_state_of(&json!({"access_token": "pt"})), TokenState::Plain);
+        assert_eq!(
+            token_state_of(&json!({"access_token": {"$wbEncrypted": "xxxx"}})),
+            TokenState::Envelope
+        );
+        assert_eq!(token_state_of(&json!({"access_token": "  "})), TokenState::Missing);
+        assert_eq!(token_state_of(&json!({})), TokenState::Missing);
     }
 
     #[test]

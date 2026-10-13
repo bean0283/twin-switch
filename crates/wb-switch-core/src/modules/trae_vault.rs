@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::modules::config::store_dir;
 use crate::modules::trae_carriers::{
-    expand_entries, hash_file, overwrite_entry, sanitize_entries, CarrierFile,
+    expand_entries, hash_file, overwrite_entry, safe_rel, sanitize_entries, CarrierFile,
 };
 use crate::modules::trae_discover::TraeClient;
 use crate::modules::trae_km::{decrypt_km_json, is_km_value};
@@ -446,19 +446,78 @@ pub fn rename_account(client_key: &str, from_id: &str, to_id: &str) -> Result<St
 }
 
 const EXPORT_FORMAT: &str = "trae-switch-vault";
-const EXPORT_VERSION: i64 = 1;
+/// 1 = 只带载体文件（`meta.files`，即 `entries` 指到的那些）；2 = 带账号目录里的**全部**文件 + 原始 meta。
+const EXPORT_VERSION: i64 = 2;
+
+/// 账号目录里**除 `meta.json` 之外**的全部文件（递归），相对路径统一用 `/`。
+///
+/// ⚠️ 为什么不能只搬 `meta.files`：那只列了「载体」文件（`entries` 指到的那些）。
+/// 账号目录里还有两类**侧车**文件，丢掉它们账号就残废：
+///   - `oauth.json` —— 网页凭证（查积分、续期 token 都要它）；
+///   - `profile.json` —— 上一次拉到的资料 / 积分缓存。
+/// 只搬载体时的表现（真机踩过）：并入后的账号名变成原始目录名、身份行显示 `oauth_717036`、
+/// 大小 `0 B`、且永远查不了积分 —— 功能其实还能用（能切号），但看上去像坏了。
+fn collect_account_files(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, cur: &Path, depth: usize, out: &mut Vec<String>) {
+        if depth > 8 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(cur) else {
+            return;
+        };
+        let mut items: Vec<_> = rd.flatten().collect();
+        items.sort_by_key(|e| e.file_name());
+        for e in items {
+            let p = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(base, &p, depth + 1, out);
+            } else if md.is_file() {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    // meta.json 由 `meta` 字段单独承载（导入时要改 id / client），不重复进文件清单
+                    if rel != "meta.json" {
+                        if let Some(r) = safe_rel(&rel) {
+                            out.push(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, 0, &mut out);
+    out
+}
+
+/// 读取 meta.json 的**原始** JSON（`VaultMeta` 结构体存不下的字段也要带走：
+/// `display_name` / `carrier` / `note` …）。读不出来返回 `Null`。
+fn read_raw_meta(client_key: &str, id: &str) -> Value {
+    std::fs::read_to_string(meta_path(client_key, id))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or(Value::Null)
+}
 
 /// 导出为单个 JSON 文本（文件内容 base64 内联）。
 pub fn export_account(client_key: &str, id: &str) -> Result<Value, String> {
     let dir = account_dir(client_key, id);
+    if !dir.is_dir() {
+        return Err("账号不存在，无法导出".into());
+    }
     let meta = read_meta(client_key, id).ok_or("账号未建档，无法导出")?;
     let mut files = Vec::new();
-    for f in &meta.files {
-        let p = dir.join(f.rel.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
+    for rel in collect_account_files(&dir) {
+        let p = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
         let Ok(data) = std::fs::read(&p) else {
             continue;
         };
-        files.push(json!({ "rel": f.rel, "len": f.len, "sha256": f.sha256, "b64": STANDARD.encode(data) }));
+        files.push(json!({
+            "rel": rel,
+            "len": data.len(),
+            "sha256": hash_file(&p).unwrap_or_default(),
+            "b64": STANDARD.encode(&data),
+        }));
     }
     Ok(json!({
         "format": EXPORT_FORMAT,
@@ -466,7 +525,10 @@ pub fn export_account(client_key: &str, id: &str) -> Result<Value, String> {
         "exported_at": chrono::Local::now().to_rfc3339(),
         "client": client_key,
         "id": id,
+        "kind": meta.kind,
         "entries": sanitize_entries(&meta.entries),
+        // 原始 meta：导入时原样恢复（只改 id / client、清空 last_used_at / verified_uid）
+        "meta": read_raw_meta(client_key, id),
         "files": files,
     }))
 }
@@ -485,9 +547,11 @@ pub fn import_account(client_key: &str, payload: &Value, prefer_name: Option<&st
     }
     let dir = account_dir(client_key, &id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建账号目录失败: {e}"))?;
-    let mut files = Vec::new();
+
+    // 1) 原样写回文件（v2 含 oauth.json / profile.json 等侧车；v1 只有载体文件，仍可导入）
+    let mut all_files: Vec<(String, i64, String)> = Vec::new();
     for f in payload.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let Some(rel) = f.get("rel").and_then(|v| v.as_str()) else {
+        let Some(rel) = f.get("rel").and_then(|v| v.as_str()).and_then(safe_rel) else {
             continue;
         };
         let Some(b64) = f.get("b64").and_then(|v| v.as_str()) else {
@@ -500,37 +564,55 @@ pub fn import_account(client_key: &str, payload: &Value, prefer_name: Option<&st
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let len = data.len() as i64;
         if std::fs::write(&p, data).is_err() {
             continue;
         }
-        files.push(CarrierFile {
-            rel: rel.to_string(),
-            len: f.get("len").and_then(|v| v.as_i64()).unwrap_or(0),
-            sha256: f.get("sha256").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        });
+        all_files.push((rel, len, hash_file(&p).unwrap_or_default()));
     }
-    let entries = payload.get("entries").and_then(|v| v.as_array()).map(|a| {
-        a.iter().filter_map(|v| v.as_str()).map(String::from).collect::<Vec<_>>()
-    }).unwrap_or_default();
+
+    let entries = sanitize_entries(
+        &payload
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    // 2) 「载体文件」的账只算 `entries` 里那些（侧车不是载体：restore() 不会把它们写进客户端）
+    let files: Vec<CarrierFile> = all_files
+        .iter()
+        .filter(|(rel, _, _)| entries.iter().any(|e| e == rel))
+        .map(|(rel, len, sha)| CarrierFile { rel: rel.clone(), len: *len, sha256: sha.clone() })
+        .collect();
+    let total: u64 = files.iter().map(|f| f.len.max(0) as u64).sum();
     let file_count = files.len();
-    let meta = VaultMeta {
-        id: id.clone(),
-        client: client_key.to_string(),
-        kind: "carrier".into(),
-        root_dir: String::new(),
-        entries: sanitize_entries(&entries),
-        file_count,
-        files,
-        total_bytes: 0,
-        created_at: chrono::Local::now().to_rfc3339(),
-        last_used_at: None,
-        verified_uid: None,
-    };
+
+    // 3) meta：优先**原样**恢复导出时的 meta（保住 kind / display_name / carrier / created_at…）；
+    //    v1 老备份没有 meta ⇒ 退回按字段拼一份（行为与修复前一致）。
+    let mut meta_value = payload
+        .get("meta")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({ "kind": payload.get("kind").and_then(|v| v.as_str()).unwrap_or("carrier") }));
+    if let Some(obj) = meta_value.as_object_mut() {
+        obj.insert("id".into(), json!(id));
+        obj.insert("client".into(), json!(client_key));
+        // 刚进本库的账号**还没在本客户端切过** ⇒ 这两项是「本机事实」，必须清空。
+        // 留着源客户端的值会让界面把它算成「当前登录」（`isLive` 就是比 `verified_uid`）。
+        obj.insert("last_used_at".into(), Value::Null);
+        obj.insert("verified_uid".into(), Value::Null);
+        obj.entry("kind").or_insert_with(|| json!("carrier"));
+        obj.insert("entries".into(), json!(entries));
+        obj.insert("files".into(), json!(files));
+        obj.insert("file_count".into(), json!(file_count));
+        obj.insert("total_bytes".into(), json!(total));
+        obj.entry("created_at").or_insert_with(|| json!(chrono::Local::now().to_rfc3339()));
+    }
     let path = meta_path(client_key, &id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?)
+    std::fs::write(path, serde_json::to_string_pretty(&meta_value).map_err(|e| e.to_string())?)
         .map_err(|e| format!("写 meta 失败: {e}"))?;
     Ok((id, file_count))
 }
@@ -594,6 +676,70 @@ pub fn plan_adoptions(
     (plan, skip)
 }
 
+/// 残档补全：目标库里同一 uid 的账号若**缺**侧车文件（`oauth.json` / `profile.json`）而源有，就补上。
+///
+/// 为什么会有这种残档：v0.2.26 之前这里走的是「只搬载体文件」的老导出格式
+/// （见 [`collect_account_files`] 的说明），于是并入过来的账号丢了网页凭证 ——
+/// 功能上还能切号（载体在），但界面上显示成 `oauth_717036` / `0 B` / 查不了积分，看着像坏了。
+///
+/// ⚠️ 只补**目标没有的**文件，绝不覆盖已有内容；`storage.json`（真正的凭据）一个字都不碰。
+/// 补完把 meta 里的账（`kind` / `files` / `file_count` / `total_bytes`）按磁盘实际情况重算 ——
+/// 原来那份写着 `total_bytes: 0`，本身就是错的。
+fn repair_missing_sidecars(target_key: &str, target_id: &str, src_key: &str, src_id: &str) -> Vec<String> {
+    let src_dir = account_dir(src_key, src_id);
+    let dst_dir = account_dir(target_key, target_id);
+    let mut copied = Vec::new();
+    for name in ["oauth.json", "profile.json"] {
+        let from = src_dir.join(name);
+        let to = dst_dir.join(name);
+        if to.is_file() || !from.is_file() {
+            continue;
+        }
+        if std::fs::copy(&from, &to).is_ok() {
+            copied.push(name.to_string());
+        }
+    }
+    if !copied.is_empty() {
+        refresh_meta_bookkeeping(target_key, target_id);
+    }
+    copied
+}
+
+/// 按磁盘上的实际情况重算 meta 里的载体账（导入 / 补全之后调用）。
+fn refresh_meta_bookkeeping(client_key: &str, id: &str) {
+    let dir = account_dir(client_key, id);
+    let mut meta_value = match read_raw_meta(client_key, id) {
+        Value::Object(_) => read_raw_meta(client_key, id),
+        _ => json!({}),
+    };
+    let entries = sanitize_entries(
+        &meta_value
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let files: Vec<CarrierFile> = expand_entries(&dir, &entries)
+        .into_iter()
+        .filter_map(|rel| {
+            let p = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
+            let md = std::fs::metadata(&p).ok()?;
+            Some(CarrierFile { rel, len: md.len() as i64, sha256: hash_file(&p).unwrap_or_default() })
+        })
+        .collect();
+    let total: u64 = files.iter().map(|f| f.len.max(0) as u64).sum();
+    if let Some(obj) = meta_value.as_object_mut() {
+        if dir.join("oauth.json").is_file() {
+            obj.insert("kind".into(), json!("oauth"));
+        }
+        obj.insert("files".into(), json!(files));
+        obj.insert("file_count".into(), json!(files.len()));
+        obj.insert("total_bytes".into(), json!(total));
+    }
+    let path = meta_path(client_key, id);
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&meta_value).unwrap_or_default());
+}
+
 /// 把「已并入 `target_key` 的客户端」账号库里的账号，全部并入 `target_key` 自己的账号库。
 ///
 /// 为什么需要它：2026-10 官方把 TRAE SOLO 并进 Trae 时（国内版 → `trae-cn`，
@@ -613,7 +759,10 @@ pub fn plan_adoptions(
 /// - 两端 `api_host` 相同（`https://api.trae.cn` / `trae-api-cn.mchost.guru`），
 ///   载体可直接使用，无需重新登录。
 ///
-/// `dry_run = true` 时只列出「会搬哪些」，**一个字节都不写**。
+/// 顺带**补全残档**：老版本「一并带入」漏搬的侧车文件（`oauth.json` / `profile.json`）
+/// 在这里补回去（只补缺失的，见 [`repair_missing_sidecars`]）—— 用户不用手工删号重搬。
+///
+/// `dry_run = true` 时只列出「会搬哪些 / 会修哪些」，**一个字节都不写**。
 pub fn adopt_merged_accounts(target_key: &str, dry_run: bool) -> Result<Value, String> {
     let target = crate::modules::trae_discover::get_client(target_key)
         .ok_or_else(|| format!("未知客户端: {target_key}"))?;
@@ -623,6 +772,8 @@ pub fn adopt_merged_accounts(target_key: &str, dry_run: bool) -> Result<Value, S
         .iter()
         .filter_map(|id| uid_of_account(target_key, id))
         .collect();
+    // uid → 目标库里的账号 id（补残档时要按 uid 找到那份残档）
+    let target_index = crate::modules::trae_oauth::vault_uid_index(target_key);
 
     // 已并入 `target_key` 的源客户端 → (key, [(id, uid)])
     let sources: Vec<(String, Vec<(String, Option<String>)>)> =
@@ -690,12 +841,50 @@ pub fn adopt_merged_accounts(target_key: &str, dry_run: bool) -> Result<Value, S
         })
         .collect();
 
+    // 残档补全（只补目标缺的侧车文件，绝不覆盖）：老版本「一并带入」漏搬 oauth.json /
+    // profile.json，用户看到的账号就成了「oauth_xxxxxx / 0 B / 查不了积分」。
+    // 这里不依赖 `plan_adoptions` 的跳过理由（那是会变的文案），直接拿目标 uid 索引对一遍。
+    let mut repaired: Vec<Value> = Vec::new();
+    for (from, accounts) in &sources {
+        for (sid, uid) in accounts {
+            let Some(uid) = uid.as_deref() else { continue };
+            let Some((tid, _)) = target_index.get(uid) else { continue };
+            if sid == tid && from == target_key {
+                continue;
+            }
+            let src_dir = account_dir(from, sid);
+            let dst_dir = account_dir(target_key, tid);
+            let need: Vec<&str> = ["oauth.json", "profile.json"]
+                .into_iter()
+                .filter(|n| src_dir.join(n).is_file() && !dst_dir.join(n).is_file())
+                .collect();
+            if need.is_empty() {
+                continue;
+            }
+            if dry_run {
+                repaired.push(json!({
+                    "from": from, "from_label": label_of(from),
+                    "source_id": sid, "id": tid, "uid": uid, "files": need,
+                }));
+                continue;
+            }
+            let copied = repair_missing_sidecars(target_key, tid, from, sid);
+            if !copied.is_empty() {
+                repaired.push(json!({
+                    "from": from, "from_label": label_of(from),
+                    "source_id": sid, "id": tid, "uid": uid, "files": copied,
+                }));
+            }
+        }
+    }
+
     Ok(json!({
         "target": target_key,
         "target_label": target.label,
         "dry_run": dry_run,
         "adopted": adopted,
         "skipped": skipped,
+        "repaired": repaired,
     }))
 }
 
@@ -780,5 +969,266 @@ mod tests {
         let (second, skip) = plan_adoptions(&mut have, &sources);
         assert!(second.is_empty(), "第二次不该再搬同一批");
         assert_eq!(skip.len(), 2);
+    }
+}
+
+/// 落盘用例：搬账号要**字节级保真**（老版本只搬载体文件，账号就残了）。
+///
+/// `account_dir` 走 `config::store_dir()`，而 `TWIN_SWITCH_HOME` 是**进程级**环境变量
+/// ⇒ 这些用例必须串行（共用一把锁），并在结束时恢复原值 + 删掉临时家目录。
+#[cfg(test)]
+mod adopt_fs_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct Sandbox {
+        prev: Option<std::ffi::OsString>,
+        dir: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(tag: &str) -> Self {
+            let prev = std::env::var_os(crate::modules::config::HOME_ENV_VAR);
+            let dir = std::env::temp_dir().join(format!(
+                "twin-switch-vault-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("建临时家目录");
+            std::env::set_var(crate::modules::config::HOME_ENV_VAR, &dir);
+            Self { prev, dir }
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(crate::modules::config::HOME_ENV_VAR, v),
+                None => std::env::remove_var(crate::modules::config::HOME_ENV_VAR),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 一份**真能被解开**的载体（uid 就藏在里面）—— `have` / `target_index` 都靠它认账号。
+    fn km_storage(uid: &str) -> String {
+        let blob = crate::modules::trae_km::encrypt_km_json(&json!({
+            "userId": uid, "token": "tok", "refreshToken": "rt",
+        }))
+        .expect("加密登录态");
+        format!("{{\"{KEY_AUTH}\":{}}}", serde_json::to_string(&blob).unwrap())
+    }
+
+    /// 造一份「SOLO 里的网页登录账号」：`oauth.json`（含 uid）+ `profile.json` + 载体。
+    fn seed_solo_account(id: &str, uid: &str) -> PathBuf {
+        let dir = account_dir("solo-cn", id);
+        std::fs::create_dir_all(dir.join("User").join("globalStorage")).unwrap();
+        let storage = km_storage(uid);
+        std::fs::write(dir.join(REL_STORAGE), &storage).unwrap();
+        std::fs::write(
+            dir.join("oauth.json"),
+            serde_json::to_string_pretty(&json!({
+                "kind": "oauth", "id": id, "client": "solo-cn",
+                "displayName": "账号 000000", "uid": uid, "token": "t", "refreshToken": "r",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("profile.json"), "{\"screen_name\":\"老王\"}").unwrap();
+        std::fs::write(
+            meta_path("solo-cn", id),
+            serde_json::to_string_pretty(&json!({
+                "id": id, "client": "solo-cn", "kind": "oauth",
+                "display_name": "账号 000000", "root_dir": "C:/x/TRAE SOLO CN",
+                "entries": [REL_STORAGE],
+                "files": [{ "rel": REL_STORAGE, "len": storage.len(), "sha256": "x" }],
+                "file_count": 1, "total_bytes": storage.len(),
+                "created_at": "2026-10-01T00:00:00+08:00",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// 造一份「老版本一并带入留下的残档」：同一 uid 的载体在，但**没有 `oauth.json`**，
+    /// meta 里写着一份明显不对的账（`kind: carrier` / `total_bytes: 0`）。
+    fn seed_legacy_copy(id: &str, uid: &str) -> PathBuf {
+        let dst = account_dir("trae-cn", id);
+        std::fs::create_dir_all(dst.join("User").join("globalStorage")).unwrap();
+        std::fs::write(dst.join(REL_STORAGE), km_storage(uid)).unwrap();
+        std::fs::write(
+            meta_path("trae-cn", id),
+            serde_json::to_string_pretty(&json!({
+                "id": id, "client": "trae-cn", "kind": "carrier",
+                "entries": [REL_STORAGE], "files": [], "file_count": 1, "total_bytes": 0,
+                "created_at": "2026-10-12T00:00:00+08:00",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        dst
+    }
+
+    /// 导出必须带上账号目录里的**全部**文件（侧车也要），meta 原样带走，但 `meta.json` 不进文件清单。
+    #[test]
+    fn export_carries_sidecars_and_raw_meta() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("export");
+        seed_solo_account("oauth_a", "u1");
+
+        let payload = export_account("solo-cn", "oauth_a").unwrap();
+        let rels: Vec<&str> = payload["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["rel"].as_str())
+            .collect();
+        assert!(rels.contains(&"oauth.json"), "侧车 oauth.json 必须带上：{rels:?}");
+        assert!(rels.contains(&"profile.json"), "侧车 profile.json 必须带上：{rels:?}");
+        assert!(rels.contains(&REL_STORAGE), "载体文件必须在：{rels:?}");
+        assert!(!rels.contains(&"meta.json"), "meta.json 由 meta 字段承载，不进文件清单");
+        assert_eq!(payload["kind"], json!("oauth"));
+        assert_eq!(payload["meta"]["display_name"], json!("账号 000000"));
+        assert_eq!(payload["version"], json!(EXPORT_VERSION));
+    }
+
+    /// 老格式（v1，没有 `meta` / 侧车）仍要能导入，且**不能**把它当成 oauth（它就是载体账号）。
+    #[test]
+    fn import_still_accepts_legacy_v1_payload() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("legacy");
+        let payload = json!({
+            "format": EXPORT_FORMAT, "version": 1, "client": "solo-cn", "id": "old",
+            "entries": [REL_STORAGE],
+            "files": [{ "rel": REL_STORAGE, "len": 5, "sha256": "", "b64": STANDARD.encode(b"hello") }],
+        });
+        let (id, count) = import_account("trae-cn", &payload, None).unwrap();
+        assert_eq!(id, "old");
+        assert_eq!(count, 1);
+        assert_eq!(std::fs::read_to_string(account_dir("trae-cn", "old").join(REL_STORAGE)).unwrap(), "hello");
+        // v1 没有 kind ⇒ 按载体处理，且 last_used_at / verified_uid 必须是空的
+        let raw = read_raw_meta("trae-cn", "old");
+        assert_eq!(raw["kind"], json!("carrier"));
+        assert!(raw["last_used_at"].is_null());
+        assert!(raw["verified_uid"].is_null());
+    }
+
+    /// 导入落盘后，`verified_uid` / `last_used_at` 必须是空的 ——
+    /// 否则界面会把这个「刚进库、还没在本客户端切过」的账号算成「当前登录」。
+    #[test]
+    fn import_clears_machine_facts() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("clear");
+        seed_solo_account("oauth_a", "u1");
+        // 源档案里带着「切过」的痕迹（源客户端的本机事实）
+        let mut meta = read_raw_meta("solo-cn", "oauth_a");
+        meta["verified_uid"] = json!("u1");
+        meta["last_used_at"] = json!("2026-10-11T00:00:00+08:00");
+        std::fs::write(meta_path("solo-cn", "oauth_a"), meta.to_string()).unwrap();
+
+        let payload = export_account("solo-cn", "oauth_a").unwrap();
+        let (id, _) = import_account("trae-cn", &payload, Some("oauth_a")).unwrap();
+        let raw = read_raw_meta("trae-cn", &id);
+        assert!(raw["verified_uid"].is_null(), "verified_uid 是本客户端的本机事实，必须清空");
+        assert!(raw["last_used_at"].is_null());
+        // 但账号本身的信息要留住
+        assert_eq!(raw["kind"], json!("oauth"));
+        assert_eq!(raw["display_name"], json!("账号 000000"));
+    }
+
+    /// 一并带入：侧车、kind、display_name、total_bytes 全都要跟着过来。
+    #[test]
+    fn adopt_keeps_sidecars_kind_and_bookkeeping() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("adopt");
+        seed_solo_account("oauth_a", "u1");
+
+        let res = adopt_merged_accounts("trae-cn", false).unwrap();
+        assert_eq!(res["adopted"].as_array().unwrap().len(), 1);
+        assert!(res["repaired"].as_array().unwrap().is_empty());
+
+        let dir = account_dir("trae-cn", "oauth_a");
+        assert!(dir.join("oauth.json").is_file(), "并入后必须带网页凭证");
+        assert!(dir.join("profile.json").is_file(), "并入后必须带资料缓存");
+        let raw = read_raw_meta("trae-cn", "oauth_a");
+        assert_eq!(raw["kind"], json!("oauth"), "账号类型不能被写成载体");
+        assert_eq!(raw["display_name"], json!("账号 000000"));
+        let len = std::fs::metadata(dir.join(REL_STORAGE)).unwrap().len() as u64;
+        assert_eq!(raw["total_bytes"], json!(len), "total_bytes 不能再是 0");
+        assert_eq!(raw["client"], json!("trae-cn"));
+        // 源**一个字节都不动**
+        assert!(account_dir("solo-cn", "oauth_a").join("oauth.json").is_file());
+    }
+
+    /// 老版本留下的残档（同一 uid 已在目标库里、但缺 oauth.json/profile.json）
+    /// 要被**补全**，而且**绝不覆盖**已有的载体文件与已有账号。
+    #[test]
+    fn adopt_repairs_legacy_copy_without_overwriting() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("repair");
+        seed_solo_account("oauth_a", "u1");
+        let dst = seed_legacy_copy("oauth_a", "u1");
+        let carrier_before = std::fs::read(dst.join(REL_STORAGE)).unwrap();
+
+        let res = adopt_merged_accounts("trae-cn", false).unwrap();
+        // 同一 uid ⇒ 不重复搬
+        assert!(res["adopted"].as_array().unwrap().is_empty());
+        let repaired = res["repaired"].as_array().unwrap();
+        assert_eq!(repaired.len(), 1, "残档必须被补全：{res}");
+        assert_eq!(repaired[0]["id"], json!("oauth_a"));
+
+        assert!(dst.join("oauth.json").is_file());
+        assert!(dst.join("profile.json").is_file());
+        // 载体**原封不动**（绝不覆盖）
+        assert_eq!(std::fs::read(dst.join(REL_STORAGE)).unwrap(), carrier_before);
+        let raw = read_raw_meta("trae-cn", "oauth_a");
+        assert_eq!(raw["kind"], json!("oauth"), "补齐网页凭证后类型要跟上来");
+        assert!(raw["total_bytes"].as_u64().unwrap() > 0, "账要按磁盘重算，不能留 0");
+        // 幂等：再跑一次没有可修的了
+        let again = adopt_merged_accounts("trae-cn", true).unwrap();
+        assert!(again["repaired"].as_array().unwrap().is_empty());
+    }
+
+    /// 预演（`dry_run`）**一个字节都不写**：残档还是要原样留着。
+    #[test]
+    fn adopt_dry_run_writes_nothing() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("dryrun");
+        seed_solo_account("oauth_a", "u1");
+        let dst = seed_legacy_copy("oauth_a", "u1");
+
+        let res = adopt_merged_accounts("trae-cn", true).unwrap();
+        assert_eq!(res["dry_run"], json!(true));
+        assert_eq!(res["repaired"].as_array().unwrap().len(), 1, "预演要如实报告会修什么");
+        assert!(!dst.join("oauth.json").exists(), "预演不该落盘");
+    }
+
+    /// 导入的备份是**外部输入**：`rel` 带 `..` / 盘符 / 绝对路径的一律丢掉，
+    /// 不许写到账号目录之外。
+    #[test]
+    fn import_rejects_path_traversal() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sb = Sandbox::new("traversal");
+        let payload = json!({
+            "format": EXPORT_FORMAT, "version": EXPORT_VERSION, "client": "trae-cn", "id": "bad",
+            "entries": [REL_STORAGE],
+            "files": [
+                { "rel": "../evil.json", "b64": STANDARD.encode(b"pwn") },
+                { "rel": "C:/Windows/Temp/evil.json", "b64": STANDARD.encode(b"pwn") },
+                { "rel": "/etc/passwd", "b64": STANDARD.encode(b"pwn") },
+                { "rel": "ok/../../evil.json", "b64": STANDARD.encode(b"pwn") },
+                { "rel": REL_STORAGE, "b64": STANDARD.encode(b"good") },
+            ],
+        });
+        let (id, count) = import_account("trae-cn", &payload, None).unwrap();
+        assert_eq!(count, 1, "只有合法的那一条算进载体文件");
+        // 越界目标：账号目录的上一级（`..` 会落到这里）与临时家目录根
+        let account = account_dir("trae-cn", &id);
+        assert!(!account.parent().unwrap().join("evil.json").exists(), "越界文件一个都不许落盘");
+        assert!(!vault_root().join("evil.json").exists());
+        assert_eq!(std::fs::read_to_string(account.join(REL_STORAGE)).unwrap(), "good");
     }
 }

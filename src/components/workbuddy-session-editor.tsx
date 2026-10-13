@@ -301,7 +301,7 @@ export function WorkbuddySessionEditor({
   }, [open, cross]);
 
   /**
-   * 目标账号按**客户端**分组（Trae 侧同一台机器上可能装了 IDE 版与 SOLO 版）。
+   * 目标账号按**客户端**分组（Trae 侧同一台机器上可能装了国内版与国际版）。
    *
    * 顺序 = `accounts` 里第一次出现的顺序，不重排 —— 与页面上客户端的排序保持一致。
    */
@@ -1427,10 +1427,10 @@ export function WorkbuddySessionEditor({
                   那几个选项在这两个页面上只会把人绕回去（用户报的「怎么还是 workbuddy 到 workbuddy」）。 */}
               {cross ? (
                 <>
-                  {/* ⚠️⚠️ **客户端与账号必须分开选**：Trae CN（IDE 版）与 TRAE SOLO CN 是两个
-                      不同产品，本机 3 个 uid 在两个客户端下**各有一份**。早先把「客户端 · 账号」
-                      拼成一个字符串塞进同一个下拉，用户报「trae 不应该多选账号，trae 和 trae solo
-                      应当分离」说的就是这个；而且老实现按 uid 反查会命中另一个客户端的同名账号。
+                  {/* ⚠️⚠️ **客户端与账号必须分开选**：Trae 国内版与国际版是两个不同客户端，
+                      同一台机器上各有一份账号档案。早先把「客户端 · 账号」
+                      拼成一个字符串塞进同一个下拉，用户报「trae 不应该多选账号」说的就是这个；
+                      而且老实现按 uid 反查会命中另一个客户端的同名账号。
                       只有一个客户端时（WorkBuddy 侧）不显示这一行，免得平白多一步。 */}
                   {crossGroups.length > 1 ? (
                     <div className="min-w-0">

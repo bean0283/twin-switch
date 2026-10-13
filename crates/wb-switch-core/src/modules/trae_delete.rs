@@ -25,7 +25,7 @@ use crate::modules::trae_export::{backup_dir, deleted_sessions_dir, is_session_i
 use crate::modules::trae_import::{patch_reserved_field, session_owner_uid};
 use crate::modules::trae_memory_scan::{load_saved_key, save_key, scan_for_key};
 use crate::modules::trae_remote::has_cloud_credential;
-use crate::modules::trae_switch::{is_running, kill_all, launch, wait_until_stopped};
+use crate::modules::trae_switch::{is_running_own, launch, stop_for_maintenance, MaintenanceStop};
 use crate::modules::trae_vault::account_label;
 
 const PAGE_SZ: usize = 4096;
@@ -44,13 +44,23 @@ pub(crate) fn resolve_live_key(client_key: &str, live: &Path) -> Result<String, 
         }
     }
     let client = get_client(client_key).ok_or("未知客户端")?;
-    if is_running(client) {
+    // ⚠️ T61：判「它自己在不在跑」，不能用 `is_running`（对已并入的 SOLO 会回退成
+    //    承载方 `Trae CN`，于是会去读**别的客户端**的进程内存找一个根本不在那儿的密钥）。
+    if is_running_own(client) {
         let scan = scan_for_key(client_key, live, None)
             .map_err(|e| format!("重新扫描密钥失败：{e}"))?;
         if let Some(k) = scan.key {
             let _ = save_key(client_key, &k);
             return Ok(k);
         }
+    }
+    let merged = client.merged_into;
+    if merged.is_some() && !crate::modules::trae_discover::has_own_exe(client) {
+        return Err(format!(
+            "{} 已并入其他客户端、本机已没有它自己的程序：无法再启动它去重扫内存密钥。\n\
+             请用「导入」把该客户端的会话并入仍在使用的客户端后再操作。",
+            client.label
+        ));
     }
     Err(
         "实时库密钥不匹配且无法自动恢复：Trae 重启后加密密钥会变化。\n\
@@ -517,13 +527,22 @@ fn delete_sessions_core(
     };
 
     // 1. 结束客户端进程（文件替换前提；WAL 残留帧由第 3 步合并，不会丢数据）
-    if is_running(client) {
-        log("结束客户端进程…");
-        let killed = kill_all(client);
-        log(&format!("已结束 {} 个进程，等待退出…", killed.len()));
-        if !wait_until_stopped(client, 10_000) {
-            return Err("客户端未能退出，无法替换数据库".into());
+    //
+    //    ⚠️⚠️ T61：必须走 `stop_for_maintenance`，不能直接 `kill_all` —— 对「已并入且本机
+    //    已无自己程序」的 SOLO，后者会回退成**承载方 `Trae CN`** 的映像名，
+    //    于是「删几条 SOLO 的旧会话」会把用户**正在用的 IDE** 一起杀掉；
+    //    而它的旧库其实没有任何进程持有，本来就不需要退出谁。
+    match stop_for_maintenance(client, 10_000) {
+        Ok(MaintenanceStop::NotRunning) => {}
+        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程（它的旧库没有被占用）。",
+            client.label
+        )),
+        Ok(MaintenanceStop::Stopped(n)) => {
+            log("结束客户端进程…");
+            log(&format!("已结束 {n} 个进程，等待退出…"));
         }
+        Err(e) => return Err(e),
     }
 
     // 2. 解密实时库为明文副本
@@ -612,13 +631,14 @@ fn delete_sessions_core(
             }
         }
     }
-    // 清理目录里更旧的整库备份：每批 ≈ 一个整库大小，留着会越攒越多（实测曾累积到 2.2 GB）。
-    // 刚写下的这份**就是**删除前的完整状态，保留它即可。
+    // 清理目录里更旧的整库备份：每批 ≈ 一个整库大小，留着会越攒越多（实测曾累积到 6.4 GB）。
+    // ⚠️ 走**用户设置里的保留策略**（时间 / 份数 / 容量三重触发），不在代码里另立一套；
+    //    策略自带「每个客户端最新一批永不清」的安全网 —— 刚写下的这份就是最新那批。
     {
-        let (n, freed) = crate::modules::trae_export::prune_backups(&bdir, 1);
+        let (n, freed) = crate::modules::trae_export::prune_with_policy(&bdir);
         if n > 0 {
             log(&format!(
-                "已清理 {n} 个旧备份，回收 {:.1} MB（仅保留最新 1 批）",
+                "已清理 {n} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
                 freed as f64 / 1_048_576.0
             ));
         }

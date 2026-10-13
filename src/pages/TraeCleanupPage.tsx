@@ -17,6 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { Link } from "react-router-dom";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -357,7 +358,9 @@ export default function TraeCleanupPage() {
         </CardHeader>
         <CardContent className="space-y-3">
           {(scan?.notes ?? []).map((n) => (
-            <Alert key={n}>
+            /* 自查钩子：探针按**结构**取注意事项原文（不许用 document.body.textContent —— 那
+               会同时扫到 `index.html` 里看门狗脚本的源码，判定从第一毫秒起就恒真/恒假）。 */
+            <Alert key={n} data-cleanup-note={n}>
               <AlertTriangle className="size-4" />
               <AlertDescription>{n}</AlertDescription>
             </Alert>
@@ -509,6 +512,23 @@ export default function TraeCleanupPage() {
                         </Button>
                       </div>
                     </div>
+                    {/* 整库备份的保留策略原文（后端给的，与真正删文件的判据同源）。
+                        ⚠️ 不自己拼这句话：拼出来就会变成「同一屏两个说法」。 */}
+                    {cat.backup_policy ? (
+                      <div
+                        data-backup-policy={cat.backup_policy.summary}
+                        className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b bg-muted/30 px-3 py-1.5 text-[11px] text-muted-foreground"
+                      >
+                        <ShieldAlert className="size-3.5 shrink-0" />
+                        <span className="min-w-0">{cat.backup_policy.summary}</span>
+                        <Link
+                          to="/settings"
+                          className="ml-auto shrink-0 underline underline-offset-2"
+                        >
+                          去设置
+                        </Link>
+                      </div>
+                    ) : null}
                     {isCollapsed ? null : (
                       <div className="max-h-80 overflow-auto p-2">
                         {cat.items.map((it) => (
@@ -527,10 +547,44 @@ export default function TraeCleanupPage() {
                             />
                             <span className="min-w-0 flex-1">
                               <span className="flex flex-wrap items-center gap-1.5">
-                                <span className="truncate font-medium">{it.title}</span>
+                                {/* 自查钩子：探针按这些属性判「超出策略 / 最旧」的标记画出来了没、
+                                    以及**第一个批次是不是最旧的那一批**（清理顺序 = 先从最老的清）。
+                                    ⚠️ 不许改成按正文文本找 —— `index.html` 的看门狗脚本源码也在
+                                    `<body>` 里，全文搜这类判定从第一毫秒起就恒真/恒假。 */}
+                                <span
+                                  className="truncate font-medium"
+                                  data-item-title={it.title}
+                                  data-item-oldest={it.oldest ? "1" : "0"}
+                                  data-item-over={it.over_policy ? "1" : "0"}
+                                  data-item-merged={it.merged_shadow ? "1" : "0"}
+                                >
+                                  {it.title}
+                                </span>
+                                {it.merged_shadow ? (
+                                  <Badge
+                                    variant="secondary"
+                                    className="text-[10px]"
+                                    title="本机已没有它自己的程序，只剩合并前留下的数据；删除它不会结束任何进程"
+                                  >
+                                    已并入
+                                  </Badge>
+                                ) : null}
                                 {it.recommended ? (
                                   <Badge className="bg-emerald-500/15 text-[10px] text-emerald-600">
                                     推荐
+                                  </Badge>
+                                ) : null}
+                                {it.over_policy ? (
+                                  <Badge
+                                    className="bg-amber-500/15 text-[10px] text-amber-600"
+                                    title={it.policy_reason || "超出设置里的整库备份保留策略"}
+                                  >
+                                    超出策略
+                                  </Badge>
+                                ) : null}
+                                {it.oldest ? (
+                                  <Badge variant="secondary" className="text-[10px]">
+                                    最旧
                                   </Badge>
                                 ) : null}
                                 {it.needs_client_stop ? (
@@ -559,7 +613,7 @@ export default function TraeCleanupPage() {
                                 <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground/70">
                                   {it.paths.length === 1
                                     ? it.paths[0]
-                                    : `${it.paths[0]} 等 ${it.paths.length} 个文件`}
+                                    : `${it.paths[0]} 等 ${it.paths.length} 个${it.kind === "dir" ? "目录" : "文件"}`}
                                 </span>
                               ) : null}
                             </span>

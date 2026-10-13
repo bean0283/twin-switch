@@ -1278,13 +1278,16 @@ pub fn export_sessions(
     drop(conn);
     log(&format!("已写入 {} 条会话记录（库内现有 {} 条）", items.len(), verified));
 
-    // 6) 只保留最新 2 份备份
-    let (pruned, freed) = trae_export::prune_backups(
-        &store_dir().join("workbuddy_export_backup"),
-        2,
-    );
+    // 6) 按**用户设置里的保留策略**清理旧备份
+    //    （`workbuddy_export_backup` 下的条目名是**裸时间戳**，没有客户端前缀 ——
+    //      `backup_owner_and_stamp` 会把这整个目录归成一组，否则每批自成一组的「最新一批」、
+    //      永远命中安全网、一份都清不掉）。
+    let (pruned, freed) = trae_export::prune_with_policy(&store_dir().join("workbuddy_export_backup"));
     if pruned > 0 {
-        log(&format!("已清理 {pruned} 份旧备份，回收 {:.1} MB", freed as f64 / 1_048_576.0));
+        log(&format!(
+            "已清理 {pruned} 份旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
+            freed as f64 / 1_048_576.0
+        ));
     }
 
     // 7) 重新拉起 WorkBuddy，让导入的会话立即可见

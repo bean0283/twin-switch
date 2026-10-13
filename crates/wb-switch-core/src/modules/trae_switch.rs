@@ -23,7 +23,10 @@ use serde_json::{json, Value};
 use crate::modules::config::store_dir;
 use crate::modules::process_list;
 use crate::modules::trae_carriers::{detect_carrier_entries, overwrite_entry, sanitize_entries};
-use crate::modules::trae_discover::{get_client, has_login_state, process_names, storage_json_path, user_data_dir, TraeClient};
+use crate::modules::trae_discover::{
+    get_client, has_login_state, has_own_exe, own_process_names, own_running, process_names,
+    storage_json_path, user_data_dir, TraeClient,
+};
 use crate::modules::trae_km::{decrypt_km_json, is_km_value, jwt_exp, jwt_user_id};
 use crate::modules::trae_synth::{needs_synthesis, synthesize_carrier};
 use crate::modules::trae_vault::{restore, uid_of_account};
@@ -158,6 +161,72 @@ pub fn quit_client(client: &TraeClient, timeout_ms: u64) -> process_list::KillOu
         // ai-agent 残不残不算客户端还在跑（与 `is_running` 同口径）。
         !m.iter().any(|(n, _)| !n.to_lowercase().contains("ai-agent"))
     })
+}
+
+// ---------------------------------------------------------------------------
+// T61：「为写它的库而结束进程」—— 只碰它自己的程序，绝不碰承载方
+// ---------------------------------------------------------------------------
+
+/// 结束该客户端时要匹配的映像名，**只用它自己的名字**（不含合并回退）+ `ai-agent`。
+fn own_kill_names(client: &TraeClient) -> Vec<String> {
+    let mut names: Vec<String> = own_process_names(client)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.push("ai-agent".into());
+    names
+}
+
+/// **它自己**的程序是否在跑（见 [`own_running`]）。
+pub fn is_running_own(client: &TraeClient) -> bool {
+    own_running(client)
+}
+
+/// 只结束**它自己的**进程（含子进程）。
+pub fn kill_all_own(client: &TraeClient) -> Vec<String> {
+    process_list::kill_now(&own_kill_names(client)).0
+}
+
+/// 只等**它自己的**进程退出。
+pub fn quit_client_own(client: &TraeClient, timeout_ms: u64) -> process_list::KillOutcome {
+    process_list::kill_tree_and_wait(&own_kill_names(client), Duration::from_millis(timeout_ms), &|m| {
+        !m.iter().any(|(n, _)| !n.to_lowercase().contains("ai-agent"))
+    })
+}
+
+/// 「为写它的库而结束客户端」的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceStop {
+    /// 它自己的程序没在跑 ⇒ 库没被占，不用结束任何东西。
+    NotRunning,
+    /// **已并入、本机已没有它自己的程序**（只剩历史数据）⇒ 没有任何属于它的进程可结束，
+    /// 而且**绝不能**去结束承载方。
+    NoOwnProgram,
+    /// 真的结束了 `n` 个进程。
+    Stopped(usize),
+}
+
+/// ⚠️⚠️ **唯一**该在「写库前结束客户端」用的入口（T61）。
+///
+/// 为什么不能直接用 [`kill_all`] / [`is_running`]：那两个走 [`process_names`]，对
+/// 「已并入且本机已无自己程序」的 SOLO 会**回退成承载方 `Trae CN` 的映像名** ——
+/// 于是「删几条 SOLO 的旧会话」会把用户**正在用的 IDE** 一起杀掉。
+/// 而合并后 SOLO 的旧库其实没有任何进程持有（承载方读的是它自己的数据目录），
+/// 根本不需要退出任何东西。
+///
+/// `Err` 只表示「它自己的进程活着但退不掉」，调用方应放弃本次写库（**未改动任何文件**）。
+pub fn stop_for_maintenance(client: &TraeClient, timeout_ms: u64) -> Result<MaintenanceStop, String> {
+    if client.merged_into.is_some() && !has_own_exe(client) {
+        return Ok(MaintenanceStop::NoOwnProgram);
+    }
+    if !is_running_own(client) {
+        return Ok(MaintenanceStop::NotRunning);
+    }
+    let killed = kill_all_own(client);
+    if !quit_client_own(client, timeout_ms).ok {
+        return Err("客户端未能退出，无法替换数据库".into());
+    }
+    Ok(MaintenanceStop::Stopped(killed.len()))
 }
 
 /// 解析客户端主程序路径：用户配置优先，其次自动探测。
@@ -488,7 +557,7 @@ fn make_rollback_dir() -> PathBuf {
 /// 不会**报错**，只会**不生效** —— 用户看到的是「切了但没反应」，比直接拒绝更难排查。
 /// 所以这里把话说清楚：去承载方切，账号是同一批。
 ///
-/// ⚠️ 判据必须是「**本机自己也跑不起来**」（[`crate::modules::trae_discover::has_own_exe`]），
+/// ⚠️ 判据必须是「**本机自己也跑不起来**」（[`has_own_exe`]），
 /// **不能**只判 `merged_into`：老机器上 SOLO 与 IDE 还各自独立装着，那时 SOLO 是个
 /// 正常可用的客户端，一刀切拒绝 = 砍功能（而且界面把它显示成可选、后端却报错，自相矛盾）。
 /// 同一判据的另一处用法见 `trae_import::import_sessions` 的目标护栏。
@@ -496,7 +565,7 @@ fn ensure_switchable(client: &TraeClient) -> Result<(), String> {
     let Some(host) = client.merged_into else {
         return Ok(());
     };
-    if crate::modules::trae_discover::has_own_exe(client) {
+    if has_own_exe(client) {
         return Ok(());
     }
     let host_label = get_client(host).map(|c| c.label).unwrap_or(host);
@@ -677,4 +746,63 @@ pub fn rollback_to(
     on_progress: Option<&dyn Fn(&str)>,
 ) -> Result<SwitchResult, String> {
     switch_to(client_key, account_id, on_progress)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️⚠️ T61 的根因判据：为写库而结束进程时用的名字里**绝不能**出现承载方的映像名 ——
+    /// 出现了就意味着「删几条 SOLO 的旧会话」会把用户**正在用的 `Trae CN`** 一起杀掉。
+    ///
+    /// 反证：把 `own_kill_names` 的实现换回 `kill_names`（回退版），在「本机已合并」的机器上
+    /// 这条立刻变红（`Trae CN` / `Trae` 会出现在结果里）。
+    #[test]
+    fn own_kill_names_excludes_the_merged_host() {
+        let solo = get_client("solo-cn").unwrap();
+        let host = get_client("trae-cn").unwrap();
+        let own = own_kill_names(solo);
+        assert!(own.contains(&"TRAE SOLO CN".to_string()), "必须含它自己的映像名");
+        assert!(own.contains(&"ai-agent".to_string()), "ai-agent 与客户端同生共死，要一起结束");
+        for n in crate::modules::trae_discover::own_process_names(host) {
+            assert!(
+                !own.contains(&n.to_string()),
+                "own_kill_names(solo-cn) 不该含承载方映像名 {n}"
+            );
+        }
+    }
+
+    /// 这次改动**不许**改变非合并客户端的行为：两套名字必须完全一致。
+    #[test]
+    fn own_and_fallback_names_agree_for_non_merged_clients() {
+        for key in ["trae-cn", "trae-intl"] {
+            let c = get_client(key).unwrap();
+            let mut a = own_kill_names(c);
+            let mut b = kill_names(c);
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{key} 的 own_kill_names 与 kill_names 必须一致");
+        }
+    }
+
+    /// 「已并入 + 本机无自己程序」⇒ 直接返回 `NoOwnProgram`，**不枚举也不结束任何进程**。
+    ///
+    /// ⚠️ 这里刻意**不**在老机器分支上调 `stop_for_maintenance` —— 那会去结束用户正在用的
+    /// 客户端（单测不许杀进程）。老机器分支只断言「判据没命中」。
+    #[test]
+    fn merged_shadow_guard_needs_both_facts_and_touches_no_process() {
+        let solo = get_client("solo-cn").unwrap();
+        let guard = solo.merged_into.is_some() && !has_own_exe(solo);
+        if has_own_exe(solo) {
+            // 老机器：SOLO 还独立装着 ⇒ 它是可用客户端，绝不能被当「只剩历史数据」
+            assert!(!guard, "本机装着 SOLO 时不许判成影子");
+        } else {
+            assert!(guard, "已并入且本机无自己程序时必须判成影子");
+            assert_eq!(
+                stop_for_maintenance(solo, 1),
+                Ok(MaintenanceStop::NoOwnProgram),
+                "影子客户端必须直接跳过，不碰任何进程"
+            );
+        }
+    }
 }

@@ -1,12 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  INTL_GATE,
   firstSelectableKey,
+  isIntlClient,
   isSelectableClient,
   resolveSelectableKey,
   selectableClients,
   type SelectableClientLike,
 } from "./trae-client-list";
+
+/** 每个用例后把临时开关恢复成**出厂态**（关），免得互相污染。 */
+afterEach(() => {
+  INTL_GATE.enabled = false;
+});
+
+/** 临时把国际版放出来（用于验证「不连坐 / 未安装也出现」这类与开关无关的判据）。 */
+function withIntl<T>(fn: () => T): T {
+  INTL_GATE.enabled = true;
+  try {
+    return fn();
+  } finally {
+    INTL_GATE.enabled = false;
+  }
+}
 
 /**
  * 真机形态（2026-10 官方把 TRAE SOLO 并进 Trae 之后）：
@@ -66,7 +83,8 @@ describe("isSelectableClient", () => {
   });
 
   it("国际版 Trae 只是「没装」，不是「已并入」⇒ 不连坐", () => {
-    expect(isSelectableClient(hostIntl)).toBe(true);
+    // 用「国际版放出来」的状态测：否则测到的是临时开关，而不是「并入了没有」这条判据。
+    expect(withIntl(() => isSelectableClient(hostIntl))).toBe(true);
   });
 
   it("已并入但本机还装着它自己的程序 ⇒ 仍然能选（老机器，别砍功能）", () => {
@@ -80,7 +98,7 @@ describe("isSelectableClient", () => {
   });
 
   it("未安装且未并入 ⇒ 照旧出现（置灰是既有的约定）", () => {
-    expect(isSelectableClient({ key: "trae-intl", installed: false })).toBe(true);
+    expect(withIntl(() => isSelectableClient({ key: "trae-intl", installed: false }))).toBe(true);
   });
 
   it("总览结构的 camelCase 字段同样生效", () => {
@@ -107,6 +125,38 @@ describe("isSelectableClient", () => {
   });
 });
 
+describe("国际版临时开关（INTL_GATE）", () => {
+  it("关（出厂态）⇒ 国际版一律不画（不分装没装、也不管有没有并入）", () => {
+    INTL_GATE.enabled = false;
+    expect(isSelectableClient(hostIntl)).toBe(false);
+    expect(isSelectableClient({ ...hostIntl, installed: true, runnable: true })).toBe(false);
+    expect(isSelectableClient({ key: "trae-intl", installed: true })).toBe(false);
+  });
+
+  it("开 ⇒ 国际版回到「只看装没装、并没并入」的老判据", () => {
+    INTL_GATE.enabled = true;
+    expect(isSelectableClient({ ...hostIntl, installed: true, runnable: true })).toBe(true);
+    // 国际版 SOLO 依旧被「已并入 + 跑不起来」摘掉 —— 开关不会把该摘的放回来。
+    expect(isSelectableClient({ ...soloIntlMerged, installed: true })).toBe(false);
+  });
+
+  it("判据只认前缀 `-intl`：国内版 key 一个都不受影响", () => {
+    expect(isIntlClient("trae-intl")).toBe(true);
+    expect(isIntlClient("solo-intl")).toBe(true);
+    expect(isIntlClient("trae-cn")).toBe(false);
+    expect(isIntlClient("solo-cn")).toBe(false);
+  });
+
+  it("藏起来的是**界面**：后端 key 查得到（关联 / 账号并入源扫描还要用）", () => {
+    INTL_GATE.enabled = false;
+    // 判据只是「不画」；`trae_list_clients` 仍返回这些 key，这里用 key 字符串本身兜住这条约定。
+    expect(isSelectableClient({ key: "solo-intl", installed: true, merged_into: "trae-intl" })).toBe(
+      false,
+    );
+    expect(isIntlClient("solo-intl")).toBe(true);
+  });
+});
+
 describe("selectableClients", () => {
   it("只摘掉该项，顺序原样保留（顺序只归后端）", () => {
     const list = selectableClients([soloMerged, hostCn]);
@@ -118,9 +168,16 @@ describe("selectableClients", () => {
     expect(list.map((c) => c.key)).toEqual(["solo-cn", "trae-cn"]);
   });
 
-  it("真机四客户端形态（后端排序后）⇒ 只剩两个 IDE，两条 SOLO 都不在", () => {
+  it("真机四客户端形态（后端排序后）⇒ 只剩 Trae CN（国际版本轮不开放）", () => {
     // 顺序复刻后端 `sort_with_order`：可运行的在前，其余按使用记忆/内置偏好。
     const list = selectableClients([hostCn, soloMerged, soloIntlMerged, hostIntl]);
+    expect(list.map((c) => c.key)).toEqual(["trae-cn"]);
+  });
+
+  it("同一形态把国际版放出来 ⇒ 两个 IDE 都在，两条 SOLO 依旧不在", () => {
+    const list = withIntl(() =>
+      selectableClients([hostCn, soloMerged, soloIntlMerged, hostIntl]),
+    );
     expect(list.map((c) => c.key)).toEqual(["trae-cn", "trae-intl"]);
   });
 });

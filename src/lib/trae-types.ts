@@ -398,6 +398,128 @@ export interface TraeAdoptMergedResult {
   dry_run: boolean;
   adopted: TraeAdoptMergedItem[];
   skipped: TraeAdoptMergedSkip[];
+  /**
+   * 顺带**补全**的残档：老版本「一并带入」只搬了载体文件，`oauth.json` / `profile.json`
+   * 没跟过来 ⇒ 账号显示成 `oauth_xxxxxx` / `0 B` / 查不了积分。这里列出补回了哪些文件。
+   */
+  repaired: TraeAdoptMergedRepair[];
+}
+
+/** 一条「补全残档」记录（只补目标缺的文件，绝不覆盖）。 */
+export interface TraeAdoptMergedRepair {
+  from: string;
+  from_label: string;
+  source_id: string;
+  /** 目标库里那份残档的账号 id。 */
+  id: string;
+  uid: string | null;
+  /** 补回来的文件名（`oauth.json` / `profile.json`）。 */
+  files: string[];
+}
+
+// ---------------------------------------------------------------------------
+// 账号 token（头像弹窗：看 / 复制 / 续期）
+// ---------------------------------------------------------------------------
+
+/** `trae_account_token`：账号的 jwt 本体与有效期。**只读、不联网。** */
+export interface TraeAccountToken {
+  ok: boolean;
+  clientKey: string;
+  id: string;
+  uid: string | null;
+  /** JWT 本体（`xxx.yyy.zzz`）。 */
+  token: string;
+  /** 到期时间（毫秒）；null = 解不出 exp。 */
+  tokenExp: number | null;
+  /** 这份 token 从哪儿读出来的：网页凭证 / 载体登录态。 */
+  source: "oauth" | "carrier";
+  /** 续期三件套（refreshToken + 设备私钥 + deviceId）齐了才为 true。 */
+  canRefresh: boolean;
+  /** 续期门槛（天）：剩余**大于**它就默认不刷新。 */
+  thresholdDays: number;
+  /** 剩余天数（负数 = 已过期）。 */
+  remainingDays: number;
+}
+
+/** `trae_account_token_refresh` 的结果。 */
+export interface TraeAccountTokenRefresh {
+  ok: boolean;
+  /** **false = 本次没刷**（token 还新鲜），不是失败 —— 界面据此弹「强制刷新」确认窗。 */
+  refreshed: boolean;
+  reason?: "fresh";
+  force?: boolean;
+  source?: "oauth" | "carrier";
+  token: string;
+  tokenExp: number | null;
+  tokenExpBefore?: number | null;
+  remainingDays: number;
+  refreshExpiredAt?: number | null;
+  /** 实际写回的文件（`oauth.json` / `User/globalStorage/storage.json`）。 */
+  updatedFiles?: string[];
+  thresholdDays?: number;
+  message: string;
+}
+
+/**
+ * `workbuddy_account_token` 的结果。
+ *
+ * 与 Trae 侧同一个形状，只有 `source` 的含义不同：WorkBuddy 的凭据就在本工具账号库里，
+ * 所以这里是**凭据形态**（明文 / 加密信封 / 缺失），不是「从哪个文件读出来的」。
+ */
+export interface WbAccountToken {
+  ok: boolean;
+  id: string;
+  uid: string;
+  name: string;
+  /** JWT 本体（`xxx.yyy.zzz`）。 */
+  token: string;
+  /** 到期时间（毫秒）；null = 解不出 exp。 */
+  tokenExp: number | null;
+  /** 刷新额度到期（毫秒）；null = 没有这个字段。 */
+  refreshExpiredAt: number | null;
+  /** `plain` = 明文可用；`envelope` = 加密信封解不开；`missing` = 没采到凭据。 */
+  source: "plain" | "envelope" | "missing";
+  /** 不能用的可读原因；null = 正常。 */
+  blockedReason: string | null;
+  canRefresh: boolean;
+  /** 续期门槛（天）：剩余**大于**它就默认不刷新。 */
+  thresholdDays: number;
+  /** 剩余天数（负数 = 已过期）。 */
+  remainingDays: number;
+}
+
+/** `workbuddy_account_token_refresh` 的结果（与 Trae 侧同语义）。 */
+export interface WbAccountTokenRefresh {
+  ok: boolean;
+  refreshed: boolean;
+  reason?: "fresh";
+  force?: boolean;
+  token: string;
+  tokenExp: number | null;
+  tokenExpBefore?: number | null;
+  remainingDays: number;
+  refreshExpiredAt?: number | null;
+  updatedFiles?: string[];
+  thresholdDays?: number;
+  message: string;
+}
+
+/**
+ * token 弹窗内部用的**归一化**形状：两个产品的差异（来源字段怎么讲、能不能刷）在
+ * 各自产品页里烘成一句话，弹窗只认这一份 —— 避免弹窗里出现 `if (provider === ...)`
+ * 散落在每个展示点上。
+ */
+export interface AccountTokenInfo {
+  token: string;
+  tokenExp: number | null;
+  refreshExpiredAt: number | null;
+  /** 来源 / 凭据形态的一句话说明。 */
+  sourceLabel: string;
+  /** 不可用 / 不可刷新的可读原因；null = 正常。 */
+  blockedReason: string | null;
+  canRefresh: boolean;
+  thresholdDays: number;
+  remainingDays: number;
 }
 
 export interface TraeImportReport {
@@ -992,6 +1114,29 @@ export interface TraeCleanupItem {
   owner_uid?: string;
   updated: string;
   created?: string;
+  /**
+   * 备份批次专用：这一批**是否超出了设置里的保留策略**。
+   * ⚠️ 由后端 `settings::excess_with_reasons` 统一判定 ⇒ 与真正删文件的判据同源。
+   */
+  over_policy?: boolean;
+  /** 备份批次专用：超出策略的原因（可能是多条，用「；」连接），例如「超过 30 天；超过保留份数（每客户端 3 份）」。 */
+  policy_reason?: string;
+  /**
+   * 备份批次专用：是不是该客户端**最旧**的一批（最新那批不算）。
+   * 清理顺序是「先从最老的清」，所以界面上给它一个「最旧」标记，让规则看得见。
+   */
+  oldest?: boolean;
+  /**
+   * 「已并入、本机已没有它自己的程序」的客户端留下的那**一条**汇总项（T61）。
+   *
+   * ⚠️ 为什么要有这个字段：合并后那两个 SOLO 只有历史数据，但它们的缓存本来是**逐目录**
+   * 列的，真机会刷出 17 行 `TRAE SOLO CN · Cache / Code Cache / …` —— 看着像这个客户端还装着。
+   * 后端把它们折成一条并打上这个标记，界面加「已并入」徽章，说明里写清「只剩历史数据、
+   * 删除不会结束任何进程」。**这也是自查探针断言「影子没被拆回十几行」的钩子。**
+   */
+  merged_shadow?: boolean;
+  /** 折成一条时吃掉的路径条数（仅 `merged_shadow` 项有）。 */
+  merged_paths?: number;
   /** 将被删除 / 搬走的路径（确认弹窗逐条列出）。 */
   paths: string[];
 }
@@ -1006,6 +1151,11 @@ export interface TraeCleanupCategory {
   bytes_mb: number;
   recommended_count: number;
   items: TraeCleanupItem[];
+  /**
+   * 「工具残留」这一类才有：当前生效的整库备份保留策略。
+   * 界面直接显示它的 `summary`（后端原文），**不要自己拼** —— 否则就成了同一屏两个说法。
+   */
+  backup_policy?: CleanupBackupPolicy;
 }
 
 /** 清理扫描结果（只读）。 */
@@ -1797,7 +1947,7 @@ export interface CrossWriteAccount {
   /** 目标 Trae 客户端的 key；WorkBuddy 侧是空串。 */
   clientKey: string;
   /**
-   * `clientKey` 对应的**客户端显示名**（`Trae CN（IDE 国内版）` / `TRAE SOLO CN` / `WorkBuddy`）。
+   * `clientKey` 对应的**客户端显示名**（`Trae CN（国内版）` / `Trae（国际版）` / `WorkBuddy`）。
    *
    * ⚠️ 必须与账号名分开给：**Trae CN 与 TRAE SOLO CN 是两个客户端**，本机 3 个 uid 在两个
    * 客户端下各有一份（实测），混在一个账号下拉里既分不清、也选不对（见 [`crossKeyOf`]）。
@@ -1836,7 +1986,7 @@ export interface CrossWriteTarget {
   /**
    * 候选目标账号（平铺）。
    *
-   * ⚠️ 账号清单里可能有**多个客户端**（Trae 侧就有 IDE 版与 SOLO 版）——编辑器会按
+   * ⚠️ 账号清单里可能有**多个客户端**（Trae 侧就有国内版与国际版）——编辑器会按
    * `clientKey` 自动分组，先让用户选客户端、再列该客户端下的账号，不会混在一个下拉里。
    */
   accounts: CrossWriteAccount[];
@@ -1851,4 +2001,42 @@ export interface CrossWriteTarget {
    * ⚠️ 调用**之前**编辑器已经把改动写回源会话了。
    */
   push: (target: CrossWriteAccount) => Promise<string>;
+}
+
+/**
+ * 整库备份保留策略（T62）。
+ *
+ * ⚠️ 键名 **camelCase**，与后端 `settings::BackupRetention` 的 serde 命名、以及磁盘上
+ * `~/.twin-switch/settings.json` 里的键**完全一致**（三处同一个形状，不会出现
+ * 「界面存了 A、后端读的是 B」）。
+ *
+ * 它管的是「删会话 / 编辑回写 / 导入 / 导出」这四条链路留下的整库备份（每批 ≈ 300 MB）。
+ */
+export interface BackupRetention {
+  /** 总开关。关掉 ⇒ 完全不自动清理（备份只增不减，到清理页逐批手动删）。 */
+  enabled: boolean;
+  /** **时间**：早于这个天数的批次清掉。`0` = 不按时间判。 */
+  keepDays: number;
+  /** **份数**：每个客户端各自保留多少批，超出的旧批清掉。`0` = 不按份数判。 */
+  keepCount: number;
+  /** **容量**：每个备份目录最多留多少 MB，从新到旧累加超出后更旧的清掉。`0` = 不按容量判。 */
+  maxTotalMb: number;
+}
+
+/** 设置快照（`settings_get` / `settings_set` 的返回）。 */
+export interface SettingsSnapshot {
+  ok: boolean;
+  backupRetention: BackupRetention;
+  /**
+   * 后端生成的策略原文 —— **与真正删文件的判据同源**，界面直接显示它，
+   * 别自己再拼一句（那就是「同一屏两个说法」）。
+   */
+  summary: string;
+  /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
+  path: string;
+}
+
+/** 「工具残留」这一类头上的保留策略（与 `BackupRetention` 同源，多一句摘要）。 */
+export interface CleanupBackupPolicy extends BackupRetention {
+  summary: string;
 }

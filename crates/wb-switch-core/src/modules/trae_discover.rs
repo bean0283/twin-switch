@@ -39,7 +39,7 @@ pub struct TraeClient {
 pub const CLIENTS: [TraeClient; 4] = [
     TraeClient {
         key: "trae-cn",
-        label: "Trae CN（IDE 国内版）",
+        label: "Trae CN（国内版）",
         user_data: "Trae CN",
         api_host: "https://api.trae.cn",
         remote_host: "https://trae-api-cn.mchost.guru",
@@ -183,7 +183,9 @@ fn detect_exe_own(client: &TraeClient) -> Option<PathBuf> {
 }
 
 /// 本客户端**自己的**进程名（不含合并回退）。
-fn own_process_names(client: &TraeClient) -> &'static [&'static str] {
+///
+/// ⚠️ 与 [`process_names`] 的分工见那里的注释：**「它自己在不在跑」只能看这里**。
+pub fn own_process_names(client: &TraeClient) -> &'static [&'static str] {
     match client.key {
         "trae-cn" => &["Trae CN", "Trae"],
         "solo-cn" => &["TRAE SOLO CN"],
@@ -211,6 +213,38 @@ pub fn process_names(client: &TraeClient) -> Vec<&'static str> {
     out
 }
 
+/// **它自己的**程序是否在跑 —— ⚠️ 只用 [`own_process_names`]，**不带合并回退**。
+///
+/// 这条判据回答的是「这台机器上，**它自己**的进程在不在」，与「它现在住在哪」（[`process_names`]）
+/// 是两件事，**不要互相替代**：
+/// - 已合并、本机已无自己程序的 SOLO ⇒ 它的映像名不可能出现在进程表里 ⇒ 恒 `false`（正确）。
+///   走 [`crate::modules::trae_switch::is_running`] 会回退成承载方 `Trae CN` 的映像名 ⇒
+///   **只要用户开着 IDE 就谎报「SOLO 正在运行」**，而且「退出 SOLO」会连正在用的 IDE 一起杀。
+/// - 老机器上 SOLO 仍独立装着且在跑 ⇒ 命中自己的映像名 ⇒ `true`（正确，别砍功能）。
+///
+/// 「要不要为写它的库而结束进程」的判据见
+/// [`crate::modules::trae_switch::stop_for_maintenance`]。
+pub fn own_running(client: &TraeClient) -> bool {
+    let names: Vec<String> = own_process_names(client).iter().map(|s| s.to_string()).collect();
+    crate::modules::process_list::find_by_names(&names)
+        .iter()
+        .any(|(n, _)| !n.to_lowercase().contains("ai-agent"))
+}
+
+/// 是不是「已并入、但本机已没有它自己的程序」——**只剩历史数据**的那种。
+///
+/// ⚠️ 这是**界面摘不摘**的同一条判据（前端 `@/lib/trae-client-list` 的
+/// `!(merged_into && runnable === false)`）：两侧必须同源。
+/// 注意它与「已并入」不是一回事 —— 老机器上 SOLO 还独立装着（`runnable = true`）时这里是 `false`。
+pub fn is_merged_shadow(c: &InstalledClient) -> bool {
+    c.merged_into.is_some() && !c.runnable
+}
+
+/// 承载方（合并进的那个客户端）的显示名 —— 拼提示文案用。
+pub fn merged_host_label(c: &InstalledClient) -> Option<&'static str> {
+    c.merged_into.and_then(get_client).map(|h| h.label)
+}
+
 /// 读取安装目录 product.json 的 remote 网关；失败回落默认值。
 pub fn remote_host(client: &TraeClient) -> String {
     if let Some(exe) = detect_exe(client) {
@@ -234,6 +268,26 @@ pub fn remote_host(client: &TraeClient) -> String {
         }
     }
     client.remote_host.to_string()
+}
+
+/// 读取安装目录 product.json 的 `appVersion` —— 就是客户端发给服务端的
+/// `ClientVersion` / `IDEVersion`（本机 Trae CN = `3.4.2`）。
+///
+/// ⚠️ **绝不能拿 `storage.json` 的 `iCubeLastVersion` 顶替**：那是 tronBuildVersion
+///    （本机 `2.3.91xxx`），与服务端认的 `appVersion` 不是一回事 —— 参考实现
+///    `trae_refresh.js` 是踩过这个坑才把这条写进注释的。
+///
+/// 返回 `None` = 客户端没装 / 读不到，调用方自行回落。
+pub fn app_version(client: &TraeClient) -> Option<String> {
+    let exe = detect_exe(client)?;
+    let dir = exe.parent()?;
+    let pj = dir.join("resources").join("app").join("product.json");
+    let text = std::fs::read_to_string(&pj).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("appVersion")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// 该客户端当前是否确实处于登录态（两把凭据键都在且非空）。
@@ -349,5 +403,59 @@ mod tests {
         // 承载方本身必须仍是独立客户端 —— 否则回退链没有终点。
         assert!(get_client("trae-cn").unwrap().merged_into.is_none());
         assert!(get_client("trae-intl").unwrap().merged_into.is_none());
+    }
+
+    fn fake(key: &'static str, installed: bool, runnable: bool) -> InstalledClient {
+        let c = get_client(key).unwrap();
+        InstalledClient {
+            key: c.key,
+            label: c.label,
+            user_data_dir: format!("C:/fake/{}", c.user_data),
+            installed,
+            exe: if runnable { Some("C:/fake/x.exe".into()) } else { None },
+            has_login: false,
+            merged_into: c.merged_into,
+            runnable,
+        }
+    }
+
+    /// T61 的判据本体：`is_merged_shadow` 必须只在「已并入 **且** 本机已无自己程序」时为真。
+    #[test]
+    fn merged_shadow_requires_no_own_program_on_this_machine() {
+        // 合并事实成立 + 本机没程序 ⇒ 影子（只剩历史数据）
+        assert!(is_merged_shadow(&fake("solo-cn", true, false)));
+        assert!(is_merged_shadow(&fake("solo-intl", true, false)));
+        // ⚠️ 反证一：老机器上 SOLO 还独立装着 ⇒ **不是**影子，别把它当影子处理（= 砍功能）
+        assert!(!is_merged_shadow(&fake("solo-cn", true, true)));
+        // ⚠️ 反证二：承载方自己永远不是影子（它没有 merged_into）
+        assert!(!is_merged_shadow(&fake("trae-cn", true, true)));
+        assert!(!is_merged_shadow(&fake("trae-cn", true, false)));
+        // 数据目录都没了就无从谈起（installed=false 由调用方先滤掉）
+        assert!(is_merged_shadow(&fake("solo-cn", false, false)));
+    }
+
+    /// 「它自己在不在跑」只能看自己的映像名 —— 这条把「回退承载方」那个坑钉死。
+    #[test]
+    fn own_process_names_never_include_the_merged_host() {
+        let solo = get_client("solo-cn").unwrap();
+        let host = get_client("trae-cn").unwrap();
+        assert_eq!(own_process_names(solo).to_vec(), vec!["TRAE SOLO CN"]);
+        // 回退版**会**带上承载方（`Trae CN`/`Trae`）—— 这是给「启动 / 读网关」用的，
+        // 也正是「判定在不在跑」绝不能用的那一版。
+        let with_fallback = process_names(solo);
+        for n in own_process_names(host) {
+            assert!(
+                !own_process_names(solo).contains(n),
+                "own_process_names(solo-cn) 不该含承载方映像名 {n}"
+            );
+            let _ = with_fallback.contains(n); // 回退版含不含取决于本机装没装，不作断言
+        }
+    }
+
+    /// 承载方显示名 —— 提示文案「已并入 Trae CN（国内版）」靠它。
+    #[test]
+    fn merged_host_label_names_the_host() {
+        assert_eq!(merged_host_label(&fake("solo-cn", true, false)), Some("Trae CN（国内版）"));
+        assert_eq!(merged_host_label(&fake("trae-cn", true, true)), None);
     }
 }
