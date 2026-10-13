@@ -7,10 +7,19 @@
 (() => {
   const D = window.__RC_DATA__ || {};
 
+  /**
+   * token 弹窗「刷新前 / 刷新后」两趟读的次数计数（**每个页面实例一份**）。
+   *
+   * ⚠️ 为什么要有它：T60 的弹窗会在刷新成功后**重新读一遍**账号档案。若两趟都给同一份，
+   *    同一屏上「有效期」写着 55 天、下面那条对照条却写「55 天 → 28 天」—— 自相矛盾，
+   *    自查反而会把这个错误形态固化成「通过」。第一趟给 `…Token`，第二趟给 `…TokenAfter`。
+   */
+  const tokenReads = { trae: 0, wb: 0 };
+
   const handlers = {
     // ⚠️ 每次发版都要跟着改 —— 截图页脚会照实显示桩里的版本，忘了改就会出现
     //    「代码是 vX、截图是 vY」的假证据。
-    "plugin:app|version": () => "0.2.26",
+    "plugin:app|version": () => "0.3.0",
     "plugin:event|listen": () => 1,
     "plugin:event|unlisten": () => null,
     "plugin:event|emit": () => null,
@@ -113,18 +122,81 @@
             target_label: "",
             dry_run: Boolean(args?.dryRun),
             adopted: [],
+            repaired: [],
             skipped: [],
           },
     trae_session_links_diverged: () => ({ ok: true, count: 0, groups: [] }),
+
+    // ---- Trae 账号 token 弹窗（T54）----
+    // ⚠️ 这两条不补 ⇒ 未桩命令返回 `null` ⇒ 弹窗只会显示「读不到这个账号的凭证」，
+    //    探针就抓不到「复制 token / 刷新 token 有效期 / 有效期」这三样，会被误判成漏。
+    trae_account_token: () => {
+      tokenReads.trae += 1;
+      return tokenReads.trae > 1 ? D.traeAccountTokenAfter : D.traeAccountToken;
+    },
+    // 默认走「剩余天数够、跳过」这条路（正是真机常见形态）：后端回 `refreshed:false`
+    // ⇒ 前端才会弹「强制刷新」确认框 —— 这条比「直接刷新成功」更值得自查。
+    // ★ T60：`force:true` 那一趟回「真的刷了，且新有效期比原来短」——
+    //    弹窗里的对照条（`data-refresh-shift="shortened"`）就靠它。
+    trae_account_token_refresh: (args) =>
+      args?.force ? D.traeAccountTokenRefreshForced : D.traeAccountTokenRefresh,
+
+    // ---- WorkBuddy 账号页（`/workbuddy-switch`）----
+    //
+    // ⚠️ 这一页以前从没进过自查 ⇒ 下列命令一条桩都没有。缺桩会让页面停在骨架
+    //    （`skeleton` 常驻），探针报「没找到账号头像按钮」，看着像功能没做。
+    //    新加一个自查页面时，**先把它要的命令列全补齐**。
+    workbuddy_account_list: () => D.wbAccountList,
+    workbuddy_credits_accounts: () => D.wbCreditsAccounts,
+    workbuddy_credits_cached: () => D.wbCreditsCached,
+    workbuddy_credits_query: () => D.wbCreditsQuery,
+    // 与 Trae 侧同一套弹窗，走的却是 WB 自己的命令 —— 桩要分别给。
+    workbuddy_account_token: () => {
+      tokenReads.wb += 1;
+      return tokenReads.wb > 1 ? D.wbAccountTokenAfter : D.wbAccountToken;
+    },
+    workbuddy_account_token_refresh: (args) =>
+      args?.force ? D.wbAccountTokenRefreshForced : D.wbAccountTokenRefresh,
 
     // ---- 首页（`/`）----
     // ⚠️ 这两条不补就是「未桩命令 ⇒ 返回 null」，首页 `trae.value.categories` 会直接抛
     //    `Cannot read properties of null (reading 'categories')` —— 自查里那条
     //    unhandledrejection 就是它，**不是页面 bug**（后端真会返回对象）。
     //    教训同「缺桩导致骨架常驻」：跑了新页面就得把该页要的命令补齐。
-    trae_cleanup_scan: () => ({ categories: [] }),
+    trae_cleanup_scan: () => D.traeCleanup,
     trae_wb_cleanup_scan: () => ({ totals: { recommended_bytes: 0 } }),
+
+    // ---- 设置页（`/settings`，T62）----
+    settings_get: () => D.settings,
+    // ⚠️ 回读语义与后端一致：把**实际落盘的值**返回给界面（后端会 `sanitized` 夹一次）。
+    //    这里镜像后端的 `summary()` 措辞 —— 探针只断言「摘要有内容且跟着新值变」，
+    //    不去逐字比对后端文案（那样桩一漂就误报）。
+    settings_set: (args) => {
+      const b = args && args.backupRetention ? args.backupRetention : D.settings.backupRetention;
+      return {
+        ok: true,
+        backupRetention: b,
+        summary: rcPolicySummary(b),
+        path: D.settings.path,
+      };
+    },
   };
+
+  /** 镜像后端 `settings::BackupRetention::summary()` 的措辞（仅供自查样本显示）。 */
+  function rcPolicySummary(b) {
+    if (!b.enabled) {
+      return "保留策略已关闭 —— 不会自动清理任何备份（备份只增不减，可到清理页逐批手动删）";
+    }
+    const parts = [];
+    if (b.keepDays > 0) parts.push("≤" + b.keepDays + " 天");
+    if (b.keepCount > 0) parts.push("每客户端 ≤" + b.keepCount + " 份");
+    if (b.maxTotalMb > 0) {
+      const gb = b.maxTotalMb >= 1024 ? (b.maxTotalMb / 1024).toFixed(1) + " GB" : b.maxTotalMb + " MB";
+      parts.push("每目录 ≤" + gb);
+    }
+    if (parts.length === 0) return "保留策略：不限制（三项都是 0）";
+    return "保留策略：" + parts.join(" · ") + "（任一超限即清理；每客户端最新一批始终保留）";
+  }
 
   window.__TAURI_INTERNALS__ = {
     invoke: (cmd, args) => {

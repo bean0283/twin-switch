@@ -51,7 +51,7 @@ fn main() {
         println!("  bytes      = {}", t.len());
         println!("  是否 JWT   = {}", t.matches('.').count() == 2);
         println!("  uid        = {:?}", jwt_user_id(t));
-        let ms = jwt_exp(t) * 1000; // jwt_exp 返回秒
+        let ms = jwt_exp(t); // jwt_exp 返回毫秒（单位归一见 modules::jwt）
         println!("  exp        = {} ({})", ms / 1000, fmt_ts(ms));
     } else {
         println!("  (不存在)");
@@ -98,7 +98,7 @@ fn main() {
                             println!("      userId = {uid}");
                         }
                         if let Some(tok) = o.get("token").and_then(|v| v.as_str()) {
-                            let ms = jwt_exp(tok) * 1000;
+                            let ms = jwt_exp(tok); // 毫秒
                             println!(
                                 "      token: jwt_uid={:?} exp={} ({})",
                                 jwt_user_id(tok),

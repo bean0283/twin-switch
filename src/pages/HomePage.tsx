@@ -396,6 +396,18 @@ export default function HomePage() {
   const visibleTraeClients = useMemo(() => selectableClients(traeClients), [traeClients]);
 
   /**
+   * 可见客户端里正在运行的数量。
+   *
+   * ⚠️ 不能用后端下发的 `trae.runningClients`：那是**全部**已安装客户端的数，
+   *    国际版被临时开关藏起来之后，卡片里画的是 1 个标签、描述却写 2 个在跑 ——
+   *    同一屏两个数字不同源，用户只会以为界面坏了。
+   */
+  const visibleRunningClients = useMemo(
+    () => visibleTraeClients.filter((c) => c.running).length,
+    [visibleTraeClients],
+  );
+
+  /**
    * 切换条的入参；`top` 只认后端下发的 `topPick`，前端不另算「谁最常用」。
    * 同一个组件也被「Trae 会话记录」用着，这里只做字段翻译。
    */
@@ -507,7 +519,7 @@ export default function HomePage() {
           icon={<Users className="size-4" />}
           label="Trae 账号"
           value={String(trae?.accountTotal ?? 0)}
-          sub={`${trae?.installedClients ?? 0} 个客户端已安装`}
+          sub={`${visibleTraeClients.length} 个客户端已安装`}
           loading={!trae}
         />
         <Stat
@@ -558,13 +570,13 @@ export default function HomePage() {
                 </CardTitle>
                 <CardDescription>
                   {trae
-                    ? `${trae.runningClients}/${trae.installedClients} 个客户端在运行 · 每个客户端的账号库与会话库各自独立`
+                    ? `${visibleRunningClients}/${visibleTraeClients.length} 个客户端在运行 · 每个客户端的账号库与会话库各自独立`
                     : "加载中…"}
                 </CardDescription>
               </div>
               <Dot
-                on={(trae?.runningClients ?? 0) > 0}
-                label={(trae?.runningClients ?? 0) > 0 ? "运行中" : "已退出"}
+                on={visibleRunningClients > 0}
+                label={visibleRunningClients > 0 ? "运行中" : "已退出"}
               />
             </div>
           </CardHeader>

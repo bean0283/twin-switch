@@ -7,6 +7,7 @@ import {
   Home,
   Repeat2,
   ScrollText,
+  Settings,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -20,6 +21,7 @@ import WorkbuddyImportPage from "@/pages/WorkbuddyImportPage";
 import WorkbuddyExportPage from "@/pages/WorkbuddyExportPage";
 import WorkbuddyCleanupPage from "@/pages/WorkbuddyCleanupPage";
 import TraeCleanupPage from "@/pages/TraeCleanupPage";
+import SettingsPage from "@/pages/SettingsPage";
 import WorkbuddySwitchPage from "@/pages/WorkbuddySwitchPage";
 import WorkbuddyRecordsPage from "@/pages/WorkbuddyRecordsPage";
 import { AppIconMark } from "@/components/product-marks";
@@ -179,6 +181,12 @@ function Layout() {
             icon={<Eraser className="size-4" />}
             label="Trae 清理"
           />
+          {/* 设置放在最后：它是全局偏好，不属于上面任何一组功能。 */}
+          <SidebarLink
+            to="/settings"
+            icon={<Settings className="size-4" />}
+            label="设置"
+          />
         </nav>
         <UpdateEntry fallbackVersion={version} />
       </aside>
@@ -220,6 +228,7 @@ export default function App() {
             <Route path="/workbuddy-export" element={<WorkbuddyExportPage />} />
             <Route path="/workbuddy-cleanup" element={<WorkbuddyCleanupPage />} />
             <Route path="/trae-cleanup" element={<TraeCleanupPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

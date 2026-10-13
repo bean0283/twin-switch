@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
+  BackupRetention,
+  SettingsSnapshot,
   TraeAccountOverview,
+  TraeAccountToken,
+  TraeAccountTokenRefresh,
+  WbAccountToken,
+  WbAccountTokenRefresh,
   TraeAdoptMergedResult,
   TraeBrowserInfo,
   TraeCleanupReport,
@@ -431,6 +437,56 @@ export function traeVaultAdoptMerged(
   return call("trae_vault_adopt_merged", { clientKey, dryRun });
 }
 
+/**
+ * 账号的 jwt 本体与有效期（点账号头像弹窗用）。**只读、不联网。**
+ *
+ * 凭证取自该账号自己的档案：优先 `oauth.json`（网页登录凭证），其次它的载体
+ * `storage.json`（切换来的账号）。两者都没有 ⇒ 报错，界面照实说明。
+ */
+export function traeAccountToken(
+  clientKey: string,
+  accountId: string,
+): Promise<TraeAccountToken> {
+  return call("trae_account_token", { clientKey, accountId });
+}
+
+/**
+ * 刷新账号 token（设备签名续期 ExchangeToken）。
+ *
+ * ⚠️ `force = false` 时，token 剩余 > 7 天**不是失败**：返回
+ * `{ ok: true, refreshed: false, reason: "fresh" }`，界面据此弹窗让用户决定要不要强制刷新。
+ * 真失败（网络 / 服务端拒绝 / 写回自检不过）才抛错。
+ */
+export function traeAccountTokenRefresh(
+  clientKey: string,
+  accountId: string,
+  force?: boolean,
+): Promise<TraeAccountTokenRefresh> {
+  return call("trae_account_token_refresh", { clientKey, accountId, force });
+}
+
+/**
+ * WorkBuddy 账号 token（jwt 本体 + 有效期 + 能不能续期）。**只读、不联网。**
+ *
+ * 凭据取自本工具账号库（`~/.twin-switch/workbuddy-accounts.json`）。
+ */
+export function workbuddyAccountToken(accountId: string): Promise<WbAccountToken> {
+  return call("workbuddy_account_token", { accountId });
+}
+
+/**
+ * 刷新 WorkBuddy 账号 token（`POST {base}/v2/billing/meter/auth/token/refresh`）。
+ *
+ * 语义与 Trae 侧一致：`force = false` 且剩余 > 7 天 ⇒ 返回
+ * `{ refreshed: false, reason: "fresh" }`（**不是失败**），界面据此弹「强制刷新」确认窗。
+ */
+export function workbuddyAccountTokenRefresh(
+  accountId: string,
+  force?: boolean,
+): Promise<WbAccountTokenRefresh> {
+  return call("workbuddy_account_token_refresh", { accountId, force });
+}
+
 /** 诊断：列出「会话的工程归属与关联表不一致」的会话（只读）。 */
 export function traeFindMisalignedProjects(clientKey: string): Promise<{
   count: number;
@@ -774,6 +830,30 @@ export function traeWbCleanupEmptyTrash(): Promise<{
   failed_count: number;
 }> {
   return call("trae_wb_cleanup_empty_trash");
+}
+
+// ---------------------------------------------------------------------------
+// 设置（`~/.twin-switch/settings.json`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读设置（整库备份保留策略）。
+ *
+ * ⚠️ **会如实报错**：「文件不存在」= 全新安装 = 默认值；「文件在但坏了」= 抛错。
+ *    调用方不能把失败当成「用了默认值」——那会让用户以为自己的设置被重置了。
+ */
+export function settingsGet(): Promise<SettingsSnapshot> {
+  return call("settings_get", {});
+}
+
+/**
+ * 写设置。
+ *
+ * 返回**实际落盘之后**的快照（后端回读一次），调用方直接用返回值刷界面 ——
+ * 这样不会出现「写成功了但界面还显示旧值」的两处不同源。
+ */
+export function settingsSet(backupRetention: BackupRetention): Promise<SettingsSnapshot> {
+  return call("settings_set", { backupRetention });
 }
 
 // ---------------------------------------------------------------------------

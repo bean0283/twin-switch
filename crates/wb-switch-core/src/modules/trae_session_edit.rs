@@ -72,13 +72,13 @@ use crate::modules::trae_decrypt::decrypt_database;
 use crate::modules::trae_delete::{classify_tables, merge_wal_into_plain, resolve_live_key};
 use crate::modules::trae_discover::{database_path, get_client};
 use crate::modules::trae_export::{
-    backup_dir, is_session_id, label_of, promote_snapshot, prune_backups, reader_plain_path,
+    backup_dir, is_session_id, label_of, promote_snapshot, prune_with_policy, reader_plain_path,
 };
 use crate::modules::trae_import::{
     ensure_project_for, native_hex_id, patch_reserved_field, rewrite_last_real_project_id,
     session_owner_uid, write_db_incremental,
 };
-use crate::modules::trae_switch::{is_running, kill_all, launch, wait_until_stopped};
+use crate::modules::trae_switch::{launch, stop_for_maintenance, MaintenanceStop};
 
 /// 抽样上限：判定「这一列是不是 JSON 文本」时最多看多少行。
 const JSON_SAMPLE: usize = 50;
@@ -1261,13 +1261,19 @@ pub fn edit_save(
         Err(e) => return Err(e),
     };
 
-    if is_running(client) {
-        log("结束客户端进程…");
-        let killed = kill_all(client);
-        log(&format!("已结束 {} 个进程，等待退出…", killed.len()));
-        if !wait_until_stopped(client, 10_000) {
-            return Err("客户端未能退出，无法替换数据库".into());
+    // ⚠️⚠️ T61：走 `stop_for_maintenance`，不能直接 `kill_all` —— 对「已并入且本机已无
+    //    自己程序」的 SOLO，后者会回退成承载方 `Trae CN` 的映像名，把用户正在用的 IDE 一起杀。
+    match stop_for_maintenance(client, 10_000) {
+        Ok(MaintenanceStop::NotRunning) => {}
+        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程（它的旧库没有被占用）。",
+            client.label
+        )),
+        Ok(MaintenanceStop::Stopped(n)) => {
+            log("结束客户端进程…");
+            log(&format!("已结束 {n} 个进程，等待退出…"));
         }
+        Err(e) => return Err(e),
     }
 
     log("解密实时库为明文副本（可能数百 MB，请稍候）…");
@@ -1525,10 +1531,13 @@ pub fn edit_save(
         }
     }
     {
-        let (n, freed) = prune_backups(&bdir, 1);
+        // ⚠️ 走**用户设置里的保留策略**。T62 之前这里写死 `keep=1`，而且
+        // `backup_owner_and_stamp` 不认 `_before_edit_` ⇒ 每次编辑留下的备份各自成组、
+        // 一份都删不掉（实测 15 份 × 378 MB）。策略自带「每个客户端最新一批永不清」。
+        let (n, freed) = prune_with_policy(&bdir);
         if n > 0 {
             log(&format!(
-                "已清理 {n} 个旧备份，回收 {:.1} MB（仅保留最新 1 批）",
+                "已清理 {n} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
                 freed as f64 / 1_048_576.0
             ));
         }

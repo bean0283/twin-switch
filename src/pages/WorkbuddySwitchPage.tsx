@@ -35,6 +35,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
+import { AccountTokenDialog } from "@/components/account-token-dialog";
 import {
   CreditBlock,
   CreditsDialog,
@@ -100,6 +101,7 @@ function WorkbuddyAccountCard({
   onSwitch,
   onRename,
   onDelete,
+  onAvatarClick,
   onExpand,
 }: {
   acc: WorkbuddyAccount;
@@ -110,6 +112,8 @@ function WorkbuddyAccountCard({
   onSwitch: () => void;
   onRename: () => void;
   onDelete: () => void;
+  /** 点头像 = 看这个账号的 token（可复制 / 续期）。 */
+  onAvatarClick: () => void;
   onExpand: () => void;
 }) {
   const exp = expiryLabel(acc.expiresAt);
@@ -121,6 +125,8 @@ function WorkbuddyAccountCard({
       identityTitle={acc.email || acc.uid}
       identityMono={!acc.email}
       isCurrent={acc.isCurrent}
+      onAvatarClick={onAvatarClick}
+      avatarLabel="查看 token（可复制 / 续期）"
       chips={
         <>
           {acc.isCurrent ? <Chip tone="ok">当前登录</Chip> : null}
@@ -188,6 +194,9 @@ export default function WorkbuddySwitchPage() {
 
   // 删除
   const [deleteTarget, setDeleteTarget] = useState<WorkbuddyAccount | null>(null);
+
+  // 账号 token（点头像打开）：看 / 复制 / 续期
+  const [tokenTarget, setTokenTarget] = useState<WorkbuddyAccount | null>(null);
 
   // OAuth 扫码
   const [oauth, setOauth] = useState<WorkbuddyOAuthStart | null>(null);
@@ -543,6 +552,7 @@ export default function WorkbuddySwitchPage() {
                   setRenameValue(acc.name);
                 }}
                 onDelete={() => setDeleteTarget(acc)}
+                onAvatarClick={() => setTokenTarget(acc)}
                 onExpand={() => {
                   const it = creditByUid.get(key);
                   if (it) credits.setExpand(it);
@@ -646,6 +656,16 @@ export default function WorkbuddySwitchPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 账号 token 弹窗（点头像打开）：看 / 复制 / 续期。与 Trae 侧共用同一组件。 */}
+      <AccountTokenDialog
+        open={tokenTarget !== null}
+        onOpenChange={(v) => !v && setTokenTarget(null)}
+        provider="workbuddy"
+        targetKey={null}
+        accountId={tokenTarget?.id ?? null}
+        accountName={tokenTarget?.name ?? null}
+      />
 
       {/* 删除 */}
       <Dialog

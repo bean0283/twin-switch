@@ -26,6 +26,86 @@ const cid = doc.sessionId;
 const uid2 = "11111111-2222-4333-8444-55555555aaaa";
 const labelOf = (u) => (u === uid ? "测试账号（uid …5d5e70）" : `另一个账号（uid …${u.slice(-6)}）`);
 
+/**
+ * Token 弹窗样本的时间戳 —— **按运行时刻现算**。
+ *
+ * ⚠️ 不许写死毫秒常量：写死之后「有效期」显示的年月日会随日子漂，而 `remainingDays`
+ *    还是老数字 ⇒ 同一屏两个数字对不上（项目硬规则「同一屏的两个数字必须同源」），
+ *    而且探针里那条「年份必须落在 2000~2999」的判据过几年就会自己变红。
+ *    线上截图那个账号就是**只剩 5 天**，所以这里刻意造 5 天。
+ */
+const T5 = Date.now() + 5 * 86_400_000; // access token：还剩 5 天
+const T14 = Date.now() + 14 * 86_400_000; // refresh 额度：还剩 14 天
+
+/**
+ * T60 的 token 弹窗样本：**老登录的 token 还剩 55 天**。
+ *
+ * 这正是用户看到「以前将近 2 个月」的那个形态 —— 10 月初登录时服务端签的是 55 天；
+ * 而官方 2026-10 起把**新签发**的收紧了，所以这条样本一强制刷新就会「变短」，
+ * 弹窗里那条「本次刷新 前 → 后」对照条 + 「刷新 ≠ 延长」的提示才有东西可画。
+ *
+ * ⚠️⚠️ 收紧后的值**两个产品不一样，样本也必须分开**。T60 初版两边共用了 `T28`，
+ *    结果 Trae 弹窗里写着「官方目前签发的就是 28 天」—— 那是 WorkBuddy 的值。共用一个
+ *    常量就抓不住这个错，所以这里刻意留两个不同的常量，探针也按产品分别断言。
+ * - **Trae = 14 天**（`T14_ISSUED`）：本机 4 份刚续期成功的账号档
+ *   （`trae/vault/<客户端>/oauth.json`）`exp - iat` 都是 **1209600 s 整**。
+ * - **WorkBuddy = 28 天**（`T28`）：官方客户端自己写的
+ *   `backups/workbuddy-desktop.20261007-183235.info` → `auth.expiresIn = 2419200 s`。
+ */
+const T55 = Date.now() + 55 * 86_400_000; // 老登录拿到的 token：还剩 55 天
+const T28 = Date.now() + 28 * 86_400_000; // WorkBuddy 服务端现在签发的：28 天
+const T14_ISSUED = Date.now() + 14 * 86_400_000; // Trae 服务端现在签发的：14 天
+
+/** WorkBuddy 账号页的积分样本（两条账号共用一条，够画卡片与「全部积分包」弹窗）。 */
+const WB_CREDIT_SAMPLE = {  ok: true,
+  account: {
+    id: "1736a5f4-f580-48c5-91b7-cd15a4421d6f",
+    uid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+    name: "弦思",
+    tokenState: "plain",
+    queryable: true,
+    blockedReason: null,
+  },
+  totalCapacity: 1_500_000,
+  totalRemaining: 1_494_260,
+  expiringSoonRemaining: 0,
+  expiredRemaining: 0,
+  soonestExpireAt: 1793966379672,
+  expiringSoon: [],
+  expired: false,
+  packageCount: 14,
+  activePackageCount: 14,
+  resources: [
+    {
+      packageCode: "TCACA_code_002_AkiJS3ZHF5",
+      packageName: null,
+      total: 1_500_000,
+      remaining: 1_494_260,
+      used: 5_740,
+      status: 0,
+      expireAt: 1793966379672,
+      expired: false,
+      expiringSoon: false,
+    },
+  ],
+  activeResources: [
+    {
+      packageCode: "TCACA_code_002_AkiJS3ZHF5",
+      packageName: null,
+      total: 1_500_000,
+      remaining: 1_494_260,
+      used: 5_740,
+      status: 0,
+      expireAt: 1793966379672,
+      expired: false,
+      expiringSoon: false,
+    },
+  ],
+  updatedAt: 1760300000000,
+  source: "summary",
+  refreshed: false,
+};
+
 const sessionItem = {
   id: cid,
   title: doc.title,
@@ -303,7 +383,10 @@ const data = {
     ],
   },
 
-  // 预演结果（`dry_run = true`）：提示条只在 `adopted` 非空时出现。
+  // 预演结果（`dry_run = true`）：提示条只在 `adopted` 或 `repaired` 非空时出现。
+  //
+  // ⚠️ 两个数组都给：`adopted` 走「还有 N 个账号留在别处」，`repaired` 走「补全老版本漏搬的
+  //    网页凭证」—— 同一屏两种文案都渲染，一次自查把两条分支都覆盖到。
   traeVaultAdoptMerged: {
     target: "trae-cn",
     target_label: "Trae CN",
@@ -324,7 +407,101 @@ const data = {
         uid: "925158341882023",
       },
     ],
+    // T51：老版本 `export_account` 只搬载体 ⇒ 先搬过来的账号缺 `oauth.json` / `profile.json`。
+    repaired: [
+      {
+        from: "solo-cn",
+        from_label: "TRAE SOLO CN",
+        source_id: "oauth_223728",
+        id: "oauth_223728",
+        uid: "4052137095223728",
+        files: ["oauth.json", "profile.json"],
+      },
+    ],
     skipped: [],
+  },
+
+  // ---- Trae 账号 token 弹窗（T54）----
+  // 一段**形如 JWT** 的串（三段、足够长 ⇒ 前端会打码成 `前 18 位…后 10 位`，
+  // 探针就靠这个 `…` 断言「默认是打码的，不是把 token 直接糊在屏幕上」）。
+  traeAccountToken: {
+    ok: true,
+    clientKey: "trae-cn",
+    id: "oauth_223728",
+    uid: "4052137095223728",
+    token:
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+      "eyJzdWIiOiI0MDUyMTM3MDk1MjIzNzI4IiwidWlkIjoiNDA1MjEzNzA5NTIyMzcyOCIsImV4cCI6MTc5Mjg4NjU3NH0." +
+      "7c9f0a3b2e5d8c1f4a6b9d0e3f2a5c8b1d4e7f0a3c6b9d2e5f8a1c4b7d0e3f6a9",
+    // ⚠️ `tokenExp` 必须是**毫秒**。旧实现把它再乘 1000 ⇒ 界面显示「58765/4/20 还剩
+    //    2000 万天」，探针里的 `saneYear` 就是这条的抓手。
+    // ⚠️ T60 起刻意用「老登录还剩 55 天」：官方现在只签发 14 天（Trae 侧），强制刷新后
+    //    到期时间反而**提前** —— 对照条（`data-refresh-shift="shortened"`）要靠它才画得出来。
+    tokenExp: T55,
+    source: "oauth",
+    canRefresh: true,
+    thresholdDays: 7,
+    remainingDays: 55,
+  },
+  // 默认这条路（`force:false`）：剩余天数够 ⇒ 后端 `refreshed:false` ⇒ 前端弹「强制刷新」确认框。
+  traeAccountTokenRefresh: {
+    ok: true,
+    refreshed: false,
+    reason: "fresh",
+    force: false,
+    source: "oauth",
+    token:
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+      "eyJzdWIiOiI0MDUyMTM3MDk1MjIzNzI4IiwidWlkIjoiNDA1MjEzNzA5NTIyMzcyOCIsImV4cCI6MTc5Mjg4NjU3NH0." +
+      "7c9f0a3b2e5d8c1f4a6b9d0e3f2a5c8b1d4e7f0a3c6b9d2e5f8a1c4b7d0e3f6a9",
+    tokenExp: T55,
+    tokenExpBefore: T55,
+    remainingDays: 55,
+    thresholdDays: 7,
+    refreshExpiredAt: null,
+    updatedFiles: [],
+    message: "token 仍然新鲜（剩余 55 天 > 门槛 7 天），本次未刷新",
+  },
+
+  // ★ T60 新增（`force:true` 这一趟）：Trae 服务端签发的**就是 14 天**，比原来（55 天）短。
+  //   探针点完确认窗里的「强制刷新」后就断言对照条 ⇒ 判据钩在 `data-refresh-shift` 上；
+  //   同时按 `data-issued-validity-days` 断言「Trae 档写的是 14，不是 WorkBuddy 的 28」。
+  traeAccountTokenRefreshForced: {
+    ok: true,
+    refreshed: true,
+    reason: "refreshed",
+    force: true,
+    source: "oauth",
+    token:
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+      "eyJzdWIiOiI0MDUyMTM3MDk1MjIzNzI4IiwidWlkIjoiNDA1MjEzNzA5NTIyMzcyOCIsImV4cCI6MTc5NDMxNDAwMH0." +
+      "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+    tokenExp: T14_ISSUED,
+    tokenExpBefore: T55,
+    remainingDays: 14,
+    thresholdDays: 7,
+    refreshExpiredAt: null,
+    updatedFiles: [],
+    message: "已刷新；新有效期由服务端签发（14 天，比原来短）",
+  },
+
+  // 刷新**之后**再读一遍账号档案：到期时间要跟着变成 14 天。
+  // ⚠️ 不换这一份，同一屏就会「有效期」写 55 天、下面凑着「刷新前 55 天 → 后 14 天」——
+  //    同一屏两个数字不同源（项目硬规则）。
+  traeAccountTokenAfter: {
+    ok: true,
+    clientKey: "trae-cn",
+    id: "oauth_223728",
+    uid: "4052137095223728",
+    token:
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+      "eyJzdWIiOiI0MDUyMTM3MDk1MjIzNzI4IiwidWlkIjoiNDA1MjEzNzA5NTIyMzcyOCIsImV4cCI6MTc5NDMxNDAwMH0." +
+      "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+    tokenExp: T14_ISSUED,
+    source: "oauth",
+    canRefresh: true,
+    thresholdDays: 7,
+    remainingDays: 14,
   },
 
   traeCredits: {
@@ -334,6 +511,163 @@ const data = {
     summary: { queried: 0, succeeded: 0, failed: 0, totalRemaining: 0 },
     updatedAt: null,
     cached: true,
+  },
+
+  // ---- WorkBuddy 账号页（`/workbuddy-switch`）----
+  //
+  // ⚠️ 这一页以前**从没进过自查**，所以下面这些命令一条桩都没有：不补的话未桩命令返回
+  //    `null` ⇒ 页面停在骨架（`skeleton` 常驻），探针会报「没找到账号头像按钮」，
+  //    看着像「头像入口没做」，其实是桩缺了（同 §9 硬规则）。
+  wbAccountList: {
+    accounts: [
+      {
+        id: "1736a5f4-f580-48c5-91b7-cd15a4421d6f",
+        uid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+        name: "弦思",
+        nickname: "弦思",
+        email: null,
+        hasToken: true,
+        expiresAt: T5,
+        lastUsedAt: Date.now() - 86_400_000,
+        isCurrent: true,
+      },
+      {
+        id: "b21f0c9e-2a44-4d3e-9f10-77c0a1e5d2b8",
+        uid: "3f21ab77-11c2-4e35-8d90-5a2b6c7d8e9f",
+        name: "账号 88d9",
+        nickname: null,
+        email: null,
+        hasToken: true,
+        expiresAt: T5,
+        lastUsedAt: null,
+        isCurrent: false,
+      },
+    ],
+    currentUid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+    loggedIn: true,
+    authFilePath: "C:/Users/11970/.workbuddy/auth.json",
+  },
+
+  wbCreditsAccounts: {
+    ok: true,
+    count: 2,
+    queryable: 2,
+    accounts: [
+      {
+        id: "1736a5f4-f580-48c5-91b7-cd15a4421d6f",
+        uid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+        name: "弦思",
+        tokenState: "plain",
+        queryable: true,
+        blockedReason: null,
+      },
+      {
+        id: "b21f0c9e-2a44-4d3e-9f10-77c0a1e5d2b8",
+        uid: "3f21ab77-11c2-4e35-8d90-5a2b6c7d8e9f",
+        name: "账号 88d9",
+        tokenState: "plain",
+        queryable: true,
+        blockedReason: null,
+      },
+    ],
+  },
+
+  wbCreditsCached: {
+    ok: true,
+    accounts: [WB_CREDIT_SAMPLE],
+    errors: [],
+    updatedAt: 1760300000000,
+    cached: true,
+    summary: { queried: 2, succeeded: 2, failed: 0, totalRemaining: 1_494_260 },
+  },
+
+  wbCreditsQuery: {
+    ok: true,
+    accounts: [WB_CREDIT_SAMPLE],
+    errors: [],
+    updatedAt: 1760300000000,
+    cached: false,
+    summary: { queried: 2, succeeded: 2, failed: 0, totalRemaining: 1_494_260 },
+  },
+
+  // ---- WorkBuddy 账号 token 弹窗（T56；与 Trae 侧同一套 UI）----
+  //
+  // ⚠️ 刻意造成「老登录还剩 55 天」：官方 2026-10 起新签发的只有 28 天，强制刷新后
+  // 到期时间反而**提前** —— 弹窗里那条对照条（`data-refresh-shift="shortened"`）与
+  // 「刷新 ≠ 延长」的提示都靠这条样本才画得出来；同时年份落在合理区间 ⇒ `saneYear` 有东西可抓。
+  wbAccountToken: {
+    ok: true,
+    id: "1736a5f4-f580-48c5-91b7-cd15a4421d6f",
+    uid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+    name: "弦思",
+    token:
+      "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJteWZFenA3ODNLaV9KQ3g4Vm5jM1hfaXg2alpyYjZDZjVPTWtHWk1QSTNzIn0." +
+      "eyJleHAiOjE3OTI4ODY1NzQsImlhdCI6MTc5MTY3Njk3NCwidWlkIjoiM2YyMWFiNzctMTFjMi00ZTM1LThkOTAtNWEyYjZjN2Q4ZTlmIn0." +
+      "9d2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e",
+    tokenExp: T55,
+    refreshExpiredAt: T14,
+    source: "plain",
+    blockedReason: null,
+    canRefresh: true,
+    thresholdDays: 7,
+    remainingDays: 55,
+  },
+
+  // 与 Trae 侧同一条路（`force:false`）：后端回 `refreshed:false` ⇒ 前端弹「强制刷新」确认窗。
+  wbAccountTokenRefresh: {
+    ok: true,
+    refreshed: false,
+    reason: "fresh",
+    force: false,
+    token:
+      "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJteWZFenA3ODNLaV9KQ3g4Vm5jM1hfaXg2alpyYjZDZjVPTWtHWk1QSTNzIn0." +
+      "eyJleHAiOjE3OTI4ODY1NzQsImlhdCI6MTc5MTY3Njk3NCwidWlkIjoiM2YyMWFiNzctMTFjMi00ZTM1LThkOTAtNWEyYjZjN2Q4ZTlmIn0." +
+      "9d2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e2f4a6b8c0e",
+    tokenExp: T55,
+    tokenExpBefore: T55,
+    remainingDays: 55,
+    thresholdDays: 7,
+    refreshExpiredAt: T14,
+    updatedFiles: [],
+    message: "token 仍然新鲜（剩余 55 天 > 门槛 7 天），本次未刷新",
+  },
+
+  // ★ T60 新增（`force:true`）：服务端签发 28 天，比原来（55 天）短 ⇒ 对照条标「变短」。
+  wbAccountTokenRefreshForced: {
+    ok: true,
+    refreshed: true,
+    reason: "refreshed",
+    force: true,
+    token:
+      "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJteWZFenA3ODNLaV9KQ3g4Vm5jM1hfaXg2alpyYjZDZjVPTWtHWk1QSTNzIn0." +
+      "eyJleHAiOjE3OTQzMTQwMDAsImlhdCI6MTc5MTY3Njk3NCwidWlkIjoiM2YyMWFiNzctMTFjMi00ZTM1LThkOTAtNWEyYjZjN2Q4ZTlmIn0." +
+      "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+    tokenExp: T28,
+    tokenExpBefore: T55,
+    remainingDays: 28,
+    thresholdDays: 7,
+    refreshExpiredAt: T14,
+    updatedFiles: [],
+    message: "已刷新；新有效期由服务端签发（28 天，比原来短）",
+  },
+
+  // 刷新**之后**再读一遍：到期时间跟着变成 28 天（同一屏两个数字必须同源）。
+  wbAccountTokenAfter: {
+    ok: true,
+    id: "1736a5f4-f580-48c5-91b7-cd15a4421d6f",
+    uid: "6aa2c43b-05f5-489a-840a-298f6cbe81ba",
+    name: "弦思",
+    token:
+      "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJteWZFenA3ODNLaV9KQ3g4Vm5jM1hfaXg2alpyYjZDZjVPTWtHWk1QSTNzIn0." +
+      "eyJleHAiOjE3OTQzMTQwMDAsImlhdCI6MTc5MTY3Njk3NCwidWlkIjoiM2YyMWFiNzctMTFjMi00ZTM1LThkOTAtNWEyYjZjN2Q4ZTlmIn0." +
+      "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+    tokenExp: T28,
+    refreshExpiredAt: T14,
+    source: "plain",
+    blockedReason: null,
+    canRefresh: true,
+    thresholdDays: 7,
+    remainingDays: 28,
   },
 
   // ---- 全局总览（`app_overview_snapshot`）----
@@ -487,8 +821,8 @@ const data = {
 
   // 更新状态：给一份「已是最新」，免得更新入口卡在检查中。
   updateState: {
-    currentVersion: "0.2.26",
-    latestVersion: "0.2.26",
+    currentVersion: "0.3.0",
+    latestVersion: "0.3.0",
     hasUpdate: false,
     checking: false,
     downloading: false,
@@ -500,6 +834,173 @@ const data = {
 
   // 启动时那次自动导入（T43 起由 `main.tsx` 编排，界面无按钮）。
   refAccounts: { created: 0, updated: 0, imported: 0, total: 1, available: true, note: null, kept: 0, blocked: 0 },
+
+  // ---- 设置页（`/settings`，T62）----
+  // 与后端 `settings::BackupRetention::default()` 同值（30 天 / 3 份 / 4096 MB）。
+  // ⚠️ 这三条数在 `backup-policy.test.ts` 里也钉过 —— 改这里要想想会不会把样本改成
+  //    「界面上看着对、实际单位错」的假象。
+  settings: {
+    ok: true,
+    backupRetention: { enabled: true, keepDays: 30, keepCount: 3, maxTotalMb: 4096 },
+    summary: "保留策略：≤30 天 · 每客户端 ≤3 份 · 每目录 ≤4.0 GB（任一超限即清理；每客户端最新一批始终保留）",
+    path: "C:/Users/x/.twin-switch/settings.json",
+  },
+
+  // ---- Trae 清理页（`/trae-cleanup`，T62 起带保留策略与「超出策略」标注）----
+  // 刻意造「一个客户端有 4 批、策略只留 3 批」的形态：最新那批必须**不**被标成超出，
+  // 更旧的那批必须被标上并带上原因 —— 这正是 T62 之前清不掉的形状。
+  traeCleanup: {
+    store_root: "C:/Users/x/.twin-switch",
+    trash_root: "C:/Users/x/.twin-switch/trash",
+    // ⚠️ 必须等于下面各类目之和（同屏两个数字同源）：402653184 + 971243520
+    total_bytes: 1_373_896_704,
+    total_mb: 1373.9,
+    cached: false,
+    stale: false,
+    scannedAt: Date.now(),
+    ageMs: 0,
+    notes: [
+      // ★ T61：影子客户端的提示必须是「已并入、只剩历史数据」，**不许**是「正在运行」。
+      //   桩里放的是修好后的那句；探针按 DOM 断言页面上出现的是这一句。
+      "TRAE SOLO CN 已并入Trae CN（国内版）、本机已没有它自己的程序 —— 只剩历史数据；删除它的会话不会结束任何进程。",
+      "Trae CN（国内版） 正在运行：删除会话时会自动结束进程，并在完成后重新启动。",
+    ],
+    categories: [
+      {
+        id: "tool_residue",
+        title: "工具残留（本工具目录）",
+        desc:
+          "整库备份、解密快照、导入中间产物与日志。删除后不影响已写入 Trae 的数据。" +
+          "整库备份按客户端分组、最旧的排在前面 —— 清理顺序就是先从最老的清，" +
+          "每个客户端最新的一批永远保留（可回滚）。",
+        count: 3,
+        recommended_count: 1,
+        bytes: 402_653_184,
+        bytes_mb: 384,
+        backup_policy: {
+          enabled: true,
+          keepDays: 30,
+          keepCount: 3,
+          maxTotalMb: 4096,
+          summary: "保留策略：≤30 天 · 每客户端 ≤3 份 · 每目录 ≤4.0 GB（任一超限即清理；每客户端最新一批始终保留）",
+        },
+        // ⚠️ 顺序 = 后端的真实顺序：**每个客户端内部从旧到新**（最旧的排最前）。
+        //    样本要是把最新的排前面，探测「先从最老的清」这条规则的判据就白写了。
+        items: [
+          {
+            // ★ 最旧 + 超出策略 ⇒ 必须同时挂「超出策略」和「最旧」两个标记、且默认勾选
+            id: "backup:trae-cn:20261010_194737",
+            kind: "batch",
+            category: "tool_residue",
+            title: "删除会话前的整库备份 · trae-cn · 2026/10/10 19:47",
+            detail:
+              "~/.twin-switch/trae/backup（3 个文件）· 该客户端最旧的一批 · 超出保留策略：超过保留份数（每客户端 3 份）",
+            bytes: 396_361_728,
+            bytes_mb: 378,
+            recommended: true,
+            over_policy: true,
+            policy_reason: "超过保留份数（每客户端 3 份）",
+            oldest: true,
+            needs_client_stop: false,
+            client_key: "trae-cn",
+            client_label: "",
+            session_id: "",
+            turns: 0,
+            updated: "2026/10/10 19:47",
+            paths: ["C:/Users/x/.twin-switch/trae/backup/trae-cn_before_delete_20261010_194737.db.bak"],
+          },
+          {
+            id: "backup:trae-cn:20261010_200820",
+            kind: "batch",
+            category: "tool_residue",
+            title: "删除会话前的整库备份 · trae-cn · 2026/10/10 20:08",
+            detail: "~/.twin-switch/trae/backup（3 个文件）· 最新一批，保留可回滚",
+            bytes: 396_361_728,
+            bytes_mb: 378,
+            recommended: false,
+            over_policy: false,
+            policy_reason: "",
+            oldest: false,
+            needs_client_stop: false,
+            client_key: "trae-cn",
+            client_label: "",
+            session_id: "",
+            turns: 0,
+            updated: "2026/10/10 20:08",
+            paths: ["C:/Users/x/.twin-switch/trae/backup/trae-cn_before_delete_20261010_200820.db.bak"],
+          },
+          {
+            id: "file:edit_tmp",
+            kind: "dir",
+            category: "tool_residue",
+            title: "编辑回写临时目录",
+            detail: "改回合中断留下的中间文件",
+            bytes: 6_291_456,
+            bytes_mb: 6,
+            recommended: true,
+            oldest: false,
+            needs_client_stop: false,
+            client_key: "",
+            client_label: "",
+            session_id: "",
+            turns: 0,
+            updated: "",
+            paths: ["C:/Users/x/.twin-switch/trae/edit_tmp"],
+          },
+        ],
+      },
+      {
+        id: "client_residue",
+        title: "客户端残留（Trae 自身缓存）",
+        desc: "Chromium/Electron 缓存、日志与崩溃转储。不碰登录态与偏好设置；清理前请关闭客户端。",
+        count: 2,
+        recommended_count: 1,
+        bytes: 971_243_520,
+        bytes_mb: 926,
+        items: [
+          {
+            // ★ T61：影子客户端（已并入、本机已无自己程序）**折成一条**。
+            //   桩里必须只有这一条 —— 要是像真机那样拆出 17 行，探针就抓不到「又拆回去了」。
+            id: "client_residue:merged-shadow:solo-cn",
+            kind: "dir",
+            category: "client_residue",
+            title: "TRAE SOLO CN（已并入 Trae CN（国内版））· 历史缓存",
+            detail:
+              "本机已没有它自己的程序，只剩合并前留下的 17 项缓存与日志。删除它们不会影响 Trae CN（国内版），也不会结束任何进程（均可再生，登录态与偏好设置不受影响）。",
+            bytes: 39_845_888,
+            bytes_mb: 38,
+            recommended: true,
+            needs_client_stop: false,
+            merged_shadow: true,
+            merged_paths: 17,
+            client_key: "solo-cn",
+            client_label: "",
+            session_id: "",
+            turns: 0,
+            updated: "",
+            paths: ["C:/Users/x/AppData/Roaming/TRAE SOLO CN/Cache"],
+          },
+          {
+            id: "client_residue:C:/Users/x/AppData/Roaming/Trae CN/Cache",
+            kind: "dir",
+            category: "client_residue",
+            title: "Trae CN（国内版）· Cache",
+            detail: "HTTP 磁盘缓存（可再生，不影响登录态）",
+            bytes: 931_397_632,
+            bytes_mb: 888,
+            recommended: false,
+            needs_client_stop: true,
+            client_key: "trae-cn",
+            client_label: "",
+            session_id: "",
+            turns: 0,
+            updated: "",
+            paths: ["C:/Users/x/AppData/Roaming/Trae CN/Cache"],
+          },
+        ],
+      },
+    ],
+  },
 };
 
 fs.writeFileSync(OUT, JSON.stringify(data), "utf8");

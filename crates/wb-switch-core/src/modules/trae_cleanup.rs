@@ -25,12 +25,14 @@ use serde_json::{json, Value};
 use crate::modules::config::{self, store_dir};
 use crate::modules::fs_remove::remove_tree_with_retry;
 use crate::modules::trae_delete::delete_sessions;
-use crate::modules::trae_discover::{get_client, list_installed_clients, user_data_dir};
+use crate::modules::trae_discover::{
+    get_client, is_merged_shadow, list_installed_clients, merged_host_label, user_data_dir,
+};
 use crate::modules::trae_export::{
-    backup_dir, deleted_sessions_dir, export_dir, import_backup_dir, list_backup_batches,
+    backup_dir, batches_with_facts, deleted_sessions_dir, export_dir, import_backup_dir,
     wb_import_backup_dir,
 };
-use crate::modules::trae_switch::is_running;
+use crate::modules::trae_switch::is_running_own;
 
 /// 客户端里**可再生**的缓存/日志（相对 userData 根）。第二个元素是给人看的说明。
 ///
@@ -182,7 +184,10 @@ fn file_item(
 /// 扫描缓存文件名（落在 `config::cache_dir()`）。
 const CACHE_NAME: &str = "trae-cleanup.json";
 /// 缓存结构版本，字段一改就 +1。
-const CACHE_VERSION: u64 = 1;
+///
+/// v2（T62）：新增 `backup_policy`，以及每个备份批次的 `over_policy` / `policy_reason`；
+/// `tool_dirs` 补上 `trae/heal_tmp` 与 `trae/edit_tmp`（原来完全清不到，实测 626 MB + 379 MB）。
+const CACHE_VERSION: u64 = 3;
 /// 「这份缓存算旧了」的阈值：10 分钟。
 ///
 /// **注意它不再是「过期就丢」的闸门**（v0.0.23 改）：以前超过 10 分钟就回落到实时扫描，
@@ -266,7 +271,17 @@ fn scan_sessions() -> (Value, Vec<String>) {
         let Some(client) = get_client(&c.key) else {
             continue;
         };
-        if is_running(client) {
+        if is_merged_shadow(&c) {
+            // ⚠️⚠️ T61：这里**绝不能**报「正在运行」——`is_running` 会回退成承载方
+            //    `Trae CN` 的映像名，只要用户开着 IDE 就是谎报；而用户照着提示去删会话，
+            //    旧实现真的会把 IDE 一起杀掉。合并后它的旧库没有任何进程持有。
+            if let Some(host) = merged_host_label(&c) {
+                notes.push(format!(
+                    "{} 已并入{}、本机已没有它自己的程序 —— 只剩历史数据；删除它的会话不会结束任何进程。",
+                    c.label, host
+                ));
+            }
+        } else if is_running_own(client) {
             notes.push(format!(
                 "{} 正在运行：删除会话时会自动结束进程，并在完成后重新启动。",
                 c.label
@@ -322,6 +337,11 @@ fn scan_sessions() -> (Value, Vec<String>) {
 fn scan_tool_residue() -> Value {
     let mut items: Vec<Value> = Vec::new();
 
+    // 本页的「可清理」标记必须与真正删文件的判据**同源** ⇒ 用当前设置里的保留策略来判，
+    // 界面上同时把策略原文摆出来（用户要能对上「我设的 30 天 / 3 份 / 4 GB」）。
+    let policy = crate::modules::settings::load().backup_retention;
+    let now_ms = crate::modules::config::now_ms();
+
     // 2.1 整库备份批次 —— 每批 ≈ 一个整库（300 MB 量级），按批列出让用户自己挑
     for (dir, label, prefix) in [
         (backup_dir(), "删除会话前的整库备份", "backup"),
@@ -333,17 +353,41 @@ fn scan_tool_residue() -> Value {
             "wb_export_backup",
         ),
     ] {
-        let batches = list_backup_batches(&dir);
-        if batches.is_empty() {
+        let pairs = batches_with_facts(&dir);
+        if pairs.is_empty() {
             continue;
         }
-        // 每个客户端只留最新一批（那就是「出事能回滚」的那一份）
+        // 谁超出策略，由**唯一那个**判定函数说了算（界面上的原因与它同源）
+        let facts: Vec<crate::modules::settings::BatchFacts> =
+            pairs.iter().map(|(_, f)| f.clone()).collect();
+        let over: BTreeMap<usize, String> = crate::modules::settings::excess_with_reasons(
+            &facts,
+            &policy,
+            now_ms,
+        )
+        .into_iter()
+        .map(|(i, rules)| {
+            let txt = rules
+                .iter()
+                .map(|r| r.describe(&policy))
+                .collect::<Vec<_>>()
+                .join("；");
+            (i, txt)
+        })
+        .collect();
+        // 每个客户端最旧 / 最新的一批。
+        // ⚠️ `pairs` 的顺序是 `(owner, stamp)` 升序（`list_backup_batches` 用 BTreeMap），
+        //    也就是**每个客户端内部从旧到新** —— 这正是用户要的「优先清最老的」：
+        //    列表头几条就是该先清的。
         let mut newest: BTreeMap<&str, &str> = BTreeMap::new();
-        for b in &batches {
+        let mut oldest: BTreeMap<&str, &str> = BTreeMap::new();
+        for (b, _) in &pairs {
             newest.insert(b.owner.as_str(), b.stamp.as_str());
+            oldest.entry(b.owner.as_str()).or_insert(b.stamp.as_str());
         }
-        for b in &batches {
+        for (i, (b, _)) in pairs.iter().enumerate() {
             let is_newest = newest.get(b.owner.as_str()) == Some(&b.stamp.as_str());
+            let is_oldest = !is_newest && oldest.get(b.owner.as_str()) == Some(&b.stamp.as_str());
             // 有些批次名不带客户端前缀（例如 `20261004-220644`），此时解析出的
             // stamp 为空、owner 本身就是时间戳 —— 显示时要把它当时间用。
             let (owner_disp, stamp_disp) = if b.stamp.is_empty() {
@@ -356,21 +400,34 @@ fn scan_tool_residue() -> Value {
             } else {
                 format!("{label} · {owner_disp} · {stamp_disp}")
             };
+            let reason = over.get(&i).cloned().unwrap_or_default();
+            let tail = if is_newest {
+                "· 最新一批，保留可回滚".to_string()
+            } else if is_oldest && !reason.is_empty() {
+                format!("· 该客户端最旧的一批 · 超出保留策略：{reason}")
+            } else if is_oldest {
+                "· 该客户端最旧的一批".to_string()
+            } else if reason.is_empty() {
+                "· 在保留策略内".to_string()
+            } else {
+                format!("· 超出保留策略：{reason}")
+            };
+            let detail = format!("{}（{} 个文件）{tail}", dir_label(&dir), b.paths.len());
             items.push(json!({
                 "id": format!("{prefix}:{}:{}", b.owner, b.stamp),
                 "kind": "batch",
                 "category": "tool_residue",
                 "title": shown_title,
-                "detail": format!(
-                    "{}（{} 个文件）{}",
-                    dir_label(&dir),
-                    b.paths.len(),
-                    if is_newest { "· 最新一批，保留可回滚" } else { "" }
-                ),
+                "detail": detail,
                 "bytes": b.bytes,
                 "bytes_mb": mb(b.bytes),
-                // 最新一批是安全网，默认不勾
-                "recommended": !is_newest,
+                // 超出策略的默认勾选；最新一批是安全网，默认不勾
+                "recommended": !is_newest && !reason.is_empty(),
+                "over_policy": !reason.is_empty(),
+                "policy_reason": reason,
+                // 该客户端当前最旧的一批 —— 界面上给它一个「最旧」标记，
+                // 让「先从最老的清」这条规则看得见。
+                "oldest": is_oldest,
                 "needs_client_stop": false,
                 "client_key": b.owner.clone(),
                 "client_label": "",
@@ -383,11 +440,17 @@ fn scan_tool_residue() -> Value {
     }
 
     // 2.2 中间产物 / 快照 / 日志
-    let tool_dirs: [(PathBuf, &str, &str, bool); 7] = [
+    //
+    // ⚠️ T62 补了 `trae/heal_tmp` 与 `trae/edit_tmp`：这两个目录原来**完全没被列出**，
+    //    所以用户点「清理」也清不到它们（本机实测 626 MB + 379 MB 一直躺着）。
+    //    同一个功能里攒中间产物的目录有四五个，加新目录时务必一起加进来。
+    let tool_dirs: [(PathBuf, &str, &str, bool); 9] = [
         (store_dir().join("workbuddy_import"), "WorkBuddy 导入的中间产物", "导入时写库暂存，可随时重建", true),
         (store_dir().join("workbuddy_scan"), "WorkBuddy 库扫描快照", "为避免与客户端争 WAL 锁而复制，可随时重建", true),
         (store_dir().join("trae").join("import_tmp"), "分批导入临时目录", "导入中断留下的中间文件", true),
         (store_dir().join("trae").join("delete_tmp"), "删除临时目录", "删除中断留下的中间文件", true),
+        (store_dir().join("trae").join("edit_tmp"), "编辑回写临时目录", "改回合中断留下的中间文件", true),
+        (store_dir().join("trae").join("heal_tmp"), "修复临时目录", "修复整库中断留下的中间文件", true),
         (store_dir().join("trae").join("decrypted"), "解密快照", "读取会话时的解密副本，删后下次读取自动重建", true),
         (store_dir().join("trae").join("logs"), "工具运行日志", "", true),
         (export_dir(), "导出产物（Markdown）", "「导出」功能生成的文件", false),
@@ -419,7 +482,65 @@ fn scan_tool_residue() -> Value {
         }
     }
 
-    tool_category("tool_residue", "工具残留（本工具目录）", "整库备份、解密快照、导入中间产物与日志。删除后不影响已写入 Trae 的数据。", items)
+    let mut cat = tool_category(
+        "tool_residue",
+        "工具残留（本工具目录）",
+        // ⚠️ 这段是**纯文本**渲染（前端 `{cat.desc}`），不要写 Markdown 星号 ——
+        //    会原样显示成 `**…**`。
+        "整库备份、解密快照、导入中间产物与日志。删除后不影响已写入 Trae 的数据。\
+         整库备份按客户端分组、最旧的排在前面 —— 清理顺序就是先从最老的清，\
+         每个客户端最新的一批永远保留（可回滚）。",
+        items,
+    );
+    // 把当前保留策略原文摆到这一类的头上：界面上「哪些批次超出策略」的标法必须与它同源，
+    // 用户看到「超出保留策略：超过 30 天」时也要能直接对上自己在设置里填的数。
+    if let Some(o) = cat.as_object_mut() {
+        o.insert(
+            "backup_policy".into(),
+            json!({
+                "summary": policy.summary(),
+                "enabled": policy.enabled,
+                "keepDays": policy.keep_days,
+                "keepCount": policy.keep_count,
+                "maxTotalMb": policy.max_total_mb,
+            }),
+        );
+    }
+    cat
+}
+
+/// 一条条目吃掉**多个**路径（合并视图用；删除侧本来就按 `paths` 逐个删，见 `delete_items`）。
+///
+/// ⚠️ `id` 必须**跨扫描稳定**：用 `synthetic_id`（调用方给一个不随目录内容变化的名字），
+/// 别拿第一个路径 —— 那份缓存被删掉之后 id 就变了，勾选状态会错位。
+fn file_item_multi(
+    category: &'static str,
+    synthetic_id: &str,
+    paths: &[PathBuf],
+    title: String,
+    detail: String,
+    recommended: bool,
+    needs_client_stop: bool,
+) -> Value {
+    let bytes: u64 = paths.iter().map(|p| path_size(p)).sum();
+    json!({
+        "id": format!("{category}:{synthetic_id}"),
+        "kind": "dir",
+        "category": category,
+        "title": title,
+        "detail": detail,
+        "bytes": bytes,
+        "bytes_mb": mb(bytes),
+        "recommended": recommended,
+        "needs_client_stop": needs_client_stop,
+        "client_key": "",
+        "client_label": "",
+        "session_id": "",
+        "turns": 0,
+        "updated": "",
+        "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+        "merged_paths": paths.len(),
+    })
 }
 
 /// 第 3 类：Trae 客户端的可再生缓存。
@@ -435,7 +556,10 @@ fn scan_client_residue() -> (Value, Vec<String>) {
             continue;
         };
         let root = user_data_dir(client);
-        let running = is_running(client);
+        // ⚠️ T61：同上 —— 已并入且本机无自己程序的客户端，它的缓存**没有被任何进程占用**，
+        //    不能提示「请先关闭客户端」（那个客户端已经不存在了）。
+        let merged_shadow = is_merged_shadow(&c);
+        let running = !merged_shadow && is_running_own(client);
         if running {
             notes.push(format!(
                 "{} 正在运行：客户端缓存被进程占用，请先关闭客户端再清理（其余项不受影响）。",
@@ -443,44 +567,43 @@ fn scan_client_residue() -> (Value, Vec<String>) {
             ));
         }
 
-        for (rel, desc) in CLIENT_RESIDUE {
-            let p = root.join(rel);
-            if !p.exists() || path_size(&p) == 0 {
-                continue;
+        // 先把这一份客户端的残留收成一个局部列表，再决定「逐条列」还是「折成一条」。
+        //
+        // ⚠️ 分成两堆：`cache_rows` 是可再生的缓存/日志（合并视图里可以默认勾选）；
+        //    `keep_rows` 是**删了找不回来**的东西（编辑器的本地文件历史）—— 它永远单独成条、
+        //    永远不默认勾选。合并成一条时如果把它一起吞进去，就等于替用户勾了「删掉撤销历史」。
+        let mut cache_rows: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut keep_rows: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut push = |p: PathBuf, label: String, desc: String, generable: bool| {
+            if p.exists() && path_size(&p) > 0 {
+                if generable {
+                    cache_rows.push((p, label, desc));
+                } else {
+                    keep_rows.push((p, label, desc));
+                }
             }
-            items.push(file_item(
-                "client_residue",
-                &p,
-                format!("{} · {}", c.label, rel),
+        };
+
+        for (rel, desc) in CLIENT_RESIDUE {
+            push(
+                root.join(rel),
+                rel.to_string(),
                 format!("{desc}（可再生，不影响登录态）"),
-                false,
                 true,
-            ));
+            );
         }
-        // 客户端日志单独列（在 logs/ 下）
-        let logs = root.join("logs");
-        if logs.is_dir() && path_size(&logs) > 0 {
-            items.push(file_item(
-                "client_residue",
-                &logs,
-                format!("{} · logs", c.label),
-                "客户端运行日志（可再生）".to_string(),
-                false,
-                true,
-            ));
-        }
-        // 编辑器本地历史
-        let hist = root.join("User").join("History");
-        if hist.is_dir() && path_size(&hist) > 0 {
-            items.push(file_item(
-                "client_residue",
-                &hist,
-                format!("{} · 本地文件历史", c.label),
-                "编辑器的文件历史与撤销记录，删后无法找回".to_string(),
-                false,
-                true,
-            ));
-        }
+        push(
+            root.join("logs"),
+            "logs".into(),
+            "客户端运行日志（可再生）".into(),
+            true,
+        );
+        push(
+            root.join("User").join("History"),
+            "本地文件历史".into(),
+            "编辑器的文件历史与撤销记录，删后无法找回".into(),
+            false,
+        );
         // 分区缓存：只碰缓存子目录，绝不动 Local Storage / Network
         let partitions = root.join("Partitions");
         if let Ok(rd) = std::fs::read_dir(&partitions) {
@@ -489,21 +612,64 @@ fn scan_client_residue() -> (Value, Vec<String>) {
                     continue;
                 }
                 for rel in PARTITION_RESIDUE {
-                    let p = ent.path().join(rel);
-                    if !p.exists() || path_size(&p) == 0 {
-                        continue;
-                    }
                     let part = ent.file_name().to_string_lossy().into_owned();
-                    items.push(file_item(
-                        "client_residue",
-                        &p,
-                        format!("{} · {part}/{rel}", c.label),
+                    push(
+                        ent.path().join(rel),
+                        format!("{part}/{rel}"),
                         "分区缓存（可再生，不影响登录态）".to_string(),
-                        false,
                         true,
-                    ));
+                    );
                 }
             }
+        }
+
+        if merged_shadow {
+            // ⚠️⚠️ T61：合并后只剩历史数据 —— 真机上这一份会刷出 **17 行**
+            //    `TRAE SOLO CN · Cache / Code Cache / GPUCache / …`，看着像这个客户端还装着。
+            //    折成**一条**（只折可再生的那些）：标题写明「已并入谁」，说明写明「只剩历史数据」。
+            if !cache_rows.is_empty() {
+                let host = merged_host_label(&c).unwrap_or("承载方");
+                let paths: Vec<PathBuf> = cache_rows.iter().map(|(p, _, _)| p.clone()).collect();
+                let mut item = file_item_multi(
+                    "client_residue",
+                    &format!("merged-shadow:{}", c.key),
+                    &paths,
+                    format!("{}（已并入 {}）· 历史缓存", c.label, host),
+                    format!(
+                        "本机已没有它自己的程序，只剩合并前留下的 {} 项缓存与日志。删除它们不会影响 {}，\
+                         也不会结束任何进程（均可再生，登录态与偏好设置不受影响）。",
+                        paths.len(), host
+                    ),
+                    true,
+                    false,
+                );
+                // 界面据此画「已并入」标记 / 自查探针据此断言「影子没有再拆成十几行」。
+                item["merged_shadow"] = json!(true);
+                item["client_key"] = json!(c.key);
+                items.push(item);
+            }
+            for (p, label, desc) in keep_rows {
+                items.push(file_item(
+                    "client_residue",
+                    &p,
+                    format!("{}（已并入）· {}", c.label, label),
+                    format!("{desc}（本机已没有这个客户端的程序，只剩历史数据）"),
+                    false,
+                    false,
+                ));
+            }
+            continue;
+        }
+
+        for (p, label, desc) in cache_rows.into_iter().chain(keep_rows) {
+            items.push(file_item(
+                "client_residue",
+                &p,
+                format!("{} · {}", c.label, label),
+                desc,
+                false,
+                true,
+            ));
         }
     }
 

@@ -325,18 +325,36 @@ fn path_size(p: &Path) -> u64 {
 
 /// 从备份条目名解析出 `(归属客户端, 时间戳)` 分组键。
 ///
-/// 三种实测命名都能覆盖：
-/// - `solo-cn_before_delete_20261004_183502.db.bak`（`trae/backup` 的整库备份，含 `-wal`/`-shm` 兄弟文件）
-/// - `solo-cn-20261004-194801`（`workbuddy_import_backup` 的子目录）
-/// - `solo-cn-20261003-200952`（`trae/import_backup` 的子目录）
+/// 四类实测命名都能覆盖：
+/// 1. `trae-cn_before_delete_20261004_183502.db.bak`（删除会话前的整库备份，含 `-wal`/`-shm` 兄弟文件）
+/// 2. `trae-cn_before_edit_20261011_202233.db.bak`（编辑回合前的整库备份，同上）
+/// 3. `solo-cn-20261004-194801`（`trae/import_backup`、`workbuddy_import_backup` 的子目录）
+/// 4. `20261011-205734`（`workbuddy_export_backup` 的子目录：**不带客户端前缀**）
+///
+/// ⚠️⚠️ **两个坑（T62 的根因，改这条必须同时想到）**：
+///
+/// **(a) 动作词不止 `delete_`**：T62 前的实现只认 `_before_delete_`，「编辑前备份」掉进第 3 项
+/// 那个 `-` 分支 —— 而它的时间戳用 `_` 分隔、整名里只有客户端 key 里那一个 `-`
+/// （`trae-cn_before_edit_20261010_194737.db.bak` 只有 2 段）⇒ 进不了「≥3 段」的判据 ⇒
+/// 每份备份自成一个 `(owner, stamp)` 组 ⇒ `prune_backups(dir, 1)` **一批都删不掉**。
+/// 实测后果：`~/.twin-switch/trae/backup` 里 `_before_edit_*` 堆到 15 份 × 378 MB ≈ 5.3 GB
+/// （同一目录里 `_before_delete_*` 只有 1 份，完全正常 —— 这就是「为什么只有编辑后的备份清不掉」）。
+///
+/// **(b) 有些条目名里根本没有客户端前缀**：`workbuddy_export_backup` 下就是光秃秃的
+/// `20261011-205734`。那时 owner 必须取**整个目录**（用空串表示），不能让「条目名」当 owner ——
+/// 否则每一批都自成一组的「最新一批」，永远命中安全网、**永远不被清理**。
 fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
-    if let Some(pos) = entry_name.find("_before_delete_") {
+    // ① 「<客户端>_before_<动作>_<YYYYMMDD_HHMMSS>…」
+    if let Some(pos) = entry_name.find("_before_") {
         let owner = entry_name[..pos].to_string();
-        let rest = &entry_name[pos + "_before_delete_".len()..];
+        let rest = &entry_name[pos + "_before_".len()..];
+        // 跳过动作词（`delete_` / `edit_`），后面才是 `YYYYMMDD_HHMMSS`
+        let rest = rest.split_once('_').map(|(_, tail)| tail).unwrap_or(rest);
         // `YYYYMMDD_HHMMSS` 共 15 个字符
         let stamp: String = rest.chars().take(15).collect();
         return (owner, stamp);
     }
+    // ② 「<客户端>-<YYYYMMDD>-<HHMMSS>」
     let parts: Vec<&str> = entry_name.split('-').collect();
     if parts.len() >= 3 {
         let n = parts.len();
@@ -344,7 +362,41 @@ fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
         let owner = parts[..n - 2].join("-");
         return (owner, stamp);
     }
+    // ③ 光秃秃的时间戳 ⇒ 归到「整个目录」这一组
+    if looks_like_stamp(entry_name) {
+        return (String::new(), entry_name.to_string());
+    }
+    // ④ 认不出来（例如 `heal-1791298713` 这种中间产物目录）：当成独立一组，
+    //    stamp 留空 ⇒ `at_ms = 0` ⇒ **不参与时间判定**，也不会被别人连坐。
     (entry_name.to_string(), String::new())
+}
+
+/// 名字是不是「裸时间戳」：`YYYYMMDD-HHMMSS` / `YYYYMMDD_HHMMSS`。
+fn looks_like_stamp(name: &str) -> bool {
+    let Some((d, t)) = name.split_once('-').or_else(|| name.split_once('_')) else {
+        return false;
+    };
+    d.len() == 8
+        && t.len() == 6
+        && d.chars().all(|c| c.is_ascii_digit())
+        && t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 时间戳 → 毫秒（UTC）。解不出返回 `0` = 「时间未知」。
+///
+/// ⚠️ `0` **绝不参与时间判定** —— 否则 `now - 0` 会把每个解析不出的批次直接判死
+/// （见 `settings::excess_batches` 里 `b.at_ms > 0` 那个前置条件）。
+fn stamp_to_ms(stamp: &str) -> i64 {
+    let s = stamp.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    let d = chrono::NaiveDateTime::parse_from_str(s, "%Y%m%d_%H%M%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y%m%d-%H%M%S"));
+    match d {
+        Ok(d) => d.and_utc().timestamp_millis(),
+        Err(_) => 0,
+    }
 }
 
 /// 备份目录里的一「批」：同一客户端、同一时间戳落下的若干文件/目录。
@@ -353,10 +405,12 @@ fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
 /// 它们必须**同生同死**——只删其中一个会留下无法使用的残片。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupBatch {
-    /// 归属客户端 key（`solo-cn` / `trae-cn`）。
+    /// 归属客户端 key（`solo-cn` / `trae-cn`）；空串 = 「整个目录一批」（条目名里没有前缀）。
     pub owner: String,
     /// `YYYYMMDD_HHMMSS` / `YYYYMMDD-HHMMSS`。
     pub stamp: String,
+    /// 批次时间（毫秒）。`0` = 解不出时间戳。
+    pub at_ms: i64,
     pub paths: Vec<PathBuf>,
     pub bytes: u64,
 }
@@ -383,9 +437,29 @@ pub fn list_backup_batches(dir: &Path) -> Vec<BackupBatch> {
         .map(|((owner, stamp), mut paths)| {
             paths.sort();
             let bytes = paths.iter().map(|p| path_size(p)).sum();
-            BackupBatch { owner, stamp, paths, bytes }
+            let at_ms = stamp_to_ms(&stamp);
+            BackupBatch { owner, stamp, at_ms, paths, bytes }
         })
         .collect()
+}
+
+/// 删掉一批（同生同死）。返回 `(删除的条目数, 回收字节)`。
+fn remove_batch(b: &BackupBatch) -> (usize, u64) {
+    let mut n = 0usize;
+    let mut freed = 0u64;
+    for p in &b.paths {
+        let sz = path_size(p);
+        let ok = if p.is_dir() {
+            std::fs::remove_dir_all(p).is_ok()
+        } else {
+            std::fs::remove_file(p).is_ok()
+        };
+        if ok {
+            n += 1;
+            freed += sz;
+        }
+    }
+    (n, freed)
 }
 
 /// 清理备份目录：**按客户端分组**，每组只保留最新 `keep` 批，回收磁盘。
@@ -393,6 +467,9 @@ pub fn list_backup_batches(dir: &Path) -> Vec<BackupBatch> {
 /// 每批 ≈ 一个整库大小（实测 279 MB 量级）。目录里可能是子目录（导入备份），也可能是
 /// 文件组（删除前的整库备份 + `-wal`/`-shm` 兄弟文件），本函数两种形态都支持：分组键
 /// 取「客户端 + 时间戳」，时间戳为 `YYYYMMDD_HHMMSS` / `YYYYMMDD-HHMMSS`，字典序即时间序。
+///
+/// ⚠️ 这是**保底档**（每个 owner 只留最新 N 批），按用户设置来的那一档是
+/// [`prune_with_policy`] —— 正常链路一律走它；本函数只留给「策略关掉 / 单测」用。
 ///
 /// 返回 `(删除的条目数, 回收的字节数)`。任何单条删除失败都跳过、不中断。
 pub fn prune_backups(dir: &Path, keep: usize) -> (usize, u64) {
@@ -413,25 +490,71 @@ pub fn prune_backups(dir: &Path, keep: usize) -> (usize, u64) {
         }
         // BTreeMap 已按 stamp 升序 → 前 `len - keep` 批是最旧的
         for b in &list[..list.len() - keep] {
-            for p in &b.paths {
-                let sz = path_size(p);
-                let ok = if p.is_dir() {
-                    std::fs::remove_dir_all(p).is_ok()
-                } else {
-                    std::fs::remove_file(p).is_ok()
-                };
-                if ok {
-                    removed += 1;
-                    freed += sz;
-                }
-            }
+            let (n, f) = remove_batch(b);
+            removed += n;
+            freed += f;
         }
     }
     (removed, freed)
 }
 
+/// 把一批的「策略视角」事实抽出来（纯数据，便于与 [`settings::excess_batches`] 对接）。
+pub fn batches_with_facts(dir: &Path) -> Vec<(BackupBatch, crate::modules::settings::BatchFacts)> {
+    list_backup_batches(dir)
+        .into_iter()
+        .map(|b| {
+            let facts = crate::modules::settings::BatchFacts {
+                owner: b.owner.clone(),
+                stamp: b.stamp.clone(),
+                at_ms: b.at_ms,
+                bytes: b.bytes,
+            };
+            (b, facts)
+        })
+        .collect()
+}
+
+/// **按用户设置里的保留策略清理备份目录** —— 所有「写备份」的链路唯一该调的出口。
+///
+/// 策略见 [`crate::modules::settings::BackupRetention`]：时间 / 份数 / 容量三重触发，
+/// 任一条超限即清；**每个 owner 最新一批永不清**（那是「出事能回滚」的唯一依赖）。
+///
+/// 返回 `(删除的条目数, 回收的字节数)`。设置文件读坏了 ⇒ `load()` 退回默认值，不会让
+/// 删除流程失败（界面要「如实报错」时另走 `settings::load_strict`）。
+pub fn prune_with_policy(dir: &Path) -> (usize, u64) {
+    let s = crate::modules::settings::load();
+    prune_with(dir, &s.backup_retention, crate::modules::config::now_ms())
+}
+
+/// 策略版的实现主体（策略当参数传进来 ⇒ 可脱离 settings.json 单测）。
+fn prune_with(
+    dir: &Path,
+    p: &crate::modules::settings::BackupRetention,
+    now_ms: i64,
+) -> (usize, u64) {
+    if !p.enabled || !dir.is_dir() {
+        return (0, 0);
+    }
+    let pairs = batches_with_facts(dir);
+    if pairs.is_empty() {
+        return (0, 0);
+    }
+    let facts: Vec<crate::modules::settings::BatchFacts> =
+        pairs.iter().map(|(_, f)| f.clone()).collect();
+    let picked = crate::modules::settings::excess_batches(&facts, p, now_ms);
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for i in picked {
+        let (n, f) = remove_batch(&pairs[i].0);
+        removed += n;
+        freed += f;
+    }
+    (removed, freed)
+}
+
 /// 一键回收工作文件占用：
-/// 1. 三处备份目录各保留最新 1 批（`trae/backup`、`trae/import_backup`、`workbuddy_import_backup`）；
+/// 1. 三处备份目录按**用户设置的保留策略**清一遍（时间 / 份数 / 容量三重触发；
+///    不在设置里另立第二套规则 —— 否则「我设了保留 3 份」会被这个按钮悄悄砍成 1 份）；
 /// 2. 删除可再生的解密快照（`trae/decrypted/*.db*`，刷新记录页会自动重新解密）。
 ///
 /// 返回 `{ freed_bytes, freed_mb, pruned_entries, details }`。
@@ -451,7 +574,7 @@ pub fn cleanup_working_files() -> Value {
         }
         // 先统计清理前占用，便于把「本来就有多少」如实告诉用户
         let before = path_size(&dir);
-        let (n, f) = prune_backups(&dir, 1);
+        let (n, f) = prune_with_policy(&dir);
         if n > 0 || before > 0 {
             details.push(json!({
                 "name": label,
@@ -1611,8 +1734,8 @@ mod tests {
     }
 
     #[test]
-    fn backup_group_key_parses_all_three_naming_schemes() {
-        // trae/backup 的整库备份（含 -wal / -shm 兄弟文件）
+    fn backup_group_key_parses_all_four_naming_schemes() {
+        // ① trae/backup 的「删除前」整库备份（含 -wal / -shm 兄弟文件）
         assert_eq!(
             backup_owner_and_stamp("solo-cn_before_delete_20261004_183502.db.bak"),
             ("solo-cn".to_string(), "20261004_183502".to_string())
@@ -1621,7 +1744,18 @@ mod tests {
             backup_owner_and_stamp("solo-cn_before_delete_20261004_183502-wal.db.bak"),
             ("solo-cn".to_string(), "20261004_183502".to_string())
         );
-        // trae/import_backup 与 workbuddy_import_backup 的子目录
+        // ② ★ T62 根因：**「编辑前」也必须归到同一个 owner**。
+        //    老实现只认 `_before_delete_` ⇒ 这一步会掉进 `-` 分支 ⇒ 15 份备份各自成组、
+        //    `prune_backups(dir, 1)` 一批都删不掉（实测堆了 5.3 GB）。
+        assert_eq!(
+            backup_owner_and_stamp("trae-cn_before_edit_20261010_194737.db.bak"),
+            ("trae-cn".to_string(), "20261010_194737".to_string())
+        );
+        assert_eq!(
+            backup_owner_and_stamp("solo-cn_before_edit_20261011_205723-wal.db.bak"),
+            ("solo-cn".to_string(), "20261011_205723".to_string())
+        );
+        // ③ trae/import_backup 与 workbuddy_import_backup 的子目录
         assert_eq!(
             backup_owner_and_stamp("solo-cn-20261003-200952"),
             ("solo-cn".to_string(), "20261003-200952".to_string())
@@ -1630,6 +1764,152 @@ mod tests {
             backup_owner_and_stamp("trae-cn-20261004-194801"),
             ("trae-cn".to_string(), "20261004-194801".to_string())
         );
+        // ④ ★ 不带客户端前缀的裸时间戳（`workbuddy_export_backup`）：
+        //    owner 必须是**空串**（= 整个目录一组），不能是条目名自己 ——
+        //    否则每一批都自成一组的「最新一批」，永远命中安全网、永远清不掉。
+        assert_eq!(
+            backup_owner_and_stamp("20261011-205734"),
+            (String::new(), "20261011-205734".to_string())
+        );
+        // 认不出的名字（中间产物目录）自成一组、stamp 空 ⇒ 不参与时间判定
+        assert_eq!(
+            backup_owner_and_stamp("heal-1791298713"),
+            ("heal-1791298713".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn before_edit_backups_now_get_pruned_like_delete_ones() {
+        // 直接复刻真机形态：`trae-cn` 1 份「删除前」+ 5 份「编辑前」。
+        // 老实现里那 5 份各自成组 ⇒ keep=1 时一份都删不掉；修好后它们同属 `trae-cn`。
+        let root = std::env::temp_dir().join(format!("wb_prune_edit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("trae-cn_before_delete_20261010_201624.db.bak"), vec![0u8; 50]).unwrap();
+        for (i, stamp) in ["20261010_194737", "20261010_194917", "20261010_200613", "20261010_200635", "20261010_200646"]
+            .iter()
+            .enumerate()
+        {
+            let _ = i;
+            std::fs::write(
+                root.join(format!("trae-cn_before_edit_{stamp}.db.bak")),
+                vec![0u8; 10],
+            )
+            .unwrap();
+        }
+
+        let batches = list_backup_batches(&root);
+        assert_eq!(batches.len(), 6, "1 份删除前 + 5 份编辑前，应合成 6 批");
+        assert!(
+            batches.iter().all(|b| b.owner == "trae-cn"),
+            "编辑前备份必须与删除前备份同属一个 owner，实际 owner：{:?}",
+            batches.iter().map(|b| b.owner.clone()).collect::<Vec<_>>()
+        );
+
+        // keep=1 ⇒ 只留最新一批（`20261010_201624` 字典序最大），其余 5 份「编辑前」全删
+        let (removed, freed) = prune_backups(&root, 1);
+        assert_eq!(removed, 5);
+        assert_eq!(freed, 50);
+        assert!(!root.join("trae-cn_before_edit_20261010_194737.db.bak").exists());
+        assert!(root.join("trae-cn_before_delete_20261010_201624.db.bak").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bare_timestamp_backups_share_one_group_and_get_pruned() {
+        // `workbuddy_export_backup` 的真实形态：只有裸时间戳，没有客户端前缀。
+        let root = std::env::temp_dir().join(format!("wb_prune_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for stamp in ["20261001-100000", "20261005-100000", "20261011-205734"] {
+            let d = root.join(stamp);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("database.db"), vec![0u8; 7]).unwrap();
+        }
+
+        let batches = list_backup_batches(&root);
+        assert_eq!(batches.len(), 3);
+        assert!(
+            batches.iter().all(|b| b.owner.is_empty()),
+            "裸时间戳条目应归到「整个目录」一组（owner 为空串）"
+        );
+
+        let (removed, freed) = prune_backups(&root, 1);
+        assert_eq!(removed, 2, "应删掉最旧的 2 个子目录");
+        assert_eq!(freed, 14);
+        assert!(root.join("20261011-205734").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stamp_to_ms_parses_both_formats_and_gives_zero_on_garbage() {
+        // 两种分隔符都要认；解不出必须是 0（= 时间未知），不是「很旧」
+        assert!(stamp_to_ms("20261011_205734") > 0);
+        assert_eq!(stamp_to_ms("20261011_205734"), stamp_to_ms("20261011-205734"));
+        assert_eq!(stamp_to_ms(""), 0);
+        assert_eq!(stamp_to_ms("20261011"), 0);
+        assert_eq!(stamp_to_ms("heal-1791298713"), 0);
+        assert_eq!(stamp_to_ms("not-a-stamp"), 0);
+    }
+
+    /// **策略版**：份数触发 + 「最新一批永不清」的安全网。
+    #[test]
+    fn prune_with_policy_honours_count_and_never_drops_newest() {
+        use crate::modules::settings::BackupRetention;
+        let root = std::env::temp_dir().join(format!("wb_prune_policy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // trae-cn 4 批、solo-cn 1 批
+        for stamp in ["20260101_100000", "20260102_100000", "20260103_100000", "20260104_100000"] {
+            std::fs::write(root.join(format!("trae-cn_before_edit_{stamp}.db.bak")), vec![0u8; 10]).unwrap();
+        }
+        std::fs::write(root.join("solo-cn_before_delete_20260101_100000.db.bak"), vec![0u8; 10]).unwrap();
+
+        // 只按份数判：每个 owner 留 2 批；时间/容量都关掉（默认 30 天 / 4 GB 会把
+        // 2026-01 那批按时间判掉，那会掩盖「份数」这条规则本身）
+        let p = BackupRetention { enabled: true, keep_days: 0, keep_count: 2, max_total_mb: 0 };
+        let (removed, _) = prune_with(&root, &p, 1_800_000_000_000);
+        assert_eq!(removed, 2, "trae-cn 应删最旧 2 批；solo-cn 只有 1 批不动");
+
+        let left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.iter().any(|n| n.contains("20260104_100000")), "最新一批必须留着：{left:?}");
+        assert!(left.iter().any(|n| n.contains("solo-cn")), "solo-cn 唯一一批必须留着：{left:?}");
+        assert_eq!(left.len(), 3);
+
+        // 再把两份都留成「只剩最新一批」的极端设置，最新那一批依然不能动
+        let p2 = BackupRetention { enabled: true, keep_days: 0, keep_count: 1, max_total_mb: 1 };
+        let _ = prune_with(&root, &p2, 1_800_000_000_000);
+        let left2: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left2.iter().any(|n| n.contains("20260104_100000")));
+        assert!(left2.iter().any(|n| n.contains("solo-cn")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_with_policy_disabled_touches_nothing() {
+        use crate::modules::settings::BackupRetention;
+        let root = std::env::temp_dir().join(format!("wb_prune_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for stamp in ["20260101_100000", "20260102_100000", "20260103_100000"] {
+            std::fs::write(root.join(format!("trae-cn_before_edit_{stamp}.db.bak")), vec![0u8; 10]).unwrap();
+        }
+        let p = BackupRetention { enabled: false, keep_days: 1, keep_count: 1, max_total_mb: 1 };
+        assert_eq!(prune_with(&root, &p, 1_800_000_000_000), (0, 0));
+        assert_eq!(std::fs::read_dir(&root).unwrap().flatten().count(), 3);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 关键行为：**每个客户端各自保留最新 `keep` 批**，且同批的 `-wal`/`-shm`

@@ -1329,16 +1329,17 @@ impl Drop for ImportGuard {
     }
 }
 
-/// 保留最新 `keep` 份备份，删除更旧的，回收磁盘（每份 ≈ 目标库大小，279 MB 量级）。
+/// 按**用户设置里的保留策略**清理 WorkBuddy 导入备份，回收磁盘
+/// （每份 ≈ 目标库大小，279 MB 量级）。
 ///
-/// 实际清理逻辑走共享的 [`crate::modules::trae_export::prune_backups`]（按客户端分组，
-/// 字典序=时间序），这里只负责补日志。
-fn prune_backups(client_key: &str, keep: usize, on_log: &dyn Fn(&str)) -> usize {
+/// 实际清理逻辑走共享的 [`crate::modules::trae_export::prune_with_policy`]（按客户端分组、
+/// 时间 / 份数 / 容量三重触发，每个客户端最新一份永不清），这里只负责补日志。
+fn prune_backups(client_key: &str, on_log: &dyn Fn(&str)) -> usize {
     let root = crate::modules::trae_export::wb_import_backup_dir();
-    let (removed, freed) = crate::modules::trae_export::prune_backups(&root, keep);
+    let (removed, freed) = crate::modules::trae_export::prune_with_policy(&root);
     if removed > 0 {
         on_log(&format!(
-            "已清理 {removed} 份 {client_key} 旧备份，回收 {:.1} MB（保留最新 {keep} 份）",
+            "已清理 {removed} 份 {client_key} 旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
             freed as f64 / 1_048_576.0
         ));
     }
@@ -1650,8 +1651,9 @@ pub fn import_sessions(
     }
     let _ = std::fs::remove_dir_all(&work);
 
-    // 7b) 只保留最新 2 份备份：每份 ≈ 目标库大小（279 MB 量级），不清理会越攒越多。
-    let pruned = prune_backups(dst_client_key, 2, &log);
+    // 7b) 按**用户设置里的保留策略**清理旧备份：每份 ≈ 目标库大小（279 MB 量级），
+    //     不清理会越攒越多。策略自带「每个客户端最新一份永不清」的安全网。
+    let pruned = prune_backups(dst_client_key, &log);
 
     // 8) 重启客户端，让导入的会话立即可用
     let relaunched = match launch(dst_client_key, None) {

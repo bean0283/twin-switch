@@ -58,6 +58,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
+import { AccountTokenDialog } from "@/components/account-token-dialog";
 import * as api from "@/lib/api";
 import { resolveSelectableKey, selectableClients } from "@/lib/trae-client-list";
 import type {
@@ -272,6 +273,8 @@ export default function TraeSwitchPage() {
    */
   const [mergePending, setMergePending] = useState<TraeAdoptMergedResult | null>(null);
   const [mergeBusy, setMergeBusy] = useState(false);
+  /** 正在看 token 的那个账号（点头像打开）。 */
+  const [tokenTarget, setTokenTarget] = useState<TraeVaultEntry | null>(null);
 
   // 网页（OAuth）登录
   const [loginOpen, setLoginOpen] = useState(false);
@@ -387,7 +390,7 @@ export default function TraeSwitchPage() {
   }, [clientKey]);
 
   /**
-   * 预演「已并入的客户端有哪些账号可以带过来」。
+   * 预演「已并入的客户端有哪些账号可以带过来 / 有哪些残档可以补全」。
    *
    * ⚠️ 只对**承载方**有意义：后端按 `merged_into == clientKey` 找源，所以切换条选中
    * `solo-cn` 时结果必然为空 —— 那正是对的（它自己就是被并进去的那个）。
@@ -395,21 +398,31 @@ export default function TraeSwitchPage() {
   async function loadMergePending(key: string) {
     try {
       const res = await api.traeVaultAdoptMerged(key, true);
-      setMergePending(res.adopted.length > 0 ? res : null);
+      // ⚠️ 两个数组都在「后端新加的字段」上：`repaired` 是 T51 才有的。
+      //    这里归一化，避免老桩 / 老后端少字段时 `undefined.length` 直接抛异常
+      //    ⇒ 提示条静默消失，看起来像「没有待并入账号」，把真问题藏了。
+      const adopted = res.adopted ?? [];
+      const repaired = res.repaired ?? [];
+      setMergePending(adopted.length > 0 || repaired.length > 0 ? { ...res, adopted, repaired } : null);
     } catch {
       // 预演失败不该打扰用户：这只是顺带提醒，不是本页主功能。
       setMergePending(null);
     }
   }
 
-  /** 用户确认后真正搬入（后端按 uid 去重、不覆盖、不动源）。 */
+  /** 用户确认后真正搬入（后端按 uid 去重、不覆盖、不动源），顺带补全老版本漏搬的侧车文件。 */
   async function onAdoptMerged() {
     if (!clientKey || mergeBusy || !mergePending) return;
     setMergeBusy(true);
     try {
       const res = await api.traeVaultAdoptMerged(clientKey, false);
-      const sources = [...new Set(res.adopted.map((a) => a.from_label))].join(" / ");
-      toast.success(`已并入 ${res.adopted.length} 个账号`, { description: `来源：${sources}` });
+      const adopted = res.adopted ?? [];
+      const repaired = res.repaired ?? [];
+      const sources = [...new Set([...adopted, ...repaired].map((a) => a.from_label))].join(" / ");
+      const parts: string[] = [];
+      if (adopted.length) parts.push(`已并入 ${adopted.length} 个账号`);
+      if (repaired.length) parts.push(`补全 ${repaired.length} 个账号的网页凭证`);
+      toast.success(parts.join("，") || "没有需要处理的账号", { description: `来源：${sources}` });
       setMergePending(null);
       await loadOverview(clientKey);
     } catch (cause) {
@@ -1174,21 +1187,39 @@ export default function TraeSwitchPage() {
             </Alert>
           ) : null}
 
-          {/* 「已并入的客户端还有账号没带过来」：只提示，用户点一下才动账号库。 */}
+          {/* 「已并入的客户端还有账号没带过来」/「带过来的账号缺网页凭证」：
+              只提示，用户点一下才动账号库。 */}
           {mergePending ? (
             <Alert className="border-amber-500/40 bg-amber-500/[0.06]">
               <Layers className="size-4" />
-              <AlertTitle>还有 {mergePending.adopted.length} 个账号留在别处</AlertTitle>
-              <AlertDescription className="space-y-2">
-                <span className="block">
-                  {[...new Set(mergePending.adopted.map((a) => a.from_label))].join(" / ")}
-                  {" "}已经并入 {selected.label}，但<strong>账号库是分开存的</strong> ——
-                  不搬过来的话，在 {selected.label} 下看不到这几个账号、也切不过去。
-                  搬入按 uid 去重、不覆盖已有账号，源客户端的账号照样保留。
-                </span>
-                <span className="block font-mono text-[11px] text-muted-foreground/80">
+              <AlertTitle>
+                {mergePending.adopted.length
+                  ? `还有 ${mergePending.adopted.length} 个账号留在别处`
+                  : `有 ${mergePending.repaired.length} 个账号缺网页凭证`}
+              </AlertTitle>
+              <AlertDescription className="min-w-0 space-y-2">
+                {mergePending.adopted.length ? (
+                  <span className="block">
+                    {[...new Set(mergePending.adopted.map((a) => a.from_label))].join(" / ")}
+                    {" "}已经并入 {selected.label}，但<strong>账号库是分开存的</strong> ——
+                    不搬过来的话，在 {selected.label} 下看不到这几个账号、也切不过去。
+                    搬入按 uid 去重、不覆盖已有账号，源客户端的账号照样保留。
+                  </span>
+                ) : null}
+                {mergePending.repaired.length ? (
+                  <span className="block">
+                    这些账号早先搬过来时<strong>只带了载体文件</strong>，网页凭证（oauth.json）没跟过来 ——
+                    所以卡片上显示的是原始目录名与 <span className="font-mono">0 B</span>、也查不了积分。
+                    点下面的按钮会<strong>只补缺失的文件</strong>（绝不覆盖已有内容、不动载体登录态）。
+                  </span>
+                ) : null}
+                <span className="block min-w-0 font-mono text-[11px] break-all text-muted-foreground/80">
                   {mergePending.adopted
                     .map((a) => `${a.source_id}${a.uid ? `（uid …${a.uid.slice(-6)}）` : ""}`)
+                    .join(" · ")}
+                  {mergePending.adopted.length && mergePending.repaired.length ? " · " : ""}
+                  {mergePending.repaired
+                    .map((a) => `${a.id}（补 ${a.files.join(" + ")}）`)
                     .join(" · ")}
                 </span>
                 <Button
@@ -1202,7 +1233,9 @@ export default function TraeSwitchPage() {
                   ) : (
                     <Layers className="mr-2 size-4" />
                   )}
-                  一并带入 {selected.label}
+                  {mergePending.adopted.length
+                    ? `一并带入 ${selected.label}`
+                    : "补全这些账号的网页凭证"}
                 </Button>
               </AlertDescription>
             </Alert>
@@ -1241,6 +1274,8 @@ export default function TraeSwitchPage() {
                       identityTitle={uid ?? entry.id}
                       identityMono
                       isCurrent={isLive}
+                      onAvatarClick={() => setTokenTarget(entry)}
+                      avatarLabel="查看 token（可复制 / 续期）"
                       chips={
                         <>
                           {isLive ? <Chip tone="ok">当前登录</Chip> : null}
@@ -1479,12 +1514,22 @@ export default function TraeSwitchPage() {
           <AlertTriangle className="size-4" />
           <AlertTitle>未安装 Trae 客户端</AlertTitle>
           <AlertDescription>
-            未检测到 Trae 客户端的数据目录。请先安装并登录 Trae CN 或 TRAE SOLO CN。
+            未检测到 Trae 客户端的数据目录。请先安装并登录 Trae CN（国内版）再回来。
           </AlertDescription>
         </Alert>
       )}
 
       <Separator className="my-1" />
+
+      {/* 账号 token 弹窗（点头像打开）：看 / 复制 / 续期。与 WorkBuddy 侧共用同一组件。 */}
+      <AccountTokenDialog
+        open={tokenTarget !== null}
+        onOpenChange={(v) => !v && setTokenTarget(null)}
+        provider="trae"
+        targetKey={clientKey}
+        accountId={tokenTarget?.id ?? null}
+        accountName={tokenTarget ? tokenTarget.displayName || tokenTarget.id : null}
+      />
 
       {/* 备份对话框 */}
       <Dialog open={backupOpen} onOpenChange={setBackupOpen}>

@@ -75,6 +75,24 @@ pub fn sanitize_entries(entries: &[String]) -> Vec<String> {
     out
 }
 
+/// 相对路径的**安全**校验：拒绝绝对路径、盘符、空段与 `..` 段。
+///
+/// ⚠️ 导入的账号备份是**外部输入**（用户粘贴的 JSON）、账号目录里的文件名也可能被改写
+/// ⇒ 凡是「拿一个字符串去 `dir.join()`」的地方都要先过这里。不过这一关，
+/// `rel = "../../x"` 会把文件写到账号目录之外（路径穿越）。
+/// 返回规范化后的相对路径（统一 `/`）；不合法返回 `None`。
+pub fn safe_rel(rel: &str) -> Option<String> {
+    let r = norm_rel(rel);
+    let t = r.trim();
+    if t.is_empty() || t.starts_with('/') || t.contains(':') {
+        return None;
+    }
+    if t.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return None;
+    }
+    Some(t.to_string())
+}
+
 pub fn hash_file(p: &Path) -> Option<String> {
     let data = std::fs::read(p).ok()?;
     use sha2::Digest;
@@ -268,4 +286,45 @@ pub struct CarrierFile {
     pub rel: String,
     pub len: i64,
     pub sha256: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 路径校验：合法相对路径放行，越界/绝对路径一律拒。
+    ///
+    /// 这条守的是「导入的账号备份是外部输入」：`rel` 直接拼进 `dir.join()` 之前必须过它。
+    #[test]
+    fn safe_rel_rejects_escapes() {
+        assert_eq!(safe_rel("User/globalStorage/storage.json").as_deref(), Some("User/globalStorage/storage.json"));
+        // 反斜杠统一成 `/`
+        assert_eq!(safe_rel("User\\globalStorage\\storage.json").as_deref(), Some("User/globalStorage/storage.json"));
+
+        for bad in [
+            "../evil.json",
+            "ok/../../evil.json",
+            "/etc/passwd",
+            "C:/Windows/Temp/evil.json",
+            "C://Windows//Temp//evil.json",
+            "",
+            "   ",
+            "User//storage.json",
+            "./storage.json",
+        ] {
+            assert!(safe_rel(bad).is_none(), "必须拒绝：{bad:?}");
+        }
+    }
+
+    /// `sanitize_entries` 只去全局状态与重复项；**不**负责路径安全（那是 `safe_rel` 的活）。
+    /// 两个函数各管一段，别互相指望。
+    #[test]
+    fn sanitize_entries_keeps_order_and_dedupes() {
+        let list = sanitize_entries(&[
+            "User/globalStorage/storage.json".into(),
+            "User/globalStorage/storage.json".into(),
+            "Local Storage/leveldb".into(),
+        ]);
+        assert_eq!(list, vec!["User/globalStorage/storage.json".to_string()]);
+    }
 }

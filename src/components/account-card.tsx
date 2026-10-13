@@ -20,25 +20,27 @@ export function Avatar({
   name,
   url,
   size = "md",
+  onClick,
+  label,
 }: {
   name: string;
   /** 真实头像 URL（Trae 侧有）；取不到时回落到首字母色块。 */
   url?: string | null;
   size?: "md" | "sm";
+  /** 传了就变成可点的按钮（Trae 账号页：点头像看该账号的 token）。 */
+  onClick?: () => void;
+  /** 可点时的 `title` / `aria-label`（图标/头像按钮必须带，见项目硬规则）。 */
+  label?: string;
 }) {
   const box = size === "md" ? "size-11 text-base" : "size-9 text-sm";
-  if (url) {
-    return (
-      <img
-        src={url}
-        alt=""
-        className={cn("shrink-0 rounded-full object-cover", box)}
-        referrerPolicy="no-referrer"
-      />
-    );
-  }
-  const initial = (name || "?").trim().charAt(0).toUpperCase();
-  return (
+  const body = url ? (
+    <img
+      src={url}
+      alt=""
+      className={cn("shrink-0 rounded-full object-cover", box)}
+      referrerPolicy="no-referrer"
+    />
+  ) : (
     <div
       className={cn(
         "flex shrink-0 items-center justify-center rounded-full font-semibold",
@@ -47,9 +49,25 @@ export function Avatar({
       )}
       aria-hidden="true"
     >
-      {initial}
+      {initialOf(name)}
     </div>
   );
+  if (!onClick) return body;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className="shrink-0 cursor-pointer rounded-full ring-offset-background transition hover:opacity-85 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:outline-hidden"
+    >
+      {body}
+    </button>
+  );
+}
+
+function initialOf(name: string): string {
+  return (name || "?").trim().charAt(0).toUpperCase();
 }
 
 /** 一个状态小徽标：比默认 Badge 更矮更紧凑，避免把卡片撑高。 */
@@ -143,6 +161,8 @@ export function AccountCard({
   chips,
   actions,
   isCurrent,
+  onAvatarClick,
+  avatarLabel,
   children,
 }: {
   name: string;
@@ -155,6 +175,9 @@ export function AccountCard({
   chips?: React.ReactNode;
   actions?: React.ReactNode;
   isCurrent?: boolean;
+  /** 点头像做什么（Trae 账号页 = 看该账号的 token）。缺省时头像不可点。 */
+  onAvatarClick?: () => void;
+  avatarLabel?: string;
   children?: React.ReactNode;
 }) {
   return (
@@ -174,7 +197,7 @@ export function AccountCard({
           isCurrent ? "bg-primary/5" : "bg-muted/30",
         )}
       >
-        <Avatar name={name} url={avatarUrl} />
+        <Avatar name={name} url={avatarUrl} onClick={onAvatarClick} label={avatarLabel} />
         {/* 用 `grow` 而不是 `flex-1`：`flex-1` 会写 `flex:1 1 0%` 这个**简写**，
             与 `basis-*` 争同一个 `flex-basis`，谁生效取决于样式表顺序（目前 basis 在后，
             但没必要押注这个）。`grow` 只写 `flex-grow`，与 basis 不冲突。 */}
