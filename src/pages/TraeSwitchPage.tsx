@@ -8,7 +8,6 @@ import {
   ExternalLink,
   FileDown,
   FileUp,
-  Globe,
   GitCompare,
   Layers,
   Loader2,
@@ -979,11 +978,65 @@ export default function TraeSwitchPage() {
 
   return (
     <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-5 px-4 py-6">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">Trae 账号管理</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          冷切换：终止客户端进程 → 还原账号载体 → 重启 → 守护判定。切换会连带写入交接记忆，便于跨账号续接任务。
-        </p>
+      {/* ⚠️ 顶部版式与「WorkBuddy 账号管理」页**对齐**（2026-10-14 用户要求：以 WorkBuddy 为准）：
+          标题在左、操作按钮组在右，**不套卡片壳**。原来这里是一张带 Globe 图标 +「登录 Trae 账号」
+          标题 + 描述的 `Card`，两个页面的顶部因此长得完全不一样 —— 「同一件事两处实现必然有一处
+          跑偏」的教训仓库里已经吃过好几次（见下面 TraeClientSwitcher 那段注释）。 */}
+      {/* ⚠️ 按钮组用 `ml-auto` 而不是只靠父级 `justify-between`：Trae 的副标题比 WB 长，
+          1360 档下按钮组一定会折到第二行，而 flex 折行后 `justify-between` 会把单独一项
+          放回**左边** —— 那样按钮就跑到了标题底下，与 WB「按钮在右」不一样。`ml-auto`
+          让它无论在第一行还是折行后都贴右。 */}
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold tracking-tight">Trae 账号管理</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            冷切换：终止客户端进程 → 还原账号载体 → 重启 → 守护判定。切换会连带写入交接记忆，便于跨账号续接任务。
+          </p>
+        </div>
+
+        {/* 登录入口按钮组（与 WB 页同构：次级动作 outline、主动作放最后一个）。
+            登录**进行中**的状态搬到下面独立的 `Alert`，与 WB 的「扫码登录」一致。
+            ⚠️ 原来那句说明文字（「导入本地登录态」直接解密…）改挂到按钮的 `title` 上 ——
+            版式对齐 WB 后没有多余的行内空间，但信息一个字都没少。 */}
+        {selected && !loginOpen ? (
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Input
+              value={loginName}
+              onChange={(e) => setLoginName(e.target.value)}
+              placeholder="账号备注（可选）"
+              title="可选：给这次登录拿到的账号起个名字"
+              className="h-8 max-w-40"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void onImportLocal()}
+              disabled={busy}
+              title="直接解密本机客户端已登录的账号，无需浏览器授权"
+            >
+              <UserPlus className="size-4" />
+              导入本地登录态
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void onImportAll()}
+              disabled={busy}
+              title="把本机所有 Trae 客户端上已登录的账号一次性收进来"
+            >
+              导入全部客户端
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void onOauthStart()}
+              disabled={busy}
+              title="网页授权登录：立即拿账号凭证，可查额度 / 签到 / 用量；不写客户端登录态，不产生可切换载体"
+            >
+              {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+              发起网页登录
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {/* 客户端选择：顺序只由后端排序决定（使用记忆 + 能不能跑起来）。
@@ -1024,127 +1077,94 @@ export default function TraeSwitchPage() {
         </div>
       )}
 
-      {/* 网页（OAuth）登录 */}
-      {selected ? (
-        <Card>
-          <CardHeader className="flex-row items-center justify-between pb-3">
-            <div>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Globe className="size-4" />
-                登录 Trae 账号
-              </CardTitle>
-              <CardDescription>
-                网页授权登录：立即拿账号凭证，可查额度 / 签到 / 用量；不写客户端登录态，不产生可切换载体
-              </CardDescription>
-            </div>
-            {loginOpen ? (
+      {/* 网页（OAuth）登录**进行中**的状态：与「WorkBuddy 账号管理」页的「扫码登录」`Alert`
+          同一套版式（2026-10-14 用户要求：以 WorkBuddy 为准）。入口按钮在上一行标题的右侧。
+          ⚠️ 别再把它套回 `Card` —— 两个页面顶部一模一样才是这次改动的目的。 */}
+      {selected && loginOpen ? (
+        <Alert>
+          <LogIn className="size-4" />
+          <AlertTitle>网页授权登录</AlertTitle>
+          {/* ⚠️ `AlertDescription` 默认是 `grid justify-items-start`：行内要「撑满」的元素
+              （回调 URL 那行的输入框）必须显式 `justify-items-stretch` + `w-full`，
+              否则整行会缩成内容宽，输入框就没宽度了。 */}
+          <AlertDescription className="min-w-0 justify-items-stretch gap-3">
+            <div className="flex w-full min-w-0 flex-wrap items-center gap-2 text-sm">
+              {["waiting", "callback_received", "processing"].includes(oauthStatus?.state ?? "") ? (
+                <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              ) : oauthStatus?.state === "done" ? (
+                <CheckCircle2 className="size-4 text-emerald-500" />
+              ) : oauthStatus?.state === "error" || oauthStatus?.state === "stopped" ? (
+                <AlertTriangle className="size-4 text-amber-500" />
+              ) : null}
+              <span className="min-w-0 flex-1 text-muted-foreground">
+                {oauthStatus?.message || oauthStateLabel(oauthStatus?.state ?? "waiting")}
+              </span>
               <Button size="sm" variant="ghost" onClick={onOauthClose} title="关闭并停止监听">
                 <X className="size-4" />关闭
               </Button>
+            </div>
+
+            {oauthLoginUrl ? (
+              <div className="flex w-full min-w-0 flex-wrap items-center gap-2">
+                <Input readOnly value={oauthLoginUrl} className="min-w-0 flex-1 font-mono text-xs" />
+                <Button size="sm" variant="outline" onClick={() => void onOauthOpenUrl(false)}>
+                  <ExternalLink className="size-4" />打开
+                </Button>
+                {oauthBrowsers.length > 0 ? (
+                  <>
+                    <select
+                      value={oauthBrowserKey}
+                      onChange={(e) => setOauthBrowserKey(e.target.value)}
+                      className="h-8 rounded-md border border-input bg-background px-2 text-xs outline-none"
+                    >
+                      {oauthBrowsers.map((b) => (
+                        <option key={b.key} value={b.key}>
+                          {b.label}
+                        </option>
+                      ))}
+                    </select>
+                    <Button size="sm" variant="outline" onClick={() => void onOauthOpenUrl(true)}>
+                      私密窗口
+                    </Button>
+                  </>
+                ) : null}
+              </div>
             ) : null}
-          </CardHeader>
-          <CardContent>
-            {!loginOpen ? (
-              <div className="flex flex-wrap items-center gap-3">
+
+            {["waiting", "callback_received", "processing"].includes(oauthStatus?.state ?? "") ? (
+              <div className="flex w-full flex-wrap items-center gap-2">
+                <Button size="sm" variant="ghost" onClick={() => void onOauthStop()}>
+                  停止监听
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setManualOpen((v) => !v)}>
+                  授权页没回跳？手动粘贴回调 URL
+                </Button>
+              </div>
+            ) : null}
+
+            {manualOpen ? (
+              <div className="flex w-full min-w-0 flex-wrap items-center gap-2">
                 <Input
-                  value={loginName}
-                  onChange={(e) => setLoginName(e.target.value)}
-                  placeholder="账号备注（可选）"
-                  className="max-w-56"
+                  value={manualUrl}
+                  onChange={(e) => setManualUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:17388/authorize?authCodeInfo=…"
+                  className="min-w-0 flex-1 font-mono text-xs"
                 />
-                <Button onClick={() => void onOauthStart()} disabled={busy}>
-                  {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-                  发起网页登录
+                <Button size="sm" onClick={() => void onOauthManual()} disabled={!manualUrl.trim() || busy}>
+                  {busy ? <Loader2 className="size-4 animate-spin" /> : null}完成登录
                 </Button>
-                <Button variant="outline" onClick={() => void onImportLocal()} disabled={busy}>
-                  <UserPlus className="size-4" />
-                  导入本地登录态
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => void onImportAll()} disabled={busy}>
-                  导入全部客户端
-                </Button>
-                <span className="text-xs text-muted-foreground">
-                  「导入本地登录态」直接解密本机客户端已登录的账号，无需浏览器授权；网页登录用私密窗口可换号
-                </span>
               </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="flex items-center gap-2 text-sm">
-                  {["waiting", "callback_received", "processing"].includes(oauthStatus?.state ?? "") ? (
-                    <Loader2 className="size-4 animate-spin text-muted-foreground" />
-                  ) : oauthStatus?.state === "done" ? (
-                    <CheckCircle2 className="size-4 text-emerald-500" />
-                  ) : oauthStatus?.state === "error" || oauthStatus?.state === "stopped" ? (
-                    <AlertTriangle className="size-4 text-amber-500" />
-                  ) : null}
-                  <span className="text-muted-foreground">
-                    {oauthStatus?.message || oauthStateLabel(oauthStatus?.state ?? "waiting")}
-                  </span>
-                </div>
+            ) : null}
 
-                {oauthLoginUrl ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Input readOnly value={oauthLoginUrl} className="min-w-0 flex-1 font-mono text-xs" />
-                    <Button size="sm" variant="outline" onClick={() => void onOauthOpenUrl(false)}>
-                      <ExternalLink className="size-4" />打开
-                    </Button>
-                    {oauthBrowsers.length > 0 ? (
-                      <>
-                        <select
-                          value={oauthBrowserKey}
-                          onChange={(e) => setOauthBrowserKey(e.target.value)}
-                          className="h-8 rounded-md border border-input bg-background px-2 text-xs outline-none"
-                        >
-                          {oauthBrowsers.map((b) => (
-                            <option key={b.key} value={b.key}>
-                              {b.label}
-                            </option>
-                          ))}
-                        </select>
-                        <Button size="sm" variant="outline" onClick={() => void onOauthOpenUrl(true)}>
-                          私密窗口
-                        </Button>
-                      </>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {["waiting", "callback_received", "processing"].includes(oauthStatus?.state ?? "") ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button size="sm" variant="ghost" onClick={() => void onOauthStop()}>
-                      停止监听
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => setManualOpen((v) => !v)}>
-                      授权页没回跳？手动粘贴回调 URL
-                    </Button>
-                  </div>
-                ) : null}
-
-                {manualOpen ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Input
-                      value={manualUrl}
-                      onChange={(e) => setManualUrl(e.target.value)}
-                      placeholder="http://127.0.0.1:17388/authorize?authCodeInfo=…"
-                      className="min-w-0 flex-1 font-mono text-xs"
-                    />
-                    <Button size="sm" onClick={() => void onOauthManual()} disabled={!manualUrl.trim() || busy}>
-                      {busy ? <Loader2 className="size-4 animate-spin" /> : null}完成登录
-                    </Button>
-                  </div>
-                ) : null}
-
-                {oauthStatus?.note ? (
-                  <Alert>
-                    <AlertTriangle className="size-4" />
-                    <AlertTitle>注意</AlertTitle>
-                    <AlertDescription>{oauthStatus.note}</AlertDescription>
-                  </Alert>
-                ) : null}
-              </div>
-            )}
-          </CardContent>
-        </Card>
+            {oauthStatus?.note ? (
+              <Alert>
+                <AlertTriangle className="size-4" />
+                <AlertTitle>注意</AlertTitle>
+                <AlertDescription>{oauthStatus.note}</AlertDescription>
+              </Alert>
+            ) : null}
+          </AlertDescription>
+        </Alert>
       ) : null}
 
       {error ? (

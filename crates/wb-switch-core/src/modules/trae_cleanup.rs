@@ -18,7 +18,7 @@
 //! （`~/.twin-switch/trash`，同盘 rename，几乎零成本），随时可清空释放空间。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -114,30 +114,81 @@ fn hard_remove(p: &Path) -> Result<(), String> {
     }
 }
 
+/// 词法规范化：消掉 `.` / `..`，**不碰文件系统**（不要求路径存在）。
+///
+/// ⚠️ `Path::starts_with` 是**逐组件**比较的，对 `a/trash/../trae` 这种写法它会认为
+/// 「以 `a/trash` 开头」⇒ 判据会被 `..` 骗过去。凡是拿路径做「在不在某目录下」的
+/// 判断，两边都必须先过这里。
+fn lexically_normalized(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 该路径是否必须**硬删**（不进回收站）。
+///
+/// ⚠️⚠️ 回收站自己（以及它里面的任何东西）只有一个合理动作：**清空**。
+///    「把回收站移进回收站」不只是没意义 —— 它就是 2026-10-14 撑爆 C 盘那次事故
+///    （116 GB）的触发器，机制见 [`move_to_trash`] 的注释。所以这里钉死成硬删。
+fn must_hard_remove(p: &Path) -> bool {
+    let t = lexically_normalized(&trash_root());
+    let q = lexically_normalized(p);
+    q == t || q.starts_with(&t)
+}
+
 /// 移入回收站（同盘 `rename`，几乎零成本）；跨盘时退化为「复制 + 删除」。
+///
+/// ⚠️⚠️ **绝不能把某个目录移进它自己里面**（`dest` 落在 `p` 的子树中）。两个原因：
+///   ① 同盘 `rename` 在这种情形下必然失败（Windows 报 `os error 5 / 拒绝访问`），
+///   ② 于是退化到 `copy_recursive`，而它一边写、一边又能读到刚写出来的那些目录
+///      ⇒ **无限自我嵌套**，直到把盘写满。
+///    真机症状：用户在清理页勾了「清理回收站」→ 回收站被「移进回收站」→
+///    `~/.twin-switch/trash` 里出现 `trash/<stamp>/000/trash/<stamp>/000/trash/…`，
+///    一路写到 C 盘只剩 0 字节（实测 2 MB 的回收站能涨到 100 MB+ 仍未停）。
+///    正常调用链已被 [`must_hard_remove`] 拦住，这里是纵深的第二道闸。
 fn move_to_trash(p: &Path, stamp: &str, seq: usize) -> Result<PathBuf, String> {
     let name = p
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "item".to_string());
     let dest_dir = trash_root().join(stamp).join(format!("{seq:03}"));
-    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建回收站目录失败: {e}"))?;
     let dest = dest_dir.join(&name);
+    if lexically_normalized(&dest).starts_with(&lexically_normalized(p)) {
+        return Err(format!(
+            "拒绝执行：目标 {} 落在源目录自己里面（会造成无限自我复制），已跳过",
+            dest.display()
+        ));
+    }
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建回收站目录失败: {e}"))?;
     if std::fs::rename(p, &dest).is_ok() {
         return Ok(dest);
     }
     // 跨盘：递归复制后再删源
-    copy_recursive(p, &dest).map_err(|e| format!("移入回收站失败: {e}"))?;
+    copy_recursive(p, &dest, &dest).map_err(|e| format!("移入回收站失败: {e}"))?;
     hard_remove(p)?;
     Ok(dest)
 }
 
-fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// 递归复制。`stop_at` = 本次要写出的目标根 —— **遇到它会成为其祖先的条目一律跳过**，
+/// 否则源里包含目标时会把新写出的内容再复制一遍，无限嵌套（见 [`move_to_trash`]）。
+fn copy_recursive(src: &Path, dst: &Path, stop_at: &Path) -> std::io::Result<()> {
     let md = std::fs::symlink_metadata(src)?;
     if md.is_dir() {
         std::fs::create_dir_all(dst)?;
         for e in std::fs::read_dir(src)?.flatten() {
-            copy_recursive(&e.path(), &dst.join(e.file_name()))?;
+            let child = e.path();
+            if stop_at.starts_with(&child) {
+                continue;
+            }
+            copy_recursive(&child, &dst.join(e.file_name()), stop_at)?;
         }
         Ok(())
     } else {
@@ -788,7 +839,7 @@ pub fn purge(ids: &[String], hard: bool, on_log: Option<&dyn Fn(&str)>) -> Resul
     // (客户端, 会话 id, 归属账号 uid) —— uid 必须在这里就取出来，
     // 本地删完之后解密库里就没有这一行了，云端同步会无从判断归属。
     let mut session_targets: Vec<(String, String, String)> = Vec::new();
-    let mut file_sel: Vec<(String, PathBuf)> = Vec::new();
+    let mut file_sel: Vec<(String, PathBuf, bool)> = Vec::new();
 
     for cat in snapshot["categories"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let category = cat["id"].as_str().unwrap_or("").to_string();
@@ -821,7 +872,10 @@ pub fn purge(ids: &[String], hard: bool, on_log: Option<&dyn Fn(&str)>) -> Resul
                     if is_protected(&pb) {
                         continue;
                     }
-                    file_sel.push((category.clone(), pb));
+                    // ⚠️⚠️ 回收站自己（含它里面的东西）一律**硬删**：见 `must_hard_remove`。
+                    //    它一进 `move_to_trash` 就会「被移进自己里面」⇒ 无限自我复制撑爆磁盘。
+                    let force_hard = must_hard_remove(&pb);
+                    file_sel.push((category.clone(), pb, force_hard));
                 }
             }
         }
@@ -858,12 +912,13 @@ pub fn purge(ids: &[String], hard: bool, on_log: Option<&dyn Fn(&str)>) -> Resul
     // 2) 文件 / 目录
     let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let mut seq = 0usize;
-    for (category, p) in &file_sel {
+    for (category, p, force_hard) in &file_sel {
         if !p.exists() {
             continue;
         }
         let sz = path_size(p);
-        let outcome = if hard {
+        let effective_hard = hard || *force_hard;
+        let outcome = if effective_hard {
             hard_remove(p)
         } else {
             move_to_trash(p, &stamp, seq).map(|_| ())
@@ -879,7 +934,7 @@ pub fn purge(ids: &[String], hard: bool, on_log: Option<&dyn Fn(&str)>) -> Resul
                     "path": p.to_string_lossy(),
                     "bytes": sz,
                     "bytes_mb": mb(sz),
-                    "hard": hard,
+                    "hard": effective_hard,
                 }));
             }
             Err(e) => errors.push(format!("{}：{e}", p.display())),
@@ -1001,6 +1056,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// ⚠️⚠️ 回归判据（2026-10-14 撑爆 C 盘那次）：回收站整棵子树都必须走硬删。
+    ///
+    /// 反证：把 `must_hard_remove` 改回 `false`（即旧行为，回收站也走 `move_to_trash`），
+    /// 这条立刻变红 —— 而真机上它会让 `~/.twin-switch/trash` 无限自我嵌套直到写满磁盘。
+    #[test]
+    fn the_whole_trash_subtree_must_be_hard_removed() {
+        let t = trash_root();
+        assert!(must_hard_remove(&t), "回收站根必须硬删");
+        assert!(
+            must_hard_remove(&t.join("20261014_081500").join("000")),
+            "回收站里的批次目录必须硬删"
+        );
+        // 正常条目不受影响：该进回收站的还得进
+        assert!(
+            !must_hard_remove(&t.join("..").join("trae").join("import_backup")),
+            "`..` 写法不许骗过判据（starts_with 不规范化，必须先词法规范化）"
+        );
+        assert!(!must_hard_remove(&t.join("..").join("trae").join("deleted_sessions")));
+        assert!(!must_hard_remove(&store_dir().join("trae").join("deleted_sessions")));
+        // 词法上「像」但组件不同的兄弟目录不能误伤
+        assert!(!must_hard_remove(&t.join("..").join("trash-old")));
+    }
+
+    /// 词法规范化本身：`..` 要真的被消掉。
+    #[test]
+    fn lexical_normalization_collapses_parent_dir() {
+        let base = trash_root();
+        assert_eq!(
+            lexically_normalized(&base.join("..").join("trae")),
+            lexically_normalized(&store_dir().join("trae"))
+        );
+        assert_eq!(
+            lexically_normalized(&base.join(".").join("x")),
+            base.join("x")
+        );
+    }
+
+    /// ⚠️⚠️ 回归判据：复制时**遇到目标所在的那棵子树必须停**。
+    ///
+    /// 场景就是事故本身 —— 源是回收站，目标写在回收站里面。
+    /// 旧实现（`copy_recursive` 没有 `stop_at` 这道闸）会把刚写出的 `trash` 目录再复制一遍，
+    /// 2 MB 的输入实测能涨到 124 MB 且**还没停**（自嵌套 185 层）⇒ 撑爆磁盘。
+    #[test]
+    fn copy_recursive_never_descends_into_the_destination_subtree() {
+        let d = tmp("selfnest");
+        let src = d.join("trash");
+        let old = src.join("20261010_194737").join("000");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("a.bin"), vec![0u8; 4096]).unwrap();
+
+        // 目标落在源里面：src/<新批次>/000/trash
+        let dest = src.join("20261014_081500").join("000").join("trash");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        copy_recursive(&src, &dest, &dest).unwrap();
+
+        // 只应复制到「旧批次」那一支，绝不能出现嵌套的 trash
+        assert_eq!(path_size(&dest), 4096, "应当恰好只有源里的那 4 KB");
+        assert!(
+            !dest.join("20261014_081500").exists(),
+            "目标自己不能被复制进目标里"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 纵深第二道闸：`move_to_trash` 必须能认出「目标在源里面」并**报错返回**，
+    /// 而不是退化成复制（真实 `trash_root()` 不可注入，这里验证判据本身）。
+    #[test]
+    fn move_to_trash_detects_when_the_destination_is_inside_the_source() {
+        let d = tmp("guard");
+        let src = d.join("trash");
+        std::fs::create_dir_all(&src).unwrap();
+        let dest = src.join("batch").join("000").join("trash");
+        assert!(
+            lexically_normalized(&dest).starts_with(&lexically_normalized(&src)),
+            "判据必须认出这是自嵌套"
+        );
+        // 加 `..` 也骗不过去
+        let sneaky = src.join("batch").join("..").join("batch").join("000").join("trash");
+        assert!(lexically_normalized(&sneaky).starts_with(&lexically_normalized(&src)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn hard_remove_handles_file_and_dir() {
         let d = tmp("hard");
@@ -1023,7 +1161,7 @@ mod tests {
         std::fs::create_dir_all(src.join("a")).unwrap();
         std::fs::write(src.join("a").join("1.txt"), b"hello").unwrap();
         let dst = d.join("dst");
-        copy_recursive(&src, &dst).unwrap();
+        copy_recursive(&src, &dst, &dst).unwrap();
         assert_eq!(std::fs::read(dst.join("a").join("1.txt")).unwrap(), b"hello");
         let _ = std::fs::remove_dir_all(&d);
     }
