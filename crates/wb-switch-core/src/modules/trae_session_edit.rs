@@ -59,7 +59,7 @@
 //!    只改个标题就绝不碰那 74 MB —— 这正是「局部修改」要的效果。
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -1514,21 +1514,27 @@ pub fn edit_save(
         stats.elapsed_ms
     ));
 
+    // 备份原库（统一出口，可在设置里关掉）→ 原子替换。与删除链路同一套：页级增量，
+    // ⚠️ 「设置关了没备」（`Ok(mode=skipped)`）与「备份失败」（`Err`）必须分得开。
     log("备份原库并原子替换…");
     let bdir = backup_dir();
-    if let Err(e) = std::fs::create_dir_all(&bdir) {
-        return err(format!("创建备份目录失败: {e}"));
-    }
+    let entry = bdir.join(crate::modules::trae_backup::entry_name(&client_key, "edit", &stamp));
     let mut backup_paths: Vec<String> = Vec::new();
-    for (label, suffix) in [("主库", ""), ("WAL", "-wal"), ("SHM", "-shm")] {
-        let f = PathBuf::from(format!("{}{}", live.to_string_lossy(), suffix));
-        if f.exists() {
-            let dst = bdir.join(format!("{client_key}_before_edit_{stamp}{suffix}.db.bak"));
-            match std::fs::copy(&f, &dst) {
-                Ok(_) => backup_paths.push(dst.to_string_lossy().into_owned()),
-                Err(e) => return err(format!("备份{label}失败，已中止写入：{e}")),
+    match crate::modules::trae_backup::snapshot_before_write(
+        &live,
+        &new_db,
+        &entry,
+        &client_key,
+        "edit",
+        "编辑会话前的整库备份",
+    ) {
+        Ok(out) => {
+            log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+            if out.get("mode").and_then(Value::as_str) != Some("skipped") {
+                backup_paths.push(entry.to_string_lossy().into_owned());
             }
         }
+        Err(e) => return err(format!("备份原库失败，已中止写入：{e}")),
     }
     {
         // ⚠️ 走**用户设置里的保留策略**。T62 之前这里写死 `keep=1`，而且
@@ -1542,22 +1548,9 @@ pub fn edit_save(
             ));
         }
     }
-    let swap = || -> Result<(), String> {
-        let shm = live.with_extension("db-shm");
-        if wal.exists() {
-            std::fs::remove_file(&wal).map_err(|e| format!("清理 WAL 失败: {e}"))?;
-        }
-        if shm.exists() {
-            std::fs::remove_file(&shm).map_err(|e| format!("清理 SHM 失败: {e}"))?;
-        }
-        if live.exists() {
-            std::fs::remove_file(&live).map_err(|e| format!("移除旧库失败: {e}"))?;
-        }
-        std::fs::rename(&new_db, &live).map_err(|e| format!("替换数据库失败: {e}"))?;
-        Ok(())
-    };
-    if let Err(e) = swap() {
-        return err(format!("替换失败（备份已保留，可手动恢复）：{e}"));
+    // 原子替换：旧库先改名让位、新库再改名就位，任何一步失败自动回滚 ⇒ 关掉备份也不丢库。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        return err(format!("替换数据库失败（原库未被改动）：{e}"));
     }
 
     if let Err(e) = promote_snapshot(&client_key, &plain) {

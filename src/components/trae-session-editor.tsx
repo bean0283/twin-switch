@@ -653,8 +653,13 @@ export function TraeSessionEditor({
     setBusy(true);
     try {
       const res = await api.traeDeleteSessions(clientKey, [picked]);
+      // ⚠️ 备份是**可选的**（「设置 → 写库前整库备份」，默认关闭）—— 不能无条件写「已整库备份」，
+      //    那是「同一屏两个说法」：用户关了开关，界面还跟他说备份好了。
+      const backupNote = res.backup.length
+        ? "已整库备份，"
+        : "未备份（「设置 → 写库前整库备份」已关闭），";
       toast.success("已删掉整条会话", {
-        description: `共移除 ${res.deleted_rows_total} 行；已整库备份，客户端侧文件移入回收站。`,
+        description: `共移除 ${res.deleted_rows_total} 行；${backupNote}客户端侧文件移入回收站。`,
       });
       onChanged?.();
       onOpenChange(false);
@@ -678,7 +683,8 @@ export function TraeSessionEditor({
           </p>
           <p className="text-muted-foreground">
             所以这里不提供「删到空」这个选项：确认后走「彻底删除会话」——
-            整库备份 → 删除该会话的全部数据行 → 加密回写 → 客户端侧文件移入回收站。
+            （视「写库前整库备份」开关）整库备份 → 删除该会话的全部数据行 → 加密回写 →
+            客户端侧文件移入回收站。
             <b>编辑器里未保存的改动会一并丢弃。</b>
           </p>
         </div>

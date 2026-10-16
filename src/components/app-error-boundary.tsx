@@ -107,7 +107,7 @@ export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorB
 
             <p className="text-xs leading-5 text-muted-foreground">
               {canPersistErrorLog()
-                ? "错误已记录到本机错误日志，可在设置页「错误日志」查看。若界面一直无法恢复，可从托盘菜单「检查更新」升级到最新版本。"
+                ? "错误已记录到本机错误日志，可在设置页「错误日志」查看。若界面一直无法恢复，可先「重新加载」，再从左侧边栏底部「检查更新」升级到最新版本。"
                 : "可以先点「重新加载」再试一次。若一直失败，请前往 GitHub 下载最新版本。"}
             </p>
           </CardContent>

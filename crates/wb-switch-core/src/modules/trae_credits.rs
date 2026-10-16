@@ -22,7 +22,11 @@ use crate::modules::{config, trae_profile, trae_vault};
 /// 磁盘缓存文件名（落在 `config::cache_dir()`）。
 const CACHE_NAME: &str = "trae-credits.json";
 /// 缓存结构版本，字段一改就 +1。
-const CACHE_VERSION: u64 = 1;
+///
+/// v2：积分包里去掉了假的 `unlimited` 条目（免费方案的功能权益，见
+/// `trae_profile::parse_entitlement`）—— 结果缓存里存的是拼好的条目，
+/// 不 +1 的话升级后 5 分钟内还会把旧的那一行「不限量 免费」吐出来。
+const CACHE_VERSION: u64 = 2;
 /// 联网结果的保鲜期：5 分钟。窗口内重复进页面不再打接口。
 const CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 
@@ -72,6 +76,32 @@ fn rfc3339_ms(s: Option<&str>) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis())
 }
 
+/// 只保留**带额度信息的真积分包**（读缓存时的兼容闸）。
+///
+/// ⚠️ v0.3.2 之前的解析器把「免费方案功能权益」（`free_utc2026xx_<uid>`，`quota` 里
+/// 只有 `enable_solo_*` 开关、**没有 `credits_limit`**）误判成「不限量积分包」
+/// （`unlimited: true`），于是每张账号卡上都多出一行并不存在的「不限量 免费」。
+/// 新解析器不会再产生这种条目，但**磁盘上的旧 `profile.json` 还在** ——
+/// 首屏（离线快照，[`cached`]）直接读它，不滤的话那个假包会一直显示到下次刷新为止。
+///
+/// 判据是「既没有 `total` 也没有 `remaining`」而**不是**「有没有 `unlimited` 字段」：
+/// 后者是旧解析器的产物，新代码不该依赖它；而且一条连额度都读不出来的条目，
+/// 界面上也没法说清它是什么（说「不限量」恰好就是这次要修的谎话）。
+fn real_packs(packs: Option<&Value>) -> Vec<Value> {
+    packs
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|p| {
+                    let missing = |k: &str| p.get(k).map_or(true, Value::is_null);
+                    !(missing("total") && missing("remaining"))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 把「账号库条目 + 它的 profile.json」拼成前端要的一条。
 fn entry(client: &str, id: &str, has_oauth: bool, profile: Option<&Value>) -> Value {
     let oauth: Option<Value> = std::fs::read_to_string(trae_vault::account_dir(client, id).join("oauth.json"))
@@ -107,10 +137,9 @@ fn entry(client: &str, id: &str, has_oauth: bool, profile: Option<&Value>) -> Va
             .map(String::from)
     });
 
-    let packs = profile
-        .and_then(|p| p.get("credit_packs"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    // ⚠️ 走 `real_packs` 而不是直接 clone：磁盘上的旧 profile.json 里可能还留着
+    // 旧解析器写下的假「不限量」包（见该函数注释）。
+    let packs = json!(real_packs(profile.and_then(|p| p.get("credit_packs"))));
     let pack_count = packs.as_array().map(Vec::len).unwrap_or(0);
     let ok = profile
         .and_then(|p| p.get("credit_ok"))
@@ -279,6 +308,26 @@ mod tests {
         assert!(rfc3339_ms(Some("2026-10-05T09:33:11.964261+08:00")).unwrap() > 1_700_000_000_000);
         assert_eq!(rfc3339_ms(Some("not-a-date")), None);
         assert_eq!(rfc3339_ms(None), None);
+    }
+
+    #[test]
+    fn legacy_unlimited_packs_are_dropped_on_read() {
+        // 旧解析器写进 profile.json 的假包：既无 `total` 也无 `remaining`
+        // （它是「免费方案的功能权益」，不是积分包）。
+        let legacy = json!([
+            { "key": "free_utc202610_x", "name": "免费", "group": "", "total": null,
+              "used": 0.0, "remaining": null, "unlimited": true,
+              "expire_at": 1793462399000i64, "status": 1 },
+            { "key": "checkin_x", "name": "签到奖励", "group": "每日签到", "total": 100.0,
+              "used": 0.0, "remaining": 100.0, "expire_at": 1793721119000i64, "status": 1 },
+        ]);
+        let kept = real_packs(Some(&legacy));
+        assert_eq!(kept.len(), 1, "假包必须被滤掉");
+        assert_eq!(kept[0]["name"], json!("签到奖励"));
+        // 没有缓存 / 形状不对时都是空数组，不许 panic。
+        assert!(real_packs(None).is_empty());
+        assert!(real_packs(Some(&json!({}))).is_empty());
+        assert!(real_packs(Some(&json!([]))).is_empty());
     }
 
     #[test]

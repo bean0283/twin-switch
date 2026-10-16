@@ -1974,18 +1974,10 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
         }));
     }
 
-    // 4) 备份原库 + 增量加密回写 + 原子替换
-    let backup = crate::modules::trae_export::import_backup_dir()
-        .join(format!("heal-{}", chrono::Local::now().timestamp()));
-    std::fs::create_dir_all(&backup).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let backup_db = backup.join("database.db");
-    std::fs::copy(&live, &backup_db).map_err(|e| format!("备份原库失败: {e}"))?;
-    // WAL 也一并备份：客户端强杀后的最新状态都在里面
-    let wal = PathBuf::from(format!("{}-wal", live.to_string_lossy()));
-    if wal.exists() {
-        let _ = std::fs::copy(&wal, backup.join("database.db-wal"));
-    }
-
+    // 4) 增量加密回写 → 备份原库（统一出口）→ 原子替换
+    //
+    // ⚠️ 顺序是「先算出新库、再备份、最后替换」。旧写法是「先整份复制备份、再回写」，
+    //    那要白复制 609 MB；现在备份只要「原库 vs 新库的变动页」，所以必须先把新库算出来。
     let new_db = work.join("live-new.db");
     log("增量加密回写（只重写变动页）…");
     let stats = write_db_incremental_with(
@@ -2003,19 +1995,50 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
         stats.changed_bytes as f64 / 1_048_576.0
     ));
 
-    // 原子替换（同目录 rename）
-    let bak_live = work.join("live-old.db");
-    std::fs::rename(&live, &bak_live).map_err(|e| format!("移开原库失败: {e}"))?;
-    if let Err(e) = std::fs::rename(&new_db, &live) {
-        let _ = std::fs::rename(&bak_live, &live);
-        let _ = std::fs::remove_dir_all(&work);
-        return Err(format!("替换实时库失败（已回滚）：{e}"));
+    // 备份走统一出口（可在设置里关掉）：目录名必须由 `entry_name` 生成，保留策略才认得出归属。
+    // ⚠️ 旧名 `heal-<ts>` 里的 `stamp` 解不出来 ⇒ 每份自成一 owner ⇒ **一份都清不掉**（T62 的坑）。
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup = bdir.join(crate::modules::trae_backup::entry_name(
+        client_key,
+        "heal",
+        &crate::modules::trae_backup::new_stamp(),
+    ));
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &live,
+            &new_db,
+            &backup,
+            client_key,
+            "heal",
+            "修正工程归属前的整库备份",
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止写入：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
+    };
+    {
+        let (n, freed) = crate::modules::trae_export::prune_with_policy(&bdir);
+        if n > 0 {
+            log(&format!(
+                "已清理 {n} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
+                freed as f64 / 1_048_576.0
+            ));
+        }
     }
-    // WAL 是旧页的残留，替换主库后必须清掉，否则会把旧内容又合并回来
-    let _ = std::fs::remove_file(&wal);
+
+    // WAL 是旧页的残留，替换主库后必须清掉，否则会把旧内容又合并回来。
+    // ⚠️ 不在这里手动删 —— `swap_in_place` 已把 `-wal` / `-shm` 连同旧库一起移走清掉了。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(format!("替换实时库失败（原库未被改动）：{e}"));
+    }
     let _ = std::fs::remove_file(format!("{}-shm", live.to_string_lossy()));
     let _ = std::fs::remove_dir_all(&work);
-    drop(bak_live);
 
     // 5) 同步刷新解密快照（否则列表还显示旧数据）
     let _ = std::fs::remove_file(decrypted_db_path(client_key));
@@ -2030,16 +2053,23 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
         }
     }
 
-    log(&format!(
-        "已修正 {fixed_sp} 条工程归属、{fixed_ctx} 条会话上下文（备份在 {}）",
-        backup.display()
-    ));
+    // ⚠️ 备份被关掉时不能写「备份在 …」——那是在说一个不存在的目录（「空」与「失败」不许长得一样）。
+    match backup_mode.as_str() {
+        "skipped" => log(&format!(
+            "已修正 {fixed_sp} 条工程归属、{fixed_ctx} 条会话上下文（未备份：设置里已关闭「写库前整库备份」）"
+        )),
+        _ => log(&format!(
+            "已修正 {fixed_sp} 条工程归属、{fixed_ctx} 条会话上下文（备份在 {}）",
+            backup.display()
+        )),
+    }
     Ok(json!({
         "checked": true,
         "fixed_sessions": fixed_sp,
         "fixed_contexts": fixed_ctx,
         "sessions": targets,
-        "backup": backup.to_string_lossy(),
+        "backup": if backup_mode == "skipped" { Value::Null } else { json!(backup.to_string_lossy()) },
+        "backup_mode": backup_mode,
         "relaunched": relaunched,
         "note": "已把副本的工程归属对齐到其真实账号的项目；客户端里现在应当能正常删除了",
     }))
@@ -2329,38 +2359,37 @@ pub fn import_sessions(
     ));
     let pages = stats.pages;
 
-    // 5) 原子替换（备份原库 + wal/shm → 替换 → 失败回滚）
-    let backup_dir = store_dir().join("trae").join("import_backup").join(format!(
-        "{dst_client_key}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    // 5) 备份原库（统一出口，可在设置里关掉）→ 原子替换
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup_dir = bdir.join(crate::modules::trae_backup::entry_name(
+        dst_client_key,
+        "import",
+        &crate::modules::trae_backup::new_stamp(),
     ));
-    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let wal = dst_db.with_extension("db-wal");
-    let shm = dst_db.with_extension("db-shm");
-    for (label, p) in [("主库", &dst_db), ("WAL", &wal), ("SHM", &shm)] {
-        if p.exists() {
-            let dst = backup_dir.join(p.file_name().unwrap_or_default());
-            std::fs::copy(p, &dst).map_err(|e| format!("备份{label}失败: {e}"))?;
-        }
-    }
-    let swap = || -> Result<(), String> {
-        if wal.exists() {
-            std::fs::remove_file(&wal).map_err(|e| format!("清理 WAL 失败: {e}"))?;
-        }
-        if shm.exists() {
-            std::fs::remove_file(&shm).map_err(|e| format!("清理 SHM 失败: {e}"))?;
-        }
-        if dst_db.exists() {
-            std::fs::remove_file(&dst_db).map_err(|e| format!("移除旧库失败: {e}"))?;
-        }
-        std::fs::rename(&new_db, &dst_db).map_err(|e| format!("替换数据库失败: {e}"))?;
-        Ok(())
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &dst_db,
+            &new_db,
+            &backup_dir,
+            dst_client_key,
+            "import",
+            "导入会话前的整库备份",
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止导入：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
     };
-    if let Err(e) = swap() {
+    // ⚠️ `-wal` / `-shm` 不在这里手动删 —— `swap_in_place` 会把它们连同旧库一起移走清掉，
+    //    手动删反而可能与替换过程抢文件。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &dst_db) {
         let _ = std::fs::remove_dir_all(&work);
-        return Err(format!("替换失败（已保留备份）：{e}"));
+        return Err(format!("替换数据库失败（原库未被改动）：{e}"));
     }
-
     // 6) 轻量自检
     //
     // ⚠️ 早前这里是「把替换后的新库**整库再解密一遍**，只为查一个 count(*)」——
@@ -2474,7 +2503,8 @@ pub fn import_sessions(
         // 对应的副本在明文副本里确实存在的个数（即真正落库成功的数量）。
         "verified_sessions": verified_sessions,
         "relaunched": relaunched,
-        "backup_dir": backup_dir.to_string_lossy(),
+        "backup_dir": if backup_mode == "skipped" { Value::Null } else { json!(backup_dir.to_string_lossy()) },
+        "backup_mode": backup_mode,
         "pruned_backups": pruned,
     }))
 }
@@ -2525,7 +2555,8 @@ pub fn sync_group(
         "writtenRows": g.written_rows,
         "pages": r.pages,
         "relaunched": r.relaunched,
-        "backupDir": r.backup_dir.to_string_lossy(),
+        "backupDir": if r.backup_mode == "skipped" { Value::Null } else { json!(r.backup_dir.to_string_lossy()) },
+        "backupMode": r.backup_mode,
         "note": "已在原会话 id 上就地更新，客户端里的位置与归属不变",
     }))
 }
@@ -2552,7 +2583,8 @@ pub fn sync_groups(
         })).collect::<Vec<Value>>(),
         "pages": r.pages,
         "relaunched": r.relaunched,
-        "backupDir": r.backup_dir.to_string_lossy(),
+        "backupDir": if r.backup_mode == "skipped" { Value::Null } else { json!(r.backup_dir.to_string_lossy()) },
+        "backupMode": r.backup_mode,
     }))
 }
 
@@ -2582,6 +2614,9 @@ struct BatchSyncResult {
     pages: u64,
     relaunched: bool,
     backup_dir: PathBuf,
+    /// `"delta"` / `"full"` / `"skipped"`（设置里关了）——
+    /// ⚠️ 界面必须在 `skipped` 时显示「未备份」，不能拿一个不存在的目录冒充备份成功。
+    backup_mode: String,
 }
 
 /// 按同步方向，把关联组的两端映射成「内容来源（from）/ 被覆盖（kept）」两方。
@@ -2860,36 +2895,38 @@ fn sync_groups_inner(
     ));
     let pages = stats.pages;
 
-    // 7) 备份 + 原子替换（失败回滚）
-    let backup_dir = store_dir()
-        .join("trae")
-        .join("import_backup")
-        .join(format!("{client_key}-sync-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let wal = dst_db.with_extension("db-wal");
-    let shm = dst_db.with_extension("db-shm");
-    for (label, p) in [("主库", &dst_db), ("WAL", &wal), ("SHM", &shm)] {
-        if p.exists() {
-            let dst = backup_dir.join(p.file_name().unwrap_or_default());
-            std::fs::copy(p, &dst).map_err(|e| format!("备份{label}失败: {e}"))?;
-        }
-    }
-    let swap = || -> Result<(), String> {
-        if wal.exists() {
-            std::fs::remove_file(&wal).map_err(|e| format!("清理 WAL 失败: {e}"))?;
-        }
-        if shm.exists() {
-            std::fs::remove_file(&shm).map_err(|e| format!("清理 SHM 失败: {e}"))?;
-        }
-        if dst_db.exists() {
-            std::fs::remove_file(&dst_db).map_err(|e| format!("移除旧库失败: {e}"))?;
-        }
-        std::fs::rename(&new_db, &dst_db).map_err(|e| format!("替换数据库失败: {e}"))?;
-        Ok(())
+    // 7) 备份原库（统一出口，可在设置里关掉）→ 原子替换
+    //
+    // ⚠️ 目录名走 `entry_name`：旧名 `{client}-sync-{ts}` 会被保留策略拆成 owner `{client}-sync`，
+    //    与 `{client}` 那一组**分成两组** ⇒ 两边的「最新一批」永不清，实际留存量翻倍。
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup_dir = bdir.join(crate::modules::trae_backup::entry_name(
+        client_key,
+        "sync",
+        &crate::modules::trae_backup::new_stamp(),
+    ));
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &dst_db,
+            &new_db,
+            &backup_dir,
+            client_key,
+            "sync",
+            "差异同步前的整库备份",
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止同步：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
     };
-    if let Err(e) = swap() {
+    // ⚠️ `-wal` / `-shm` 由 `swap_in_place` 连同旧库一起移走清掉，这里不手动删。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &dst_db) {
         let _ = std::fs::remove_dir_all(&work);
-        return Err(format!("替换失败（已保留备份）：{e}"));
+        return Err(format!("替换失败（原库未被改动）：{e}"));
     }
 
     // 8) 轻量自检
@@ -2946,6 +2983,7 @@ fn sync_groups_inner(
         pages,
         relaunched,
         backup_dir,
+        backup_mode,
     })
 }
 
@@ -2994,7 +3032,7 @@ mod tests {
         out
     }
 
-    /// ⚠️ **结构护栏：任何会删掉实时库 WAL 的写路径，必须先合并 WAL。**
+    /// ⚠️ **结构护栏：任何会毁掉实时库 WAL 的写路径，必须先合并 WAL。**
     ///
     /// 客户端是 WAL 模式，写入几乎全在 `database.db-wal` 里（主库文件字节往往纹丝不动）。
     /// 一条写路径若「只解密主库 → 改明文 → 回写 → 删 WAL」，就会把客户端**刚写下、还没落盘**
@@ -3002,35 +3040,58 @@ mod tests {
     ///
     /// 删除路径（`delete_sessions_core`）与同步路径（`sync_groups_inner`）一直有这一步；
     /// **复制（`import_sessions`）与自愈（`heal_session_projects`）曾经漏掉**（T32 补）。
-    /// 本用例按函数体扫描，新增写路径若忘了合并会直接失败。
+    ///
+    /// ⚠️⚠️ **T66 起「销毁 WAL」有两种形态**，只查旧的那种会让护栏**静默失效**：
+    /// 1. 就地 `remove_file(&wal)`（老写法）；
+    /// 2. 调 `trae_backup::swap_in_place()` —— 它会把 `-wal` / `-shm` **连同旧库一起移走清掉**，
+    ///    所以调用方**一次 `remove_file` 都不写**，却照样把 WAL 毁了。
+    /// 两种都要扫，而且**都**必须先合并 WAL。
+    ///
+    /// （`trae_backup.rs` 自己**不在扫描清单里**：`swap_in_place` / `restore_inner` 就是执行者，
+    /// 合并义务落在调用方；把执行者也纳入会让护栏恒假。）
     #[test]
-    fn every_wal_removal_site_merges_wal_first() {
-        let files: [(&str, &str); 3] = [
+    fn every_wal_destroying_write_path_merges_wal_first() {
+        let files: [(&str, &str); 4] = [
             ("trae_import.rs", include_str!("trae_import.rs")),
             ("trae_delete.rs", include_str!("trae_delete.rs")),
+            // ⚠️ T66 补：这两条链路一直在合并 WAL，却从来没被护栏看过。
+            ("trae_session_edit.rs", include_str!("trae_session_edit.rs")),
             ("workbuddy_import.rs", include_str!("workbuddy_import.rs")),
         ];
-        let merge_calls = ["merge_wal_into_plain(", "merge_live_wal_into("];
+        // ⚠️⚠️ 判据字符串**必须拼出来**，不许在源码里写成完整字面量 ——
+        //     `split_fn_bodies` 会把缩进的函数体并进「它前面那个顶层函数」，
+        //     而 `mod tests` 里的缩进 `fn` 不是顶层函数 ⇒ **本用例自己的源码会被当成
+        //     某个写路径的函数体**。写成完整字面量就会让命中数凭空 +1，
+        //     而且会「顺手」命中旁边的 merge 字面量 ⇒ 护栏依然通过，却全是假的。
+        let needle_wal_rm = concat!("remove_file(&", "wal)");
+        let needle_swap = concat!("swap_in_place", "(");
+        let merge_calls = [
+            concat!("merge_wal_into_plain", "("),
+            concat!("merge_live_wal_into", "("),
+        ];
         let mut checked = 0usize;
         for (name, src) in files {
             for body in split_fn_bodies(src) {
-                if !body.contains("remove_file(&wal)") {
+                let destroys_wal = body.contains(needle_wal_rm) || body.contains(needle_swap);
+                if !destroys_wal {
                     continue;
                 }
                 checked += 1;
                 let head: Vec<&str> = body.lines().take(1).collect();
                 assert!(
                     merge_calls.iter().any(|c| body.contains(c)),
-                    "⚠️ {name} 的 `{}` 删除了实时库 WAL，却没有先合并 WAL \
+                    "⚠️ {name} 的 `{}` 销毁了实时库 WAL（就地删 或 换库位），却没有先合并 WAL \
                      ⇒ 会永久丢掉客户端未 checkpoint 的写入。\
                      请在解密明文后、改动前调用 `merge_wal_into_plain` / `merge_live_wal_into`。",
                     head.first().unwrap_or(&"<未知函数>")
                 );
             }
         }
-        assert!(
-            checked >= 5,
-            "护栏失效：只扫到 {checked} 处删 WAL 的写路径，预期至少 5 处（删除/自愈/复制/同步/WorkBuddy 导入）"
+        assert_eq!(
+            checked, 6,
+            "护栏失效或写路径数量变了：只扫到 {checked} 处「会毁掉 WAL」的写路径，预期 6 处\
+             （删除 / 自愈 / 复制 / 同步 / 回写 / WorkBuddy 导入）。\
+             新增写路径请一起加进来，别让护栏悄悄漏掉它。"
         );
     }
 

@@ -28,10 +28,16 @@ export interface CreditPack {
   /** 稳定 key（WorkBuddy 用 packageCode，Trae 用 entitlement_id）。 */
   key: string;
   name: string;
-  /** 总额度；`null` = 接口没给额度（不限量包）。 */
+  /** 总额度；`null` = 这项没有额度信息（正常数据两侧都不会出现，纯兜底）。 */
   total: number | null;
   used: number;
-  /** 剩余；`null` = 不限量。 */
+  /**
+   * 剩余；`null` = **额度未知**。
+   *
+   * ⚠️ 别把它读成「不限量」：Trae 与 WorkBuddy 的积分都是计量制的，没有不限量包。
+   * v0.3.2 之前这里写着「不限量」，而它唯一一次被触发就是「免费方案的功能权益」被
+   * 误当成积分包 —— 一个并不存在的包，见 `trae_profile::parse_entitlement`。
+   */
   remaining: number | null;
   /** 到期时间（毫秒）；`null` = 长期有效。 */
   expireAt: number | null;
@@ -143,8 +149,11 @@ function PackageRow({ p }: { p: CreditPack }) {
     <div className="min-w-0 space-y-1.5">
       <div className="flex min-w-0 items-baseline justify-between gap-2">
         <span className="flex min-w-0 items-baseline gap-1.5">
-          <span className="shrink-0 text-xs font-medium tabular-nums">
-            {p.remaining == null ? "不限量" : `${credits(p.remaining)} 积分`}
+          <span
+            className="shrink-0 text-xs font-medium tabular-nums"
+            title={p.remaining == null ? "接口没给这个包的额度信息" : undefined}
+          >
+            {p.remaining == null ? "额度未知" : `${credits(p.remaining)} 积分`}
           </span>
           <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={p.name}>
             {p.name}
@@ -177,8 +186,11 @@ function PackageDetailRow({ p }: { p: CreditPack }) {
           </div>
         </div>
         <div className="shrink-0 text-right text-xs">
-          <div className="font-medium tabular-nums">
-            {p.remaining == null ? "不限量" : `${credits(p.remaining)} / ${credits(p.total)}`}
+          <div
+            className="font-medium tabular-nums"
+            title={p.remaining == null ? "接口没给这个包的额度信息" : undefined}
+          >
+            {p.remaining == null ? "额度未知" : `${credits(p.remaining)} / ${credits(p.total)}`}
           </div>
           <div className="mt-1 text-[11px] text-muted-foreground tabular-nums">已用 {credits(p.used)}</div>
         </div>

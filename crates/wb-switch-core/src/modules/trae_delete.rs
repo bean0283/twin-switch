@@ -614,22 +614,32 @@ fn delete_sessions_core(
         stats.elapsed_ms
     ));
 
-    // 7. 备份原库（含 wal/shm）→ 原子替换
+    // 7. 备份原库（统一出口，可在设置里关掉）→ 原子替换
+    //
+    // ⚠️ 备份从「整份复制 609 MB」改成**页级增量**：Trae 的库逐页加密，而上面那步
+    //    增量回写是「整份照抄原密文 + 只重写变动页」⇒ 新库与原库的差异**恰好就是变动页**
+    //    ⇒ 只存变动页的原密文即可还原。实测从 609 MB 降到几 MB。
+    // ⚠️ 关掉开关时返回的是 `Ok(mode=skipped)`，**不是**失败 —— 但日志必须写明「未备份」，
+    //    否则用户会以为「备份成功了」（「空」与「失败」不许长得一样）。
     log("备份原库并原子替换…");
     let bdir = backup_dir();
-    if let Err(e) = std::fs::create_dir_all(&bdir) {
-        return err(format!("创建备份目录失败: {e}"));
-    }
+    let entry = bdir.join(crate::modules::trae_backup::entry_name(client_key, "delete", &stamp));
     let mut backup_paths: Vec<String> = Vec::new();
-    for (label, suffix) in [("主库", ""), ("WAL", "-wal"), ("SHM", "-shm")] {
-        let f = PathBuf::from(format!("{}{}", live.to_string_lossy(), suffix));
-        if f.exists() {
-            let dst = bdir.join(format!("{client_key}_before_delete_{stamp}{suffix}.db.bak"));
-            match std::fs::copy(&f, &dst) {
-                Ok(_) => backup_paths.push(dst.to_string_lossy().into_owned()),
-                Err(e) => return err(format!("备份{label}失败，已中止删除：{e}")),
+    match crate::modules::trae_backup::snapshot_before_write(
+        &live,
+        &new_db,
+        &entry,
+        client_key,
+        "delete",
+        "删除会话前的整库备份",
+    ) {
+        Ok(out) => {
+            log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+            if out.get("mode").and_then(Value::as_str) != Some("skipped") {
+                backup_paths.push(entry.to_string_lossy().into_owned());
             }
         }
+        Err(e) => return err(format!("备份原库失败，已中止删除：{e}")),
     }
     // 清理目录里更旧的整库备份：每批 ≈ 一个整库大小，留着会越攒越多（实测曾累积到 6.4 GB）。
     // ⚠️ 走**用户设置里的保留策略**（时间 / 份数 / 容量三重触发），不在代码里另立一套；
@@ -643,22 +653,10 @@ fn delete_sessions_core(
             ));
         }
     }
-    let swap = || -> Result<(), String> {
-        let shm = live.with_extension("db-shm");
-        if wal.exists() {
-            std::fs::remove_file(&wal).map_err(|e| format!("清理 WAL 失败: {e}"))?;
-        }
-        if shm.exists() {
-            std::fs::remove_file(&shm).map_err(|e| format!("清理 SHM 失败: {e}"))?;
-        }
-        if live.exists() {
-            std::fs::remove_file(&live).map_err(|e| format!("移除旧库失败: {e}"))?;
-        }
-        std::fs::rename(&new_db, &live).map_err(|e| format!("替换数据库失败: {e}"))?;
-        Ok(())
-    };
-    if let Err(e) = swap() {
-        return err(format!("替换失败（备份已保留，可手动恢复）：{e}"));
+    // 原子替换：旧库先改名让位、新库再改名就位，任何一步失败自动回滚。
+    // ⚠️ 这就是「关掉备份也不丢库」的底气 —— 备份只管「能回到从前」，不再承担「防丢失」。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        return err(format!("替换数据库失败（原库未被改动）：{e}"));
     }
 
     // 7.1 把删除后的明文提升为新快照：它就是新库的完整明文（增量回写逐页已校验），

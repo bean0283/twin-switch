@@ -1612,34 +1612,38 @@ pub fn import_sessions(
                 .ok()
         })
         .unwrap_or(0);
-    let backup_dir = store_dir().join("workbuddy_import_backup").join(format!(
-        "{dst_client_key}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    // 6) 备份原库（统一出口，可在设置里关掉）→ 原子替换
+    //
+    // ⚠️ 这里的目标库是 **Trae 的库**（609 MB 量级），所以也走整库备份开关：
+    //    关了就不留历史版本，「不丢库」由 `swap_in_place` 的原子替换保证。
+    let bdir = crate::modules::trae_export::wb_import_backup_dir();
+    let backup_dir = bdir.join(crate::modules::trae_backup::entry_name(
+        dst_client_key,
+        "wbimport",
+        &crate::modules::trae_backup::new_stamp(),
     ));
-    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let shm = dst_db.with_extension("db-shm");
-    for (label, p) in [("主库", &dst_db), ("WAL", &wal), ("SHM", &shm)] {
-        if p.exists() {
-            let dst = backup_dir.join(p.file_name().unwrap_or_default());
-            std::fs::copy(p, &dst).map_err(|e| format!("备份{label}失败: {e}"))?;
-        }
-    }
-    let swap = || -> Result<(), String> {
-        if wal.exists() {
-            std::fs::remove_file(&wal).map_err(|e| format!("清理 WAL 失败: {e}"))?;
-        }
-        if shm.exists() {
-            std::fs::remove_file(&shm).map_err(|e| format!("清理 SHM 失败: {e}"))?;
-        }
-        if dst_db.exists() {
-            std::fs::remove_file(&dst_db).map_err(|e| format!("移除旧库失败: {e}"))?;
-        }
-        std::fs::rename(&new_db, &dst_db).map_err(|e| format!("替换数据库失败: {e}"))?;
-        Ok(())
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &dst_db,
+            &new_db,
+            &backup_dir,
+            dst_client_key,
+            "wbimport",
+            "导入 WorkBuddy 会话前的整库备份",
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止导入：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
     };
-    if let Err(e) = swap() {
+    // ⚠️ `-wal` / `-shm` 由 `swap_in_place` 连同旧库一起移走清掉，这里不手动删。
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &dst_db) {
         let _ = std::fs::remove_dir_all(&work);
-        return Err(format!("替换失败（原库已备份到 {}）：{e}", backup_dir.display()));
+        return Err(format!("替换失败（原库未被改动）：{e}"));
     }
 
     // 7) 把工作明文提升为新快照：它就是新库的**完整明文**（增量回写保证逐页一致），
@@ -1682,7 +1686,8 @@ pub fn import_sessions(
         "target_label": dst_client.label,
         "target_uid": dst_uid,
         "relaunched": relaunched,
-        "backup_dir": backup_dir.to_string_lossy(),
+        "backup_dir": if backup_mode == "skipped" { Value::Null } else { json!(backup_dir.to_string_lossy()) },
+        "backup_mode": backup_mode,
         "pruned_backups": pruned,
     }))
 }

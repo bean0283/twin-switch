@@ -36,6 +36,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
+import { CheckinButton } from "@/components/checkin-button";
 import {
   CreditBlock,
   CreditsDialog,
@@ -478,6 +479,10 @@ export default function WorkbuddySwitchPage() {
               />
             </label>
           </Button>
+          {/* 签到：只签本页客户端的账号（WorkBuddy 只有一个客户端，所以就是全部）。
+              与首页那个「一键签到」是**同一套实现**（`CheckinButton`），只是 scope 不同。
+              签成功后刷新一次积分，免得同屏出现「新余额」和「旧数字」。 */}
+          <CheckinButton scope="workbuddy" onSuccess={() => void credits.refresh()} />
         </div>
       </div>
 

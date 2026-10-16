@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import { AlertTriangle, HardDrive, Loader2, RotateCcw, Save, ShieldAlert } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  DatabaseBackup,
+  HardDrive,
+  Loader2,
+  RotateCcw,
+  Save,
+  ShieldAlert,
+} from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -25,20 +35,19 @@ import {
 import type { BackupRetention, SettingsSnapshot } from "@/lib/trae-types";
 
 /**
- * 设置页（T62）。
+ * 设置页（T62 起；T66 加了「写库前整库备份」开关）。
  *
- * 目前只有一项：**整库备份保留策略** —— 时间 / 最大容量 / 保留份数**三重触发**。
+ * 两项：**写库前是否留整库备份**（默认关）与**整库备份保留策略**（时间 / 容量 / 份数三重触发）。
  *
- * 它管的是「删会话 / 编辑回写 / 导入 / 导出」这四条链路留下的整库备份
- * （每批 ≈ 一个整库，实测 300 MB ~ 380 MB）。没有这个设置之前，份数是在代码里写死的
- * （删会话留 1 份、导入留 2 份），而且「编辑前备份」因为分组判据漏了 `_before_edit_`
- * 导致一份都清不掉，本机实测堆了 6.4 GB。
+ * 保留策略管的是「删会话 / 编辑回写 / 导入 / 导出」这几条链路留下的整库备份。
+ * T66 之后这些备份默认是**页级增量**（只存变动的页，通常几 MB），所以策略压力已经小得多；
+ * 但**老版本留下的整份备份**还躺在盘上，策略仍然是它们的清理依据。
  *
  * ⚠️ 三条界面硬规则：
  *  1. **「空」和「失败」绝不许长得一样** —— 读失败时撤掉表单，明确写「读取失败，
  *     不是设置被重置」；绝不能拿默认值填进输入框假装正常。
- *  2. **界面上的策略原文一律用后端返回的 `summary`**，不自己拼 —— 那句话与实际
- *     删文件的判据同源，自己拼就会变成「同一屏两个说法」。
+ *  2. **界面上的策略原文一律用后端返回的 `summary` / `beforeWriteSummary`**，不自己拼 ——
+ *     那句话与实际判据同源，自己拼就会变成「同一屏两个说法」。
  *  3. **保存后用返回值刷界面**（后端回读一次再返回），不会出现「存进去的是 A、
  *     界面显示的还是 B」。
  */
@@ -49,6 +58,8 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   /** 表单草稿。`null` = 还没载入 / 载入失败（此时不渲染表单）。 */
   const [draft, setDraft] = useState<BackupRetention | null>(null);
+  /** 写库前备份开关的草稿。`null` = 还没载入 / 载入失败。 */
+  const [beforeWrite, setBeforeWrite] = useState<boolean | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -57,11 +68,13 @@ export default function SettingsPage() {
       const s = await api.settingsGet();
       setSnap(s);
       setDraft(s.backupRetention);
+      setBeforeWrite(s.backupBeforeWrite);
     } catch (cause) {
       // ⚠️ 撤掉表单与默认值：失败时给用户看「30 天 / 3 份 / 4 GB」，
       //    他会以为设置被重置了 —— 实际只是文件坏了。
       setSnap(null);
       setDraft(null);
+      setBeforeWrite(null);
       setError(api.asError(cause));
     } finally {
       setLoading(false);
@@ -73,15 +86,20 @@ export default function SettingsPage() {
   }, [load]);
 
   async function save() {
-    if (!draft) return;
+    if (!draft || beforeWrite === null) return;
     setSaving(true);
     try {
-      const next = await api.settingsSet(draft);
+      // ⚠️ 传**补丁**而不是整份设置：这里两项都改了，但以后加字段时不会互相覆盖。
+      const next = await api.settingsSet({
+        backupRetention: draft,
+        backupBeforeWrite: beforeWrite,
+      });
       setSnap(next);
       // 用**后端回读的实际值**刷表单：手输了离谱的数会被后端夹到合理区间，
       // 界面必须显示夹过之后的值，否则用户以为自己的 99999 天生效了。
       setDraft(next.backupRetention);
-      toast.success("设置已保存", { description: next.summary });
+      setBeforeWrite(next.backupBeforeWrite);
+      toast.success("设置已保存", { description: next.beforeWriteSummary });
     } catch (cause) {
       toast.error("保存失败", { description: api.asError(cause).split("\n")[0] });
     } finally {
@@ -92,10 +110,12 @@ export default function SettingsPage() {
   const dirty =
     !!draft &&
     !!snap &&
+    beforeWrite !== null &&
     (draft.enabled !== snap.backupRetention.enabled ||
       draft.keepDays !== snap.backupRetention.keepDays ||
       draft.keepCount !== snap.backupRetention.keepCount ||
-      draft.maxTotalMb !== snap.backupRetention.maxTotalMb);
+      draft.maxTotalMb !== snap.backupRetention.maxTotalMb ||
+      beforeWrite !== snap.backupBeforeWrite);
 
   return (
     <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-5 px-4 py-6">
@@ -130,20 +150,88 @@ export default function SettingsPage() {
             内容坏了（删掉它即可回到默认值，不影响任何 Trae / WorkBuddy 数据）。
           </AlertDescription>
         </Alert>
-      ) : draft && snap ? (
-        <Card data-settings-loaded="1">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
-              <HardDrive className="size-4" />
-              整库备份保留策略
-            </CardTitle>
-            <CardDescription>
-              删会话、改回合、导入、导出这几条链路在动库之前都会先整份备份（每批 ≈ 一个整库，
-              实测 300~380 MB）。这里设定它保留多久、留几份、最多占多少。
-              <strong className="text-foreground">三重触发，任一超限即清理。</strong>
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid min-w-0 gap-5">
+      ) : draft && snap && beforeWrite !== null ? (
+        <>
+          {/* ── 写库前整库备份（T66，默认关） ─────────────────────────────── */}
+          <Card data-settings-loaded="1">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <DatabaseBackup className="size-4" />
+                写库前整库备份
+              </CardTitle>
+              <CardDescription>
+                删除会话 / 改回合 / 导入这几条链路在动库之前，要不要先留一份库的副本。
+                <strong className="text-foreground">默认关闭。</strong>
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid min-w-0 gap-4">
+              <div
+                className={
+                  beforeWrite
+                    ? "grid gap-2 rounded-lg border bg-muted/30 px-3 py-3"
+                    : "grid gap-2 rounded-lg border border-dashed px-3 py-3"
+                }
+              >
+                <label className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 size-4 shrink-0 accent-[var(--primary)]"
+                    checked={beforeWrite}
+                    onChange={(e) => setBeforeWrite(e.target.checked)}
+                    data-field="backupBeforeWrite"
+                    title="开 / 关「写库前先留一份备份」"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium">
+                      写库前先备份（现在：{beforeWrite ? "已开启" : "已关闭"})
+                    </span>
+                    <span
+                      className="mt-0.5 block text-xs text-muted-foreground"
+                      data-before-write-summary={snap.beforeWriteSummary}
+                    >
+                      {snap.beforeWriteSummary}
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              {/* 关掉之后会怎样 / 为什么关了也安全 —— 用户要求「引导用户知道这个开关」，
+                  所以这里必须把两种选择的后果都写清，而不是只写「默认关闭」。 */}
+              <div className="grid min-w-0 gap-2 rounded-lg border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+                <div>
+                  <strong className="text-foreground">关掉之后：</strong>
+                  删除 / 改回合 / 导入之后<strong className="text-foreground">无法把库退回到操作前</strong>
+                  （操作本身的可见结果不受影响，只是没有历史版本可回退）。
+                </div>
+                <div>
+                  <strong className="text-foreground">为什么关了也不容易出事：</strong>
+                  换库位走的是<strong className="text-foreground">原子替换</strong> ——
+                  旧库先改名让位、新库再改名就位，任何一步失败都会自动回滚。
+                  「备份」只负责留历史版本，不再负责「防止写坏」。
+                </div>
+                <div>
+                  <strong className="text-foreground">打开之后会有多大：</strong>
+                  T66 起备份是<strong className="text-foreground">页级增量</strong> ——
+                  只存跟原库不同的那几个页（Trae 库逐页加密，写库也只会改动几页），
+                  通常几 MB；只有变动超过一半页时才退回整份。
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <HardDrive className="size-4" />
+                整库备份保留策略
+              </CardTitle>
+              <CardDescription>
+                上面那个开关打开时，每次写库都会落下一份备份。这里设定它保留多久、留几份、
+                最多占多少。<strong className="text-foreground">三重触发，任一超限即清理。</strong>
+                早先版本的「整份」备份（每份 300 MB 上下）也由这套策略清理。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid min-w-0 gap-5">
             {/* 总开关 */}
             <div className="grid gap-2 rounded-lg border bg-muted/30 px-3 py-3">
               <label className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3">
@@ -267,36 +355,54 @@ export default function SettingsPage() {
               <Button
                 variant="outline"
                 disabled={saving || !dirty}
-                onClick={() => setDraft(snap.backupRetention)}
+                onClick={() => {
+                  setDraft(snap.backupRetention);
+                  setBeforeWrite(snap.backupBeforeWrite);
+                }}
                 data-action="reset"
               >
                 <RotateCcw className="size-4" />
                 放弃修改
               </Button>
               <span className="min-w-0 text-xs text-muted-foreground break-all">
-                默认：30 天 / 每客户端 3 份 / 每目录 4 GB（任一超限即清理）。
+                默认：不备份 / 30 天 / 每客户端 3 份 / 每目录 4 GB（任一超限即清理）。
               </span>
             </div>
 
             <div className="min-w-0 text-xs text-muted-foreground break-all">
               设置文件：{snap.path}
             </div>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        </>
       ) : null}
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <AlertTriangle className="size-4" />
-            为什么备份会占这么多盘
+            备份为什么会占盘
           </CardTitle>
           <CardDescription>
-            整库备份是<strong>整份</strong>数据库的副本，不是增量 —— 一次删会话就能落下 300 MB 上下。
-            不设上限的话，改几次回合就能堆到 GB 级。清理页里「工具残留」那一类会把每一批
-            列出来，并标出哪几批超出了这里的策略。
+            <strong className="text-foreground">新备份（T66 起）</strong>是页级增量：只存跟原库不同的页，
+            通常几 MB —— 打开「写库前整库备份」也不至于再堆出 GB。
+            <br />
+            <strong className="text-foreground">老备份（T66 之前）</strong>是整份库副本，一次删会话就落下
+            300 MB 上下，改几次回合就能堆到 GB 级 —— 盘上现存的那批就是这些。
+            清理页里「工具残留」那一类会把每一批列出来（
+            <strong className="text-foreground">最旧的排在前面</strong>），并标出哪几批超出了上面的策略；
+            每一批都能单独「还原」回实时库。
           </CardDescription>
         </CardHeader>
+        <CardContent>
+          <Link
+            to="/trae-cleanup"
+            className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+          >
+            去清理页看每一批备份
+            <ArrowRight className="size-3.5" />
+          </Link>
+        </CardContent>
       </Card>
     </div>
   );

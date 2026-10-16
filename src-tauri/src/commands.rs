@@ -5,9 +5,12 @@
 
 use serde_json::{json, Value};
 
+use std::path::PathBuf;
+
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    app_overview, client_usage, config, error_log, settings, trae_cleanup, trae_credits, trae_delete,
+    app_overview, checkin, client_usage, config, error_log, settings, trae_backup, trae_cleanup,
+    trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
     trae_profile, trae_remote, trae_session_edit, trae_switch, trae_vault, workbuddy_cleanup,
     workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
@@ -227,6 +230,13 @@ pub async fn trae_account_overview(client_key: String) -> Result<Value, String> 
         client_usage::record_use(&client_key);
         let client = trae_discover::get_client(&client_key).ok_or("未知客户端")?;
         let live = trae_switch::describe_account(&client_key);
+        // ⚠️ 「当前登录」判据的**唯一来源**：客户端登录态解出来的 uid（未登录 = 空串）。
+        // 要在 `live` 被 move 进 json! 之前取出来。
+        let current_uid = live
+            .get("uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let vault: Vec<Value> = trae_vault::list_vault_accounts(&client_key)
             .iter()
             .map(|id| {
@@ -240,6 +250,16 @@ pub async fn trae_account_overview(client_key: String) -> Result<Value, String> 
                 } else {
                     None
                 };
+                // ⚠️ 与 WorkBuddy 的 `isCurrent`（`workbuddy_vault::list`）**同源同形**：
+                // 上游一次算好、前端只读 —— 界面各处**不许再自己拼判据**。
+                //
+                // T65 四改前前端拼的是 `meta.verified_uid === live.uid`，而 `meta.verified_uid`
+                // 只在**切换成功**时写入、oauth 账号连 `meta` 都没有 ⇒ 三个账号一个徽标都不亮。
+                // 现在统一走 `trae_oauth::account_identity`（oauth 读自己的 oauth.json，
+                // 载体从库内 storage 解），与「账号还没加入账号库」那个 Alert 用同一份 uid。
+                let account_uid = trae_oauth::account_identity(&client_key, id).map(|(u, _)| u);
+                let is_current =
+                    !current_uid.is_empty() && account_uid.as_deref() == Some(current_uid.as_str());
                 json!({
                     "id": id,
                     "meta": meta,
@@ -247,6 +267,11 @@ pub async fn trae_account_overview(client_key: String) -> Result<Value, String> 
                     "oauth": oauth,
                     "displayName": trae_vault::display_name(&client_key, id),
                     "profile": trae_vault::read_profile(&client_key, id),
+                    // uid 与 `isCurrent` **必须是同一份**：徽标亮着的那张卡，
+                    // 卡面上显示的 uid 就得是判「当前登录」时用的那个 uid。
+                    // 前端只在它为 null 时才回退到自己解析。
+                    "uid": account_uid,
+                    "isCurrent": is_current,
                 })
             })
             .collect();
@@ -300,6 +325,19 @@ pub async fn trae_credits_cached(client_key: Option<String>) -> Result<Value, St
 #[tauri::command]
 pub async fn trae_credits_query(client_key: Option<String>, force: Option<bool>) -> Result<Value, String> {
     Ok(trae_credits::query(client_key, force.unwrap_or(false)).await)
+}
+
+/// 一键签到（Trae / WorkBuddy 全部账号）。
+///
+/// - `scope`：`"trae"` / `"workbuddy"` / `"all"`（默认）；
+/// - `client_key`：只在 Trae 侧生效，限定本客户端下的账号（账号管理页按当前选中的客户端签）。
+///
+/// 网络请求本身是异步的，不占主线程；结果里每个账号一条，
+/// `status` 六档（`success` / `already` / `skipped` / `unavailable` / `inactive` / `failed`）
+/// **绝不允许合并** —— 「跳过」和「失败」长得一样就是骗人。
+#[tauri::command]
+pub async fn checkin_run(scope: Option<String>, client_key: Option<String>) -> Result<Value, String> {
+    Ok(checkin::run(scope.as_deref(), client_key.as_deref()).await)
 }
 
 /// 识别当前登录账号（写入账号库前调用，拿 uid 做归属）。
@@ -966,7 +1004,43 @@ pub async fn trae_wb_cleanup_empty_trash() -> Result<Value, String> {
 // 设置（`~/.twin-switch/settings.json`）
 // ---------------------------------------------------------------------------
 
-/// 读设置 —— 目前只有「整库备份保留策略」（时间 / 最大容量 / 保留份数三重触发）。
+/// 设置的**增量补丁**：只写显式给了的字段，没给的一律保持原样。
+///
+/// ⚠️ 用 `Option` + `#[serde(default)]`，而不是「整个 `Settings`」：前端可能只想改一项，
+/// 传整个结构就会把另一项用「前端自己以为的值」覆盖掉（两个界面同时开着就会互相踩）。
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SettingsPatch {
+    pub backup_retention: Option<settings::BackupRetention>,
+    /// 写库前的整库备份开关（默认 `false` = 不备份）。
+    pub backup_before_write: Option<bool>,
+}
+
+/// 设置快照的**唯一出口** —— `settings_get` 与 `settings_set` 都返回它的形状。
+///
+/// ⚠️ 两个命令必须同形（前端拿任一返回值都能直接刷界面）：各拼一份迟早会出现
+/// 「保存后界面少了一项」或「同一屏两个说法」。
+fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
+    json!({
+        "ok": true,
+        "backupRetention": {
+            "enabled": s.backup_retention.enabled,
+            "keepDays": s.backup_retention.keep_days,
+            "keepCount": s.backup_retention.keep_count,
+            "maxTotalMb": s.backup_retention.max_total_mb,
+        },
+        "summary": s.backup_retention.summary(),
+        "backupBeforeWrite": s.backup_before_write,
+        "beforeWriteSummary": if s.backup_before_write {
+            "开启 —— 每次写库前留一份备份（页级增量，只存变动页，通常几 MB）"
+        } else {
+            "已关闭（默认）—— 写库不留历史版本；库位替换是原子的，不会因此丢库"
+        },
+        "path": path.to_string_lossy(),
+    })
+}
+
+/// 读设置（整库备份保留策略 + 写库前是否备份）。
 ///
 /// ⚠️ 走 `load_strict`：**「空」和「失败」绝不许长得一样**。
 /// - 文件不存在 = 全新安装 ⇒ 返回默认值（`ok: true`）；
@@ -979,47 +1053,33 @@ pub async fn trae_wb_cleanup_empty_trash() -> Result<Value, String> {
 pub async fn settings_get() -> Result<Value, String> {
     off_main(|| {
         let s = settings::load_strict()?;
-        Ok(json!({
-            "ok": true,
-            "backupRetention": {
-                "enabled": s.backup_retention.enabled,
-                "keepDays": s.backup_retention.keep_days,
-                "keepCount": s.backup_retention.keep_count,
-                "maxTotalMb": s.backup_retention.max_total_mb,
-            },
-            "summary": s.backup_retention.summary(),
-            "path": settings::settings_path().to_string_lossy(),
-        }))
+        Ok(settings_snapshot(&s, &settings::settings_path()))
     })
     .await?
 }
 
 /// 写设置（原子替换：先写 `.tmp` 再 rename，写到一半断电不会留下半个 JSON）。
 ///
-/// 落在合理区间由后端再夹一次（`sanitized`）—— 手输 999999999 天不会造成数据风险，
-/// 但会让界面摘要没法看、`keep_days * 86_400_000` 还会溢出 `i64`。
+/// 只写传进来的字段（见 [`SettingsPatch`]）。落在合理区间由后端再夹一次（`sanitized`）——
+/// 手输 999999999 天不会造成数据风险，但会让界面摘要没法看、`keep_days * 86_400_000`
+/// 还会溢出 `i64`。
 ///
-/// 返回与 [`settings_get`] 同形，**前端可直接用它刷界面**（省掉一次读盘 ——
+/// 返回与 [`settings_get`] **同形**，前端可直接用它刷界面（省掉一次读盘 ——
 /// 也就不会出现「写成功了但界面显示的是旧值」这种两处不同源的情况）。
 #[tauri::command]
-pub async fn settings_set(backup_retention: settings::BackupRetention) -> Result<Value, String> {
+pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
     off_main(move || {
         let mut next = settings::load();
-        next.backup_retention = backup_retention;
+        if let Some(r) = patch.backup_retention {
+            next.backup_retention = r;
+        }
+        if let Some(b) = patch.backup_before_write {
+            next.backup_before_write = b;
+        }
         let path = settings::save(&next)?;
         // 回读一次：把「实际落盘的值」返回给界面，而不是「用户刚提交的值」
         let saved = settings::load_strict()?;
-        Ok(json!({
-            "ok": true,
-            "backupRetention": {
-                "enabled": saved.backup_retention.enabled,
-                "keepDays": saved.backup_retention.keep_days,
-                "keepCount": saved.backup_retention.keep_count,
-                "maxTotalMb": saved.backup_retention.max_total_mb,
-            },
-            "summary": saved.backup_retention.summary(),
-            "path": path.to_string_lossy(),
-        }))
+        Ok(settings_snapshot(&saved, &path))
     })
     .await?
 }
@@ -1116,6 +1176,107 @@ pub async fn trae_cleanup_empty_trash() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(trae_cleanup::empty_trash)
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// 备份批次概览（只读）：这一批是增量还是整份、省了多少、能不能还原、不能还原的原因。
+///
+/// ⚠️ 界面上的「可以还原」必须由它说了算，**不许前端自己看目录里有没有文件** ——
+/// 真正的判据在 [`trae_backup::inspect`] 里（比如「增量与整份同时存在」就不敢还原）。
+#[tauri::command]
+pub async fn trae_backup_inspect(backup_dir: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = PathBuf::from(err_unless_backup_dir(&backup_dir)?);
+        Ok(trae_backup::inspect(&dir))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 把这一批备份还原到它所属客户端的实时库。
+///
+/// ⚠️⚠️ 三条硬约束（都在这里兜住，不指望前端记得）：
+///  1. **只认本工具自己的备份根目录** —— 传进来的路径必须落在 `~/.twin-switch` 下的某个
+///     备份目录里；否则一个手滑的绝对路径就能把任意文件复制到库位上。
+///  2. **还原前先停客户端** —— 不停就等于「还原完立刻被运行中的 Trae 覆盖回去」，
+///     而且换库位时它还在读写，会出乱子。停下之后**还原完自动重启**（和删除 / 导入一致）。
+///  3. **还原前先把当前库另存** —— 还原错了还能再还原回来（详见 [`trae_backup::restore_with_park`]）。
+#[tauri::command]
+pub async fn trae_backup_restore(
+    client_key: String,
+    backup_dir: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = PathBuf::from(err_unless_backup_dir(&backup_dir)?);
+        let client = trae_discover::get_client(&client_key)
+            .ok_or_else(|| format!("未知的客户端：{client_key}"))?;
+        let live = trae_discover::database_path(client);
+
+        // 概览先过一遍：不可还原的批次直接如实拒绝（把 `inspect` 给的理由原样带回）
+        let info = trae_backup::inspect(&dir);
+        if info.get("canRestore").and_then(Value::as_bool) != Some(true) {
+            let why = info
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("这份备份不可还原");
+            return Err(format!("这份备份不能还原：{why}"));
+        }
+
+        // ① 停客户端（⚠️ 走 `stop_for_maintenance`：只碰它**自己的**程序）
+        let was_running = matches!(
+            trae_switch::stop_for_maintenance(client, 20_000)?,
+            trae_switch::MaintenanceStop::Stopped(_)
+        );
+
+        // ② 另存当前库 + 还原
+        let park_root = trae_export::backup_dir();
+        let out = trae_backup::restore_with_park(&dir, &live, &park_root, &client_key);
+
+        // ③ 无论成败都尝试把客户端起回来（失败时也要起 —— 用户还得用它）
+        let relaunched = trae_switch::launch(&client_key, None).is_ok();
+
+        let mut v = out?;
+        if let Some(o) = v.as_object_mut() {
+            o.insert("clientKey".into(), json!(client_key));
+            o.insert("wasRunning".into(), json!(was_running));
+            o.insert("relaunched".into(), json!(relaunched));
+            o.insert("live".into(), json!(live.to_string_lossy()));
+        }
+        Ok(v)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 校验「这个路径确实是本工具的备份目录」并返回规范化的绝对路径。
+///
+/// ⚠️ 两边都过 `lexically_normalized()` 再比 —— `Path::starts_with` 是**逐组件**比较、
+/// 不做词法规范化，`.../backup/../../trae/decrypted` 会被它当成「以 backup 开头」（T64 的坑）。
+fn err_unless_backup_dir(raw: &str) -> Result<String, String> {
+    let p = PathBuf::from(raw.trim());
+    if !p.is_absolute() {
+        return Err(format!("备份目录必须是绝对路径：{raw}"));
+    }
+    let p = trae_cleanup::lexically_normalized(&p);
+    if !p.is_dir() {
+        return Err(format!("备份目录不存在：{}", p.display()));
+    }
+    let roots = [
+        trae_export::backup_dir(),
+        trae_export::import_backup_dir(),
+        trae_export::wb_import_backup_dir(),
+        config::store_dir().join("workbuddy_export_backup"),
+    ];
+    let inside = roots.iter().any(|r| {
+        let r = trae_cleanup::lexically_normalized(r);
+        p != r && p.starts_with(&r)
+    });
+    if !inside {
+        return Err(format!(
+            "只允许还原本工具自己的备份目录下的条目，拒绝：{}",
+            p.display()
+        ));
+    }
+    Ok(p.to_string_lossy().into_owned())
 }
 
 /// 删除预览：标题 / 各表行数 / 磁盘文件（只读，不删任何东西）。

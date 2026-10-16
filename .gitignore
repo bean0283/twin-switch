@@ -13,6 +13,9 @@ dist
 dist-ssr
 target/
 src-tauri/target/
+# 备用 target 目录：「用户正开着 tauri dev」时共享 target 会被
+# `.cargo-build-lock` 锁住（os error 5），验证只能另起一个 CARGO_TARGET_DIR。见 T67。
+target-*/
 src-tauri/gen/schemas/
 *.local
 
