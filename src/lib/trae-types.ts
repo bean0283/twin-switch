@@ -105,20 +105,25 @@ export interface TraeAccountProfile {
   fetched_at?: string;
 }
 
-/** 一个积分包（`user_current_entitlement_list` 的一项）。 */
+/** 一个积分包（`user_current_entitlement_list` 的一项，已被后端筛掉非积分包的权益条目）。 */
 export interface TraeCreditPack {
   /** 稳定 key（entitlement_id）。 */
   key: string;
   name: string;
   /** 分组名（「每日签到」等）。 */
   group: string;
-  /** 总额度；`null` = 接口没给额度（不限量包，见 `unlimited`）。 */
-  total: number | null;
+  /**
+   * 总额度、已用、剩余。
+   *
+   * ⚠️ 这里刻意**不给 `null`**：后端的积分包判据就是「带 `credits_limit`」
+   * （见 `trae_profile::parse_entitlement`），能进这个列表的包一定有额度。
+   * v0.3.2 之前这里允许 `null` 并配一个 `unlimited` 标记，于是每张账号卡都多出
+   * 一行「不限量 免费」—— 那是「免费方案的功能权益」被误判成积分包，
+   * **Trae 根本没有不限量积分**。
+   */
+  total: number;
   used: number;
-  /** 剩余；`null` = 不限量。 */
-  remaining: number | null;
-  /** 额度缺失 = 这个包不限量（接口确实这么给，不是解析失败）。 */
-  unlimited: boolean;
+  remaining: number;
   /** 到期时间（毫秒）；`null` = 长期有效。 */
   expire_at: number | null;
   /** 1 = 有效。 */
@@ -175,6 +180,23 @@ export interface TraeVaultEntry {
   displayName?: string | null;
   /** 接口拉取的账号资料（昵称 / 积分），网络失败时为空。 */
   profile?: TraeAccountProfile | null;
+  /**
+   * 本机客户端**当前登录**的是不是这个账号。
+   *
+   * ⚠️ 上游（`trae_account_overview`）一次算好，与 WorkBuddy 的 `isCurrent` 同源同形；
+   * 界面各处**只读它**，不许再自己拼判据 —— T65 四改前前端拼的是
+   * `meta.verified_uid === live.uid`，而 `meta.verified_uid` 只在切换成功时写入、
+   * oauth 账号连 `meta` 都没有 ⇒ 三个账号一个「当前登录」徽标都不亮。
+   */
+  isCurrent: boolean;
+  /**
+   * 这个账号的 uid（后端 `trae_oauth::account_identity` 算出来的唯一一份）。
+   *
+   * ⚠️ 与 `isCurrent` 同源：徽标亮着的那张卡，卡面 uid 就是判「当前登录」用的那个 uid。
+   * `null` = 读不出（载体账号的 storage 未登录 / oauth.json 缺 uid），
+   * 此时前端才回退到自己解析。
+   */
+  uid?: string | null;
 }
 
 export interface TraeLiveAccount {
@@ -533,7 +555,13 @@ export interface TraeImportReport {
   verified_sessions: number;
   /** 导入后是否已自动重启目标客户端。 */
   relaunched?: boolean;
-  backup_dir: string;
+  /**
+   * 备份目录。⚠️ **`null` = 未备份**（「设置 → 写库前整库备份」关着，默认如此），
+   * 与「备份失败」（会抛错）不是一回事 —— 界面必须把两者分开说。
+   */
+  backup_dir: string | null;
+  /** `"delta"`（页级增量）/ `"full"`（整份）/ `"skipped"`（未备份）。 */
+  backup_mode?: string;
   /** 源目标是否同一客户端库（同库跨账号复制）。 */
   same_db?: boolean;
   /** 本次成功登记的跨账号关联组数（仅同库复制时有值）。 */
@@ -877,7 +905,10 @@ export interface TraeWorkbuddyReport {
   target_uid: string;
   /** 导入后是否已自动重启目标客户端。 */
   relaunched?: boolean;
-  backup_dir: string;
+  /** ⚠️ `null` = 未备份（开关关着），与「备份失败」不是一回事。 */
+  backup_dir: string | null;
+  /** `"delta"` / `"full"` / `"skipped"`。 */
+  backup_mode?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,7 +2054,7 @@ export interface BackupRetention {
   maxTotalMb: number;
 }
 
-/** 设置快照（`settings_get` / `settings_set` 的返回）。 */
+/** 设置快照（`settings_get` / `settings_set` 的返回，两者**同形**）。 */
 export interface SettingsSnapshot {
   ok: boolean;
   backupRetention: BackupRetention;
@@ -2032,11 +2063,116 @@ export interface SettingsSnapshot {
    * 别自己再拼一句（那就是「同一屏两个说法」）。
    */
   summary: string;
+  /**
+   * **写库前是否留一份整库备份**（T66）。默认 `false`。
+   *
+   * ⚠️ 关掉的只是「留历史版本」，不影响数据安全 —— 库位替换走原子替换
+   * （`trae_backup::swap_in_place`），失败会自动回滚。
+   */
+  backupBeforeWrite: boolean;
+  /** 与 `backupBeforeWrite` 同源的一句话（后端生成，界面直接显示）。 */
+  beforeWriteSummary: string;
   /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
   path: string;
+}
+
+/** `trae_backup_inspect` 的返回：一批备份能不能还原、省了多少。 */
+export interface TraeBackupInfo {
+  dir: string;
+  /** `"delta"`（页级增量）/ `"full"`（整份）/ `"unknown"`（老格式认不出）。 */
+  mode: string;
+  /** 这一份在磁盘上实际占的字节数。 */
+  bytes: number;
+  /** 备份时原库的字节数（= 整份备份本该占的大小）。 */
+  originalBytes: number | null;
+  /** 增量里记了多少个变动页；整份备份为 `null`。 */
+  changedPages: number | null;
+  createdAt: number | null;
+  note: string;
+  /** ⚠️ 界面上的「可以还原」**只读这个字段**，别自己看目录里有没有文件。 */
+  canRestore: boolean;
+  /** 不能还原的理由（`canRestore` 为 `true` 时是空串）。 */
+  reason: string;
 }
 
 /** 「工具残留」这一类头上的保留策略（与 `BackupRetention` 同源，多一句摘要）。 */
 export interface CleanupBackupPolicy extends BackupRetention {
   summary: string;
+  /**
+   * **写库前是否留整库备份**（T66）。默认 `false`。
+   *
+   * 清理页是用户「发现备份占了盘」的第一现场，所以这里也要把它带出来 ——
+   * 否则用户只能看到一堆旧备份，不知道新备份其实已经默认不做了。
+   */
+  beforeWrite: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 每日签到（Trae / WorkBuddy）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个账号的签到结果状态。
+ *
+ * ⚠️ 这六档**绝不允许在界面上合并**：
+ * - `success`     —— 这次真的签到 / 领取成功；
+ * - `already`     —— 今天已经签过（**正常**，不是失败）；
+ * - `skipped`     —— token 已过期，**一个请求都没发**就跳过；
+ * - `unavailable` —— 这个账号压根签不了（没有网页凭证 / 凭据是加密信封 / 活动功能关闭）；
+ * - `inactive`    —— 当前没有进行中的签到活动；
+ * - `failed`      —— 真的失败了。
+ *
+ * 「跳过」和「失败」长得一样，就等于告诉用户「失败了」—— 而它其实连试都没试。
+ */
+export type CheckinStatus =
+  | "success"
+  | "already"
+  | "skipped"
+  | "unavailable"
+  | "inactive"
+  | "failed";
+
+/** 一个账号的签到结果。 */
+export interface CheckinItem {
+  client: "trae" | "workbuddy";
+  /** Trae 侧才有（账号库按 `clientKey/<id>` 分目录）。 */
+  clientKey: string;
+  id: string;
+  uid: string;
+  name: string;
+  status: CheckinStatus;
+  /** 面向用户的一句话（含失败的具体原因）。 */
+  message: string;
+  /** 本次到账积分；`null` = **未知**（接口没给），与 `0` 不是一回事。 */
+  gained: number | null;
+  /** 当前余额；`null` = 未知。 */
+  balance: number | null;
+  /** 传输层失败是 `0`，与「服务端回了 4xx」是两回事。 */
+  httpStatus: number;
+  /** 服务端业务码；`null` = 响应里没有。 */
+  code: number | null;
+}
+
+/** 汇总。⚠️ 分档计数与上面六档一一对应，禁止把 `skipped` 并进 `failed`。 */
+export interface CheckinSummary {
+  total: number;
+  success: number;
+  already: number;
+  skipped: number;
+  unavailable: number;
+  inactive: number;
+  failed: number;
+  /** 本次合计到账积分（`null` 的那些不计入）。 */
+  gained: number;
+}
+
+/** `checkin_run` 的返回。 */
+export interface CheckinResult {
+  ok: boolean;
+  scope: string;
+  clientKey: string;
+  startedAt: number;
+  finishedAt: number;
+  items: CheckinItem[];
+  summary: CheckinSummary;
 }

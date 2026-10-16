@@ -17,12 +17,14 @@ import type { TraeCreditEntry, TraeCreditsResult } from "@/lib/trae-types";
  * 差别只在这个适配函数里。
  */
 export function traeEntryToView(e: TraeCreditEntry): CreditView {
+  // 后端的积分包判据是「带 `credits_limit`」，所以这里的 `total` / `remaining`
+  // 直接就是数字 —— 不再有「不限量」这一说（那行假数据见 `trae-profile.rs` 的注释）。
   const packs: CreditPack[] = (e.packs ?? []).map((p) => ({
     key: p.key,
     name: p.group ? `${p.name} · ${p.group}` : p.name,
-    total: p.unlimited ? null : p.total,
+    total: p.total,
     used: p.used,
-    remaining: p.unlimited ? null : p.remaining,
+    remaining: p.remaining,
     expireAt: p.expire_at,
   }));
 
@@ -31,7 +33,7 @@ export function traeEntryToView(e: TraeCreditEntry): CreditView {
   if (!e.queryable) {
     return {
       ok: true,
-      unavailable: "该账号是切换载体，没有网页凭证，无法查询积分。用「发起网页登录」添加的账号才有额度明细。",
+      unavailable: "该账号是切换载体，没有网页凭证，无法查询积分。用「扫码添加账号」添加的账号才有额度明细。",
       remaining: null,
       packCount: 0,
       packs: [],
@@ -174,7 +176,7 @@ export function TraeCreditsHeader({
       hint={
         <>
           积分包来自 Trae 官方额度接口{clientLabel ? ` · ${clientLabel}` : ""}；
-          只有用「发起网页登录」添加的账号才有网页凭证，才能查积分。
+          只有用「扫码添加账号」添加的账号才有网页凭证，才能查积分。
         </>
       }
       busy={busy}

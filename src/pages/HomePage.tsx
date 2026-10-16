@@ -24,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { CheckinButton } from "@/components/checkin-button";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import * as api from "@/lib/api";
 import { creditResourceName } from "@/lib/credit-package-names";
@@ -499,10 +500,15 @@ export default function HomePage() {
             {generatedAt ? <span className="ml-2 text-xs">采集于 {fmtTime(generatedAt)}</span> : null}
           </p>
         </div>
-        <Button variant="outline" onClick={() => void refreshAll()} disabled={refreshing}>
-          {refreshing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-          {refreshing ? "刷新中…" : "刷新"}
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* 一键签到：Trae + WorkBuddy 的全部账号。签到成功后只刷新概览（含积分），
+              不重跑「可回收空间」那趟重扫 —— 那是本页最贵的一步，与签到无关。 */}
+          <CheckinButton scope="all" onSuccess={() => void refreshOverview()} />
+          <Button variant="outline" onClick={() => void refreshAll()} disabled={refreshing}>
+            {refreshing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            {refreshing ? "刷新中…" : "刷新"}
+          </Button>
+        </div>
       </div>
 
       {error ? (

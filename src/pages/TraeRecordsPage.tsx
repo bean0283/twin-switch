@@ -786,7 +786,7 @@ export default function TraeRecordsPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Trae 会话记录</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            从客户端进程内存提取 SQLCipher 密钥并解密本地库 → 查看、导出 MD / ZIP、彻底删除会话（删除前自动整库备份）。
+            从客户端进程内存提取 SQLCipher 密钥并解密本地库 → 查看、导出 MD / ZIP、彻底删除会话（删除前整库备份，需在「设置 → 写库前整库备份」里开启；默认关闭）。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1060,7 +1060,7 @@ export default function TraeRecordsPage() {
                                 variant="ghost"
                                 className="text-destructive"
                                 onClick={() => void openDelete([s])}
-                                title="彻底删除（先备份）"
+                                title="彻底删除（若已开启「写库前整库备份」则先备份一份）"
                               >
                                 <Trash2 className="size-4" />
                               </Button>
@@ -1092,7 +1092,7 @@ export default function TraeRecordsPage() {
                         size="sm"
                         disabled={busy}
                         onClick={() => void openDelete(pickedSessions)}
-                        title="整批只做一趟：一次解密、一次回写、一份整库备份"
+                        title="整批只做一趟：一次解密、一次回写、最多一份整库备份（取决于「写库前整库备份」开关）"
                       >
                         {busy ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                         删除所选
@@ -1123,7 +1123,12 @@ export default function TraeRecordsPage() {
               删除 {batchReport.count} 个会话 · 共 {batchReport.deleted_rows_total} 行 · 移入回收站{" "}
               {batchReport.sessions.reduce((n, s) => n + (s.moved_files ?? 0), 0)} 个文件
             </p>
-            <p className="break-all">备份：{batchReport.backup.join("、") || "—"}</p>
+            <p className="break-all">
+              备份：
+              {batchReport.backup.length
+                ? batchReport.backup.join("、")
+                : "未备份（「设置 → 写库前整库备份」已关闭）"}
+            </p>
             <p className="break-all">回收站：{batchReport.trash_dirs.join("、") || "—"}（文件可还原）</p>
             <p>
               云端任务列表：已清 {batchReport.cloud.deleted} 条
@@ -1559,7 +1564,7 @@ export default function TraeRecordsPage() {
                     <Button
                       size="sm"
                       disabled={healBusy !== null || !clientKey}
-                      title="会备份整库后回写，并自动重启客户端"
+                      title="会（视「写库前整库备份」开关）备份整库后回写，并自动重启客户端"
                       onClick={() => void runHeal()}
                     >
                       {healBusy === "heal" ? (
@@ -1603,7 +1608,7 @@ export default function TraeRecordsPage() {
             </DialogTitle>
             <DialogDescription className="break-words">
               {deleteTargets.length > 1
-                ? `整批一次完成：只解密一趟、只回写一趟、只留一份整库备份（逐条删会让备份按整库大小成倍膨胀）。`
+                ? `整批一次完成：只解密一趟、只回写一趟、最多留一份整库备份（视「写库前整库备份」开关；逐条删会让备份成倍膨胀）。`
                 : `「${deleteTargets[0]?.title || "（无标题）"}」`}
             </DialogDescription>
           </DialogHeader>
@@ -1702,7 +1707,7 @@ export default function TraeRecordsPage() {
           {/* ⚠️ 长文案不要放进 `DialogFooter`：它在 ≥640px 会变成横排（`sm:flex-row`），
               没有伸缩余量的整段文字会被压成一行一个字。 */}
           <p className="text-xs text-muted-foreground">
-            删除会先整库备份、把会话文件移入本工具回收站（可恢复），期间会结束并自动重启客户端。
+            删除会先把会话文件移入本工具回收站（可恢复），期间会结束并自动重启客户端。是否在动库前留一份整库备份，取决于「设置 → 写库前整库备份」开关（默认关闭）。
           </p>
 
           <DialogFooter>
@@ -1862,7 +1867,7 @@ export default function TraeRecordsPage() {
               <Alert>
                 <AlertTriangle className="size-4" />
                 <AlertDescription className="leading-5">
-                  导入会把该会话写进目标账号的本地加密库（原库先自动备份到工具目录）。写入前会自动退出目标客户端；
+                  导入会把该会话写进目标账号的本地加密库（原库是否先备份到工具目录，取决于「设置 → 写库前整库备份」开关；默认关闭）。写入前会自动退出目标客户端；
                   目标账号须已在本机登录过。同客户端跨账号（如 Trae CN 的 A→B）会在库内复制会话并生成新 id，源账号记录保留。
                   与云端任务列表的同步行为未定义，若云端清理本地孤儿行，导入的会话可能被覆盖。
                 </AlertDescription>
@@ -1881,7 +1886,10 @@ export default function TraeRecordsPage() {
                   {importReport.skipped.length ? (
                     <div>跳过（目标库已存在）：{importReport.skipped.join(", ")}</div>
                   ) : null}
-                  <div className="break-all font-mono text-emerald-600/80">备份：{importReport.backup_dir}</div>
+                  <div className="break-all font-mono text-emerald-600/80">
+                    备份：
+                    {importReport.backup_dir || "未备份（「设置 → 写库前整库备份」已关闭）"}
+                  </div>
                 </div>
               ) : null}
             </div>

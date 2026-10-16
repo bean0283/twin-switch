@@ -4,9 +4,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   Database,
+  DatabaseBackup,
   Eraser,
   FolderOpen,
   HardDrive,
+  History,
   Loader2,
   MessagesSquare,
   MonitorCog,
@@ -42,6 +44,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type {
+  TraeBackupInfo,
   TraeCleanupCategory,
   TraeCleanupItem,
   TraeCleanupReport,
@@ -97,6 +100,58 @@ export default function TraeCleanupPage() {
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [hard, setHard] = useState(false);
+
+  /** 还原：目标批次 + 它的后端概览（`canRestore` 只信后端）+ 过程日志。 */
+  const [restoreItem, setRestoreItem] = useState<TraeCleanupItem | null>(null);
+  const [restoreInfo, setRestoreInfo] = useState<TraeBackupInfo | null>(null);
+  const [restoreLoading, setRestoreLoading] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+
+  /**
+   * 打开「还原这一批」的确认框。
+   *
+   * ⚠️ 能不能还原**由后端的 `trae_backup_inspect` 说了算**，前端不许自己看目录里有没有文件 ——
+   * 真正的判据里有「增量与整份同时存在就不敢还原」这类规则，自己判必然漂移。
+   */
+  const openRestore = useCallback(async (it: TraeCleanupItem) => {
+    setRestoreItem(it);
+    setRestoreInfo(null);
+    setRestoreError(null);
+    setRestoreLoading(true);
+    try {
+      setRestoreInfo(await api.traeBackupInspect(it.paths[0]));
+    } catch (cause) {
+      setRestoreError(api.asError(cause));
+    } finally {
+      setRestoreLoading(false);
+    }
+  }, []);
+
+  async function doRestore() {
+    if (!restoreItem || !restoreInfo?.canRestore) return;
+    setRestoreBusy(true);
+    setRestoreError(null);
+    try {
+      const out = await api.traeBackupRestore(restoreItem.client_key, restoreItem.paths[0]);
+      const parked = (out as { parked?: { dir?: string } | null }).parked;
+      toast.success("已还原", {
+        description:
+          "库已回到这一批备份的状态；还原前的库也另存了一份" +
+          (parked?.dir ? `（${parked.dir}）` : "") +
+          "，可以再还原回去。",
+      });
+      setRestoreItem(null);
+      setRestoreInfo(null);
+      // 还原改了实时库 ⇒ 必须强制重扫，不能吃缓存
+      await load(false, true);
+    } catch (cause) {
+      setRestoreError(api.asError(cause));
+      toast.error("还原失败", { description: api.asError(cause).split("\n")[0] });
+    } finally {
+      setRestoreBusy(false);
+    }
+  }
 
   useEffect(() => {
     // 与其它进度面板同样的 `listen()` 竞态：异步注册期间组件若已卸载，
@@ -515,18 +570,40 @@ export default function TraeCleanupPage() {
                     {/* 整库备份的保留策略原文（后端给的，与真正删文件的判据同源）。
                         ⚠️ 不自己拼这句话：拼出来就会变成「同一屏两个说法」。 */}
                     {cat.backup_policy ? (
-                      <div
-                        data-backup-policy={cat.backup_policy.summary}
-                        className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b bg-muted/30 px-3 py-1.5 text-[11px] text-muted-foreground"
-                      >
-                        <ShieldAlert className="size-3.5 shrink-0" />
-                        <span className="min-w-0">{cat.backup_policy.summary}</span>
-                        <Link
-                          to="/settings"
-                          className="ml-auto shrink-0 underline underline-offset-2"
+                      <div className="border-b bg-muted/30 px-3 py-1.5 text-[11px] text-muted-foreground">
+                        <div
+                          data-backup-policy={cat.backup_policy.summary}
+                          className="flex flex-wrap items-center gap-x-2 gap-y-1"
                         >
-                          去设置
-                        </Link>
+                          <ShieldAlert className="size-3.5 shrink-0" />
+                          <span className="min-w-0">{cat.backup_policy.summary}</span>
+                          <Link
+                            to="/settings"
+                            className="ml-auto shrink-0 underline underline-offset-2"
+                          >
+                            去设置
+                          </Link>
+                        </div>
+                        {/* T66：写库前备份的开关状态。这一页是用户「发现备份占了盘」的第一现场，
+                            必须在这里就告诉他「新备份其实默认已经不做了」，否则他只会
+                            盯着一堆旧备份猜「为什么还在涨」。 */}
+                        <div
+                          data-before-write={cat.backup_policy.beforeWrite ? "1" : "0"}
+                          className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1"
+                        >
+                          <DatabaseBackup className="size-3.5 shrink-0" />
+                          <span className="min-w-0">
+                            {cat.backup_policy.beforeWrite
+                              ? "写库前整库备份：已开启（每次写库留一份，页级增量，通常几 MB）"
+                              : "写库前整库备份：已关闭（默认）—— 下面这些都是以前留下的，不会再新增"}
+                          </span>
+                          <Link
+                            to="/settings"
+                            className="ml-auto shrink-0 underline underline-offset-2"
+                          >
+                            去开启
+                          </Link>
+                        </div>
                       </div>
                     ) : null}
                     {isCollapsed ? null : (
@@ -617,6 +694,26 @@ export default function TraeCleanupPage() {
                                 </span>
                               ) : null}
                             </span>
+                            {/* 「还原」只在**单目录形态**的备份批次上给。
+                                ⚠️ 文件形态的老备份不给按钮：那一批含 `主库 / -wal / -shm` 三个兄弟文件，
+                                   按名字排序后第一个是 `-wal`，拿它当库还原会把 WAL 写到库位上。
+                                   ⚠️ `client_key` 为空的（例如历史遗留的 `heal-*`）也不给 ——
+                                   名字里看不出它属于哪个客户端，无从还原。 */}
+                            {it.kind === "batch" && it.paths.length === 1 && it.client_key ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="mt-1 h-6 shrink-0 px-2 text-[11px]"
+                                disabled={busy}
+                                title={`把实时库还原到这一批备份的状态（会先停客户端、先把当前库另存一份）`}
+                                data-action="restore-batch"
+                                onClick={() => void openRestore(it)}
+                              >
+                                <History className="size-3.5" />
+                                还原
+                              </Button>
+                            ) : null}
                           </label>
                         ))}
                       </div>
@@ -707,6 +804,114 @@ export default function TraeCleanupPage() {
           清理选中项
         </Button>
       </div>
+
+      {/* 还原确认弹窗（T66）。
+          ⚠️ 这里**必须把后果写全**：还原是「拿旧库盖掉现库」，比清理更重；
+             同时要如实说出「能不能还原由后端判」与「还原前会先另存一份」。 */}
+      <Dialog
+        open={restoreItem !== null}
+        onOpenChange={(v) => {
+          if (!v && !restoreBusy) {
+            setRestoreItem(null);
+            setRestoreInfo(null);
+            setRestoreError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>还原到这一批备份</DialogTitle>
+            <DialogDescription className="break-all">
+              {restoreItem ? restoreItem.title : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {restoreLoading ? (
+            <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              正在核对这一批备份…
+            </div>
+          ) : restoreError ? (
+            <Alert variant="destructive" data-restore-error="1">
+              <ShieldAlert className="size-4" />
+              <AlertTitle>读取这一批失败</AlertTitle>
+              <AlertDescription className="break-all whitespace-pre-wrap">
+                {restoreError}
+              </AlertDescription>
+            </Alert>
+          ) : restoreInfo ? (
+            <div className="grid gap-3 text-sm">
+              <div className="grid gap-1 rounded-lg border bg-muted/30 px-3 py-2.5">
+                <div data-restore-can={restoreInfo.canRestore ? "1" : "0"} className="font-medium">
+                  {restoreInfo.canRestore ? "这一批可以还原" : "这一批不能还原"}
+                </div>
+                {restoreInfo.canRestore ? null : (
+                  <div className="text-xs text-muted-foreground">{restoreInfo.reason}</div>
+                )}
+                <div className="text-xs text-muted-foreground">
+                  形态：
+                  {restoreInfo.mode === "delta"
+                    ? "页级增量（只存了跟原库不同的页）"
+                    : restoreInfo.mode === "full"
+                      ? "整份副本"
+                      : `认不出（${restoreInfo.mode}）`}
+                  {restoreInfo.changedPages != null ? ` · ${restoreInfo.changedPages} 页` : ""}
+                  {restoreInfo.originalBytes
+                    ? ` · 原库 ${humanSize(restoreInfo.originalBytes)}`
+                    : ""}
+                  {` · 这一份占 ${humanSize(restoreInfo.bytes)}`}
+                </div>
+                {restoreInfo.note ? (
+                  <div className="text-xs text-muted-foreground">{restoreInfo.note}</div>
+                ) : null}
+              </div>
+
+              <Alert>
+                <AlertTriangle className="size-4" />
+                <AlertTitle>还原会做什么</AlertTitle>
+                <AlertDescription className="grid gap-1">
+                  <span>① 先结束 Trae 客户端（还原完自动起回来）。</span>
+                  <span>
+                    ② 把<strong>当前库另存一份</strong>，所以<strong>还原错了还能再还原回去</strong>。
+                  </span>
+                  <span>
+                    ③ 用这一批备份替换实时库；<strong>这一批之后做的改动都会丢</strong>。
+                  </span>
+                  <span className="text-muted-foreground">
+                    增量备份只对「写库那一刻」有效 —— 之后 Trae 若又改过库，会直接拒绝还原（不会拼出坏库）。
+                  </span>
+                </AlertDescription>
+              </Alert>
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={restoreBusy}
+              onClick={() => {
+                setRestoreItem(null);
+                setRestoreInfo(null);
+                setRestoreError(null);
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              disabled={restoreBusy || restoreLoading || !restoreInfo?.canRestore}
+              onClick={() => void doRestore()}
+              data-action="restore-confirm"
+            >
+              {restoreBusy ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <History className="size-4" />
+              )}
+              确认还原
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 确认弹窗 */}
       <Dialog open={confirmOpen} onOpenChange={(v) => !busy && setConfirmOpen(v)}>

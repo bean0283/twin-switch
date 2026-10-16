@@ -1,4 +1,5 @@
 pub mod app_overview;
+pub mod checkin;
 pub mod client_usage;
 pub mod config;
 pub mod error_log;
@@ -6,6 +7,7 @@ pub mod fs_remove;
 pub mod jwt;
 pub mod process_list;
 pub mod settings;
+pub mod trae_backup;
 pub mod trae_carriers;
 pub mod trae_cleanup;
 pub mod trae_credits;

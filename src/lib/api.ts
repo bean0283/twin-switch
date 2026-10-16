@@ -2,10 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
   BackupRetention,
+  CheckinResult,
   SettingsSnapshot,
   TraeAccountOverview,
   TraeAccountToken,
   TraeAccountTokenRefresh,
+  TraeBackupInfo,
   WbAccountToken,
   WbAccountTokenRefresh,
   TraeAdoptMergedResult,
@@ -505,7 +507,13 @@ export function traeHealSessionProjects(clientKey: string): Promise<{
   fixed_sessions: number;
   fixed_contexts: number;
   sessions: string[];
-  backup?: string;
+  /**
+   * 备份目录。⚠️ **`null` = 未备份**（「设置 → 写库前整库备份」关着，默认如此），
+   * 与「备份失败」（会抛错）是两回事。
+   */
+  backup: string | null;
+  /** `"delta"` / `"full"` / `"skipped"`。 */
+  backup_mode: string;
   relaunched: boolean;
   note: string;
 }> {
@@ -554,7 +562,9 @@ export function traeSessionSyncGroup(
   writtenRows: number;
   pages: number;
   relaunched: boolean;
-  backupDir: string;
+  /** ⚠️ `null` = 未备份（开关关着），与「备份失败」不是一回事。 */
+  backupDir: string | null;
+  backupMode: string;
   note: string;
 }> {
   return call("trae_session_sync_group", { clientKey, groupId, direction });
@@ -582,7 +592,9 @@ export function traeSessionSyncGroups(
   }[];
   pages: number;
   relaunched: boolean;
-  backupDir: string;
+  /** ⚠️ `null` = 未备份（开关关着），与「备份失败」不是一回事。 */
+  backupDir: string | null;
+  backupMode: string;
 }> {
   return call("trae_session_sync_groups", { clientKey, items });
 }
@@ -847,13 +859,41 @@ export function settingsGet(): Promise<SettingsSnapshot> {
 }
 
 /**
- * 写设置。
+ * 写设置（**增量补丁**：只写你给了的字段，没给的一律保持原样）。
+ *
+ * ⚠️ 别传「整个 SettingSnapshot」—— 那会把另一项用前端自己以为的值覆盖掉
+ * （两个界面同时开着就会互相踩）。
  *
  * 返回**实际落盘之后**的快照（后端回读一次），调用方直接用返回值刷界面 ——
  * 这样不会出现「写成功了但界面还显示旧值」的两处不同源。
  */
-export function settingsSet(backupRetention: BackupRetention): Promise<SettingsSnapshot> {
-  return call("settings_set", { backupRetention });
+export function settingsSet(patch: {
+  backupRetention?: BackupRetention;
+  backupBeforeWrite?: boolean;
+}): Promise<SettingsSnapshot> {
+  return call("settings_set", { patch });
+}
+
+/**
+ * 一批备份的概览（只读）：增量还是整份、省了多少、**能不能还原**。
+ *
+ * ⚠️ 「可以还原」只听后端的 `canRestore` —— 前端别自己看目录里有没有文件。
+ */
+export function traeBackupInspect(backupDir: string): Promise<TraeBackupInfo> {
+  return call("trae_backup_inspect", { backupDir });
+}
+
+/**
+ * 把一批备份还原到实时库。
+ *
+ * ⚠️ 后端会：① 只认本工具自己的备份根目录；② **先停客户端**、还原完自动重启；
+ * ③ 还原前先把当前库**另存一份**（还原错了还能退回）。三者都在后端兜住。
+ */
+export function traeBackupRestore(
+  clientKey: string,
+  backupDir: string,
+): Promise<Record<string, unknown>> {
+  return call("trae_backup_restore", { clientKey, backupDir });
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +926,23 @@ export function traeCreditsQuery(
   force = false,
 ): Promise<TraeCreditsResult> {
   return call("trae_credits_query", { clientKey: clientKey ?? null, force });
+}
+
+/**
+ * 一键签到（Trae / WorkBuddy 的账号）。
+ *
+ * `scope = "all"`（默认）签两边；`"trae"` / `"workbuddy"` 只签一边。
+ * `clientKey` **只在 Trae 侧生效**，限定本客户端下的账号（账号管理页按当前选中的客户端签）。
+ * `clientKey: null` = Trae 的全部客户端。
+ *
+ * 每个账号一条结果，`status` 六档（见 `CheckinStatus`）互不合并 ——
+ * 单账号失败不会影响其它账号，也不会让整个调用抛错。
+ */
+export function checkinRun(
+  scope: "all" | "trae" | "workbuddy" = "all",
+  clientKey?: string | null,
+): Promise<CheckinResult> {
+  return call("checkin_run", { scope, clientKey: clientKey ?? null });
 }
 
 /**

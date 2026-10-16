@@ -119,7 +119,7 @@ fn hard_remove(p: &Path) -> Result<(), String> {
 /// ⚠️ `Path::starts_with` 是**逐组件**比较的，对 `a/trash/../trae` 这种写法它会认为
 /// 「以 `a/trash` 开头」⇒ 判据会被 `..` 骗过去。凡是拿路径做「在不在某目录下」的
 /// 判断，两边都必须先过这里。
-fn lexically_normalized(p: &Path) -> PathBuf {
+pub fn lexically_normalized(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -404,10 +404,21 @@ fn scan_tool_residue() -> Value {
             "wb_export_backup",
         ),
     ] {
-        let pairs = batches_with_facts(&dir);
+        let mut pairs = batches_with_facts(&dir);
         if pairs.is_empty() {
             continue;
         }
+        // ⚠️ **按真实时间重排**（owner 升序 → 时间升序 → 名字兜底），不要照抄 `list_backup_batches`
+        //    的 `(owner, stamp)` 字典序。字典序只在「名字里带得出时间」时才等于时间序：
+        //    T66 起历史遗留的 `heal-1791298713` 与裸时间戳目录会**共用一个 owner**，
+        //    而 `heal-*` 的字典序排在 `2026...` 后面 ⇒ 会被误标成「最新一批」，
+        //    用户按「先清最老的」去勾就会勾错。`at_ms` 才是唯一的排序依据。
+        pairs.sort_by(|a, b| {
+            a.0.owner
+                .cmp(&b.0.owner)
+                .then(a.1.at_ms.cmp(&b.1.at_ms))
+                .then(a.0.stamp.cmp(&b.0.stamp))
+        });
         // 谁超出策略，由**唯一那个**判定函数说了算（界面上的原因与它同源）
         let facts: Vec<crate::modules::settings::BatchFacts> =
             pairs.iter().map(|(_, f)| f.clone()).collect();
@@ -427,18 +438,17 @@ fn scan_tool_residue() -> Value {
         })
         .collect();
         // 每个客户端最旧 / 最新的一批。
-        // ⚠️ `pairs` 的顺序是 `(owner, stamp)` 升序（`list_backup_batches` 用 BTreeMap），
-        //    也就是**每个客户端内部从旧到新** —— 这正是用户要的「优先清最老的」：
-        //    列表头几条就是该先清的。
-        let mut newest: BTreeMap<&str, &str> = BTreeMap::new();
-        let mut oldest: BTreeMap<&str, &str> = BTreeMap::new();
-        for (b, _) in &pairs {
-            newest.insert(b.owner.as_str(), b.stamp.as_str());
-            oldest.entry(b.owner.as_str()).or_insert(b.stamp.as_str());
+        // ⚠️ `pairs` 现已按 owner 分组、组内**从旧到新** —— 这正是用户要的
+        //    「优先清最老的」：列表头几条就是该先清的。
+        let mut first_of: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut last_of: BTreeMap<&str, usize> = BTreeMap::new();
+        for (i, (b, _)) in pairs.iter().enumerate() {
+            first_of.entry(b.owner.as_str()).or_insert(i);
+            last_of.insert(b.owner.as_str(), i);
         }
         for (i, (b, _)) in pairs.iter().enumerate() {
-            let is_newest = newest.get(b.owner.as_str()) == Some(&b.stamp.as_str());
-            let is_oldest = !is_newest && oldest.get(b.owner.as_str()) == Some(&b.stamp.as_str());
+            let is_newest = last_of.get(b.owner.as_str()) == Some(&i);
+            let is_oldest = !is_newest && first_of.get(b.owner.as_str()) == Some(&i);
             // 有些批次名不带客户端前缀（例如 `20261004-220644`），此时解析出的
             // stamp 为空、owner 本身就是时间戳 —— 显示时要把它当时间用。
             let (owner_disp, stamp_disp) = if b.stamp.is_empty() {
@@ -554,6 +564,9 @@ fn scan_tool_residue() -> Value {
                 "keepDays": policy.keep_days,
                 "keepCount": policy.keep_count,
                 "maxTotalMb": policy.max_total_mb,
+                // T66：写库前备份的开关状态也一并带出来 —— 清理页是用户「发现备份占了盘」
+                // 的第一现场，不在这里告诉他「新备份已经默认不做了」，他就只能看到一堆旧备份发懵。
+                "beforeWrite": crate::modules::settings::backup_before_write(),
             }),
         );
     }

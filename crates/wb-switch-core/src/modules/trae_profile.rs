@@ -9,9 +9,21 @@
 //! ## 为什么要把包明细也存下来
 //!
 //! 接口返回的 `user_entitlement_pack_list` 里每个包都有独立额度与到期时间
-//! （实测本机账号同时挂着「免费」「每月登录赠送」「每日签到 ×N」）。
+//! （实测本机账号同时挂着「每月登录赠送」与「每日签到 ×N」）。
 //! 只算一个总数会丢掉「哪部分快到期了」这个真正有用的信息，所以这里解析成
 //! [`parse_entitlement`] 的统一形状，和 WorkBuddy 侧的账号卡保持同一种读法。
+//!
+//! ## ⚠️ 这份列表里混着两类东西（T65 五改踩过的坑）
+//!
+//! 除了真正的积分包，列表**第一项**永远是「免费方案的**功能权益**」：
+//! `entitlement_id = free_utc2026xx_<uid>`、`display_desc = "免费"`，
+//! 它的 `quota` 里只有 `enable_solo_agent` / `enable_solo_builder` /
+//! `no_bonus_quota` / `solo_agent_parallel_limit` 这些**功能开关**，
+//! **没有 `credits_limit`** —— 它没有积分，只表示「这个套餐能开哪些功能」。
+//!
+//! 曾经这里把「没有额度字段」当成「不限量包」（`unlimited: true`），
+//! 于是每张账号卡都凭空多出一行「不限量 免费」，而 Trae 根本没有不限量积分。
+//! 现在唯一判据是：**带 `credits_limit` 的才是积分包**，其余一律不算。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -156,14 +168,17 @@ fn pack_name(p: &Value) -> String {
 /// {
 ///   "ok": true, "error": null,
 ///   "total": 4800.0, "used": 4221.24, "remaining": 578.76,
-///   "pack_count": 6,
+///   "pack_count": 6, "non_credit_count": 1,
 ///   "packs": [{ "key","name","group","total","used","remaining",
-///               "expire_at","status","unlimited" }]
+///               "expire_at","status" }]
 /// }
 /// ```
 ///
+/// - **积分包判据**：条目带 `credits_limit` 才算积分包。列表里的
+///   `free_utc2026xx_<uid>`（`display_desc = "免费"`）是「免费方案能开哪些功能」的
+///   权益条目、**没有额度**，会被计入 `non_credit_count` 并从 `packs` 里剔除 ——
+///   它不是「不限量包」（Trae 没有不限量积分）。
 /// - 汇总优先取 `usage_summary`（官方算好的口径）；它缺失时退化成逐个包累加。
-/// - `total`/`used` 为 `null` 表示「这一项接口没给」（例如不限量的“免费”包没有额度）。
 /// - 包按到期时间升序，长期有效的排最后。
 pub fn parse_entitlement(j: &Value) -> Value {
     // 认证失败（实测 code=1001，token 过期就是这条）
@@ -175,30 +190,51 @@ pub fn parse_entitlement(j: &Value) -> Value {
             } else {
                 format!("接口返回 code={code}：{}", msg.trim())
             };
-            return json!({ "ok": false, "error": friendly, "packs": [], "pack_count": 0 });
+            return json!({
+                "ok": false,
+                "error": friendly,
+                "packs": [],
+                "pack_count": 0,
+                "non_credit_count": 0
+            });
         }
     }
 
     let Some(list) = j.get("user_entitlement_pack_list").and_then(Value::as_array) else {
-        return json!({ "ok": false, "error": "接口未返回积分包列表", "packs": [], "pack_count": 0 });
+        return json!({
+            "ok": false,
+            "error": "接口未返回积分包列表",
+            "packs": [],
+            "pack_count": 0,
+            "non_credit_count": 0
+        });
     };
 
     let mut packs: Vec<Value> = Vec::new();
     let mut sum_limit = 0.0f64;
     let mut sum_used = 0.0f64;
     let mut sum_remaining = 0.0f64;
+    // 列表里混进来的「功能权益」条目数（不是积分包，见模块头注释）。
+    let mut non_credit = 0usize;
 
     for p in list {
-        let limit = pack_limit(p);
+        // ⚠️⚠️ 唯一的积分包判据：**带 `credits_limit`**。
+        //
+        // 曾经这里是 `let remaining = limit.map(|l| (l - used).max(0.0));`，
+        // 再加上 `"unlimited": limit.is_none()` —— 等于宣布「没有额度字段 = 不限量」。
+        // 实测三个账号的列表里各有一条 `free_utc202610_<uid>`（`display_desc = "免费"`），
+        // 它的 `quota` 只有 `enable_solo_agent` / `no_bonus_quota` 这些开关、
+        // **一个积分都没有** ⇒ 被冤枉成「不限量包」⇒ 每张账号卡多出一行「不限量 免费」。
+        // Trae 没有不限量积分：没有 `credits_limit` 就说明它根本不是积分包。
+        let Some(limit) = pack_limit(p) else {
+            non_credit += 1;
+            continue;
+        };
         let used = p.pointer("/usage/credits_amount").and_then(Value::as_f64).unwrap_or(0.0);
-        let remaining = limit.map(|l| (l - used).max(0.0));
-        if let Some(l) = limit {
-            sum_limit += l;
-        }
+        let remaining = (limit - used).max(0.0);
+        sum_limit += limit;
         sum_used += used;
-        if let Some(r) = remaining {
-            sum_remaining += r;
-        }
+        sum_remaining += remaining;
 
         // 到期时间：expire_time（秒）；0 / 缺失视为长期有效。
         let expire_sec = p
@@ -219,11 +255,9 @@ pub fn parse_entitlement(j: &Value) -> Value {
                 .unwrap_or_else(|| format!("pack-{}", packs.len())),
             "name": pack_name(p),
             "group": p.get("group_name").and_then(Value::as_str).unwrap_or("").to_string(),
-            "total": limit.map(round2),
+            "total": round2(limit),
             "used": round2(used),
-            "remaining": remaining.map(round2),
-            // 额度缺失 = 这个包不限量（接口确实这么给，不是解析失败）
-            "unlimited": limit.is_none(),
+            "remaining": round2(remaining),
             "expire_at": expire_sec.map(|s| s * 1000),
             "status": p.get("status").and_then(Value::as_i64).unwrap_or(0),
         }));
@@ -237,6 +271,23 @@ pub fn parse_entitlement(j: &Value) -> Value {
         .and_then(|u| u.get("total_amount"))
         .and_then(Value::as_f64)
         .unwrap_or(sum_limit);
+
+    // 「空」与「失败」绝不许长得一样：列表非空、一个积分包都没认出，**但服务端又报出
+    // 有总额度** —— 这不是「这个账号没积分」，是接口结构变了，必须报错而不是画成 0。
+    if packs.is_empty() && !list.is_empty() && total > 0.0 {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "接口返回 {} 项权益，但没有一项带 credits_limit（总额度却写着 {}）—— 接口结构可能变了",
+                list.len(),
+                round2(total)
+            ),
+            "pack_count": 0,
+            "non_credit_count": non_credit,
+            "packs": [],
+        });
+    }
+
     let used = us
         .and_then(|u| u.get("consumed_amount"))
         .and_then(Value::as_f64)
@@ -254,6 +305,7 @@ pub fn parse_entitlement(j: &Value) -> Value {
         "used": round2(used),
         "remaining": round2(remaining),
         "pack_count": packs.len(),
+        "non_credit_count": non_credit,
         "packs": packs,
     })
 }
@@ -366,16 +418,125 @@ mod tests {
         assert_eq!(v["remaining"], json!(120.0));
     }
 
+    /// 实测**逐字抄**下来的「免费方案功能权益」条目（`free_utc202610_4052137095223728`）。
+    ///
+    /// 注意它的 `quota`（以及 `product_extra.subscription_extra.quota`）里
+    /// **只有功能开关、没有 `credits_limit`** —— 这就是「不限量 免费」那行假数据的来源。
+    fn free_entitlement() -> Value {
+        json!({
+            "display_desc": "免费",
+            "entitlement_base_info": {
+                "available_endpoint": 0,
+                "charge_amount": 0,
+                "currency": 0,
+                "end_time": 1793462399,
+                "ent_status": 0,
+                "entitlement_id": "free_utc202610_4052137095223728",
+                "product_extra": {
+                    "subscription_extra": {
+                        "period_type": 0,
+                        "quota": {
+                            "enable_solo_agent": true,
+                            "enable_solo_builder": true,
+                            "enable_solo_coder": true,
+                            "enable_solo_lite": true,
+                            "enable_solo_web": true,
+                            "no_bonus_quota": true,
+                            "solo_agent_parallel_limit": 2
+                        }
+                    }
+                },
+                "product_id": 0,
+                "product_type": 0,
+                "quota": {
+                    "enable_solo_agent": true,
+                    "enable_solo_builder": true,
+                    "enable_solo_coder": true,
+                    "enable_solo_lite": true,
+                    "enable_solo_web": true,
+                    "no_bonus_quota": true,
+                    "solo_agent_parallel_limit": 2
+                },
+                "start_time": 1790784000,
+                "user_id": "4052137095223728"
+            },
+            "expire_time": 1793462399,
+            "is_hide": false,
+            "is_last_period": false,
+            "is_oneweek": false,
+            "next_billing_time": 0,
+            "source_id": "",
+            "status": 1,
+            "usage": {},
+            "yearly_expire_time": 0
+        })
+    }
+
+    /// 「免费」权益**不是积分包**：没有 `credits_limit` ⇒ 不进 `packs`，
+    /// 只记进 `non_credit_count`。用户在账号卡上看不到这一行（T65 五改）。
     #[test]
-    fn pack_without_limit_is_unlimited() {
-        let raw = json!({ "user_entitlement_pack_list": [pack("免费", None, 0.0, 0)] });
+    fn the_free_plan_entitlement_is_not_a_credit_pack() {
+        let v = parse_entitlement(&json!({ "user_entitlement_pack_list": [free_entitlement()] }));
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["pack_count"], json!(0));
+        assert_eq!(v["non_credit_count"], json!(1));
+        assert!(v["packs"].as_array().unwrap().is_empty(), "免费权益不该出现在积分包里");
+        assert_eq!(v["total"], json!(0.0));
+        assert_eq!(v["remaining"], json!(0.0));
+    }
+
+    /// 混在一起时：真包照常列出，「免费」权益被剔除，且**结果里再没有 `unlimited` 字段**。
+    #[test]
+    fn free_entitlement_is_skipped_while_real_packs_survive() {
+        let raw = json!({
+            "usage_summary": { "total_amount": 1700.0, "consumed_amount": 5.74 },
+            "user_entitlement_pack_list": [
+                free_entitlement(),
+                pack("每月登录赠送", Some(500.0), 5.74, 1793462399),
+                pack("签到奖励", Some(100.0), 0.0, 1793721119),
+            ],
+        });
         let v = parse_entitlement(&raw);
-        let p = &v["packs"][0];
-        assert_eq!(p["unlimited"], json!(true));
-        assert_eq!(p["total"], Value::Null);
-        assert_eq!(p["remaining"], Value::Null);
-        // expire_time=0 → 长期有效
-        assert_eq!(p["expire_at"], Value::Null);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["pack_count"], json!(2));
+        assert_eq!(v["non_credit_count"], json!(1));
+        assert_eq!(v["total"], json!(1700.0));
+        assert_eq!(v["remaining"], json!(1694.26));
+
+        let packs = v["packs"].as_array().unwrap();
+        assert_eq!(packs[0]["name"], json!("每月登录赠送"));
+        assert_eq!(packs[0]["remaining"], json!(494.26));
+        // ⚠️ 这条是本事故的钉子：「不限量」说的是**一件不存在的事**，
+        // 任何积分包都必须带得出额度。
+        assert!(
+            packs.iter().all(|p| p.get("unlimited").is_none()),
+            "解析结果里不该再出现 unlimited 字段"
+        );
+        assert!(
+            packs.iter().all(|p| !p["total"].is_null() && !p["remaining"].is_null()),
+            "真积分包必须带出 total / remaining"
+        );
+    }
+
+    /// 列表里一个积分包都没认出来、**但服务端说有额度** ⇒ 那是接口结构变了，
+    /// 必须报错，不能画成「0 积分」（「空」与「失败」不许长得一样）。
+    #[test]
+    fn total_amount_without_any_credit_pack_is_a_shape_error_not_a_zero_balance() {
+        let v = parse_entitlement(&json!({
+            "usage_summary": { "total_amount": 1700.0, "consumed_amount": 5.74 },
+            "user_entitlement_pack_list": [free_entitlement()],
+        }));
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"].as_str().unwrap().contains("credits_limit"),
+            "实际：{}",
+            v["error"]
+        );
+
+        // 边界：服务端也没说有额度（没有 usage_summary）⇒ 就是「这个账号没有积分包」，正常空结果。
+        let v2 = parse_entitlement(&json!({ "user_entitlement_pack_list": [free_entitlement()] }));
+        assert_eq!(v2["ok"], json!(true));
+        assert_eq!(v2["pack_count"], json!(0));
     }
 
     #[test]
@@ -421,3 +582,4 @@ mod tests {
         assert_eq!(v2["packs"][0]["name"], json!("组-X"));
     }
 }
+

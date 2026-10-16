@@ -692,21 +692,37 @@ pub fn is_oauth_only(client_key: &str, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 「账号库里**这一个**账号是哪个 uid」的**唯一出口**，返回 `(uid, kind)`。
+///
+/// - `oauth` 账号：读它自己的 `oauth.json` 里的 `uid`（那是它**自己的**身份）；
+/// - 载体账号：从**账号库内**那份 `User/globalStorage/storage.json` 解 uid。
+///
+/// 二者的顺序**不能换**：`oauth` 账号的载体是「首次切换时以当前登录态为骨架合成」的
+/// （见 [`super::trae_vault::plan_adoptions`]），那份 storage 里可能是**别的** uid，
+/// 先读 storage 会把 oauth 账号认成别人。
+///
+/// ⚠️⚠️ 不要拿 `meta.verified_uid` 当唯一依据 —— 它只在**切换成功**时写入，
+/// 一个刚导入 / 刚备份、还没切换过的账号它就是空的。T65 四改前，账号卡的
+/// 「当前登录」徽标正是用它拼的 ⇒ oauth 账号连 `meta` 都没有 ⇒ 三个账号
+/// 一个徽标都不亮（用户截图）。`vault_uid_index` 与 `trae_account_overview`
+/// 的 `isCurrent` 都只走这里，保证「同一个账号的 uid」全项目只有一个算法。
+pub fn account_identity(client_key: &str, id: &str) -> Option<(String, String)> {
+    if let Some(uid) = read_oauth_account(client_key, id)
+        .and_then(|oa| oa.get("uid").and_then(|v| v.as_str()).map(String::from))
+        .filter(|s| !s.is_empty())
+    {
+        return Some((uid, "oauth".into()));
+    }
+    let text = std::fs::read_to_string(account_dir(client_key, id).join(REL_STORAGE)).ok()?;
+    crate::modules::trae_vault::uid_from_storage_text(&text).map(|uid| (uid, "carrier".into()))
+}
+
 /// 账号库里所有账号的 uid → {id, kind} 索引（跨载体账号与凭证账号查重）。
 pub fn vault_uid_index(client_key: &str) -> std::collections::HashMap<String, (String, String)> {
     let mut out = std::collections::HashMap::new();
     for id in list_vault_accounts(client_key) {
-        if let Some(oa) = read_oauth_account(client_key, &id) {
-            if let Some(uid) = oa.get("uid").and_then(|v| v.as_str()) {
-                out.insert(uid.to_string(), (id, "oauth".into()));
-                continue;
-            }
-        }
-        let sp = account_dir(client_key, &id).join(REL_STORAGE);
-        if let Ok(text) = std::fs::read_to_string(&sp) {
-            if let Some(uid) = crate::modules::trae_vault::uid_from_storage_text(&text) {
-                out.insert(uid, (id, "carrier".into()));
-            }
+        if let Some((uid, kind)) = account_identity(client_key, &id) {
+            out.insert(uid, (id, kind));
         }
     }
     out
@@ -1708,3 +1724,4 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         Ok(())
     }
 }
+

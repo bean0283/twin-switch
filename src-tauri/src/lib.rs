@@ -5,27 +5,67 @@ mod update_service;
 #[cfg(target_os = "macos")]
 mod instance_lock;
 
+/// 托盘图标 hover 时的提示。
+///
+/// ⚠️ 只在这里出现一次 —— 想改文案改这一处，别去别处再抄一遍。
+const TRAY_TOOLTIP: &str = "TwinSwitch —— 左键单击打开，右键菜单";
+
+/// 把主窗口显示出来并聚焦 —— **托盘所有入口的唯一出口**。
+///
+/// ⚠️⚠️ 三个入口（右键菜单「显示主窗口」/ 左键单击 / 左键双击）**都**必须调它：
+///   ① 只 `show()` 不够 —— 窗口如果先前是最小化的，`show()` 之后仍是最小化状态，
+///      用户看着「打开了但没反应」，所以要 `unminimize`；
+///   ② `set_focus` 保证它真的跑到前台，而不是在别的窗口后面闪一下。
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 /// 右下角托盘：关闭窗口时隐藏到托盘（不退出），托盘菜单可恢复 / 真正退出。
+///
+/// ⚠️⚠️ **「打开程序」在托盘上有三个入口，必须全部接上，行为完全一致**：
+///   ① 右键菜单「显示主窗口」；② 左键单击；③ 左键双击。
+///
+/// **T67**：原先只接了 ①，左键那两个入口**压根没人处理** ⇒ 用户「双击打不开，
+/// 只能右键」。注意 `show_menu_on_left_click(false)` 的语义**只是「左键不弹菜单」**，
+/// 它**不会**替我们把窗口显示出来 —— 关掉菜单等于把左键空出来，还得自己填行为。
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::TrayIconBuilder;
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let tray = TrayIconBuilder::new()
         .icon(app.default_window_icon().expect("缺省窗口图标").clone())
+        // 用户「不知道图标怎么打开」时，hover 提示就是最省事的引导
+        .tooltip(TRAY_TOOLTIP)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.unminimize();
-                    let _ = w.set_focus();
-                }
-            }
+            "show" => focus_main_window(app),
             "quit" => app.exit(0),
+            _ => {}
+        })
+        // ⚠️ 左键必须接 —— 不接的话单击/双击都是「点了没反应」（T67 的成因）
+        .on_tray_icon_event(|tray, event| match event {
+            // Windows 上双击的消息序列是 `Click` → `DoubleClick` → `Click`
+            // （tray-icon 把 `WM_LBUTTONUP` 映射成 Click、`WM_LBUTTONDBLCLK` 映射成
+            // DoubleClick）⇒ 其实只接 Click 就已经覆盖双击了。
+            // 这里仍**显式**接住 DoubleClick，是为了让意图留在代码里：
+            // 将来谁要改成「单击切前台、双击干别的」，一眼能看见双击早被管着。
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => focus_main_window(tray.app_handle()),
             _ => {}
         })
         .build(app)?;
@@ -58,10 +98,9 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            // ⚠️ 与托盘三入口走**同一个出口**：原先这里只 `show + set_focus`、
+            // 漏了 `unminimize` ⇒ 「应用已最小化时再次双击 exe」同样是「没反应」。
+            focus_main_window(app);
         }));
     }
 
@@ -102,6 +141,7 @@ pub fn run() {
             commands::trae_refresh_profile,
             commands::trae_credits_cached,
             commands::trae_credits_query,
+            commands::checkin_run,
             commands::trae_identify_live,
             commands::trae_backup_account,
             commands::trae_switch_to,
@@ -154,6 +194,8 @@ pub fn run() {
             commands::trae_cleanup_scan,
             commands::trae_cleanup_purge,
             commands::trae_cleanup_empty_trash,
+            commands::trae_backup_inspect,
+            commands::trae_backup_restore,
             commands::trae_delete_info,
             commands::trae_delete_session,
             commands::trae_delete_sessions,

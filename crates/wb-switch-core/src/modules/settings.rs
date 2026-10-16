@@ -263,6 +263,19 @@ pub fn excess_with_reasons(
 pub struct Settings {
     #[serde(default)]
     pub backup_retention: BackupRetention,
+    /// **写库前的整库备份**开关（T66）。**默认关闭**。
+    ///
+    /// ⚠️ 关掉的只是「留一份整库历史版本」，**不影响数据安全** —— 库位替换走
+    /// [`crate::modules::trae_backup::swap_in_place`]（旧库先改名让位、新库再改名就位，
+    /// 任何一步失败都自动回滚），所以「写库写一半崩了」不会丢库。备份只负责「能回到从前」。
+    ///
+    /// ⚠️ 只对**整库级**备份生效（Trae 的删除 / 编辑 / 导入）。WorkBuddy 那边备的是
+    /// 0.2 MB 的库和**被改的那一个**会话正文，量级在 KB，不受这个开关影响。
+    ///
+    /// ⚠️ 默认 `false` ⇒ 老用户的 `settings.json` 里没有这个键，反序列化后就是关，
+    /// **与「新装也是关」一致**（不许出现「升级后行为突然变了」这种说不清的事）。
+    #[serde(default)]
+    pub backup_before_write: bool,
 }
 
 impl Settings {
@@ -270,6 +283,18 @@ impl Settings {
         self.backup_retention = self.backup_retention.sanitized();
         self
     }
+}
+
+/// 写库前要不要留整库备份 —— **唯一出口**。
+///
+/// 各处写库链路一律问它，不许自己 `load()` 再读字段：
+/// 读法一分叉就会出现「这里备、那里不备」，而用户看到的是同一个开关。
+///
+/// ⚠️ 读盘失败（设置文件坏了）时 [`load`] 退回默认 = **不备份**。这是故意的：
+/// 备份是「留历史」，不是「保命」（保命靠 `trae_backup::swap_in_place` 的原子替换），
+/// 所以坏文件下宁可不动用户的磁盘，也不能凭空写出一堆 609 MB。
+pub fn backup_before_write() -> bool {
+    load().backup_before_write
 }
 
 /// 读设置：**坏文件不报错、退回默认**。

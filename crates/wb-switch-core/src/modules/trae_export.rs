@@ -310,7 +310,7 @@ pub fn wb_import_backup_dir() -> PathBuf {
 }
 
 /// 递归统计一个路径的字节数（文件即自身大小，目录累加）。
-fn path_size(p: &Path) -> u64 {
+pub(crate) fn path_size(p: &Path) -> u64 {
     let Ok(md) = std::fs::metadata(p) else {
         return 0;
     };
@@ -343,7 +343,11 @@ fn path_size(p: &Path) -> u64 {
 /// **(b) 有些条目名里根本没有客户端前缀**：`workbuddy_export_backup` 下就是光秃秃的
 /// `20261011-205734`。那时 owner 必须取**整个目录**（用空串表示），不能让「条目名」当 owner ——
 /// 否则每一批都自成一组的「最新一批」，永远命中安全网、**永远不被清理**。
-fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
+///
+/// **(c) 认不出来的名字同样要归「整个目录」**（T66 补）：历史遗留的 `heal-1791298713`
+/// 曾经「自己当 owner、stamp 留空」，等于每份都自成一个只有 1 批的组 ⇒ 一份都删不掉。
+/// 见下面分支 ④ 的注释。
+pub(crate) fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
     // ① 「<客户端>_before_<动作>_<YYYYMMDD_HHMMSS>…」
     if let Some(pos) = entry_name.find("_before_") {
         let owner = entry_name[..pos].to_string();
@@ -366,9 +370,17 @@ fn backup_owner_and_stamp(entry_name: &str) -> (String, String) {
     if looks_like_stamp(entry_name) {
         return (String::new(), entry_name.to_string());
     }
-    // ④ 认不出来（例如 `heal-1791298713` 这种中间产物目录）：当成独立一组，
-    //    stamp 留空 ⇒ `at_ms = 0` ⇒ **不参与时间判定**，也不会被别人连坐。
-    (entry_name.to_string(), String::new())
+    // ④ 认不出来的名字（历史遗留：`heal-1791298713` 这种中间产物目录）
+    //    ⇒ **也归到「整个目录」这一组**，并把整名当 stamp。
+    //
+    // ⚠️⚠️ 这里**绝不能**「自己当 owner、stamp 留空」。老实现就是这么写的，后果是：
+    // 每个名字 ⇒ 一个只有 1 批的 owner ⇒ 永远命中「每个 owner 最新一批永不清」的安全网
+    // ⇒ `at_ms = 0` 又不参与时间判定 ⇒ **一份都删不掉**。实测 `import_backup/heal-1791298713`
+    // 就这么在白占 314 MB。
+    //
+    // 归到 `owner = ""` 之后它就和同目录其它「无名条目」共用一个组，份数 / 容量 / 时间
+    // 三条规则都能落到它头上（时间靠 [`entry_mtime_ms`] 的 mtime 兜底）。
+    (String::new(), entry_name.to_string())
 }
 
 /// 名字是不是「裸时间戳」：`YYYYMMDD-HHMMSS` / `YYYYMMDD_HHMMSS`。
@@ -415,6 +427,19 @@ pub struct BackupBatch {
     pub bytes: u64,
 }
 
+/// 条目（文件或目录）的最后修改时间（毫秒）。取不到返回 `0`。
+///
+/// ⚠️ 只当**兜底**用：名字里能解出时间戳时一律以名字为准 —— 名字是备份内容的属性，
+/// mtime 只是「这份文件什么时候落到这个目录里」的旁证（复制、解压、移动都会改 mtime）。
+fn entry_mtime_ms(p: &Path) -> i64 {
+    std::fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// 扫描备份目录并按「客户端 + 时间戳」分批（**只读**，不删任何东西）。
 ///
 /// 顺序即时间序（`owner` 升序、`stamp` 字典序），调用方可据此判定「最新 N 批」。
@@ -437,7 +462,14 @@ pub fn list_backup_batches(dir: &Path) -> Vec<BackupBatch> {
         .map(|((owner, stamp), mut paths)| {
             paths.sort();
             let bytes = paths.iter().map(|p| path_size(p)).sum();
-            let at_ms = stamp_to_ms(&stamp);
+            let mut at_ms = stamp_to_ms(&stamp);
+            if at_ms == 0 {
+                // ⚠️ 名字里没有可解的时间（历史遗留目录）⇒ 用 mtime 兜底。
+                //    不给兜底的话 `at_ms` 恒为 0，而时间规则的前置条件是 `at_ms > 0`
+                //    ⇒ 这份备份**永远不参与时间判定**，只增不减。
+                //    取「最新」的那个 mtime：宁可把它当成新的（少删一份），也别误判成旧的。
+                at_ms = paths.iter().map(|p| entry_mtime_ms(p)).max().unwrap_or(0);
+            }
             BackupBatch { owner, stamp, at_ms, paths, bytes }
         })
         .collect()
@@ -1771,11 +1803,56 @@ mod tests {
             backup_owner_and_stamp("20261011-205734"),
             (String::new(), "20261011-205734".to_string())
         );
-        // 认不出的名字（中间产物目录）自成一组、stamp 空 ⇒ 不参与时间判定
+        // ④ ★ 认不出的名字（历史遗留的中间产物目录）也归「整个目录」一组，
+        //    **不能**「自己当 owner、stamp 留空」—— 那样每份都自成一个只有 1 批的组，
+        //    永远命中「最新一批永不清」的安全网 ⇒ **一份都删不掉**（T66 修的 T62 残留）。
+        //    整名当 stamp ⇒ 组内仍是各自独立的一批，份数 / 容量规则照样能落到它头上。
         assert_eq!(
             backup_owner_and_stamp("heal-1791298713"),
-            ("heal-1791298713".to_string(), String::new())
+            (String::new(), "heal-1791298713".to_string())
         );
+    }
+
+    #[test]
+    fn legacy_unrecognized_backups_still_get_pruned() {
+        // 复刻真机：`trae/import_backup` 里 `heal-1791298713` 白占 314 MB 却删不掉。
+        //
+        // ⚠️ 判据**刻意不依赖目录 mtime 的先后**：NTFS 上目录时间戳是**延迟刷新**的
+        //    （同一批内新建的几个目录 mtime 常常一模一样），拿它排顺序的断言必然时好时坏。
+        //    真正的回归点只有一个：**旧实现下这里判定出的「该清」是 0 条，新实现是 2 条**。
+        //    —— 旧实现给每个认不出的名字单独一个 owner，每组只有 1 批 ⇒ 永远被安全网保护。
+        use crate::modules::settings::{excess_batches, BackupRetention};
+
+        let root = std::env::temp_dir().join(format!("wb_prune_heal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mk = |name: &str, kb: usize| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("database.db"), vec![0u8; kb * 1024]).unwrap();
+        };
+        mk("heal-1791298713", 100);
+        mk("20261011-205734", 10);
+        mk("20261012-101010", 10);
+
+        let batches = list_backup_batches(&root);
+        assert_eq!(batches.len(), 3, "三份各自成一批");
+        for b in &batches {
+            assert_eq!(b.owner, "", "无名条目（含 heal-*）必须都归到「整个目录」这一组");
+            assert!(b.at_ms > 0, "时间必须由 mtime 兜底（stamp 解不出时），否则永远不参与时间判定");
+        }
+
+        let facts: Vec<_> = batches_with_facts(&root).into_iter().map(|(_, f)| f).collect();
+        // 不按时间 / 容量判，只按份数：owner="" 下 3 批只留 1 批 ⇒ 该清 2 批。
+        // 旧实现下这里会是 **0**（三份分属三个 owner，谁都是自己那组的最新一批）。
+        let p = BackupRetention { enabled: true, keep_days: 0, keep_count: 1, max_total_mb: 0 };
+        let excess = excess_batches(&facts, &p, crate::modules::config::now_ms());
+        assert_eq!(
+            excess.len(),
+            2,
+            "owner 归组修好后 3 批该清 2 批；若为 0 说明又变回「每份自成一 owner」了"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

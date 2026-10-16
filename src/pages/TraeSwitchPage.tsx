@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
+import { CheckinButton } from "@/components/checkin-button";
 import {
   TraeCreditBlock,
   TraeCreditsDialog,
@@ -277,7 +278,6 @@ export default function TraeSwitchPage() {
 
   // 网页（OAuth）登录
   const [loginOpen, setLoginOpen] = useState(false);
-  const [loginName, setLoginName] = useState("");
   const [oauthStart, setOauthStart] = useState<TraeOAuthStartResult | null>(null);
   const [oauthStatus, setOauthStatus] = useState<TraeOAuthSessionStatus | null>(null);
   const [oauthBrowsers, setOauthBrowsers] = useState<TraeBrowserInfo[]>([]);
@@ -285,14 +285,15 @@ export default function TraeSwitchPage() {
   const [manualOpen, setManualOpen] = useState(false);
   const [manualUrl, setManualUrl] = useState("");
 
-  // 备份 / 重命名 / 导入 / 交接记忆 对话框
-  const [backupOpen, setBackupOpen] = useState(false);
-  const [backupName, setBackupName] = useState("");
+  // 重命名 / 交接记忆 对话框
+  //
+  // ⚠️ 2026-10-14（T65 二改）：原来这里还有 `backupOpen/backupName`（备份当前登录态）与
+  // `importOpen/importText/importName`（粘贴 JSON 导入账号备份）两组状态。按用户要求
+  // 「严格按 workbuddy 的界面进行设计」，Trae 页头部只留 WB 那五个入口，这两个**弹窗型**
+  // 入口被替换成 WB 那套**文件型**的「导出账号包 / 导入账号包」（见 `onExportPack` /
+  // `onImportPack`）—— 连同弹窗、连同一整组 state 一起删，不留死代码。
   const [renameTarget, setRenameTarget] = useState<TraeVaultEntry | null>(null);
   const [renameName, setRenameName] = useState("");
-  const [importOpen, setImportOpen] = useState(false);
-  const [importText, setImportText] = useState("");
-  const [importName, setImportName] = useState("");
   const [handoffOpen, setHandoffOpen] = useState(false);
 
   /** 底部「回滚」卡里选中的账号 id（回滚 = 切回它）。 */
@@ -351,23 +352,14 @@ export default function TraeSwitchPage() {
   }, []);
 
   /**
-   * 清空「使用记忆」，客户端顺序回到内置默认。
+   * ⚠️ 2026-10-14（T65 二改）：「重置排序」按钮**已按用户要求撤掉**
+   * （原话：「其他的重置排序、导入全部客户端等不需要」），所以这里那份
+   * `traeClientUsageReset` 的调用一并删除 —— 入口没了、函数还留着就是死代码。
    *
-   * ⚠️ 内置默认里 `solo-cn` 仍排第一，但它已被摘掉（并入 Trae CN、本机没有它的程序）
-   * ⇒ 界面上看到的第一项就是 `trae-cn`。别在这里写 `solo-cn` 了，用户根本看不到它。
-   *
-   * 这个动作**只影响展示顺序**，不碰账号库、不碰任何会话数据，所以不需要二次确认。
+   * 后端能力（`trae_client_usage_reset`）仍在，需要时把入口加回客户端标签条右侧即可。
+   * 内置默认里 `solo-cn` 仍排第一，但它已被摘掉（并入 Trae CN、本机没有它的程序）
+   * ⇒ 界面上看到的第一项就是 `trae-cn`。别在任何地方写死 `solo-cn`，用户根本看不到它。
    */
-  async function onResetUsageOrder() {
-    try {
-      await api.traeClientUsageReset();
-      setClientKey(null);
-      await loadClients();
-      toast.success("已重置排序记忆", { description: "客户端顺序回到内置默认" });
-    } catch (cause) {
-      toast.error("重置排序记忆失败", { description: api.asError(cause) });
-    }
-  }
 
   async function loadOverview(key: string) {
     setLoading(true);
@@ -475,7 +467,9 @@ export default function TraeSwitchPage() {
     if (!clientKey || busy) return;
     setBusy(true);
     try {
-      const res = await api.traeOauthStart(clientKey, loginName.trim() || undefined);
+      // 不再传「账号备注」：头部那个输入框已按 WB 的版式去掉，
+      // 账号名导入后在卡片上用「重命名」随时能改（Trae 侧本来就有这个入口）。
+      const res = await api.traeOauthStart(clientKey, undefined);
       setOauthStart(res);
       setOauthStatus(null);
       setLoginOpen(true);
@@ -508,24 +502,109 @@ export default function TraeSwitchPage() {
     }
   }
 
-  async function onImportAll() {
+  /**
+   * 导出**账号包**：本客户端下账号库里所有账号，逐个导出成自包含 JSON，
+   * 再打包成一个文件让用户下载。
+   *
+   * ⚠️ 与 WorkBuddy 页的「导出账号包」**同一套交互**（下载一个 `.json` 文件），
+   * 而不是原来那个「复制到剪贴板」—— 用户要求严格按 WB 的界面来。
+   * ⚠️ 后端 `trae_vault::export_account` 是**逐账号**的，这里在前端聚合：
+   * 一个个成功才收进来，**失败的账号要单独列出来**，绝不悄悄少几个
+   * （「少导出了 3 个」和「导出了 3 个」在界面上长得一样，是最典型的坑）。
+   */
+  async function onExportPack() {
+    if (!clientKey || busy) return;
+    const entries = overview?.vault ?? [];
+    if (!entries.length) {
+      toast.error("账号库是空的", { description: "先在客户端登录一次，然后点「导入本机登录态」" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const accounts: Record<string, unknown>[] = [];
+      const failed: string[] = [];
+      for (const e of entries) {
+        try {
+          const r = await api.traeExportAccount(clientKey, e.id);
+          if (r.payload) accounts.push(r.payload);
+          else failed.push(e.id);
+        } catch {
+          failed.push(e.id);
+        }
+      }
+      if (!accounts.length) {
+        toast.error("导出失败", { description: `所有账号都没导出成功：${failed.join("、")}` });
+        return;
+      }
+      const pack = {
+        format: "trae-account-pack",
+        version: 1,
+        client: clientKey,
+        exported_at: new Date().toISOString(),
+        count: accounts.length,
+        accounts,
+      };
+      const blob = new Blob([JSON.stringify(pack, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `trae-accounts-${clientKey}-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(`账号包已导出（${accounts.length} 个账号）`, {
+        description: failed.length ? `${failed.length} 个失败未包含：${failed.join("、")}` : undefined,
+      });
+    } catch (cause) {
+      toast.error("导出账号包失败", { description: api.asError(cause) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * 导入**账号包**：接受两种文件 ——
+   * ① 本工具导出的账号包（`{ accounts: [...] }`，一次多个）；
+   * ② 单个账号的自包含 JSON（旧版逐账号导出的那种），也能直接导入。
+   *
+   * ⚠️ 逐个导入、逐个报结果：**成功数和失败数分开说**，失败的要把账号名列出来。
+   * 冲突时后端自动改 id（不改用户已有账号），所以「导入 N 个」与「新增 N 个」可能不等，
+   * 这里如实按后端返回的 id 报。
+   */
+  async function onImportPack(file: File) {
     if (!clientKey || busy) return;
     setBusy(true);
     try {
-      const { results } = await api.traeImportAllLocalLogins();
-      const okCount = results.filter((r) => r.ok).length;
-      const failCount = results.length - okCount;
-      const imported = results.filter((r) => r.ok);
-      const msg = `已导入 ${okCount} 个客户端的本地登录态${failCount ? `，${failCount} 个未登录或失败` : ""}`;
-      toast.success(msg, {
-        description:
-          imported.length > 0
-            ? imported.map((r) => `${r.client}：${r.displayName || r.uid || r.id}`).join("；")
-            : "未发现已登录的客户端登录态",
-      });
-      void loadOverview(clientKey);
+      const raw: unknown = JSON.parse(await file.text());
+      const list: unknown[] = Array.isArray((raw as { accounts?: unknown[] })?.accounts)
+        ? ((raw as { accounts: unknown[] }).accounts as unknown[])
+        : [raw];
+      if (!list.length) {
+        toast.error("账号包里没有账号", { description: "文件内容为空" });
+        return;
+      }
+      const imported: string[] = [];
+      const failed: string[] = [];
+      for (const item of list) {
+        try {
+          const r = await api.traeImportAccount(clientKey, item as Record<string, unknown>);
+          imported.push(r.id);
+        } catch (cause) {
+          const name =
+            (item as { id?: string })?.id ?? (item as { name?: string })?.name ?? "未命名";
+          failed.push(`${name}（${api.asError(cause)}）`);
+        }
+      }
+      if (imported.length) {
+        toast.success(`已导入 ${imported.length} 个账号`, {
+          description: imported.join("、"),
+        });
+        void loadOverview(clientKey);
+      }
+      if (failed.length) {
+        toast.error(`${failed.length} 个账号没导入成功`, { description: failed.join("；") });
+      }
     } catch (cause) {
-      toast.error("一键导入失败", { description: api.asError(cause) });
+      toast.error("导入账号包失败", { description: api.asError(cause) });
     } finally {
       setBusy(false);
     }
@@ -557,7 +636,7 @@ export default function TraeSwitchPage() {
     if (!clientKey || !manualUrl.trim()) return;
     setBusy(true);
     try {
-      const s = await api.traeOauthManual(clientKey, manualUrl.trim(), loginName.trim() || undefined);
+      const s = await api.traeOauthManual(clientKey, manualUrl.trim(), undefined);
       setOauthStatus(s);
       if (s.state === "done") {
         toast.success(s.message);
@@ -790,23 +869,11 @@ export default function TraeSwitchPage() {
     }
   }
 
-  async function onBackup() {
-    if (!clientKey || busy || !backupName.trim()) return;
-    setBusy(true);
-    try {
-      const res = await api.traeBackupAccount(clientKey, backupName.trim());
-      setBackupOpen(false);
-      setBackupName("");
-      toast.success("已备份当前登录态", {
-        description: res.verifiedUid ? `识别到账号 uid：${res.verifiedUid}` : undefined,
-      });
-      await loadOverview(clientKey);
-    } catch (cause) {
-      toast.error("备份失败", { description: api.asError(cause) });
-    } finally {
-      setBusy(false);
-    }
-  }
+  // ⚠️ 2026-10-14（T65 二改）：原来这里还有 `onBackup()`（备份当前登录态）与
+  // `onImport()`（粘贴 JSON 导入账号备份）。用户要求 Trae 页头部严格按 WorkBuddy 的
+  // 五个入口来（导入本机登录态 / 扫码添加账号 / 导出账号包 / 导入账号包 / 签到），
+  // 这两个入口连同它们的弹窗一并删除。账号入库走「导入本机登录态」，
+  // 整库搬家走「导出账号包 / 导入账号包」（文件型，与 WB 一致）。
 
   async function onRename() {
     if (!clientKey || !renameTarget || !renameName.trim()) return;
@@ -842,21 +909,6 @@ export default function TraeSwitchPage() {
       await loadOverview(clientKey);
     } catch (cause) {
       toast.error("移除失败", { description: api.asError(cause) });
-    }
-  }
-
-  async function onImport() {
-    if (!clientKey || !importText.trim()) return;
-    try {
-      const payload = JSON.parse(importText.trim());
-      const res = await api.traeImportAccount(clientKey, payload, importName.trim() || undefined);
-      setImportOpen(false);
-      setImportText("");
-      setImportName("");
-      toast.success("导入成功", { description: `账号：${res.id}，文件 ${res.files} 个` });
-      await loadOverview(clientKey);
-    } catch (cause) {
-      toast.error("导入失败", { description: api.asError(cause) });
     }
   }
 
@@ -948,6 +1000,17 @@ export default function TraeSwitchPage() {
   const selected = visibleClients.find((c) => c.key === clientKey) ?? visibleClients[0] ?? null;
   const live = overview?.live;
 
+  /**
+   * 头部副标题里显示的登录态文件路径（与 WB 页那片等宽小字同构）。
+   * 分隔符跟着数据目录走：Windows 上 `user_data_dir` 是反斜杠，macOS / Linux 是斜杠。
+   */
+  const loginStateFile = useMemo(() => {
+    const dir = selected?.user_data_dir;
+    if (!dir) return "—";
+    const sep = dir.includes("\\") ? "\\" : "/";
+    return [dir.replace(/[\\/]+$/, ""), "User", "globalStorage", "storage.json"].join(sep);
+  }, [selected]);
+
   // ---- 积分：与账号卡片融合显示（展示层与 WorkBuddy 侧同一套）----
   const credits = useTraeCredits(clientKey);
 
@@ -960,12 +1023,18 @@ export default function TraeSwitchPage() {
 
   const creditsLoading = credits.result === null && credits.error === null;
 
-  /** 当前登录的 uid 是否已经在账号库里（不在就提示先备份）。 */
+  /**
+   * 当前登录的账号是否已经在账号库里（不在就提示先「导入本机登录态」）。
+   *
+   * ⚠️ 判据 = 后端算好的 `isCurrent`（唯一出口），**不再在这里自己拼 uid 比较**。
+   * 这里原来写的是 `v.meta?.verified_uid === live.uid || v.oauth?.uid === live.uid`，
+   * 与卡片上那枚「当前登录」徽标（另一处自己拼、且漏了 oauth 分支）**不是同一份判据** ——
+   * 于是出现同屏自相矛盾：这条 Alert 认为「账号已在库里」（不报），卡片却一个徽标都不亮。
+   * 现在两处都读 `isCurrent`，要么一起亮、要么一起不亮。
+   */
   const liveInVault = useMemo(() => {
     if (!overview?.loggedIn || !live?.uid) return true;
-    return overview.vault.some(
-      (v) => v.meta?.verified_uid === live.uid || v.oauth?.uid === live.uid,
-    );
+    return overview.vault.some((v) => v.isCurrent);
   }, [overview, live]);
 
   /** 底部「回滚」卡的下拉候选：整个账号库（名字优先取积分条目里的真实昵称）。 */
@@ -978,72 +1047,108 @@ export default function TraeSwitchPage() {
 
   return (
     <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-5 px-4 py-6">
-      {/* ⚠️ 顶部版式与「WorkBuddy 账号管理」页**对齐**（2026-10-14 用户要求：以 WorkBuddy 为准）：
-          标题在左、操作按钮组在右，**不套卡片壳**。原来这里是一张带 Globe 图标 +「登录 Trae 账号」
-          标题 + 描述的 `Card`，两个页面的顶部因此长得完全不一样 —— 「同一件事两处实现必然有一处
-          跑偏」的教训仓库里已经吃过好几次（见下面 TraeClientSwitcher 那段注释）。 */}
-      {/* ⚠️ 按钮组用 `ml-auto` 而不是只靠父级 `justify-between`：Trae 的副标题比 WB 长，
-          1360 档下按钮组一定会折到第二行，而 flex 折行后 `justify-between` 会把单独一项
-          放回**左边** —— 那样按钮就跑到了标题底下，与 WB「按钮在右」不一样。`ml-auto`
-          让它无论在第一行还是折行后都贴右。 */}
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold tracking-tight">Trae 账号管理</h1>
+      {/* ⚠️ 顶部版式**逐字照「WorkBuddy 账号管理」页**（2026-10-14 用户第二次提出，原话：
+          「trae 的界面要求是导入本机登录态、扫码添加账号、导出账号包、导入账号包、签到，
+          其他的重置排序、导入全部客户端等不需要。你要严格按 workbuddy 的界面进行设计」）。
+          基准就是 WB 页那一行：左边「标题 + 一行说明」，右边一排 `outline` 小按钮，
+          外层 `flex flex-wrap items-end justify-between gap-3`；
+          按钮的**集合、顺序、图标、文案**全部对齐 WB（`LogIn` / `UserPlus` / `FileDown` /
+          `FileUp` / 签到）。
+          撤掉的四个入口：导入全部客户端、重置排序、导入备份、备份当前登录态
+          （弹窗 / state / handler 一并删除，不留死代码 —— 见文件里几处「T65 二改」注释）。
+          账号入库走「导入本机登录态」，整库搬家走「导出 / 导入账号包」。
+          外层间距仍由页面容器的 `flex-col gap-5`（20px）给，与 WB 的 `mb-5` 同值。 */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold">Trae 账号管理</h1>
+          {/* 副标题**与 WB 页同构**：WB 是「国内版 · 登录态文件 <路径>」，
+              Trae 是「<客户端名> · 登录态文件 <路径>」—— 同样「一个标签 + 等宽小字路径」。
+              ⚠️ 路径不是编的：`Trae/<数据目录>/User/globalStorage/storage.json` 就是这个
+              客户端的登录态载体（`trae_import_local_login` 解密的就是它，账号卡上判
+              「有载体」判的也是它），这里只是把账号库一直在用的那个相对路径拼到数据目录后面。
+              数据目录本身来自后端（`selected.user_data_dir`，与「未识别到登录态」提示同源）。 */}
           <p className="mt-1 text-sm text-muted-foreground">
-            冷切换：终止客户端进程 → 还原账号载体 → 重启 → 守护判定。切换会连带写入交接记忆，便于跨账号续接任务。
+            {selected ? selected.label : "未检测到客户端"} · 登录态文件{" "}
+            <code className="rounded bg-muted px-1 text-xs">{loginStateFile}</code>
           </p>
         </div>
 
-        {/* 登录入口按钮组（与 WB 页同构：次级动作 outline、主动作放最后一个）。
-            登录**进行中**的状态搬到下面独立的 `Alert`，与 WB 的「扫码登录」一致。
-            ⚠️ 原来那句说明文字（「导入本地登录态」直接解密…）改挂到按钮的 `title` 上 ——
-            版式对齐 WB 后没有多余的行内空间，但信息一个字都没少。 */}
-        {selected && !loginOpen ? (
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Input
-              value={loginName}
-              onChange={(e) => setLoginName(e.target.value)}
-              placeholder="账号备注（可选）"
-              title="可选：给这次登录拿到的账号起个名字"
-              className="h-8 max-w-40"
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void onImportLocal()}
-              disabled={busy}
-              title="直接解密本机客户端已登录的账号，无需浏览器授权"
-            >
-              <UserPlus className="size-4" />
-              导入本地登录态
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void onImportAll()}
-              disabled={busy}
-              title="把本机所有 Trae 客户端上已登录的账号一次性收进来"
-            >
-              导入全部客户端
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void onOauthStart()}
-              disabled={busy}
-              title="网页授权登录：立即拿账号凭证，可查额度 / 签到 / 用量；不写客户端登录态，不产生可切换载体"
-            >
-              {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-              发起网页登录
-            </Button>
-          </div>
-        ) : null}
+        {/* 五个入口，与 WB 页**一一对应**（顺序也照抄）。按钮说明一律挂 `title`：
+            版式对齐 WB 后没有多余的行内空间，但信息一个字都不能少。
+            ⚠️ 不再用 `{selected && ...}` 整组隐藏 —— WB 页的按钮是常驻的，
+            没有客户端时只置灰，不该「消失」（消失掉的按钮等于告诉用户这个功能不存在）。 */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void onImportLocal()}
+            disabled={!selected || busy}
+            title="直接解密本机客户端已登录的账号，无需浏览器授权"
+          >
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+            导入本机登录态
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void onOauthStart()}
+            disabled={!selected || busy}
+            title="网页授权登录：立即拿账号凭证，可查额度 / 签到 / 用量；不写客户端登录态，不产生可切换载体"
+          >
+            <UserPlus className="size-4" />
+            扫码添加账号
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void onExportPack()}
+            disabled={!selected || busy || !(overview?.vault.length ?? 0)}
+            title="把本客户端账号库里的所有账号导出成一个 JSON 文件（自包含载体，可再导入）"
+          >
+            <FileDown className="size-4" />
+            导出账号包
+          </Button>
+          {/* 与 WB 页同构：文件选择器藏在 `label` 里，外观就是普通 `outline` 小按钮。
+              `asChild` 下 `disabled` 不生效（透传到 label 上无意义），所以用
+              `pointer-events-none opacity-50` 表达置灰，`onChange` 里再兜一层判空。 */}
+          <Button
+            variant="outline"
+            size="sm"
+            asChild
+            className={!selected || busy ? "pointer-events-none opacity-50" : undefined}
+          >
+            <label className="cursor-pointer" title="从 JSON 文件导入账号（支持整包，也支持单个账号）">
+              <FileUp className="size-4" />
+              导入账号包
+              <input
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onImportPack(f);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </Button>
+          {/* 签到：只签**当前选中客户端**下的账号（首页那个「一键签到」签的是全部）。
+              两者是同一套实现（`CheckinButton`），只是 scope / clientKey 不同。 */}
+          <CheckinButton
+            scope="trae"
+            clientKey={clientKey}
+            onSuccess={() => void credits.refresh()}
+          />
+        </div>
       </div>
 
       {/* 客户端选择：顺序只由后端排序决定（使用记忆 + 能不能跑起来）。
           ⚠️ v0.2.25 起改用与首页 /「Trae 会话记录」**共用的** `<TraeClientSwitcher>`：
           本页原先自己内联了一套，于是「已并入」徽标、置灰规则都没跟上（合并后的 SOLO
           还留在标签条上），正是「同一件事两处实现必然有一处跑偏」。
-          「已并入且本机跑不起来的客户端不进标签条」的判据也只有那一处。 */}
+          「已并入且本机跑不起来的客户端不进标签条」的判据也只有那一处。
+          ⚠️ 右侧原来还有「重置排序 / 导入备份 / 备份当前登录态」三个按钮，
+          2026-10-14（T65 二改）按用户要求撤掉，这一行只剩标签条 + 运行状态。 */}
       {visibleClients.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
           <TraeClientSwitcher
@@ -1056,24 +1161,6 @@ export default function TraeSwitchPage() {
           <Badge variant="secondary" className="ml-auto">
             {overview?.running ? "客户端运行中" : "客户端未运行"}
           </Badge>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-muted-foreground"
-            title="清空使用记忆，排序回到内置默认"
-            onClick={() => void onResetUsageOrder()}
-          >
-            <RotateCcw className="size-4" />
-            重置排序
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
-            <FileUp className="size-4" />
-            导入备份
-          </Button>
-          <Button size="sm" onClick={() => setBackupOpen(true)} disabled={!overview?.loggedIn || busy}>
-            <UserPlus className="size-4" />
-            备份当前登录态
-          </Button>
         </div>
       )}
 
@@ -1189,7 +1276,7 @@ export default function TraeSwitchPage() {
               <AlertTriangle className="size-4" />
               <AlertTitle>未识别到登录态</AlertTitle>
               <AlertDescription>
-                请先在 {selected.label} 中登录，再回来备份 / 切换账号。
+                请先在 {selected.label} 中登录，再回来导入 / 切换账号。
                 <span className="mt-1 block font-mono text-[11px] text-muted-foreground/70">
                   数据目录：{selected.user_data_dir}
                 </span>
@@ -1201,8 +1288,8 @@ export default function TraeSwitchPage() {
               <AlertTitle>当前登录的账号还没加入账号库</AlertTitle>
               <AlertDescription>
                 {live?.username ?? live?.email ?? "当前账号"}
-                {live?.uid ? `（uid ${shortUid(live.uid)}）` : ""} 尚未备份。
-                点右上角「备份当前登录态」把它收进来，之后就能像 WorkBuddy 那样一卡一账号地看积分与切换。
+                {live?.uid ? `（uid ${shortUid(live.uid)}）` : ""} 还没进账号库。
+                点右上角「导入本机登录态」把它收进来，之后就能像 WorkBuddy 那样一卡一账号地看积分与切换。
               </AlertDescription>
             </Alert>
           ) : null}
@@ -1278,11 +1365,17 @@ export default function TraeSwitchPage() {
                   const hasCarrier = (meta?.files ?? []).some(
                     (f) => f.rel.replace(/\\/g, "/") === "User/globalStorage/storage.json",
                   );
-                  const isLive =
-                    overview.loggedIn && meta?.verified_uid != null && meta.verified_uid === live?.uid;
+                  // ⚠️ 「当前登录」判据 = 后端 `isCurrent`（唯一出口，与 WorkBuddy 同源同形）。
+                  // 这里原来自己拼 `overview.loggedIn && meta?.verified_uid === live?.uid`：
+                  // `meta.verified_uid` 只在**切换成功**时写、oauth 账号连 `meta` 都没有
+                  // ⇒ 三个账号一个「当前登录」徽标都不亮（T65 四改，用户截图）。
+                  const isLive = entry.isCurrent === true;
                   const name =
                     entry.displayName || (isOauth && oa?.displayName ? oa.displayName : null) || entry.id;
-                  const uid = isOauth ? (oa?.uid ?? null) : (meta?.verified_uid ?? null);
+                  // uid **优先用后端那一份**（与 `isCurrent` 同源，见 `TraeVaultEntry.uid`）；
+                  // 后端读不出时才回退到自己解析的旧路径。
+                  const uid =
+                    entry.uid ?? (isOauth ? (oa?.uid ?? null) : (meta?.verified_uid ?? null));
                   const exp = tokenExpiryLabel(oa?.tokenExp);
                   const credit = creditById.get(entry.id) ?? null;
                   return (
@@ -1357,7 +1450,7 @@ export default function TraeSwitchPage() {
             ) : (
               <Card>
                 <CardContent className="py-10 text-center text-sm text-muted-foreground">
-                  账号库为空。点「发起网页登录」扫码添加，或「备份当前登录态」把当前账号收进来。
+                  账号库为空。点「扫码添加账号」授权添加，或「导入本机登录态」把客户端当前登录的账号收进来。
                 </CardContent>
               </Card>
             )}
@@ -1551,27 +1644,11 @@ export default function TraeSwitchPage() {
         accountName={tokenTarget ? tokenTarget.displayName || tokenTarget.id : null}
       />
 
-      {/* 备份对话框 */}
-      <Dialog open={backupOpen} onOpenChange={setBackupOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>备份当前登录态</DialogTitle>
-            <DialogDescription>为该账号取一个便于识别的名称，载体文件将完整复制进账号库。</DialogDescription>
-          </DialogHeader>
-          <Input
-            value={backupName}
-            onChange={(e) => setBackupName(e.target.value)}
-            placeholder="例如：工作主账号"
-            autoFocus
-          />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setBackupOpen(false)}>取消</Button>
-            <Button onClick={() => void onBackup()} disabled={!backupName.trim() || busy}>
-              {busy ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}备份
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* ⚠️ 2026-10-14（T65 二改）：原来这里还有两个 `Dialog`
+          ——「备份当前登录态」与「导入账号备份（粘贴 JSON）」。
+          Trae 页头部改成与 WorkBuddy 一致的五个入口后，这两个入口没有了，
+          弹窗一并删除（留着就是永远打不开的死 UI）。
+          现在整库搬家走文件：「导出账号包」下载 JSON、「导入账号包」选文件导入。 */}
 
       {/* 重命名对话框 */}
       <Dialog open={renameTarget !== null} onOpenChange={(v) => !v && setRenameTarget(null)}>
@@ -1586,32 +1663,6 @@ export default function TraeSwitchPage() {
             <Button onClick={() => void onRename()} disabled={!renameName.trim() || renameName.trim() === renameTarget?.id}>
               确定
             </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* 导入对话框 */}
-      <Dialog open={importOpen} onOpenChange={setImportOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>导入账号备份</DialogTitle>
-            <DialogDescription>粘贴此前导出的自包含 JSON（含 base64 载体文件）。</DialogDescription>
-          </DialogHeader>
-          <Input
-            value={importName}
-            onChange={(e) => setImportName(e.target.value)}
-            placeholder="覆盖账号名（可选）"
-          />
-          <textarea
-            value={importText}
-            onChange={(e) => setImportText(e.target.value)}
-            rows={8}
-            className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs shadow-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
-            placeholder='{"format":"trae-vault","files":[...]}'
-          />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setImportOpen(false)}>取消</Button>
-            <Button onClick={() => void onImport()} disabled={!importText.trim()}>导入</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
