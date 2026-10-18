@@ -382,6 +382,7 @@ mod tests {
             has_login: true,
             merged_into: None,
             runnable,
+            exe_manual: false,
         }
     }
 

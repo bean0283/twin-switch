@@ -68,7 +68,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::modules::config::store_dir;
 use crate::modules::process_list;
@@ -177,34 +177,6 @@ fn truncate_utf8(s: &str, max: usize) -> String {
 // 进程控制（WorkBuddy.exe：tasklist / taskkill / 直接拉起）
 // ---------------------------------------------------------------------------
 
-fn run_cmd(program: &str, args: &[String], timeout: Duration) -> Option<String> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// 正在运行的 WorkBuddy 进程 [(名称, pid)]。
 ///
 /// 走 [`process_list::find_by_names`]：一次全量快照后内存过滤，
@@ -238,40 +210,21 @@ pub(crate) fn wb_wait_stopped(timeout_ms: u64) -> bool {
     wb_quit(Duration::from_millis(timeout_ms)).ok
 }
 
-/// 定位 WorkBuddy 主程序：优先常见安装位置，再退回询问一次正在运行的进程。
+/// 定位 WorkBuddy 主程序 —— 直接问**唯一出口** [`workbuddy_switch::resolve_exe`]。
+///
+/// ⚠️ 这里曾经自己写了一套（常见目录 + 起一个系统脚本查进程路径），
+/// 与 `workbuddy_switch` 那套并存 ⇒ 同一个问题两个答案：用户在设置里填了路径，
+/// 导出链路却仍按自己那套判成「找不到」。现在合成一处，顺带去掉那次外部进程调用
+/// （它每次要等几百毫秒，而且受限环境下会被拦）。
 pub fn resolve_wb_exe() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(pf) = std::env::var("ProgramFiles") {
-        candidates.push(PathBuf::from(pf).join("WorkBuddy").join(WB_IMAGE));
-    }
-    if let Ok(la) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(la).join("Programs").join("WorkBuddy").join(WB_IMAGE));
-    }
-    for c in &candidates {
-        if c.is_file() {
-            return Some(c.clone());
-        }
-    }
-    // 兜底：问一次正在运行的进程（Electron 多进程，取第一个能读到路径的）
-    if let Some(out) = run_cmd(
-        "powershell",
-        &[
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            format!("(Get-Process -Name '{WB_IMAGE}' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path }} | Select-Object -First 1).Path"),
-        ],
-        Duration::from_secs(20),
-    ) {
-        let p = out.trim().trim_matches('"').to_string();
-        if !p.is_empty() && Path::new(&p).is_file() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    None
+    crate::modules::workbuddy_switch::resolve_exe()
 }
 
 pub(crate) fn wb_launch() -> Result<PathBuf, String> {
-    let exe = resolve_wb_exe().ok_or("未找到 WorkBuddy 主程序（WorkBuddy.exe），请手动启动")?;
+    let exe = resolve_wb_exe().ok_or(
+        "未找到 WorkBuddy 主程序。请在「设置 → 客户端主程序路径」里指定它，\
+         或先手动打开一次 WorkBuddy（工具会自动记住位置）。",
+    )?;
     use std::process::Command;
     let mut cmd = Command::new(&exe);
     if let Some(dir) = exe.parent() {

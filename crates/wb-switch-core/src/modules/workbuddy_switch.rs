@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::modules::config::{now_ms, store_dir};
-use crate::modules::process_list;
+use crate::modules::{process_list, settings};
 use crate::modules::workbuddy_auth;
 use crate::modules::workbuddy_vault;
 
@@ -98,10 +98,19 @@ fn save_exe_cache(p: &Path) {
     );
 }
 
-/// 探测 WorkBuddy 可执行文件：缓存 → 常见安装路径。
+/// 探测 WorkBuddy 可执行文件 —— **唯一出口**，顺序即优先级：
+///
+/// 1. **用户在设置里手动指定**的路径（`settings.json` 的 `workbuddyExe`；
+///    文件不存在就当没指定，见 [`settings::workbuddy_exe_override`]）；
+/// 2. 上次探测成功记下的缓存；
+/// 3. 常见安装路径；
+/// 4. **它正在跑的进程**（`QueryFullProcessImageNameW`）—— 装到自定义目录时靠这条。
 ///
 /// 不用注册表（`reg.exe` 在受限环境会被拦截），也不用 `wmic`（新系统已移除）。
 pub fn resolve_exe() -> Option<PathBuf> {
+    if let Some(p) = settings::workbuddy_exe_override() {
+        return Some(p);
+    }
     if let Some(cached) = load_exe_cache() {
         return Some(cached);
     }
@@ -121,6 +130,20 @@ pub fn resolve_exe() -> Option<PathBuf> {
         if c.exists() {
             save_exe_cache(&c);
             return Some(c);
+        }
+    }
+    // 兜底：问一次**正在跑的进程**（Electron 多进程，取第一个读得到路径的那条）。
+    let names: Vec<String> = workbuddy_auth::WINDOWS_IMAGE_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for p in crate::modules::process_list::find_by_names_ex(&names) {
+        let Some(exe) = crate::modules::process_list::exe_path_of_pid(p.pid) else {
+            continue;
+        };
+        if exe.is_file() {
+            save_exe_cache(&exe);
+            return Some(exe);
         }
     }
     None

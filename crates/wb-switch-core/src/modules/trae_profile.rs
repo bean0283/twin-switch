@@ -38,6 +38,8 @@ const ENTITLE_PATH: &str = "/trae/api/v2/pay/user_current_entitlement_list";
 /// 实测可用域名：签到脚本走 api.trae.cn；oauth 落库的 host 可能是 api.trae.com.cn，
 /// 请求失败时按候选列表逐个回退。
 const HOSTS: &[&str] = &["https://api.trae.cn", "https://api.trae.com.cn"];
+/// 每台域名最多试几次（传输层抖动时同一台重试一次，常常就过了）。
+const HOST_ATTEMPTS: u32 = 2;
 
 pub fn profile_path(client_key: &str, id: &str) -> PathBuf {
     account_dir(client_key, id).join("profile.json")
@@ -56,8 +58,27 @@ fn gen_device_id() -> String {
     format!("{now}{}", now % 997)
 }
 
-/// 候选域名（去重）：oauth 落库 host 优先，接口实测域名兜底。
-fn candidate_hosts(oauth: &Value) -> Vec<String> {
+/// 候选域名（去重）—— **顺序即优先级**，2026-10-18 改过。
+///
+/// 顺序：**本客户端已知可用的域名**（[`TraeClient::api_host`]）→ oauth 落库的 host →
+/// 其它实测域名。
+///
+/// ## 为什么不能把 oauth host 放第一
+///
+/// oauth 落库的 `host` 是**登录时**用的域名（`https://api.trae.com.cn`）。2026-10-18
+/// 用户报的 `code=-1: error sending request for url (https://api.trae.com.cn/…)`
+/// 就是这个域名上的**传输层失败**——不是域名挂了：同一天实测它对 `GET /` 回 404、
+/// 对积分接口回 401 JSON，属于**偶发抖动 / 连接被重置**（当天另一台域名
+/// `api.trae.cn` 的 `GET /` 也超时过一次，是同一类抖动）。
+///
+/// 所以这里做的事是「排序 + 重试 + 真回退」，三条缺一不可：
+/// 先打最可能通的那台 → 抖动时同一台再试一次 → 仍不行才换下一台。
+/// 旧代码只有「打一次」，且把失败返回**当成应答**（见 [`refresh_profile`]），
+/// 于是**一次抖动 = 这个账号永久报错**，直到下次刷新。
+///
+/// 国际版账号反过来：它的 token 只认 `api.trae.ai`，`api.trae.cn` 会回一个
+/// 「区域不对」的业务错码。所以第一档取**客户端自己的** `api_host`，而不是写死一个。
+fn candidate_hosts(oauth: &Value, client_key: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |h: String| {
         let h = h.trim().trim_end_matches('/').to_string();
@@ -65,6 +86,9 @@ fn candidate_hosts(oauth: &Value) -> Vec<String> {
             out.push(h);
         }
     };
+    if let Some(c) = crate::modules::trae_discover::get_client(client_key) {
+        push(c.api_host.to_string());
+    }
     if let Some(h) = oauth.get("host").and_then(|v| v.as_str()) {
         push(h.to_string());
     }
@@ -72,6 +96,26 @@ fn candidate_hosts(oauth: &Value) -> Vec<String> {
         push((*h).to_string());
     }
     out
+}
+
+/// 这份返回算不算「**这台域名根本不通**」—— 是的话换下一台，别当成业务应答。
+///
+/// - `code == -1`：传输层失败（DNS / 连接被拒 / TLS），[`crate::modules::config::http_request`]
+///   的约定值。`message` 是 reqwest 的英文原文，直接抛给用户没人看得懂。
+/// - `code >= 400`：网关返回了 HTTP 错误（`api.trae.com.cn` 的 404 + HTML 挡板页走这条，
+///   见 T65）。
+///
+/// ⚠️ **业务错码（1001 等）不算不可用**：那是「这台域名听得懂、只是这个账号不行」，
+/// 必须原样报给用户，换域名只会把真正的原因盖掉。
+fn host_unusable(j: &Value) -> bool {
+    match j.get("code").and_then(Value::as_i64) {
+        // ⚠️ 只认 **HTTP 状态码区间**（400–599）与传输失败（-1）。
+        // Trae 的业务错码是 4/5 位数（1001 凭据失效、20403、9005/9095、9074），
+        // 用 `code >= 400` 会把 `1001` 也当成「域名不通」而换域名 —— 那会把
+        // 「这个账号的 token 过期了」这个真正原因盖成一个含糊的网络错误。
+        Some(c) => c == -1 || (400..600).contains(&c),
+        None => false,
+    }
 }
 
 fn value_str(v: Option<&Value>) -> Option<String> {
@@ -310,8 +354,34 @@ pub fn parse_entitlement(j: &Value) -> Value {
     })
 }
 
+/// 读上一次落盘的 profile.json（读不到返回 `None`）。
+fn previous_profile(client_key: &str, id: &str) -> Option<Value> {
+    let txt = std::fs::read_to_string(profile_path(client_key, id)).ok()?;
+    serde_json::from_str::<Value>(&txt).ok().filter(Value::is_object)
+}
+
+fn write_profile(client_key: &str, id: &str, profile: &Value) {
+    let p = profile_path(client_key, id);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, serde_json::to_string_pretty(profile).unwrap_or_default());
+}
+
 /// 刷新账号资料（昵称 + 积分包明细）并缓存到 profile.json。
-/// 网络全部失败时返回 None 且不动旧缓存。oauth 为 `read_oauth_account` 的返回。
+///
+/// 返回 `None` 只表示「这个账号没有可用的 token」（没有 oauth.json）。
+///
+/// ## 域名回退（2026-10-18 修）
+///
+/// 旧实现把 oauth 落库的 host 放第一，且**把失败也当成应答**：
+/// `fetch_entitlement` 在连不上时返回 `{"code":-1,"message":"error sending request…"}`，
+/// 它是个 object ⇒ `is_object()` 为真 ⇒ 判定「这台域名有应答」⇒ 直接写盘返回，
+/// **永远轮不到 `api.trae.cn`**。界面上就成了「部分用户积分必报错，报的还是英文原文」。
+///
+/// 现在：[`host_unusable`] 为真的域名一律跳过（继续试下一台）；所有域名都不通时，
+/// **照实写一份失败**（保留昵称/头像，数字清空 + 中文原因）——
+/// 绝不悄悄留着上次的成功数字让用户以为「刚查过了」。
 pub async fn refresh_profile(client_key: &str, id: &str, oauth: &Value) -> Option<Value> {
     let raw_token = value_str(oauth.get("token"))?;
     let token = clean_token(&raw_token);
@@ -319,37 +389,68 @@ pub async fn refresh_profile(client_key: &str, id: &str, oauth: &Value) -> Optio
         return None;
     }
     let device_id = value_str(oauth.get("deviceId")).unwrap_or_else(gen_device_id);
-    for host in candidate_hosts(oauth) {
-        let info = fetch_user_info(&host, &token).await;
-        let ent = fetch_entitlement(&host, &token, &device_id).await;
-        if info.is_none() && ent.is_none() {
-            continue;
+    let hosts = candidate_hosts(oauth, client_key);
+    let mut tried: Vec<String> = Vec::new();
+    for host in hosts.iter() {
+        // 每台域名最多试 2 次：这类失败是**传输层抖动**（超时 / 连接被重置），
+        // 隔几百毫秒再打一次常常就过 —— 比直接换域名更快，也不浪费其它域名的机会。
+        for attempt in 1..=HOST_ATTEMPTS {
+            let info = fetch_user_info(host, &token).await;
+            let ent = fetch_entitlement(host, &token, &device_id).await;
+            let dead = match ent.as_ref() {
+                Some(j) => host_unusable(j),
+                // 两边都没拿到东西 ⇒ 这台域名这轮没通
+                None => info.is_none(),
+            };
+            if !dead {
+                let credit = ent.as_ref().map(parse_entitlement);
+                let profile = json!({
+                    "screen_name": info.as_ref().and_then(|i| i.get("screen_name")).cloned().unwrap_or(Value::Null),
+                    "user_id": info.as_ref().and_then(|i| i.get("user_id")).cloned().unwrap_or(Value::Null),
+                    "mobile": info.as_ref().and_then(|i| i.get("mobile")).cloned().unwrap_or(Value::Null),
+                    "avatar": info.as_ref().and_then(|i| i.get("avatar")).cloned().unwrap_or(Value::Null),
+                    "region": info.as_ref().and_then(|i| i.get("region")).cloned().unwrap_or(Value::Null),
+                    // 兼容旧字段：`credits` 仍是「剩余积分」，只是从整数变成两位小数。
+                    "credits": credit.as_ref().and_then(|c| c.get("remaining")).cloned().unwrap_or(Value::Null),
+                    "credits_total": credit.as_ref().and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null),
+                    "credits_used": credit.as_ref().and_then(|c| c.get("used")).cloned().unwrap_or(Value::Null),
+                    "credit_packs": credit.as_ref().and_then(|c| c.get("packs")).cloned().unwrap_or(json!([])),
+                    "credit_ok": credit.as_ref().and_then(|c| c.get("ok")).cloned().unwrap_or(json!(false)),
+                    "credit_error": credit.as_ref().and_then(|c| c.get("error")).cloned().unwrap_or(Value::Null),
+                    "host": host,
+                    "fetched_at": chrono::Local::now().to_rfc3339(),
+                });
+                write_profile(client_key, id, &profile);
+                return Some(profile);
+            }
+            if attempt < HOST_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
         }
-        let credit = ent.as_ref().map(parse_entitlement);
-        let profile = json!({
-            "screen_name": info.as_ref().and_then(|i| i.get("screen_name")).cloned().unwrap_or(Value::Null),
-            "user_id": info.as_ref().and_then(|i| i.get("user_id")).cloned().unwrap_or(Value::Null),
-            "mobile": info.as_ref().and_then(|i| i.get("mobile")).cloned().unwrap_or(Value::Null),
-            "avatar": info.as_ref().and_then(|i| i.get("avatar")).cloned().unwrap_or(Value::Null),
-            "region": info.as_ref().and_then(|i| i.get("region")).cloned().unwrap_or(Value::Null),
-            // 兼容旧字段：`credits` 仍是「剩余积分」，只是从整数变成两位小数。
-            "credits": credit.as_ref().and_then(|c| c.get("remaining")).cloned().unwrap_or(Value::Null),
-            "credits_total": credit.as_ref().and_then(|c| c.get("total")).cloned().unwrap_or(Value::Null),
-            "credits_used": credit.as_ref().and_then(|c| c.get("used")).cloned().unwrap_or(Value::Null),
-            "credit_packs": credit.as_ref().and_then(|c| c.get("packs")).cloned().unwrap_or(json!([])),
-            "credit_ok": credit.as_ref().and_then(|c| c.get("ok")).cloned().unwrap_or(json!(false)),
-            "credit_error": credit.as_ref().and_then(|c| c.get("error")).cloned().unwrap_or(Value::Null),
-            "host": host,
-            "fetched_at": chrono::Local::now().to_rfc3339(),
-        });
-        let p = profile_path(client_key, id);
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&p, serde_json::to_string_pretty(&profile).unwrap_or_default());
-        return Some(profile);
+        tried.push(host.clone());
     }
-    None
+    // 一台都没通：写「失败」，别让旧的成功数字继续挂在界面上。
+    let error = format!(
+        "网络请求失败：连不上 Trae 的接口（已试 {}）。请检查网络或系统代理后重试；\
+         如果一直不通，用官方客户端打开一次这个账号也能确认它是否正常。",
+        if tried.is_empty() { "（没有可用域名）".to_string() } else { tried.join("、") }
+    );
+    let mut profile = previous_profile(client_key, id).unwrap_or_else(|| json!({}));
+    if let Some(o) = profile.as_object_mut() {
+        for k in ["screen_name", "user_id", "mobile", "avatar", "region"] {
+            o.entry(k).or_insert(Value::Null);
+        }
+        o.insert("credits".into(), Value::Null);
+        o.insert("credits_total".into(), Value::Null);
+        o.insert("credits_used".into(), Value::Null);
+        o.insert("credit_packs".into(), json!([]));
+        o.insert("credit_ok".into(), json!(false));
+        o.insert("credit_error".into(), json!(error));
+        o.insert("host".into(), json!(tried.last().cloned().unwrap_or_default()));
+        o.insert("fetched_at".into(), json!(chrono::Local::now().to_rfc3339()));
+    }
+    write_profile(client_key, id, &profile);
+    Some(profile)
 }
 
 #[cfg(test)]
@@ -583,3 +684,42 @@ mod tests {
     }
 }
 
+
+    /// 2026-10-18：域名顺序 —— **客户端自己的 api_host 必须第一**。
+    ///
+    /// 反例（真机上出现的就是这个）：oauth 落库 host 是 `api.trae.com.cn`，
+    /// 而它现在连不上；若把它排第一，每个国内版账号都要先撞一次必然失败的请求。
+    #[test]
+    fn candidate_hosts_put_the_client_host_first() {
+        let oauth = json!({ "host": "https://api.trae.com.cn/" });
+        let cn = candidate_hosts(&oauth, "trae-cn");
+        assert_eq!(cn[0], "https://api.trae.cn");
+        assert_eq!(cn[1], "https://api.trae.com.cn");
+        // 去重 + 去尾部斜杠
+        assert_eq!(cn.iter().filter(|h| *h == "https://api.trae.com.cn").count(), 1);
+
+        // 国际版反过来：它的 token 只认 api.trae.ai
+        let intl = candidate_hosts(&oauth, "trae-intl");
+        assert_eq!(intl[0], "https://api.trae.ai");
+        assert!(intl.contains(&"https://api.trae.com.cn".to_string()));
+
+        // 未知 clientKey 也不能崩：只是少了第一档
+        let unknown = candidate_hosts(&oauth, "nope");
+        assert_eq!(unknown[0], "https://api.trae.com.cn");
+        assert!(!unknown.is_empty());
+    }
+
+    /// 「这台域名不通」与「这个账号不行」必须分开：前者换域名，后者原样报给用户。
+    #[test]
+    fn host_unusable_only_covers_transport_and_gateway_errors() {
+        // 传输层失败（reqwest 原文）—— 换域名
+        assert!(host_unusable(&json!({"code": -1, "message": "error sending request for url (…)"})));
+        // 网关 404 + HTML 挡板页 —— 换域名
+        assert!(host_unusable(&json!({"code": 404, "message": "404 Not Found"})));
+        assert!(host_unusable(&json!({"code": 502, "message": "Bad Gateway"})));
+        // 业务错码：听得懂，只是这个账号不行 ⇒ **不许**换域名把真因盖掉
+        assert!(!host_unusable(&json!({"code": 1001, "message": "authenticate failed"})));
+        assert!(!host_unusable(&json!({"code": 0, "user_entitlement_pack_list": []})));
+        // 正常返回没有 code 字段
+        assert!(!host_unusable(&json!({"user_entitlement_pack_list": []})));
+    }

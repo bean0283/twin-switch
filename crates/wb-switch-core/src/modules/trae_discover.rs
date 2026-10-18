@@ -123,13 +123,323 @@ pub fn has_own_exe(client: &TraeClient) -> bool {
 }
 
 /// 只按**本客户端自己的名字**找主程序（不含合并回退）。
+///
+/// 四级，**顺序即优先级**（2026-10-18 加前三级，起因：用户把 Trae 装在自定义目录，
+/// 固定目录扫不到就报「未找到主程序，请在设置里手动指定路径」，而当时设置里
+/// 根本没有那一项）：
+///
+/// 1. **用户在设置里手动指定**的路径（[`crate::modules::settings::trae_exe_override`]）——
+///    文件不存在就当没指定，自动探测继续兜底；
+/// 2. **它自己正在跑的进程**（`QueryFullProcessImageNameW`）—— 客户端开着时最准；
+/// 3. **注册表卸载项**里的 `DisplayIcon` / `InstallLocation` —— 装过就有，与是否在跑无关；
+/// 4. 固定的几个常见目录（原有逻辑）。
+///
+/// ⚠️ 2/3 都**必须过** [`client_of_exe`] 这一关：`Trae.exe` 同时出现在国内版与国际版的
+/// 候选名里，只看文件名会把国际版的路径当成国内版的 —— 于是「切换国内版」实际启动了
+/// 国际版，而界面上一切正常。判定靠安装目录名 + `product.json` 的网关地址。
 fn detect_exe_own(client: &TraeClient) -> Option<PathBuf> {
-    let exe_names: [&str; 2] = match client.key {
+    if let Some(p) = crate::modules::settings::trae_exe_override(client.key) {
+        return Some(p);
+    }
+    if let Some(p) = from_running_process(client) {
+        return Some(p);
+    }
+    for exe in registry_exes() {
+        if exe.is_file() && client_of_exe(&exe) == Some(client.key) {
+            return Some(exe);
+        }
+    }
+    scan_known_dirs(client)
+}
+
+/// 本客户端认的主程序文件名（顺序即优先）。
+fn exe_names_of(client: &TraeClient) -> [&'static str; 2] {
+    match client.key {
         "trae-cn" => ["Trae CN.exe", "Trae.exe"],
         "solo-cn" => ["TRAE SOLO CN.exe", "Trae Solo.exe"],
         "trae-intl" => ["Trae.exe", "Trae CN.exe"],
         _ => ["TRAE SOLO.exe", "Trae Solo.exe"],
+    }
+}
+
+/// 这个 exe 属于哪个客户端 —— `None` = 认不出（宁可不认，也不猜）。
+///
+/// 判据一：**安装目录名**等于该客户端的用户数据目录名（`Trae CN` / `Trae` / …）。
+/// 判据二：读它自己的 `resources/app/product.json`，看 remote 网关与谁一致 ——
+/// 自定义目录（`D:\soft\Trae`）靠这条才认得出。
+fn client_of_exe(exe: &Path) -> Option<&'static str> {
+    let dir_name = exe.parent()?.file_name()?.to_string_lossy().to_string();
+    for c in CLIENTS.iter() {
+        if dir_name.eq_ignore_ascii_case(c.user_data) {
+            return Some(c.key);
+        }
+    }
+    let remote = product_remote_host(exe)?;
+    CLIENTS
+        .iter()
+        .find(|c| remote.eq_ignore_ascii_case(c.remote_host))
+        .map(|c| c.key)
+}
+
+/// 读 `<安装目录>/resources/app/product.json` 的 `bootConfig.remote.trae.normal`。
+fn product_remote_host(exe: &Path) -> Option<String> {
+    let pj = exe.parent()?.join("resources").join("app").join("product.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(pj).ok()?).ok()?;
+    let h = v
+        .get("bootConfig")?
+        .get("remote")?
+        .get("trae")?
+        .get("normal")?
+        .as_str()?
+        .trim_end_matches('/')
+        .to_string();
+    (!h.is_empty()).then_some(h)
+}
+
+/// 从**正在运行的它自己的进程**反查 exe 路径。
+fn from_running_process(client: &TraeClient) -> Option<PathBuf> {
+    let names: Vec<String> = own_process_names(client).iter().map(|s| s.to_string()).collect();
+    for p in crate::modules::process_list::find_by_names_ex(&names) {
+        // 只认主进程：Electron 的 GPU / renderer 子进程用同一个映像名，但
+        // 「谁的路径」都一样，取到就是安装目录；这里不额外挑，先取第一个能认出来的。
+        let Some(exe) = crate::modules::process_list::exe_path_of_pid(p.pid) else { continue };
+        if !exe.is_file() {
+            continue;
+        }
+        let base = exe
+            .file_name()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !exe_names_of(client)
+            .iter()
+            .any(|n| n.to_ascii_lowercase() == base)
+        {
+            continue;
+        }
+        if client_of_exe(&exe) == Some(client.key) {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// 从**正在运行的进程**取某客户端的主程序路径 —— 设置页「用运行中的客户端」用。
+///
+/// 与 [`from_running_process`] 的区别：**不校验安装目录**。用户点这个按钮就是
+/// 「它明明开着，把它的路径给我」，此时目录名/网关都可能不标准（自定义安装）。
+/// 仍要求文件名里带 `trae`，免得把同映像名的其它程序（含本工具自己）当成它。
+pub fn exe_from_running_lenient(client_key: &str) -> Option<PathBuf> {
+    let client = get_client(client_key)?;
+    let mut names: Vec<String> = own_process_names(client).iter().map(|s| s.to_string()).collect();
+    // 已合并的 SOLO：它的界面就是承载方开出来的，进程名归承载方。
+    if let Some(h) = client.merged_into.and_then(get_client) {
+        for n in own_process_names(h) {
+            if !names.iter().any(|x| x == n) {
+                names.push((*n).to_string());
+            }
+        }
+    }
+    for p in crate::modules::process_list::find_by_names_ex(&names) {
+        let Some(exe) = crate::modules::process_list::exe_path_of_pid(p.pid) else {
+            continue;
+        };
+        let base = exe
+            .file_name()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if exe.is_file() && base.contains("trae") {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// 注册表里登记的 Trae 主程序路径（**本进程内缓存一次**）。
+///
+/// 走 `reg query` 而不是再引一个注册表 crate：这是**兜底路径**，只在固定目录扫不到的
+/// 时候跑一次，输出解析足够简单（`REG_SZ` 行 + 值里带 `.exe`）。
+/// 缓存是必须的 —— `list_installed_clients()` 每次刷新要对 4 个客户端各问一遍。
+fn registry_exes() -> Vec<PathBuf> {
+    let Ok(g) = registry_cell().lock() else {
+        return probe_registry();
     };
+    if let Some(v) = g.as_ref() {
+        return v.clone();
+    }
+    drop(g);
+    let found = probe_registry();
+    if let Ok(mut w) = registry_cell().lock() {
+        *w = Some(found.clone());
+    }
+    found
+}
+
+/// 注册表探测结果的进程内缓存（只算一次；`None` = 还没算过）。
+static REGISTRY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<PathBuf>>>> =
+    std::sync::OnceLock::new();
+
+fn registry_cell() -> &'static std::sync::Mutex<Option<Vec<PathBuf>>> {
+    REGISTRY_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 注册表里登记的主程序路径（**只读诊断用**：`examples/trae_discover_probe` 会打印它）。
+///
+/// 「装在自定义目录却找不到」时，先看这里有没有它 —— 有 = 我们的判定（`client_of_exe`）
+/// 没认出来；没有 = 安装包压根没登记 `DisplayIcon`/`InstallLocation`，只能手动指定。
+pub fn registry_candidates() -> Vec<PathBuf> {
+    registry_exes()
+}
+
+/// 丢掉注册表探测缓存 —— 用户装完客户端 / 改完设置点「重新检测」时调，
+/// 否则「重新检测」会永远返回第一次的结果（**「没重新检测」和「检测不到」长得一样**）。
+pub fn invalidate_discovery_cache() {
+    if let Ok(mut g) = registry_cell().lock() {
+        *g = None;
+    }
+}
+
+#[cfg(windows)]
+fn probe_registry() -> Vec<PathBuf> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY,
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 读一个 REG_SZ 值（读不到 / 不是字符串都返回 `None`）。
+    fn query_sz(key: HKEY, name: &str) -> Option<String> {
+        let name_w = wide(name);
+        let mut ty = Default::default();
+        let mut size: u32 = 0;
+        unsafe {
+            if RegQueryValueExW(
+                key,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut ty),
+                None,
+                Some(&mut size),
+            ) != ERROR_SUCCESS
+                || size == 0
+            {
+                return None;
+            }
+        }
+        let mut buf = vec![0u8; size as usize + 2];
+        unsafe {
+            if RegQueryValueExW(
+                key,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut ty),
+                Some(buf.as_mut_ptr()),
+                Some(&mut size),
+            ) != ERROR_SUCCESS
+            {
+                return None;
+            }
+        }
+        let units: Vec<u16> = buf[..size as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|c| *c != 0)
+            .collect();
+        String::from_utf16(&units).ok().map(|s| s.trim().to_string())
+    }
+
+    /// 把一条候选值收进结果：`DisplayIcon` 形如 `"C://X//Trae CN.exe",0`。
+    fn push_candidate(value: &str, out: &mut Vec<PathBuf>) {
+        let raw = value.split(',').next().unwrap_or(value).trim().trim_matches('"');
+        let lower = raw.to_ascii_lowercase();
+        if !lower.contains("trae") {
+            return;
+        }
+        let p = PathBuf::from(raw);
+        if p.is_file() && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+
+    /// `InstallLocation` 只有一个目录，得自己拼 exe 名。
+    fn push_location(value: &str, out: &mut Vec<PathBuf>) {
+        let dir = PathBuf::from(value.trim().trim_matches('"'));
+        if !dir.is_dir() {
+            return;
+        }
+        for name in ["Trae CN.exe", "Trae.exe", "TRAE SOLO CN.exe", "TRAE SOLO.exe"] {
+            let p = dir.join(name);
+            if p.is_file() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (root, path) in [
+        (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ] {
+        let root_w = wide(path);
+        let mut hkey = HKEY::default();
+        unsafe {
+            if RegOpenKeyExW(root, PCWSTR(root_w.as_ptr()), 0, KEY_READ, &mut hkey) != ERROR_SUCCESS
+            {
+                continue;
+            }
+            let mut index = 0u32;
+            loop {
+                let mut name = [0u16; 512];
+                let mut len = name.len() as u32;
+                if RegEnumKeyExW(
+                    hkey,
+                    index,
+                    PWSTR(name.as_mut_ptr()),
+                    &mut len,
+                    None,
+                    PWSTR::null(),
+                    None,
+                    None,
+                ) != ERROR_SUCCESS
+                {
+                    break;
+                }
+                index += 1;
+                let sub_name = String::from_utf16_lossy(&name[..len as usize]);
+                let sub_w = wide(&sub_name);
+                let mut sub = HKEY::default();
+                if RegOpenKeyExW(hkey, PCWSTR(sub_w.as_ptr()), 0, KEY_READ, &mut sub)
+                    != ERROR_SUCCESS
+                {
+                    continue;
+                }
+                if let Some(v) = query_sz(sub, "DisplayIcon") {
+                    push_candidate(&v, &mut out);
+                }
+                if let Some(v) = query_sz(sub, "InstallLocation") {
+                    push_location(&v, &mut out);
+                }
+                let _ = RegCloseKey(sub);
+            }
+            let _ = RegCloseKey(hkey);
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn probe_registry() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 原有的固定目录扫描（常见安装位置）。
+fn scan_known_dirs(client: &TraeClient) -> Option<PathBuf> {
+    let exe_names = exe_names_of(client);
     let mut dirs: Vec<PathBuf> = Vec::new();
     dirs.push(user_data_dir(client));
     dirs.push(localappdata_dir().join("Programs").join(client.user_data));
@@ -141,7 +451,10 @@ fn detect_exe_own(client: &TraeClient) -> Option<PathBuf> {
         dirs.push(PathBuf::from(base).join(client.user_data));
     }
     for ch in "CDEFGH".chars() {
-        for sub in ["Program Files", "Program Files (x86)"] {
+        // 盘符根 + 常见的一级子目录：`D:\Trae CN`、`D:\Program Files\Trae CN`。
+        // （用户自定义安装最常落在盘符根或一个自建目录里，深度再大就靠注册表/手动指定。）
+        dirs.push(PathBuf::from(format!("{ch}:\\")).join(client.user_data));
+        for sub in ["Program Files", "Program Files (x86)", "Apps", "Software"] {
             dirs.push(PathBuf::from(format!("{ch}:\\")).join(sub).join(client.user_data));
         }
     }
@@ -170,7 +483,6 @@ fn detect_exe_own(client: &TraeClient) -> Option<PathBuf> {
                 return hit;
             }
             if count == 1 {
-                let _ = count;
                 for e in std::fs::read_dir(&dir).ok()?.flatten() {
                     if e.file_name().to_string_lossy().to_lowercase().ends_with(".exe") {
                         return Some(e.path());
@@ -328,6 +640,11 @@ pub struct InstalledClient {
     /// 判据与 [`has_own_exe`] 是同一条（数据目录在 **且** 自己的主程序在），
     /// 切号护栏 `trae_switch::ensure_switchable` 也走它 —— 三处必须同源。
     pub runnable: bool,
+    /// 这个 exe 是**用户手动指定**的（设置里填的），还是自动探测出来的。
+    ///
+    /// 界面要能分开显示：自动探测的结果随时可能变（换了安装位置），手动指定的是
+    /// 用户明确意图 —— 混成一句「路径：X」会让用户以为「我明明没设，哪来的路径」。
+    pub exe_manual: bool,
 }
 
 pub fn list_installed_clients() -> Vec<InstalledClient> {
@@ -348,6 +665,7 @@ pub fn list_installed_clients() -> Vec<InstalledClient> {
                 exe: own_exe.map(|p| p.to_string_lossy().into_owned()),
                 has_login: installed && has_login_state(c),
                 merged_into: c.merged_into,
+                exe_manual: crate::modules::settings::trae_exe_override(c.key).is_some(),
             }
         })
         .collect()
@@ -416,6 +734,7 @@ mod tests {
             has_login: false,
             merged_into: c.merged_into,
             runnable,
+            exe_manual: false,
         }
     }
 

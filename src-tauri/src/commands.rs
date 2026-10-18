@@ -13,7 +13,7 @@ use wb_switch_core::modules::{
     trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
     trae_profile, trae_remote, trae_session_edit, trae_switch, trae_vault, workbuddy_cleanup,
-    workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
+    workbuddy_auth, workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
     workbuddy_session_edit, workbuddy_sessions, workbuddy_switch, workbuddy_vault,
 };
 
@@ -191,8 +191,14 @@ pub fn trae_export_dir() -> String {
 /// 没有历史时退回内置偏好顺序（`solo-cn` 第一）。`topPick` 是排在最前且**确有使用历史**
 /// 的那个 key，界面据此打「常用」徽标。
 #[tauri::command]
-pub async fn trae_list_clients() -> Value {
-    off_main(|| {
+pub async fn trae_list_clients(refresh: Option<bool>) -> Value {
+    let refresh = refresh.unwrap_or(false);
+    off_main(move || {
+        // 「重新检测」= 丢掉注册表探测缓存再算一次 —— 否则装了新客户端之后
+        // 界面会一直返回第一次的结果，与「检测不到」长得一模一样。
+        if refresh {
+            trae_discover::invalidate_discovery_cache();
+        }
         let mut clients = trae_discover::list_installed_clients();
         client_usage::sort_installed(&mut clients);
         let keys: Vec<&str> = clients.iter().map(|c| c.key).collect();
@@ -1014,6 +1020,13 @@ pub struct SettingsPatch {
     pub backup_retention: Option<settings::BackupRetention>,
     /// 写库前的整库备份开关（默认 `false` = 不备份）。
     pub backup_before_write: Option<bool>,
+    /// 手动指定的客户端主程序路径（`clientKey → 绝对路径`）。
+    ///
+    /// ⚠️ **整表覆盖**：前端传的是「改完之后的全量映射」，删掉某个键就等于
+    /// 「把这个客户端恢复成自动探测」。这样不会出现「想清空却清不掉」的半个状态。
+    pub trae_exe: Option<std::collections::HashMap<String, String>>,
+    /// 手动指定的 WorkBuddy 主程序路径（`None` = 不改；空串 = 恢复自动探测）。
+    pub workbuddy_exe: Option<String>,
 }
 
 /// 设置快照的**唯一出口** —— `settings_get` 与 `settings_set` 都返回它的形状。
@@ -1037,6 +1050,13 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
             "已关闭（默认）—— 写库不留历史版本；库位替换是原子的，不会因此丢库"
         },
         "path": path.to_string_lossy(),
+        // 手动指定的主程序路径（前端拿它渲染「已指定 / 自动探测」两种状态）。
+        "traeExe": s.trae_exe,
+        "workbuddyExe": s.workbuddy_exe,
+        // 自动探测到的 WorkBuddy 主程序（界面在「没手动指定」时显示这一条）。
+        // 与真正启动时用的是**同一个出口**，不会出现「显示 A、启动 B」。
+        "workbuddyDetected": workbuddy_switch::resolve_exe()
+            .map(|p| p.to_string_lossy().into_owned()),
     })
 }
 
@@ -1076,10 +1096,104 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         if let Some(b) = patch.backup_before_write {
             next.backup_before_write = b;
         }
+        if let Some(m) = patch.trae_exe {
+            // ⚠️ 存之前先校验：一个不存在的路径存进去，等于把「找不到主程序」
+            //    换成「找到但启动失败」，错误更难懂。空串视为「清除这一项」。
+            let mut clean: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (k, v) in m {
+                let v = v.trim().to_string();
+                if v.is_empty() {
+                    continue;
+                }
+                let p = std::path::Path::new(&v);
+                if !p.is_file() {
+                    return Err(format!("这个路径不是一个文件：{v}"));
+                }
+                if !v.to_ascii_lowercase().ends_with(".exe") {
+                    return Err(format!("请选择客户端的主程序（.exe），当前是：{v}"));
+                }
+                clean.insert(k, v);
+            }
+            next.trae_exe = clean;
+            // 装完客户端 / 改完路径 ⇒ 让注册表探测重算一次，
+            // 否则「重新检测」会返回第一次的结果（等于没检测）。
+            trae_discover::invalidate_discovery_cache();
+        }
+        if let Some(v) = patch.workbuddy_exe {
+            let v = v.trim().to_string();
+            if v.is_empty() {
+                next.workbuddy_exe = String::new();
+            } else {
+                if !std::path::Path::new(&v).is_file() {
+                    return Err(format!("WorkBuddy 的路径不是一个文件：{v}"));
+                }
+                if !v.to_ascii_lowercase().ends_with(".exe") {
+                    return Err(format!("请选择 WorkBuddy 的主程序（.exe），当前是：{v}"));
+                }
+                next.workbuddy_exe = v;
+            }
+        }
         let path = settings::save(&next)?;
         // 回读一次：把「实际落盘的值」返回给界面，而不是「用户刚提交的值」
         let saved = settings::load_strict()?;
         Ok(settings_snapshot(&saved, &path))
+    })
+    .await?
+}
+
+/// 取「正在运行的客户端」的主程序路径（设置页的「用运行中的客户端」按钮）。
+///
+/// 为什么需要它：Trae 允许装到任意目录，自动探测再全也可能漏；而**它正在跑**
+/// 这件事本身就是最可靠的线索（`QueryFullProcessImageNameW` 直接给绝对路径）。
+/// 用户点一下就把路径填对，比让他去「右键快捷方式 → 打开文件所在位置」强。
+///
+/// ⚠️ 没在跑时**如实报错**，不许回一个猜的路径 —— 填错路径的后果是「切换时启动了
+/// 别的东西」，比「没找到」难查得多。
+#[tauri::command]
+pub async fn trae_exe_from_running(client_key: String) -> Result<Value, String> {
+    off_main(move || {
+        let client =
+            trae_discover::get_client(&client_key).ok_or_else(|| format!("未知客户端：{client_key}"))?;
+        match trae_discover::exe_from_running_lenient(client_key.as_str()) {
+            Some(p) => Ok(json!({
+                "ok": true,
+                "clientKey": client_key,
+                "label": client.label,
+                "path": p.to_string_lossy(),
+            })),
+            None => Err(format!(
+                "{} 现在没有在运行。请先打开它，或直接粘贴它的主程序路径（右键桌面快捷方式 → 打开文件所在位置）。",
+                client.label
+            )),
+        }
+    })
+    .await?
+}
+
+/// 取「正在运行的 WorkBuddy」的主程序路径（设置页的「用运行中的」）。
+///
+/// 与 [`trae_exe_from_running`] 同一个道理：装在自定义目录时，**它正在跑**
+/// 就是最可靠的线索。没在跑就如实报错，不许回一个猜的路径。
+#[tauri::command]
+pub async fn workbuddy_exe_from_running() -> Result<Value, String> {
+    off_main(|| {
+        let names: Vec<String> = workbuddy_auth::WINDOWS_IMAGE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for p in wb_switch_core::modules::process_list::find_by_names_ex(&names) {
+            let Some(exe) = wb_switch_core::modules::process_list::exe_path_of_pid(p.pid) else {
+                continue;
+            };
+            if exe.is_file() {
+                return Ok(json!({ "ok": true, "path": exe.to_string_lossy() }));
+            }
+        }
+        Err(
+            "WorkBuddy 现在没有在运行。请先打开它，或直接粘贴它的主程序路径（右键桌面快捷方式 → 打开文件所在位置）。"
+                .to_string(),
+        )
     })
     .await?
 }
@@ -1232,7 +1346,7 @@ pub async fn trae_backup_restore(
         let out = trae_backup::restore_with_park(&dir, &live, &park_root, &client_key);
 
         // ③ 无论成败都尝试把客户端起回来（失败时也要起 —— 用户还得用它）
-        let relaunched = trae_switch::launch(&client_key, None).is_ok();
+        let relaunched = trae_switch::launch(&client_key).is_ok();
 
         let mut v = out?;
         if let Some(o) = v.as_object_mut() {

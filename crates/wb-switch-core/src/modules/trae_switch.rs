@@ -35,6 +35,14 @@ pub const OUTCOME_ACTIVE: &str = "active";
 pub const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 pub const OUTCOME_NEEDS_CONFIRM: &str = "needs_confirm";
 
+/// 找不到主程序时给用户的下一句 —— **必须指向一个真的存在的入口**。
+///
+/// 2026-10-18 之前这里写的是「请在设置里手动指定路径」，而当时设置页**根本没有那一项**：
+/// 用户照着提示去设置里翻一遍，什么也找不到。所以这条文案必须与
+/// `SettingsPage` 上的区块标题保持一致（`客户端主程序路径`）。
+pub const MISSING_EXE_HINT: &str =
+    "请在「设置 → 客户端主程序路径」里指定它，或先手动打开一次该客户端（工具会自动记住位置）。";
+
 // ---------------------------------------------------------------------------
 // 配置（存于 `<~/.twin-switch>/trae/config.json`）
 // ---------------------------------------------------------------------------
@@ -45,8 +53,6 @@ pub struct TraeConfig {
     pub active_client: String,
     /// clientKey → 载体条目相对路径列表；空表示用自动探测结果。
     pub fingerprints: HashMap<String, Vec<String>>,
-    /// clientKey → 主程序绝对路径；空表示自动探测。
-    pub client_exe: HashMap<String, String>,
     /// 切换后自动重新拉起客户端。
     pub auto_relaunch: bool,
     /// 守护超时（毫秒）。
@@ -60,7 +66,6 @@ impl Default for TraeConfig {
         Self {
             active_client: "trae-cn".into(),
             fingerprints: HashMap::new(),
-            client_exe: HashMap::new(),
             auto_relaunch: true,
             guard_timeout_ms: 25000,
             auto_snapshot_before_switch: true,
@@ -229,13 +234,18 @@ pub fn stop_for_maintenance(client: &TraeClient, timeout_ms: u64) -> Result<Main
     Ok(MaintenanceStop::Stopped(killed.len()))
 }
 
-/// 解析客户端主程序路径：用户配置优先，其次自动探测。
-pub fn resolve_exe(client: &TraeClient, configured: Option<&str>) -> Option<PathBuf> {
-    if let Some(c) = configured {
-        if !c.trim().is_empty() && Path::new(c.trim()).is_file() {
-            return Some(PathBuf::from(c.trim()));
-        }
-    }
+/// 解析客户端主程序路径 —— **唯一出口**，内部顺序即优先级：
+///
+/// 1. 用户在设置里手动指定的路径（`settings.json` 的 `traeExe`，见
+///    [`crate::modules::settings::trae_exe_override`]）—— 文件不存在就当没指定；
+/// 2. 自动探测（运行中进程 → 注册表 → 常见目录，见
+///    [`crate::modules::trae_discover::detect_exe`]）；
+/// 3. 已合并的 SOLO 回退到承载方的主程序。
+///
+/// ⚠️ 以前这里还有一个 `configured: Option<&str>` 入参，读的是 `trae/config.json`
+/// 的 `client_exe` —— 那个字段**从来没有界面能写**，等于一条死路；留着它就会出现
+/// 「设置里改了 A、真正生效的是 B」。现在只剩这一个出口。
+pub fn resolve_exe(client: &TraeClient) -> Option<PathBuf> {
     crate::modules::trae_discover::detect_exe(client)
 }
 
@@ -273,10 +283,10 @@ fn spawn_client(exe: &Path) -> std::io::Result<Child> {
 }
 
 /// 拉起客户端（同步返回主程序路径）。
-pub fn launch(client_key: &str, configured_exe: Option<&str>) -> Result<PathBuf, String> {
+pub fn launch(client_key: &str) -> Result<PathBuf, String> {
     let client = get_client(client_key).ok_or("未知客户端")?;
-    let exe = resolve_exe(client, configured_exe)
-        .ok_or(format!("未找到 {} 的主程序，请在设置里手动指定路径", client.label))?;
+    let exe = resolve_exe(client)
+        .ok_or_else(|| format!("未找到 {} 的主程序。{}", client.label, MISSING_EXE_HINT))?;
     let _ = spawn_client(&exe);
     Ok(exe)
 }
@@ -285,12 +295,11 @@ pub fn launch(client_key: &str, configured_exe: Option<&str>) -> Result<PathBuf,
 /// 进程没出现就重试一次，仍失败则抛出带真因的错误，交给上层回滚。
 pub fn launch_and_wait(
     client_key: &str,
-    configured_exe: Option<&str>,
     on_log: Option<&dyn Fn(&str)>,
 ) -> Result<(), String> {
     let client = get_client(client_key).ok_or("未知客户端")?;
-    let exe = resolve_exe(client, configured_exe)
-        .ok_or(format!("未找到 {} 的主程序，请在设置里手动指定路径", client.label))?;
+    let exe = resolve_exe(client)
+        .ok_or_else(|| format!("未找到 {} 的主程序。{}", client.label, MISSING_EXE_HINT))?;
 
     // 进程刚被强杀时，客户端可能还在收尾（单实例锁/管道未释放）；
     // 立刻重启会被它判成「已有实例」而直接退出，等一下更稳。
@@ -355,7 +364,7 @@ pub fn launch_and_wait(
     }
 
     Err(format!(
-        "客户端没能启动：{last_reason}。可检查：① 主程序路径是否正确（设置里可手动指定）；② 是否被安全软件拦截；③ 试着手动双击一次客户端，确认它能正常打开。"
+        "客户端没能启动：{last_reason}。可检查：① 主程序路径是否正确（「设置 → 客户端主程序路径」）；② 是否被安全软件拦截；③ 试着手动双击一次客户端，确认它能正常打开。"
     ))
 }
 
@@ -646,11 +655,11 @@ pub fn switch_to(
         let target_uid = uid_of_account(client_key, account_id);
 
         log("启动 Trae 客户端…");
-        if let Err(e) = launch_and_wait(client_key, cfg.client_exe.get(client_key).map(|s| s.as_str()), Some(&log)) {
+        if let Err(e) = launch_and_wait(client_key, Some(&log)) {
             for rel in &entries {
                 overwrite_entry(&rollback_dir, &root_dir, rel);
             }
-            let _ = launch(client_key, cfg.client_exe.get(client_key).map(|s| s.as_str()));
+            let _ = launch(client_key);
             log("已尝试用原账号重新拉起客户端");
             let _ = std::fs::remove_dir_all(&rollback_dir);
             return Err(format!("启动失败，已回滚：{e}"));
@@ -709,7 +718,7 @@ pub fn switch_to(
             for rel in &entries {
                 overwrite_entry(&rollback_dir, &root_dir, rel);
             }
-            let _ = launch(client_key, cfg.client_exe.get(client_key).map(|s| s.as_str()));
+            let _ = launch(client_key);
         }
     } else {
         log("已按设置跳过自动启动，请手动打开 Trae 验证");
