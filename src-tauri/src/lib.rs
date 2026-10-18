@@ -191,6 +191,8 @@ pub fn run() {
             commands::trae_wb_cleanup_empty_trash,
             commands::settings_get,
             commands::settings_set,
+            commands::trae_exe_from_running,
+            commands::workbuddy_exe_from_running,
             commands::trae_cleanup_scan,
             commands::trae_cleanup_purge,
             commands::trae_cleanup_empty_trash,

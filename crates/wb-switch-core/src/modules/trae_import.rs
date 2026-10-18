@@ -1962,7 +1962,7 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
         let _ = std::fs::remove_dir_all(&work);
         log("没有需要修正的工程归属，库未改动");
         if was_running {
-            let _ = launch(client_key, None);
+            let _ = launch(client_key);
         }
         return Ok(json!({
             "checked": true,
@@ -2047,7 +2047,7 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
     // 6) 重启客户端
     let mut relaunched = false;
     if was_running {
-        match launch(client_key, None) {
+        match launch(client_key) {
             Ok(_) => relaunched = true,
             Err(e) => log(&format!("重启客户端失败（请手动启动）：{e}")),
         }
@@ -2477,7 +2477,7 @@ pub fn import_sessions(
     let verified_sessions = sid_pairs.len();
 
     // 7) 导入期间结束过目标客户端进程，成功后自动重启，保证导入的会话立即可用
-    let relaunched = match launch(dst_client_key, None) {
+    let relaunched = match launch(dst_client_key) {
         Ok(_) => {
             log("导入成功，已自动重启目标客户端");
             true
@@ -2961,7 +2961,7 @@ fn sync_groups_inner(
     }
 
     // 9) 重启客户端
-    let relaunched = match launch(client_key, None) {
+    let relaunched = match launch(client_key) {
         Ok(_) => {
             log(&format!(
                 "同步完成（{} 个关联组），已自动重启客户端",

@@ -9,7 +9,7 @@
 //! ⚠️ 本模块**只管策略判定**，不碰文件；真正删文件的是
 //! [`crate::modules::trae_export::prune_with_policy`]。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -276,13 +276,64 @@ pub struct Settings {
     /// **与「新装也是关」一致**（不许出现「升级后行为突然变了」这种说不清的事）。
     #[serde(default)]
     pub backup_before_write: bool,
+    /// **用户手动指定的客户端主程序路径**（T69）：`clientKey → 绝对路径`。
+    ///
+    /// ## 为什么需要
+    ///
+    /// Trae 允许把程序装到任意目录（`D:\Trae CN`、`D:\soft\Trae`…），自动探测只扫
+    /// 固定的几处（`%LOCALAPPDATA%\Programs` / `Program Files` / `<盘符>:\Program Files`），
+    /// 装在自定义目录的机器上就「未找到主程序，请在设置里手动指定路径」—— 而**设置里
+    /// 压根没有那一项**（这就是 2026-10-18 用户报的问题）。现在补上：
+    ///
+    /// - 这里是**唯一**的用户意图来源，优先级**高于**任何自动探测；
+    /// - 路径不存在时**不算数**（见 [`trae_exe_override`]）—— 用户拔了移动硬盘、
+    ///   或手动填错，都不许让「切换」拿一个不存在的 exe 去 spawn 然后报一个
+    ///   看不出真因的错。此时自动探测照常兜底。
+    ///
+    /// ## 为什么不复用 `<store>/trae/config.json` 的 `client_exe`
+    ///
+    /// 那个字段是早期命令行版的遗物，**从来没有界面写过它**（代码里只有读）。
+    /// 同一件事留两处配置 = 迟早「界面上改了 A、真正生效的是 B」。
+    /// 现在用户可见的只有这一份；`trae_switch` 读路径时也**只**问这里。
+    #[serde(default)]
+    pub trae_exe: HashMap<String, String>,
+    /// **用户手动指定的 WorkBuddy 主程序路径**（`WorkBuddy.exe` 的绝对路径）。
+    ///
+    /// 与 [`Settings::trae_exe`] 同一个道理：WorkBuddy 也能装到自定义目录，
+    /// 自动探测（常见目录 + 运行中的进程）扫不到时报的是
+    /// 「未找到 WorkBuddy 主程序（WorkBuddy.exe），请手动启动」——
+    /// 那句同样没给出可操作的下一步。这里给它一个能填的地方。
+    ///
+    /// ⚠️ 空串 = 没指定（走自动探测）；**文件不存在也当没指定**（见
+    /// [`workbuddy_exe_override`]），这样拔了移动硬盘不会去 spawn 一个不存在的程序。
+    #[serde(default)]
+    pub workbuddy_exe: String,
 }
 
 impl Settings {
     pub fn sanitized(mut self) -> Self {
         self.backup_retention = self.backup_retention.sanitized();
+        // 去掉空白项与空值：空串留在磁盘上等于「设了一个空路径」，
+        // 会让界面显示「已手动指定」而实际什么都没指定。
+        self.trae_exe = self
+            .trae_exe
+            .into_iter()
+            .map(|(k, v)| (k, v.trim().to_string()))
+            .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
+            .collect();
+        self.workbuddy_exe = self.workbuddy_exe.trim().to_string();
         self
     }
+}
+
+/// 用户手动指定的主程序路径（**唯一出口**）—— 文件不存在就当没指定。
+///
+/// ⚠️ 这里做 `is_file()` 校验而不是在调用方各写一遍：注册表 / 进程 / 目录扫描
+/// 三条自动探测都得先看它，校验散开就会出现「A 处认了 B 处不认」。
+pub fn trae_exe_override(client_key: &str) -> Option<PathBuf> {
+    let p = load().trae_exe.get(client_key).cloned()?;
+    let p = PathBuf::from(p.trim());
+    p.is_file().then_some(p)
 }
 
 /// 写库前要不要留整库备份 —— **唯一出口**。
@@ -578,4 +629,13 @@ mod tests {
         assert!(ExcessRule::Count.describe(&p).contains("2 份"));
         assert!(ExcessRule::Size.describe(&p).contains("100 MB"));
     }
+}
+
+/// 用户手动指定的 WorkBuddy 主程序路径 —— **文件不存在就当没指定**。
+///
+/// 与 [`trae_exe_override`] 同一条规矩：校验只在这里做一次，调用方各写一遍
+/// 迟早会出现「A 处认了 B 处不认」。
+pub fn workbuddy_exe_override() -> Option<PathBuf> {
+    let p = PathBuf::from(load().workbuddy_exe.trim());
+    p.is_file().then_some(p)
 }

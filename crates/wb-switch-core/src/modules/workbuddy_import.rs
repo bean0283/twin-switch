@@ -1660,7 +1660,7 @@ pub fn import_sessions(
     let pruned = prune_backups(dst_client_key, &log);
 
     // 8) 重启客户端，让导入的会话立即可用
-    let relaunched = match launch(dst_client_key, None) {
+    let relaunched = match launch(dst_client_key) {
         Ok(_) => {
             log("导入成功，已自动重启目标客户端");
             true

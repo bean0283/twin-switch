@@ -1558,7 +1558,7 @@ pub fn edit_save(
         crate::modules::trae_export::drop_snapshot_meta(&client_key);
     }
 
-    let relaunched = match launch(&client_key, None) {
+    let relaunched = match launch(&client_key) {
         Ok(_) => {
             log("写入成功，已自动重启客户端");
             true

@@ -128,6 +128,47 @@ pub fn all_processes() -> Vec<(String, u32)> {
         .collect()
 }
 
+/// 取某个进程**主程序的绝对路径**（`QueryFullProcessImageNameW`）。
+///
+/// 用途：Trae 允许把程序装到任意目录，自动探测扫不到时，「它现在正在跑」
+/// 就是最可靠的路径来源 —— 用户开着客户端点一下就能把路径填对。
+///
+/// 失败返回 `None`（权限不足 / 进程已退出 / 非 Windows 平台）。**不报错**：
+/// 对调用方来说「拿不到」和「没有这个进程」是同一件事，不必区分。
+#[cfg(windows)]
+pub fn exe_path_of_pid(pid: u32) -> Option<std::path::PathBuf> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    unsafe {
+        // PROCESS_QUERY_LIMITED_INFORMATION：权限要求最低的一档，普通用户可开。
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(h);
+        if r.is_err() || len == 0 {
+            return None;
+        }
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buf[..len as usize],
+        )))
+    }
+}
+
+/// 非 Windows：拿不到（本工具只在 Windows 上跑 Trae，这里仅为编译通过）。
+#[cfg(not(windows))]
+pub fn exe_path_of_pid(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// 归一化映像名：去空白 / 去引号 / 去 `.exe` 后缀 / 转小写。
 fn norm(name: &str) -> String {
     let s = name.trim().trim_matches('"').to_ascii_lowercase();

@@ -697,7 +697,7 @@ fn delete_sessions_core(
     }
 
     // 9. 删除期间结束过客户端进程，成功后自动重启，保证删除结果立即可见
-    let relaunched = match launch(client_key, None) {
+    let relaunched = match launch(client_key) {
         Ok(_) => {
             log("删除成功，已自动重启客户端");
             true

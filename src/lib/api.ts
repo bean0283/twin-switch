@@ -118,11 +118,13 @@ function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
  * ⚠️ 界面**不显示**「已并入且本机跑不起来」的客户端 —— 那层过滤在
  * `@/lib/trae-client-list`，别在这里或组件里各写一份。
  */
-export function traeListClients(): Promise<{
+export function traeListClients(refresh = false): Promise<{
   clients: TraeInstalledClient[];
   usage?: TraeClientUsageSnapshot;
 }> {
-  return call("trae_list_clients");
+  // `refresh = true` 时后端会丢掉「注册表探测」的缓存重算一次 ——
+  // 用户装完客户端点「重新检测」必须真的重新看一遍系统。
+  return call("trae_list_clients", { refresh });
 }
 
 /** 清空「客户端使用记忆」（排序回到内置偏好；界面上仍看不到已被摘掉的客户端）。 */
@@ -870,8 +872,42 @@ export function settingsGet(): Promise<SettingsSnapshot> {
 export function settingsSet(patch: {
   backupRetention?: BackupRetention;
   backupBeforeWrite?: boolean;
+  /**
+   * 手动指定的客户端主程序路径（`clientKey → 绝对路径`）。
+   *
+   * ⚠️ **整表覆盖**：传「改完之后的全量映射」，某个键不存在 = 那个客户端恢复自动探测。
+   * 后端会先校验「是不是一个真实存在的 .exe」，不通过就整体报错、一个都不写。
+   */
+  traeExe?: Record<string, string>;
+  /** 手动指定的 WorkBuddy 主程序路径（空串 = 恢复自动探测）。 */
+  workbuddyExe?: string;
 }): Promise<SettingsSnapshot> {
   return call("settings_set", { patch });
+}
+
+/**
+ * 取「正在运行的客户端」的主程序路径（设置页的「用运行中的客户端」）。
+ *
+ * 为什么需要：Trae 允许装到任意目录，自动探测再全也可能漏；**它正在跑**本身就是
+ * 最可靠的线索。没在跑时后端**如实报错**（不会回一个猜的路径）——
+ * 填错路径的后果是「切换时启动了别的东西」，比「没找到」难查得多。
+ */
+export function traeExeFromRunning(clientKey: string): Promise<{
+  ok: boolean;
+  clientKey: string;
+  label: string;
+  path: string;
+}> {
+  return call("trae_exe_from_running", { clientKey });
+}
+
+/**
+ * 取「正在运行的 WorkBuddy」的主程序路径（设置页 WorkBuddy 那一行的按钮）。
+ *
+ * 没在跑时后端**如实报错**，不会回一个猜的路径。
+ */
+export function workbuddyExeFromRunning(): Promise<{ ok: boolean; path: string }> {
+  return call("workbuddy_exe_from_running");
 }
 
 /**

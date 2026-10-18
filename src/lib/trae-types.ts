@@ -13,6 +13,14 @@ export interface TraeInstalledClient {
   merged_into?: string | null;
   /** 本机能不能真把它跑起来（数据目录在 **且** 找得到主程序）。 */
   runnable?: boolean;
+  /**
+   * 这个路径是**用户手动指定**的（设置里填的），还是自动探测出来的。
+   *
+   * 装到自定义目录（`D:\Trae CN`、`D:\soft\Trae`…）时自动探测可能扫不到，
+   * 用户在设置里指定之后这里为 `true` —— 界面要能分开显示，否则用户会以为
+   * 「我明明没设，哪来的路径」。
+   */
+  exe_manual?: boolean;
 }
 
 /** 单个客户端的「使用记忆」（对应 `client_usage::ClientUsage`）。 */
@@ -2074,6 +2082,22 @@ export interface SettingsSnapshot {
   beforeWriteSummary: string;
   /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
   path: string;
+  /**
+   * 用户**手动指定**的客户端主程序路径：`clientKey → 绝对路径`。
+   *
+   * 只有用户真按了「保存」才会出现；没有某个键 = 那个客户端走自动探测。
+   * 装到自定义目录（非 `%LOCALAPPDATA%\Programs` / `Program Files`）时靠它。
+   */
+  traeExe: Record<string, string>;
+  /** 手动指定的 WorkBuddy 主程序路径（空串 = 没指定，走自动探测）。 */
+  workbuddyExe: string;
+  /**
+   * 自动探测到的 WorkBuddy 主程序；`null` = 没找到。
+   *
+   * ⚠️ 与真正启动时用的是**同一个出口**（`workbuddy_switch::resolve_exe`），
+   * 所以这里显示的路径就是「点了按钮要启动的那个」，不会两处不同源。
+   */
+  workbuddyDetected: string | null;
 }
 
 /** `trae_backup_inspect` 的返回：一批备份能不能还原、省了多少。 */
