@@ -15,6 +15,7 @@ import {
   gatewayPool,
   gatewayPreview,
   gatewayModelsGet,
+  gatewayModelLabels,
   gatewaySetEnabled,
   gatewayStatus,
   gatewayUpstreamsGet,
@@ -60,6 +61,8 @@ type Discovered = {
   product: string;
   model: string;
   display: string;
+  /// 对外公开名（Qoder 是客户端里显示的那个名字，其余家等于 `model`）。
+  public?: string;
   source: string;
 };
 
@@ -129,6 +132,53 @@ const SCOPE_ALIAS: Record<string, string> = {
   "qoder-global": "qoder-g",
 };
 
+/// 专有板块的标题（板块 key 是**产品级**：Qoder 两个区域并成一框）。
+const OWN_LABEL: Record<string, string> = { qoder: "Qoder" };
+
+/// 作用域 → 产品（`qoder-global` → `qoder`）。
+const productOfScope = (scope: string) => scope.split("-")[0];
+
+/// 「通用模型」框头的筛选/默认来源选项：按**产品**筛，不按区域 ——
+/// 用户眼里「Qoder 有没有这个模型」比「是 Qoder 国内还是国际」重要得多。
+const FILTER_PRODUCTS: { key: string; label: string }[] = [
+  { key: "trae", label: "Trae" },
+  { key: "wb", label: "WB" },
+  { key: "qoder", label: "Qoder" },
+];
+
+/// 模型名归一化指纹（与后端 `gateway_pool::normalize_model_key` **同一条规则**）。
+///
+/// 「通用模型」靠它把 `GLM-5.3`（Qoder）和 `glm-5.3`（Trae）认成同一个模型 ——
+/// 两边规则一旦不一致，通用列表里就会冒出两个只差大小写的同名条目。
+function normModel(s: string): string {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+/// 对外公开名（与后端 `gateway_models::public_from` 同一条规则）。
+///
+/// Qoder 上游认 `gmodel` 这类代号，客户端里显示的是 `GLM-5.3` —— 界面上只给后者
+/// （2026-10-24 用户要求「只显示正常的模型，复制也只复制正常的模型名」）。
+function publicOf(scope: string, model: string, display: string): string {
+  if (!scope.startsWith("qoder")) return model;
+  const d = (display ?? "").trim();
+  if (!d || d.toLowerCase() === model.toLowerCase()) return model;
+  return d;
+}
+
+/// 模型名渲染：有比公开名更好看的显示名时并排给（`DeepSeek-V4-Flash 正式版 deepseek-v4.1-flash`），
+/// 否则只显示公开名。**代号永远不进这个组件** —— 用户认不出 `gmodel`。
+function ModelName({ display, name }: { display: string; name: string }) {
+  if (display && display !== name) {
+    return (
+      <>
+        {display}
+        <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">{name}</span>
+      </>
+    );
+  }
+  return <span className="font-mono">{name}</span>;
+}
+
 function Card({
   title,
   desc,
@@ -171,9 +221,12 @@ export default function GatewayPage() {
 
   const [discovered, setDiscovered] = useState<Discovered[]>([]);
   const [reports, setReports] = useState<SourceReport[]>([]);
-  /// 「复制时固定来源」：全局一个下拉（空 = 自动选号，复制裸名）。
+  /// 「复制时固定来源」：全局一个下拉（空 = 全部，复制裸名）。
   /// 之前是每个模型一个下拉，25 行下拉把页面撑得又高又乱。
   const [copyScope, setCopyScope] = useState<string>("");
+  /// 通用框的搜索词。模型多起来（20 组、名字还长短不一）光靠滚动找不到 ——
+  /// 用户报「没看到 DeepSeek-V4.1-Flash」，其实它在通用框里、只是要往下滚。
+  const [modelQuery, setModelQuery] = useState("");
   const [scanning, setScanning] = useState(false);
   /// 积分共享总开关（关闭会真的停网关）。
   const [gwOn, setGwOn] = useState(true);
@@ -224,33 +277,86 @@ export default function GatewayPage() {
   }, [pool]);
 
   // 分组口径：**跨产品**才算通用（Trae ↔ WorkBuddy ↔ Qoder）。
-  // 同一产品的国内/国际两个区域同名（如 qoder 的 qmodel）**各归各的方框** ——
-  // 它们其实是不同区域的不同服务，混在一起会让人以为「国内外并起来了」。
-  const { sharedModels, ownModels, ownScopes } = useMemo(() => {
+  //
+  // 板块归属按**产品**归并：Qoder 国内/国际各自只有 10 / 14 个模型，拆成两个框
+  // 用户得两头找（2026-10-24 要求「不再分国内国际，数量太少，合并显示」）；
+  // Trae / WB 各有 40+ 个，仍按国内外分开列。
+  //
+  // ⚠️ 分组的键是**公开名**的归一化指纹：Qoder 的 `GLM-5.3`(代号 `gmodel`) 与
+  //    Trae 的 `glm-5.3` 是同一个模型 ⇒ 合并成一行、各挂一个来源徽章，
+  //    点徽章用 `qoder:` / `trae:` 前缀锁定那一家（与原有的裸名自动选号并存）。
+  const { sharedModels, ownModels, ownScopes, sharedCount } = useMemo(() => {
     const productOf = (scope: string) => scope.split("-")[0];
-    const byModel = new Map<string, string[]>();
+    /// 板块 key：Qoder 两个区域并到同一个 `qoder` 框，其余按作用域各自成框。
+    const boardOf = (scope: string) => (scope.startsWith("qoder") ? "qoder" : scope);
+    type Group = { name: string; display: string; rank: number; scopes: string[] };
+    const groups = new Map<string, Group>();
     discovered.forEach((d) => {
-      const arr = byModel.get(d.model) ?? [];
-      if (!arr.includes(d.scope)) arr.push(d.scope);
-      byModel.set(d.model, arr);
-    });
-    const shared: { model: string; scopes: string[] }[] = [];
-    const own: Record<string, string[]> = {};
-    byModel.forEach((scopes, model) => {
-      const products = new Set(scopes.map(productOf));
-      if (products.size >= 2) {
-        shared.push({ model, scopes: scopes.slice().sort() });
-      } else {
-        // 同一产品：每个区域各自列出来（国内外分开）。
-        scopes.forEach((sc) => {
-          (own[sc] ??= []).push(model);
-        });
+      const pub = d.public || publicOf(d.scope, d.model, d.display);
+      const key = normModel(pub);
+      // 代表名怎么挑：① 公开名已经是人话（Qoder 的 `GLM-5.3`）优先；
+      //                ② 有显示名的次之；③ 只剩代号的最后。
+      const display = d.display && d.display !== pub ? d.display : pub;
+      const rank = pub !== d.model ? 2 : display !== pub ? 1 : 0;
+      const g = groups.get(key);
+      if (!g) {
+        groups.set(key, { name: pub, display, rank, scopes: [d.scope] });
+        return;
+      }
+      if (!g.scopes.includes(d.scope)) g.scopes.push(d.scope);
+      if (rank > g.rank) {
+        g.name = pub;
+        g.display = display;
+        g.rank = rank;
       }
     });
-    shared.sort((a, b) => a.model.localeCompare(b.model));
-    Object.keys(own).forEach((k) => own[k].sort());
-    return { sharedModels: shared, ownModels: own, ownScopes: Object.keys(own).sort() };
+
+    type Row = { key: string; name: string; display: string; scopes: string[] };
+    const shared: Row[] = [];
+    const own: Record<string, Row[]> = {};
+    groups.forEach((g, key) => {
+      const scopes = g.scopes.slice().sort();
+      const row: Row = { key, name: g.name, display: g.display, scopes };
+      if (new Set(scopes.map(productOf)).size >= 2) {
+        shared.push(row);
+      } else {
+        // 同一产品：按板块归并（Qoder 国内+国际并成一框，同名模型只出现一行）。
+        // `groups` 已经按公开名指纹合并过，所以这里 push 一次就够了，不会重复。
+        (own[boardOf(scopes[0])] ??= []).push(row);
+      }
+    });
+    shared.sort((a, b) => a.name.localeCompare(b.name));
+    Object.keys(own).forEach((k) => own[k].sort((a, b) => a.name.localeCompare(b.name)));
+    // 板块顺序固定成 Trae → WorkBuddy → Qoder（字母序会让 Qoder 跑最前面，
+    // 但它模型最少，摆在头一个反而像主入口）。
+    const ORDER = ["trae-cn", "trae-global", "wb-cn", "wb-global", "qoder"];
+    const rank = (s: string) => (ORDER.includes(s) ? ORDER.indexOf(s) : 99);
+    const ownScopes = Object.keys(own).sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    // 每个产品有多少模型被**并进「通用模型」**了。
+    // 用户报「WB 少了 DeepSeek-V4.1-Flash」就是因为它与 Trae 同名、跑去了通用框，
+    // 专有框里只数剩下的 43 个 —— 不给这句提示，看着就像识别漏了。
+    const sharedCount: Record<string, number> = {};
+    shared.forEach((r) => {
+      new Set(r.scopes.map(productOf)).forEach((p) => {
+        sharedCount[p] = (sharedCount[p] ?? 0) + 1;
+      });
+    });
+    return { sharedModels: shared, ownModels: own, ownScopes, sharedCount };
   }, [discovered]);
+
+  /// 框头下拉选了一家 ⇒ 通用列表只留这家真正提供的（之前那个下拉只管「复制时加
+  /// 什么前缀」，列表照样全显示，用户以为筛选坏了 —— 2026-10-24 反馈）。
+  /// 搜索框与下拉是**与**关系：先按产品筛，再按关键字筛。
+  const visibleShared = sharedModels.filter((r) => {
+    if (copyScope && !r.scopes.some((sc) => productOfScope(sc) === copyScope)) return false;
+    const q = modelQuery.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      r.name.toLowerCase().includes(q) ||
+      (r.display ?? "").toLowerCase().includes(q) ||
+      r.scopes.some((sc) => sc.includes(q))
+    );
+  });
 
 
   async function createKey() {
@@ -287,15 +393,24 @@ export default function GatewayPage() {
     // ① 先读**本地** models.json 立即渲染（毫秒级，不联网、不转圈）。
     void (async () => {
       try {
-        const cached = (await gatewayModelsGet()) as Record<string, string[]>;
+        // 显示名表跟清单一起读：本地缓存里只有代号，不补显示名的话首屏又会
+        // 退回 `gmodel` 这种看不懂的名字（Qoder 的公开名就是从这张表来的）。
+        const [cached, table] = await Promise.all([
+          gatewayModelsGet() as Promise<Record<string, string[]>>,
+          gatewayModelLabels().catch(() => ({}) as Record<string, Record<string, string>>),
+        ]);
         const rows: Discovered[] = Object.entries(cached ?? {}).flatMap(([scope, list]) =>
-          (list ?? []).map((m) => ({
-            scope,
-            product: scope.split("-")[0],
-            model: m,
-            display: "",
-            source: "本地缓存",
-          })),
+          (list ?? []).map((m) => {
+            const display = table?.[scope]?.[m] ?? "";
+            return {
+              scope,
+              product: scope.split("-")[0],
+              model: m,
+              display,
+              public: publicOf(scope, m, display),
+              source: "本地缓存",
+            };
+          }),
         );
         if (rows.length > 0) setDiscovered(rows);
       } catch {
@@ -764,33 +879,56 @@ export default function GatewayPage() {
               <div className="flex items-center gap-1.5 border-b border-border/60 bg-muted/40 px-2.5 py-1.5">
                 <span className="text-[11px] font-medium">通用模型</span>
                 <span className="rounded bg-background px-1 text-[10px] text-muted-foreground">
-                  {sharedModels.length}
+                  {copyScope ? `${visibleShared.length}/${sharedModels.length}` : sharedModels.length}
                 </span>
                 <select
                   value={copyScope}
                   onChange={(e) => setCopyScope(e.target.value)}
                   className="ml-auto h-5 max-w-[92px] rounded border border-border bg-background px-1 text-[10px] outline-none focus:border-primary"
-                  title="点模型名时复制成什么：自动 = 裸名（后端选号）；选某一家 = 带前缀锁定"
+                  title="按产品筛选，同时决定复制时带哪个前缀：全部 = 裸名（后端自动选号）；选某一家 = 只显示这家有的模型并带前缀锁定"
                 >
-                  <option value="">自动</option>
-                  {Object.keys(SCOPE_LABEL).map((sc) => (
-                    <option key={sc} value={sc}>
-                      {SCOPE_SHORT[sc]}
+                  <option value="">全部</option>
+                  {FILTER_PRODUCTS.map((p) => (
+                    <option key={p.key} value={p.key}>
+                      {p.label}
                     </option>
                   ))}
                 </select>
               </div>
-              <div className="max-h-56 overflow-y-auto p-1">
-                {sharedModels.map(({ model, scopes }) => {
-                  const useScope = copyScope && scopes.includes(copyScope) ? copyScope : "";
-                  const toCopy = useScope ? `${SCOPE_ALIAS[useScope]}:${model}` : model;
+              {/* 搜索框放在滚动区外面：滚到下面时也能改关键字 */}
+              <div className="border-b border-border/60 px-1.5 py-1">
+                <input
+                  value={modelQuery}
+                  onChange={(e) => setModelQuery(e.target.value)}
+                  placeholder="搜模型…（如 v4.1 / flash / qwen）"
+                  className="h-6 w-full rounded border border-border bg-background px-1.5 text-[10px] outline-none placeholder:text-muted-foreground/60 focus:border-primary"
+                />
+              </div>
+              <div className="max-h-72 overflow-y-auto p-1">
+                {visibleShared.length === 0 && (
+                  <p className="px-1.5 py-1 text-[10px] text-muted-foreground">
+                    {modelQuery.trim()
+                      ? `没有匹配「${modelQuery.trim()}」的模型 —— 也可能它只属于某一家，在下面的专有框里。`
+                      : "这家没有与其他产品同名的模型 —— 它自己的模型都在下面的专有框里。"}
+                  </p>
+                )}
+                {visibleShared.map(({ key, name, display, scopes }) => {
+                  // 筛选的是**产品**，前缀要落到真正提供它的具体作用域（`qoder` 可能
+                  // 只有国际版有），否则前缀会把请求指到一个没有这个模型的作用域。
+                  const useScope =
+                    copyScope && scopes.find((sc) => productOfScope(sc) === copyScope)
+                      ? scopes.find((sc) => productOfScope(sc) === copyScope)!
+                      : "";
+                  // 复制的永远是**公开名**（`GLM-5.3` 而不是 `gmodel`）：发哪一家的哪个代号
+                  // 由后端按落到的账号决定，用户只需要认得出这是哪个模型。
+                  const toCopy = useScope ? `${SCOPE_ALIAS[useScope]}:${name}` : name;
                   return (
                     // ⚠️ 这里**不能**用整行 `<button>` 包住来源徽章：徽章本身要是按钮
                     //    （点它就锁定那一家），button 套 button 是非法 HTML，点了会串行为。
                     // ⚠️ 卡片窄（窗口小 / 两列）时徽章会顶出边界被 `overflow-hidden` 裁掉，
                     //    右边的复制图标就点不到了 ⇒ 整行 `flex-wrap`，放不下自动落到第二行。
                     <div
-                      key={model}
+                      key={key}
                       className="flex w-full flex-wrap items-center gap-x-1 gap-y-0.5 rounded-md px-1.5 py-1 text-[11px] hover:bg-accent"
                     >
                       <button
@@ -804,9 +942,9 @@ export default function GatewayPage() {
                           )
                         }
                         title={`复制：${toCopy}（按块头下拉的默认来源）`}
-                        className="min-w-0 flex-1 basis-[72px] truncate text-left font-mono"
+                        className="min-w-0 flex-1 basis-[72px] truncate text-left"
                       >
-                        {model}
+                        <ModelName display={display} name={name} />
                       </button>
                       <span className="flex shrink-0 flex-wrap items-center justify-end gap-0.5">
                         {scopes.map((sc) => (
@@ -815,11 +953,11 @@ export default function GatewayPage() {
                             type="button"
                             onClick={() =>
                               void doCopy(
-                                `${SCOPE_ALIAS[sc] ?? sc}:${model}`,
+                                `${SCOPE_ALIAS[sc] ?? sc}:${name}`,
                                 `锁定 ${SCOPE_LABEL[sc] ?? sc} —— 只走这一家的积分`,
                               )
                             }
-                            title={`点一下复制 ${SCOPE_ALIAS[sc] ?? sc}:${model}（锁定 ${SCOPE_LABEL[sc] ?? sc}）`}
+                            title={`点一下复制 ${SCOPE_ALIAS[sc] ?? sc}:${name}（锁定 ${SCOPE_LABEL[sc] ?? sc}）`}
                             className="rounded border border-border px-1 text-[9px] text-muted-foreground transition-colors hover:border-primary hover:bg-primary/5 hover:text-foreground"
                           >
                             {SCOPE_SHORT[sc] ?? sc}
@@ -847,36 +985,64 @@ export default function GatewayPage() {
                 })}
                 </div>
                 <div className="border-t border-border/60 px-2 py-1 text-[10px] leading-4 text-muted-foreground">
-                  要「自动切换」就点<span className="text-foreground">模型名</span>或最右边的复制图标（下拉保持
-                  <span className="text-foreground">自动</span>＝复制裸名）；想让某个模型只花某一家的积分，点
-                  <span className="text-foreground"> Trae / WB / Qoder </span>徽章＝锁死那一家（自动带前缀）
+                  下拉选<span className="text-foreground">全部</span>＝只列所有模型、复制裸名（后端自动选号）；
+                  选某一家＝
+                  <span className="text-foreground">只列这家有的模型</span>并带前缀锁定（如
+                  <span className="font-mono">qoder:GLM-5.3</span>）。点
+                  <span className="text-foreground"> Trae / WB / Qoder </span>徽章也能单独锁那一家
                 </div>
               </div>
 
-            {/* 各作用域一个小方框 */}
-            {ownScopes.map((scope) => (
-              <div key={scope} className="flex min-w-0 flex-col overflow-hidden rounded-lg border border-border">
+            {/* 专有板块（Qoder 国内+国际已并成一框） */}
+            {ownScopes.map((board) => (
+              <div key={board} className="flex min-w-0 flex-col overflow-hidden rounded-lg border border-border">
                 <div className="flex items-center gap-1.5 border-b border-border/60 bg-muted/40 px-2.5 py-1.5">
-                  <span className="text-[11px] font-medium">{SCOPE_LABEL[scope] ?? scope}</span>
+                  <span className="text-[11px] font-medium">
+                    {OWN_LABEL[board] ?? SCOPE_LABEL[board] ?? board}
+                  </span>
                   <span className="rounded bg-background px-1 text-[10px] text-muted-foreground">
-                    {ownModels[scope].length}
+                    {ownModels[board].length}
                   </span>
                   <span className="ml-auto text-[10px] text-muted-foreground">专有</span>
                 </div>
-                <div className="max-h-56 overflow-y-auto p-1">
-                  {ownModels[scope].map((model) => (
-                    <button
-                      key={model}
-                      type="button"
-                      onClick={() => void doCopy(model, "专有模型：只有这一家提供，直接裸名")}
-                      title={`复制：${model}`}
-                      className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-[11px] hover:bg-accent"
+                <div className="max-h-72 overflow-y-auto p-1">
+                  {ownModels[board].map(({ key, name, display }) => (
+                    // 专有块只有一个动作：点右边的复制按钮复制裸名。
+                    // ⚠️ 以前名字本身是按钮、右边那个 `<Copy>` 只是装饰（没有 onClick）——
+                    //    用户照着形状点图标，一点反应都没有（2026-10-24 反馈）。
+                    //    现在名字是**纯文本**，唯一的交互就是那个真按钮。
+                    <div
+                      key={key}
+                      className="flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-[11px] hover:bg-accent"
                     >
-                      <span className="min-w-0 flex-1 truncate font-mono">{model}</span>
-                      <Copy className="size-3 shrink-0 text-muted-foreground/50" />
-                    </button>
+                      <span className="min-w-0 flex-1 truncate">
+                        <ModelName display={display} name={name} />
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void doCopy(
+                            name,
+                            `${OWN_LABEL[board] ?? board} 专有模型：只有这一家提供，直接裸名`,
+                          )
+                        }
+                        title={`复制 ${name}`}
+                        className="grid size-5 shrink-0 place-items-center rounded text-muted-foreground/60 transition-colors hover:bg-primary/10 hover:text-primary"
+                      >
+                        <Copy className="size-3" />
+                      </button>
+                    </div>
                   ))}
                 </div>
+                {/* 「WB 少了某个模型」的真相：它与别的产品同名，被并进上面的通用框了。
+                    不写这一句，用户只会以为识别漏读。 */}
+                {(sharedCount[productOfScope(board)] ?? 0) > 0 && (
+                  <div className="border-t border-border/60 px-2 py-1 text-[10px] leading-4 text-muted-foreground">
+                    另有 {sharedCount[productOfScope(board)]} 个与其它产品同名的模型已并入
+                    <span className="text-foreground">「通用模型」</span>（带本产品徽章），
+                    这里只列它独有的。
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -888,7 +1054,7 @@ export default function GatewayPage() {
           <input
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            placeholder="glm-5 或 qoder-cn:glm-5"
+            placeholder="GLM-5.3 或 qoder:GLM-5.3"
             className="h-8 w-64 rounded-lg border border-border bg-background px-2.5 text-xs outline-none focus:border-primary"
           />
           <button

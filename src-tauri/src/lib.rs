@@ -203,6 +203,7 @@ pub fn run() {
             commands::gateway_key_restore,
             commands::gateway_key_delete,
             commands::gateway_models_discover,
+            commands::gateway_model_labels,
             commands::gateway_models_selected,
             commands::gateway_models_save,
             commands::gateway_models_get,

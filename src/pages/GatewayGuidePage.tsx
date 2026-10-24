@@ -264,9 +264,13 @@ export default function GatewayGuidePage() {
               <li>
                 · 想锁死某家：加前缀 <code className="font-mono">wb:glm-5.3</code> /{" "}
                 <code className="font-mono">trae:glm-5.3</code> /{" "}
-                <code className="font-mono">qoder:qmodel</code>（国际版用 <code className="font-mono">-g</code>）
+                <code className="font-mono">qoder:GLM-5.3</code>（国际版用 <code className="font-mono">-g</code>）
               </li>
-              <li>· 大小写敏感，别手打，直接复制</li>
+              <li>
+                · Qoder 只露客户端里的名字（<code className="font-mono">GLM-5.3</code>），
+                <code className="font-mono">gmodel</code> 这类代号由网关自己换，你不用管
+              </li>
+              <li>· 别手打，直接复制（大小写、连字符都可能和上游不一致）</li>
             </ul>
             {test?.models?.sample?.length ? (
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -363,8 +367,8 @@ export default function GatewayGuidePage() {
           </p>
           <p>
             <span className="font-medium text-foreground">响应很慢 / 超时</span>
-            ：热门免费模型可能在上游排队（如 <code className="font-mono">dfmodel</code>），
-            换 <code className="font-mono">qmodel</code> / <code className="font-mono">gmodel</code> 之类。
+            ：热门免费模型可能在上游排队（如 <code className="font-mono">DeepSeek-Flash</code>），
+            换 <code className="font-mono">Qwen3.8-Max</code> / <code className="font-mono">GLM-5.3</code> 之类。
           </p>
           <p>
             <span className="font-medium text-foreground">模型名报「未知作用域」</span>

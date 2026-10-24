@@ -29,10 +29,15 @@ pub struct DiscoveredModel {
     /// 作用域（`trae-cn` / `wb-cn` / `qoder-cn` …）
     pub scope: String,
     pub product: String,
-    /// 真正要填进客户端的模型名。
+    /// 真正要填进客户端的模型名（发上游用的**代号**）。
     pub model: String,
     /// 客户端里的显示名（可能为空）。
     pub display: String,
+    /// **对外公开名**：Qoder 用客户端里显示的名字（`GLM-5.3`），其余家用代号。
+    ///
+    /// 界面分组、复制、`/v1/models` 都只认这一个字段 —— `gmodel` 这种代号不再外露
+    /// （2026-10-24 用户要求「只显示正常的模型，复制也只复制正常的模型名」）。
+    pub public: String,
     /// 这条是怎么来的：`state.vscdb` / `本地文件` / `手填`
     pub source: String,
 }
@@ -102,24 +107,27 @@ async fn discover_qoder() -> (Vec<DiscoveredModel>, Vec<SourceReport>) {
             Ok(list) => {
                 let found = list.len();
                 for (key, display) in list {
+                    // 对外名 = 客户端里那个名字（`GLM-5.3`），代号 `gmodel` 只在发上游时用。
+                    let public = public_from(&scope, &key, &display);
                     out.push(DiscoveredModel {
-                        scope: format!("qoder-{}", region.as_str()),
+                        scope: scope.clone(),
                         product: "Qoder".into(),
                         model: key,
                         display,
+                        public,
                         source: "线上模型清单（COSY /algo/api/v2/model/list）".into(),
                     });
                 }
                 reports.push(SourceReport {
                     product: "Qoder".into(),
-                    scope: format!("qoder-{}", region.as_str()),
+                    scope: scope.clone(),
                     found,
                     note: format!("{}：线上模型清单（COSY）", region.display_name()),
                 });
             }
             Err(e) => reports.push(SourceReport {
                 product: "Qoder".into(),
-                scope: format!("qoder-{}", region.as_str()),
+                scope: scope.clone(),
                 found: 0,
                 note: format!("拉取失败：{e}"),
             }),
@@ -149,8 +157,10 @@ fn discover_trae() -> (Vec<DiscoveredModel>, SourceReport) {
                     out.push(DiscoveredModel {
                         scope: scope.into(),
                         product: "Trae".into(),
-                        model,
+                        model: model.clone(),
                         display,
+                        // Trae 的代号本身就是人话（`glm-5.3` / `DeepSeek-V4-Pro`），不做改名。
+                        public: model,
                         source: "state.vscdb".into(),
                     });
                 }
@@ -323,6 +333,8 @@ async fn discover_workbuddy() -> (Vec<DiscoveredModel>, SourceReport) {
                             product: "WorkBuddy".into(),
                             model: id.to_string(),
                             display,
+                            // WorkBuddy 的 id 就是要填进客户端的名字，不改。
+                            public: id.to_string(),
                             source: "/v3/config".into(),
                         });
                     }
@@ -384,6 +396,230 @@ pub fn models_file() -> PathBuf {
     store_dir().join("models.json")
 }
 
+/// 模型**显示名**表：`{ 作用域: { 代号: 显示名 } }`。
+///
+/// 为什么单独一份：`models.json` 的形态是「作用域 → 名单」（`Vec<String>`），被选号、
+/// 勾选、`/v1/models` 共用，塞不下显示名。而 Qoder 的清单里发上游的是**代号**
+/// （`qmodel_38max` / `dmodel` / `kmodel_latest`），客户端界面上显示的是
+/// `Qwen3.8-Max` / `DeepSeek-V4` / `Kimi-K2.5` —— 用户看到代号根本认不出是哪个模型
+/// （2026-10-24 用户反馈「qoder 读取到的模型与客户端显示的不一致」）。
+///
+/// 所以：`models.json` 保持代号（请求要用它），这张表只负责「显示 + 反查」。
+pub fn labels_file() -> PathBuf {
+    store_dir().join("model-labels.json")
+}
+
+/// 读显示名表（读不到就是空表，不报错：老机器上本来就没有这个文件）。
+pub fn label_map() -> BTreeMap<String, BTreeMap<String, String>> {
+    std::fs::read_to_string(labels_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 这个作用域是不是 Qoder —— **只有 Qoder 需要把代号换成客户端里的名字**。
+///
+/// Trae / WorkBuddy 的代号本身就是人话（`glm-5.3` / `deepseek-v4.1-flash`），
+/// 而且它们的显示名里有大量「内部条目」（`code-review-judge` → `DeepSeek-V3.1-Terminus`、
+/// `custom_openai_compatible//…`），跟着改名只会把可用的名字改成不相干的字。
+pub fn is_qoder_scope(scope: &str) -> bool {
+    scope.starts_with("qoder")
+}
+
+/// 对外公开名：`scope` 是 Qoder 就用客户端里显示的 `display`，否则用代号。
+///
+/// 两条「不改名」的例外：
+/// - `display` 为空；
+/// - `display` 与代号**只差大小写**（`auto` ↔ `Auto`）—— 改过去等于让 `Auto` 和别家
+///   的 `auto` 变成两个不同的模型，跨产品合并立刻断掉。
+pub fn public_from(scope: &str, code: &str, display: &str) -> String {
+    if !is_qoder_scope(scope) {
+        return code.to_string();
+    }
+    let d = display.trim();
+    if d.is_empty() || d.eq_ignore_ascii_case(code) {
+        return code.to_string();
+    }
+    d.to_string()
+}
+
+/// 某一个代号在界面上/接口里对外的名字（查不到就返回代号本身）。
+pub fn public_name(scope: &str, code: &str) -> String {
+    let labels = label_map();
+    let disp = labels
+        .get(scope)
+        .and_then(|m| m.get(code))
+        .map(String::as_str)
+        .unwrap_or("");
+    public_from(scope, code, disp)
+}
+
+/// `公开名 → 上游代号`（Qoder 专用；其余作用域返回空表）。
+///
+/// ⚠️ 同一个作用域里**两个代号显示成同一个名字**时不收录：那说明上游自己就有歧义
+/// （`kmodel` / `kmodel_latest` 这种），猜错了会把请求悄悄发到另一个模型上。
+pub fn public_to_code_map(scope: &str) -> BTreeMap<String, String> {
+    let mut by_public: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (code, disp) in label_map().get(scope).into_iter().flatten() {
+        let public = public_from(scope, code, disp);
+        if public != *code {
+            by_public.entry(public).or_default().push(code.clone());
+        }
+    }
+    by_public
+        .into_iter()
+        .filter(|(_, codes)| codes.len() == 1)
+        .map(|(public, codes)| (public, codes[0].clone()))
+        .collect()
+}
+
+/// 整份清单的三元组：`(作用域, 代号, 公开名)`。
+///
+/// 分组、选号、`/v1/models` 全部走这一个出口 —— 三处各算一遍必然算出三种结果。
+pub fn catalog_rows(scope: Option<&str>) -> Vec<(String, String, String)> {
+    let labels = label_map();
+    let mut out = Vec::new();
+    for (sc, list) in crate::modules::gateway_pool::catalog() {
+        if let Some(want) = scope {
+            if sc != want {
+                continue;
+            }
+        }
+        for code in list {
+            let disp = labels
+                .get(&sc)
+                .and_then(|m| m.get(&code))
+                .map(String::as_str)
+                .unwrap_or("");
+            out.push((sc.clone(), code.clone(), public_from(&sc, &code, disp)));
+        }
+    }
+    out
+}
+
+/// **公开名 → 这一家上游认的代号**（发请求前必须过这里）。
+///
+/// 顺序（每一步都必须先于下一步）：
+/// 1. 已经是这家的代号 ⇒ 原样（`auto` 这类和显示名同形的不能改写）；
+/// 2. 公开名精确命中（`GLM-5.3` → `gmodel`）；
+/// 3. 归一化命中（大小写 / 连字符差异，`glm-5.3` 也能认）；
+/// 4. 认不出就原样返回 —— 让上游如实报「模型不存在」，而不是我们瞎换一个。
+pub fn upstream_model(scope: &str, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    let codes: Vec<String> = crate::modules::gateway_pool::catalog()
+        .into_iter()
+        .find(|(s, _)| s == scope)
+        .map(|(_, l)| l)
+        .unwrap_or_default();
+    if codes.iter().any(|c| c == name) {
+        return name.to_string();
+    }
+    let map = public_to_code_map(scope);
+    if let Some(code) = map.get(name) {
+        return code.clone();
+    }
+    let want = crate::modules::gateway_pool::normalize_model_key(name);
+    for (public, code) in &map {
+        if crate::modules::gateway_pool::normalize_model_key(public) == want {
+            return code.clone();
+        }
+    }
+    for code in &codes {
+        if crate::modules::gateway_pool::normalize_model_key(code) == want {
+            return code.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// 把用户填的模型名**归一化成对外公开名**（Qoder 是客户端里的名字，其余是代号）。
+///
+/// 四种写法都要认（用户真的会混着填）：
+///
+/// | 写法 | 例子 | 结果 |
+/// | --- | --- | --- |
+/// | 公开名 | `GLM-5.3` / `glm-5.3` | 原样 / 换成清单里的写法 |
+/// | Qoder 代号（老配置） | `gmodel` / `dfmodel` | `GLM-5.3` / `DeepSeek-Flash` |
+/// | 客户端显示名 | `DeepSeek-V4-Flash 正式版` | 该作用域的公开名 |
+/// | 带作用域前缀 | `qoder:GLM-5.3` | 先剥前缀，再**只按那一家的清单**反查 |
+///
+/// ⚠️ 带前缀时**必须按作用域反查**：`DeepSeek-V4-Pro` 同时是 trae 的代号和 qoder
+/// 的公开名。只按全局查会把 trae 的代号塞给 Qoder，上游直接回「模型不存在」。
+///
+/// ⚠️ 这一步**只改「名字怎么称呼」**，不改「发哪家的哪个代号」——
+/// 后者是 [`upstream_model`] 的事，选号之后才知道落到哪一家。
+pub fn canonical_model(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    if let Some((ns, rest)) = name.split_once(':') {
+        let scope = crate::modules::gateway_pool::scope_alias(ns.trim()).to_string();
+        let rest = canonical_model_in(Some(&scope), rest.trim());
+        return format!("{ns}:{rest}");
+    }
+    canonical_model_in(None, name)
+}
+
+/// [`canonical_model`] 的作用域版本：`scope = None` 表示在所有作用域里找。
+pub fn canonical_model_in(scope: Option<&str>, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    let rows = catalog_rows(scope);
+    let norm = crate::modules::gateway_pool::normalize_model_key;
+
+    // ① 已经是代号 ⇒ 换成公开名（`gmodel` → `GLM-5.3`，`auto` → `auto`）。
+    if let Some((_, _, public)) = rows.iter().find(|(_, code, _)| code == name) {
+        return public.clone();
+    }
+    // ② 已经是公开名 ⇒ 原样（作用域锁定时只看这家，避免把别人家的名字带过去）。
+    if rows.iter().any(|(_, _, public)| public == name) {
+        return name.to_string();
+    }
+    // ③ 归一化命中（大小写 / 连字符差异是常见输入误差）。
+    let want = norm(name);
+    if let Some((_, _, public)) = rows
+        .iter()
+        .find(|(_, code, public)| norm(code) == want || norm(public) == want)
+    {
+        return public.clone();
+    }
+    // ④ 客户端显示名（`DeepSeek-V4-Flash 正式版`）⇒ 反查公开名。
+    //    多义（不同作用域同一个显示名指向不同模型）时**不猜**：宁可让 `resolve_scopes`
+    //    报「找不到这个模型」，也不能把请求悄悄转到另一家的另一个模型上。
+    let labels = label_map();
+    let want = name.to_lowercase();
+    let mut hits: Vec<String> = Vec::new();
+    for (sc, code, public) in &rows {
+        let hit = labels
+            .get(sc)
+            .and_then(|m| m.get(code))
+            .map(|d| d.to_lowercase() == want)
+            .unwrap_or(false);
+        if hit && !hits.contains(public) {
+            hits.push(public.clone());
+        }
+    }
+    if hits.len() == 1 {
+        return hits.remove(0);
+    }
+    name.to_string()
+}
+
+/// 单个模型的显示名（查不到就用代号本身，界面不会出现空白）。
+pub fn display_of(scope: &str, model: &str) -> String {
+    label_map()
+        .get(scope)
+        .and_then(|m| m.get(model))
+        .cloned()
+        .unwrap_or_else(|| model.to_string())
+}
+
 /// 已登记（勾选过）的模型：`{ 作用域: [模型…] }`。
 /// 识别 + **落盘**（合并写入 `models.json`）。
 ///
@@ -419,6 +655,30 @@ pub async fn discover_and_save() -> (Vec<DiscoveredModel>, Vec<SourceReport>) {
     }
     if let Ok(text) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(&path, text);
+    }
+
+    // 显示名表：增量写入（识别失败的作用域保留旧值，与 models.json 同一策略）。
+    // 只收「显示名 ≠ 代号」的条目 —— Trae / WorkBuddy 两边同名，存进去只是噪音。
+    let mut labels = label_map();
+    for m in &models {
+        if m.display.trim().is_empty() || m.display == m.model {
+            continue;
+        }
+        labels
+            .entry(m.scope.clone())
+            .or_default()
+            .insert(m.model.clone(), m.display.clone());
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&labels) {
+        let lp = labels_file();
+        if let Some(dir) = lp.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // 原子写：写到 .tmp 再 rename，避免读到半截 JSON。
+        let tmp = lp.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &lp);
+        }
     }
     (models, reports)
 }
