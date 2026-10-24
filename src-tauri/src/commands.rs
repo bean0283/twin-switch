@@ -16,6 +16,7 @@ use wb_switch_core::modules::{
     workbuddy_auth, workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
     workbuddy_session_edit, workbuddy_sessions, workbuddy_switch, workbuddy_vault,
 };
+use wb_switch_core::modules::{gateway_keys, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_realm, qoder_sessions, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -1027,6 +1028,8 @@ pub struct SettingsPatch {
     pub trae_exe: Option<std::collections::HashMap<String, String>>,
     /// 手动指定的 WorkBuddy 主程序路径（`None` = 不改；空串 = 恢复自动探测）。
     pub workbuddy_exe: Option<String>,
+    /// 切号时是否把 WorkBuddy 的定时任务同步给新账号（`None` = 不改）。
+    pub sync_workbuddy_automations: Option<bool>,
 }
 
 /// 设置快照的**唯一出口** —— `settings_get` 与 `settings_set` 都返回它的形状。
@@ -1044,6 +1047,8 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         },
         "summary": s.backup_retention.summary(),
         "backupBeforeWrite": s.backup_before_write,
+        // 切号是否同步定时任务（WorkBuddy 的 automations 按 owner_user_id 归属）。
+        "syncWorkbuddyAutomations": s.sync_workbuddy_automations,
         "beforeWriteSummary": if s.backup_before_write {
             "开启 —— 每次写库前留一份备份（页级增量，只存变动页，通常几 MB）"
         } else {
@@ -1095,6 +1100,9 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         }
         if let Some(b) = patch.backup_before_write {
             next.backup_before_write = b;
+        }
+        if let Some(v) = patch.sync_workbuddy_automations {
+            next.sync_workbuddy_automations = v;
         }
         if let Some(m) = patch.trae_exe {
             // ⚠️ 存之前先校验：一个不存在的路径存进去，等于把「找不到主程序」
@@ -1739,6 +1747,39 @@ pub async fn workbuddy_rollback() -> Result<Value, String> {
         .map_err(|e| format!("回滚任务失败: {e}"))?
 }
 
+/// **手动添加账号**：直接粘 `access_token`（可选 `refresh_token`），不再走一次授权。
+///
+/// 走这条路径**不消耗 re 额度** —— 适合手上已有可用 token、只想登记进来用于切换的场景。
+/// 校验（三段式 / sub / 未过期 / 两个 token 同源）全在
+/// [`workbuddy_vault::add_manual_token`] 里做，任何一条不符都直接报错，不保存半成品。
+#[tauri::command]
+pub async fn workbuddy_account_add_token(
+    access_token: String,
+    refresh_token: Option<String>,
+    domain: Option<String>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    off_main(move || {
+        let saved = workbuddy_vault::add_manual_token(
+            &access_token,
+            refresh_token.as_deref(),
+            domain.as_deref(),
+            name.as_deref(),
+        )?;
+        // ⚠️ 凭据不回传前端：只给身份与到期时间。
+        Ok(json!({
+            "ok": true,
+            "accountId": saved.get("id").cloned().unwrap_or(Value::Null),
+            "uid": saved.get("uid").cloned().unwrap_or(Value::Null),
+            "nickname": saved.get("nickname").cloned().unwrap_or(Value::Null),
+            "domain": saved.get("domain").cloned().unwrap_or(Value::Null),
+            "expiresAt": saved.get("expiresAt").cloned().unwrap_or(Value::Null),
+            "refreshExpiresAt": saved.get("refreshExpiresAt").cloned().unwrap_or(Value::Null),
+        }))
+    })
+    .await?
+}
+
 /// 导入本机 WorkBuddy 当前登录态到账号库。
 #[tauri::command]
 pub async fn workbuddy_import_local() -> Result<Value, String> {
@@ -2308,4 +2349,693 @@ mod main_thread_guard {
             );
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// 积分共享（本地额度网关，127.0.0.1:57892）
+// ---------------------------------------------------------------------------
+
+/// 网关运行状态（含账号池规模）。
+#[tauri::command]
+pub async fn gateway_status() -> Result<Value, String> {
+    Ok(gateway_server::status())
+}
+
+/// 账号池：三产品摊平，最紧迫的排前面。
+#[tauri::command]
+pub async fn gateway_pool() -> Result<Value, String> {
+    Ok(json!(gateway_pool::snapshot()))
+}
+
+/// 选号预览：只算不发，不消耗额度。
+#[tauri::command]
+pub async fn gateway_preview(model: String) -> Result<Value, String> {
+    gateway_pool::preview(&model).map(|s| json!(s))
+}
+
+#[tauri::command]
+pub async fn gateway_keys_list() -> Result<Value, String> {
+    gateway_keys::list()
+}
+
+/// 新建 Key。**明文只在这里返回一次**。
+#[tauri::command]
+pub async fn gateway_key_create(name: String, scopes: Vec<String>) -> Result<Value, String> {
+    let (plaintext, key) = gateway_keys::create(&name, scopes)?;
+    Ok(json!({ "plaintext": plaintext, "key": key }))
+}
+
+#[tauri::command]
+pub async fn gateway_key_revoke(id: String) -> Result<Value, String> {
+    gateway_keys::revoke(&id).map(|k| json!(k))
+}
+
+#[tauri::command]
+pub async fn gateway_key_restore(id: String) -> Result<Value, String> {
+    gateway_keys::restore(&id).map(|k| json!(k))
+}
+
+#[tauri::command]
+pub async fn gateway_key_delete(id: String) -> Result<(), String> {
+    gateway_keys::delete(&id)
+}
+
+/// 模型目录（`models.json`）。空对象表示还没登记。
+#[tauri::command]
+pub async fn gateway_models_get() -> Result<Value, String> {
+    read_store_json("models.json")
+}
+
+#[tauri::command]
+pub async fn gateway_models_set(value: Value) -> Result<(), String> {
+    write_store_json("models.json", &value)
+}
+
+/// 上游地址表（`upstreams.json`）。没登记的产品会 501，不会假装成功。
+#[tauri::command]
+pub async fn gateway_upstreams_get() -> Result<Value, String> {
+    read_store_json("upstreams.json")
+}
+
+#[tauri::command]
+pub async fn gateway_upstreams_set(value: Value) -> Result<(), String> {
+    write_store_json("upstreams.json", &value)
+}
+
+fn read_store_json(name: &str) -> Result<Value, String> {
+    let path = config::store_dir().join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{} 格式损坏：{e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(format!("读取 {} 失败：{e}", path.display())),
+    }
+}
+
+fn write_store_json(name: &str, value: &Value) -> Result<(), String> {
+    let path = config::store_dir().join(name);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败：{e}"))?;
+    }
+    let body = serde_json::to_vec_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("写入失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("落盘失败：{e}"))
+}
+
+
+/// 自动识别：从本机客户端里扫出可用模型（并附带每家的来源说明）。
+#[tauri::command]
+pub async fn gateway_models_discover() -> Result<Value, String> {
+    // 识别完**立即落盘**：新电脑上 models.json 不存在时，纯内存结果会让
+    // 选号/预览继续报「模型目录为空」。
+    let (models, reports) = gateway_models::discover_and_save().await;
+    Ok(json!({ "models": models, "reports": reports }))
+}
+
+/// 已勾选的模型（`models.json`）。
+#[tauri::command]
+pub async fn gateway_models_selected() -> Result<Value, String> {
+    Ok(json!(gateway_models::load_selected()))
+}
+
+/// 保存勾选结果（`{ 作用域: [模型…] }`）。
+#[tauri::command]
+pub async fn gateway_models_save(map: Value) -> Result<(), String> {
+    let parsed: std::collections::BTreeMap<String, Vec<String>> =
+        serde_json::from_value(map).map_err(|e| format!("模型清单格式不对：{e}"))?;
+    gateway_models::save_selected(&parsed)
+}
+
+
+// ---------------------------------------------------------------------------
+// Qoder 账号（国内 / 国际两套账号库）
+// ---------------------------------------------------------------------------
+
+/// 两个区域的静态信息（端口无关，只给界面用）。
+#[tauri::command]
+pub async fn qoder_regions() -> Result<Value, String> {
+    Ok(json!([
+        {
+            "region": "cn",
+            "label": qoder_realm::QoderRegion::Cn.display_name(),
+            "domain": qoder_realm::realm_spec(qoder_realm::QoderRegion::Cn).domain,
+            "cli_dir": qoder_realm::realm_spec(qoder_realm::QoderRegion::Cn).cli_home_dir,
+        },
+        {
+            "region": "global",
+            "label": qoder_realm::QoderRegion::Global.display_name(),
+            "domain": qoder_realm::realm_spec(qoder_realm::QoderRegion::Global).domain,
+            "cli_dir": qoder_realm::realm_spec(qoder_realm::QoderRegion::Global).cli_home_dir,
+        },
+    ]))
+}
+
+/// 列出账号（默认两个区域都列）。
+#[tauri::command]
+pub async fn qoder_accounts_list(region: Option<String>) -> Result<Value, String> {
+    let list = match region.as_deref().and_then(qoder_realm::QoderRegion::parse) {
+        Some(r) => qoder_accounts::list(r)?,
+        None => qoder_accounts::list_all()?,
+    };
+    Ok(json!(list))
+}
+
+/// 新增账号（PAT 登录：uid + token 手填）。
+#[tauri::command]
+pub async fn qoder_account_add(
+    region: String,
+    uid: String,
+    name: String,
+    token: String,
+    email: Option<String>,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region)
+        .ok_or_else(|| format!("未知区域 {region:?}（只支持 cn / global）"))?;
+    if uid.trim().is_empty() {
+        return Err("uid 不能为空".into());
+    }
+    let mut acc = qoder_accounts::QoderAccount::new(r, uid.trim(), name.trim());
+    acc.email = email.filter(|e| !e.trim().is_empty());
+    acc.access_token = Some(token.trim().to_string());
+    acc.source = qoder_accounts::SOURCE_PAT.to_string();
+    let saved = qoder_accounts::add(acc)?;
+    Ok(json!(saved))
+}
+
+#[tauri::command]
+pub async fn qoder_account_remove(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_accounts::remove(r, &id).map(|a| json!(a))
+}
+
+#[tauri::command]
+pub async fn qoder_account_restore(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_accounts::restore(r, &id).map(|a| json!(a))
+}
+
+/// 给某个账号换一份 PAT。
+#[tauri::command]
+pub async fn qoder_account_set_token(region: String, id: String, token: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    if token.trim().is_empty() {
+        return Err("token 不能为空".into());
+    }
+    qoder_accounts::update(r, &id, |a| {
+        a.access_token = Some(token.trim().to_string());
+        a.source = qoder_accounts::SOURCE_PAT.to_string();
+    })
+    .map(|a| json!(a))
+}
+
+/// 查一次额度与套餐并写回账号记录。
+#[tauri::command]
+pub async fn qoder_account_refresh(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let list = qoder_accounts::list(r)?;
+    let acc = list
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("找不到账号 {id}"))?;
+    let updated = qoder_api::refresh_account(&acc).await?;
+    Ok(json!(updated))
+}
+
+
+/// 批量刷新一个区域的全部账号额度。
+///
+/// **串行**查（与 0.3.4 的 WorkBuddy 额度查询同口径）：并发会让上游频控，
+/// 而且多账号同时刷新 token 容易互相踢。单个失败只记入 `failed`，不影响其它账号。
+#[tauri::command]
+pub async fn qoder_accounts_refresh_all(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let list = qoder_accounts::list(r)?;
+    let mut ok = 0usize;
+    let mut failed: Vec<Value> = Vec::new();
+    for acc in &list {
+        if !acc.is_usable() {
+            failed.push(json!({ "uid": acc.uid, "error": "没有凭据" }));
+            continue;
+        }
+        match qoder_api::refresh_account(acc).await {
+            Ok(_) => ok += 1,
+            Err(e) => failed.push(json!({ "uid": acc.uid, "error": e })),
+        }
+    }
+    Ok(json!({ "ok": ok, "failed": failed, "total": list.len() }))
+}
+
+
+/// 发起 Qoder 浏览器登录（设备授权 + PKCE）。**不发网络请求**，只返回授权页地址。
+#[tauri::command]
+pub async fn qoder_login_start(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_login::start(r)
+}
+
+/// 轮询一次登录状态。`done=false` 就继续等（前端每 2 秒一次）。
+#[tauri::command]
+pub async fn qoder_login_poll(region: String, login_id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    Ok(qoder_login::poll(r, &login_id).await)
+}
+
+#[tauri::command]
+pub async fn qoder_login_cancel(login_id: String) -> Result<bool, String> {
+    Ok(qoder_login::cancel(&login_id))
+}
+
+
+/// 导出账号包（**含明文凭据**）。返回落盘路径与 JSON 文本。
+#[tauri::command]
+pub async fn qoder_accounts_export(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_tools::export(r)
+}
+
+/// 导入预览（脱敏：只回 uid / 昵称 / 有没有凭据）。
+#[tauri::command]
+pub async fn qoder_import_preview(region: String, json: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_tools::import_preview(r, &json)
+}
+
+/// 真正导入。`indexes = null` 表示全部。
+#[tauri::command]
+pub async fn qoder_import_apply(
+    region: String,
+    json: String,
+    indexes: Option<Vec<usize>>,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_tools::import_apply(r, &json, indexes)
+}
+
+/// 一键签到：当前区域所有有凭据的账号**串行**签（避免上游频控）。
+///
+/// 活动制（`/sash/api/v1/me/campaigns`）。结果四档：
+/// 领到 / 今日已签 / **有活动但领不了**（前置条件未达成）/ 失败。
+/// 「领不了」单独一档 —— 它既不是成功也不是失败，重试也不会成功。
+#[tauri::command]
+pub async fn qoder_checkin_all(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let list = qoder_accounts::list(r)?;
+    let mut claimed = 0usize;
+    let mut already = 0usize;
+    let mut blocked = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut blocked_reason = String::new();
+    let mut messages: Vec<String> = Vec::new();
+
+    for acc in list.iter().filter(|a| a.is_usable()) {
+        match qoder_tools::checkin_claim(r, acc).await {
+            Ok(v) => {
+                let is_ok = v.get("ok").and_then(Value::as_bool) == Some(true);
+                if is_ok && v.get("already").and_then(Value::as_bool) == Some(true) {
+                    already += 1;
+                } else if is_ok {
+                    claimed += 1;
+                } else if v.get("blocked").and_then(Value::as_bool) == Some(true) {
+                    blocked += 1;
+                    if blocked_reason.is_empty() {
+                        blocked_reason = v
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                } else {
+                    failures.push(
+                        v.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("签到失败")
+                            .to_string(),
+                    );
+                }
+                if let Some(m) = v.get("message").and_then(Value::as_str) {
+                    if !m.is_empty() {
+                        messages.push(format!("{}：{m}", acc.name));
+                    }
+                }
+            }
+            Err(e) => failures.push(format!("{}：{e}", acc.name)),
+        }
+    }
+
+    Ok(json!({
+        "claimed": claimed,
+        "already": already,
+        "blocked": blocked,
+        "blockedReason": blocked_reason,
+        "failed": failures.len(),
+        "messages": messages,
+        "failures": failures,
+    }))
+}
+
+/// 刷新该账号的访问令牌（用 refresh_token 换新的，并写回账号库）。
+#[tauri::command]
+pub async fn qoder_token_refresh(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let acc = qoder_accounts::list(r)?
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("找不到账号 {id}"))?;
+    let updated = qoder_api::refresh_token(&acc).await?;
+    Ok(json!(updated))
+}
+
+/// 改显示名（不动 uid / 凭据）。
+#[tauri::command]
+pub async fn qoder_account_rename(region: String, id: String, name: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("名字不能为空".into());
+    }
+    qoder_accounts::update(r, &id, |a| a.name = name.clone()).map(|a| json!(a))
+}
+
+/// 「切换」：把该账号的凭据**写回 Qoder 桌面端登录态**（`auth.v1.dat`）。
+///
+/// 四条纪律见 `qoder_auth_dat` 模块头：原地改写、进程守卫、写后校验、失败回滚。
+/// 写完同时把它设为网关的默认账号（这样客户端和网关落在同一个号上）。
+///
+/// ⚠️ 本机没有桌面端登录态时**不静默降级**，直接报错说明原因。
+#[tauri::command]
+pub async fn qoder_account_switch(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let acc = qoder_accounts::list(r)?
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("找不到账号 {id}"))?;
+    let access = acc
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "这个账号没有访问令牌，无法切换".to_string())?;
+    let refresh = acc.refresh_token.clone().unwrap_or_default();
+
+    let outcome = qoder_auth_dat::switch_to(r, &acc.uid, access, &refresh)?;
+    qoder_accounts::set_default(r, &acc.uid)?;
+
+    // 写完把客户端拉起来 —— 用户切号之后本来就要打开它，不该让他再点一次图标。
+    let launched = qoder_auth_dat::launch_desktop(r).ok();
+
+    Ok(json!({
+        "ok": true,
+        "mode": "desktop",
+        "path": outcome.path.display().to_string(),
+        "backup": outcome.backup.map(|p| p.display().to_string()),
+        "launched": launched,
+        "note": match &launched {
+            Some(p) => format!("{}（已启动 {}）", outcome.note, p),
+            None => format!("{}（没能自动启动客户端，请手动打开）", outcome.note),
+        },
+    }))
+}
+
+
+/// 从本机 Qoder 客户端导入登录态 —— **自动识别两个版本**。
+///
+/// 本机可能同时装着国内版与国际版（`%APPDATA%\com.qodercn.app.stable` /
+/// `%APPDATA%\com.qoder.app.stable`）。这里**各扫各的、各写各的库**：
+/// 国际版账号只会进 `accounts.global.json`，不会污染国内版库。
+///
+/// 导入后立刻逐个校验（能查通或续期成功才算可用），失效的标 `disabled` 并进 `failed`。
+#[tauri::command]
+pub async fn qoder_import_local() -> Result<Value, String> {
+    let mut out = serde_json::Map::new();
+
+    for r in [qoder_realm::QoderRegion::Cn, qoder_realm::QoderRegion::Global] {
+        let key = r.as_str().to_string();
+        let found = qoder_auth_dat::scan_local(r);
+        if found.is_empty() {
+            let reason = match qoder_auth_dat::auth_dat_path(r) {
+                Some(p) => format!(
+                    "找到登录态文件但解不开或没有令牌：{}",
+                    p.display()
+                ),
+                None => "本机没有这个版本的登录态（没装 / 没登录过）".to_string(),
+            };
+            out.insert(key, json!({ "imported": 0, "updated": 0, "accounts": [], "failed": [], "reason": reason }));
+            continue;
+        }
+
+        let existing = qoder_accounts::list(r)?;
+        let mut imported = 0usize;
+        let mut updated = 0usize;
+        let mut rows: Vec<Value> = Vec::new();
+
+        for a in found {
+            match existing.iter().find(|x| x.uid == a.uid) {
+                Some(old) => {
+                    let id = old.id.clone();
+                    let (token, refresh, name, email, avatar, source, exp) = (
+                        a.token.clone(),
+                        a.refresh.clone(),
+                        a.name.clone(),
+                        a.email.clone(),
+                        a.avatar.clone(),
+                        a.source.clone(),
+                        a.expires_at,
+                    );
+                    qoder_accounts::update(r, &id, |x| {
+                        x.access_token = Some(token);
+                        if refresh.is_some() {
+                            x.refresh_token = refresh;
+                        }
+                        if !name.is_empty() {
+                            x.name = name;
+                        }
+                        if email.is_some() {
+                            x.email = email;
+                        }
+                        if let Some(v) = avatar {
+                            x.meta = serde_json::json!({ "avatar": v });
+                        }
+                        x.source = source;
+                        if exp.is_some() {
+                            x.expires_at = exp;
+                        }
+                        // 重新导入视为「用户想再用它」：先解开禁用，交给下面的校验裁决。
+                        x.disabled = false;
+                    })?;
+                    updated += 1;
+                }
+                None => {
+                    let mut acc = qoder_accounts::QoderAccount::new(r, &a.uid, a.name.clone());
+                    acc.access_token = Some(a.token.clone());
+                    acc.refresh_token = a.refresh.clone();
+                    acc.email = a.email.clone();
+                    acc.source = a.source.clone();
+                    acc.expires_at = a.expires_at;
+                    if let Some(v) = a.avatar.clone() {
+                        acc.meta = serde_json::json!({ "avatar": v });
+                    }
+                    qoder_accounts::add(acc)?;
+                    imported += 1;
+                }
+            }
+            rows.push(json!({ "uid": a.uid, "name": a.name, "source": a.source }));
+        }
+
+        // 校验：能查通（或续期成功）才算可用。
+        let mut failed: Vec<Value> = Vec::new();
+        for row in &rows {
+            let uid = row.get("uid").and_then(Value::as_str).unwrap_or_default();
+            let Some(acc) = qoder_accounts::list(r)?.into_iter().find(|x| x.uid == uid) else {
+                continue;
+            };
+            match qoder_api::refresh_account(&acc).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = qoder_accounts::update(r, &acc.id, |x| x.disabled = true);
+                    failed.push(json!({ "uid": uid, "error": e }));
+                }
+            }
+        }
+
+        out.insert(
+            key,
+            json!({
+                "imported": imported,
+                "updated": updated,
+                "accounts": rows,
+                "failed": failed,
+            }),
+        );
+    }
+
+    Ok(Value::Object(out))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------------------------------------------------------------------------
+// Qoder 会话记录（只读本地 SQLite）
+// ---------------------------------------------------------------------------
+
+/// 会话列表。`include_archived = false` 时过滤归档。
+#[tauri::command]
+pub async fn qoder_sessions_list(region: String, include_archived: Option<bool>) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::list(r, include_archived.unwrap_or(false)).map(|v| json!(v))
+}
+
+/// 单个会话的消息。正文只取 `parts[type=text]`（`thinking` 单独给）。
+#[tauri::command]
+pub async fn qoder_session_detail(region: String, session_id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::detail(r, &session_id)
+}
+
+/// 两个版本各有多少会话。
+#[tauri::command]
+pub async fn qoder_sessions_counts() -> Result<Value, String> {
+    Ok(qoder_sessions::counts())
+}
+
+
+/// 改会话标题（会写客户端库：客户端在跑时拒绝，写前自动备份）。
+#[tauri::command]
+pub async fn qoder_session_rename(region: String, session_id: String, title: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::rename(r, &session_id, &title)
+}
+
+/// 删除会话（软删除 `deleted_at`，消息保留）。
+#[tauri::command]
+pub async fn qoder_session_delete(region: String, session_id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::remove(r, &session_id)
+}
+
+/// 复制会话（同库新建一条 + 复制全部消息）。
+#[tauri::command]
+pub async fn qoder_session_duplicate(region: String, session_id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::duplicate(r, &session_id)
+}
+
+
+/// 存该账号的 Cosy 设备身份（从抓包里复制 `cosy-machinetoken` / `cosy-machinetype`）。
+///
+/// 活动下发（`/me/campaigns`）绑定登录时服务端签发的设备令牌；客户端只在内存里持有，
+/// 所以要用户粘贴一次。两个都给才算设置了；传空串表示清除、退回派生值。
+#[tauri::command]
+pub async fn qoder_account_set_cosy(
+    region: String,
+    id: String,
+    machine_token: String,
+    machine_type: String,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let token = machine_token.trim().to_string();
+    let mtype = machine_type.trim().to_string();
+    if token.is_empty() || mtype.is_empty() {
+        return Err("machinetoken 与 machinetype 都要填（抓包请求头里各复制一份）".into());
+    }
+    qoder_accounts::update(r, &id, |a| {
+        a.cosy_machine_token = Some(token);
+        a.cosy_machine_type = Some(mtype);
+    })
+    .map(|a| json!(a))
+}
+
+
+/// 积分共享总开关：关掉会**真的停掉网关**（释放端口），不只是隐藏入口。
+#[tauri::command]
+pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
+    gateway_server::set_enabled(enabled)?;
+    if enabled {
+        let port = gateway_keys::GATEWAY_PORT;
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = gateway_server::serve(port).await {
+                eprintln!("[gateway] {e}");
+            }
+        });
+    } else {
+        gateway_server::request_stop();
+    }
+    Ok(json!({ "enabled": enabled, "status": gateway_server::status() }))
+}
+
+
+/// 改 Qoder 会话里**一条消息的正文**（只动 `parts[type=text].text`，保留思维链/工具调用）。
+#[tauri::command]
+pub async fn qoder_session_update_message(
+    region: String,
+    session_id: String,
+    message_id: String,
+    text: String,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::update_message_text(r, &session_id, &message_id, &text)
+}
+
+/// 删除 Qoder 会话里的一条消息（物理删，写前已备份）。
+#[tauri::command]
+pub async fn qoder_session_delete_message(
+    region: String,
+    session_id: String,
+    message_id: String,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_sessions::delete_message(r, &session_id, &message_id)
+}
+
+
+/// 首页的 Qoder 概况（账号数 / 积分合计 / 会话数 / 客户端是否运行）。
+#[tauri::command]
+pub async fn qoder_home_summary() -> Result<Value, String> {
+    Ok(qoder_tools::home_summary())
+}
+
+
+/// Qoder 本机数据：扫可清理项（缓存 / 日志 / 我们自己的备份）。
+#[tauri::command]
+pub async fn qoder_cleanup_scan() -> Result<Value, String> {
+    Ok(qoder_cleanup::scan())
+}
+
+/// Qoder 本机数据清理（只删勾选项，且必须在扫描清单内）。
+#[tauri::command]
+pub async fn qoder_cleanup_run(region: String, keys: Vec<String>) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    qoder_cleanup::clean(r, &keys)
+}
+
+
+/// 清空 Qoder 清理页的回收站（硬删，不可恢复）。
+#[tauri::command]
+pub async fn qoder_cleanup_empty_trash() -> Result<Value, String> {
+    qoder_cleanup::empty_trash()
+}
+
+
+/// 「使用说明」页的真机自检：网关在跑 → 能列模型 → 会选哪个账号 →（可选）真发一次对话。
+///
+/// ⚠️ 这不是示意图：每一步都是**现场跑出来的真实结果**，失败会如实返回原因。
+#[tauri::command]
+pub async fn gateway_guide_selftest(
+    key: Option<String>,
+    model: Option<String>,
+) -> Result<Value, String> {
+    Ok(gateway_server::selftest(key, model).await)
 }

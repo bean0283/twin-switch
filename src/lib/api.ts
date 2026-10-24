@@ -881,6 +881,8 @@ export function settingsSet(patch: {
   traeExe?: Record<string, string>;
   /** 手动指定的 WorkBuddy 主程序路径（空串 = 恢复自动探测）。 */
   workbuddyExe?: string;
+  /** 切号时是否同步 WorkBuddy 的定时任务。 */
+  syncWorkbuddyAutomations?: boolean;
 }): Promise<SettingsSnapshot> {
   return call("settings_set", { patch });
 }
@@ -975,7 +977,7 @@ export function traeCreditsQuery(
  * 单账号失败不会影响其它账号，也不会让整个调用抛错。
  */
 export function checkinRun(
-  scope: "all" | "trae" | "workbuddy" = "all",
+  scope: "all" | "trae" | "workbuddy" | "qoder" = "all",
   clientKey?: string | null,
 ): Promise<CheckinResult> {
   return call("checkin_run", { scope, clientKey: clientKey ?? null });
@@ -1312,4 +1314,420 @@ export function updateDownload(): Promise<void> {
 /** 安装已下载的更新包并重启应用（无包时会返回可读错误）。 */
 export function updateRestart(): Promise<void> {
   return call("update_restart");
+}
+
+
+// ---------------------------------------------------------------------------
+// 积分共享（本地额度网关 127.0.0.1:57892）
+// ---------------------------------------------------------------------------
+
+export async function gatewayStatus(): Promise<unknown> {
+  return invoke("gateway_status");
+}
+
+export async function gatewayPool(): Promise<unknown> {
+  return invoke("gateway_pool");
+}
+
+export async function gatewayPreview(model: string): Promise<unknown> {
+  return invoke("gateway_preview", { model });
+}
+
+export async function gatewayKeysList(): Promise<unknown> {
+  return invoke("gateway_keys_list");
+}
+
+/// 新建 Key：**明文只返回这一次**。
+export async function gatewayKeyCreate(
+  name: string,
+  scopes: string[] = [],
+): Promise<{ plaintext: string; key: unknown }> {
+  return invoke("gateway_key_create", { name, scopes });
+}
+
+export async function gatewayKeyRevoke(id: string): Promise<unknown> {
+  return invoke("gateway_key_revoke", { id });
+}
+
+export async function gatewayKeyRestore(id: string): Promise<unknown> {
+  return invoke("gateway_key_restore", { id });
+}
+
+export async function gatewayKeyDelete(id: string): Promise<void> {
+  return invoke("gateway_key_delete", { id });
+}
+
+export async function gatewayModelsGet(): Promise<unknown> {
+  return invoke("gateway_models_get");
+}
+
+export async function gatewayModelsSet(value: unknown): Promise<void> {
+  return invoke("gateway_models_set", { value });
+}
+
+export async function gatewayUpstreamsGet(): Promise<unknown> {
+  return invoke("gateway_upstreams_get");
+}
+
+export async function gatewayUpstreamsSet(value: unknown): Promise<void> {
+  return invoke("gateway_upstreams_set", { value });
+}
+
+
+/// 自动识别本机客户端里的模型（附带每家来源说明）。
+export async function gatewayModelsDiscover(): Promise<{
+  models: { scope: string; product: string; model: string; display: string; source: string }[];
+  reports: { product: string; scope: string; found: number; note: string }[];
+}> {
+  return invoke("gateway_models_discover");
+}
+
+/// 已勾选的模型。
+export async function gatewayModelsSelected(): Promise<Record<string, string[]>> {
+  return invoke("gateway_models_selected");
+}
+
+/// 保存勾选结果。
+export async function gatewayModelsSave(map: Record<string, string[]>): Promise<void> {
+  return invoke("gateway_models_save", { map });
+}
+
+
+// ---------------------------------------------------------------------------
+// Qoder 账号（国内 / 国际两套账号库）
+// ---------------------------------------------------------------------------
+
+export async function qoderRegions(): Promise<unknown> {
+  return invoke("qoder_regions");
+}
+
+export async function qoderAccountsList(region?: string): Promise<unknown> {
+  return invoke("qoder_accounts_list", { region: region ?? null });
+}
+
+export async function qoderAccountAdd(
+  region: string,
+  uid: string,
+  name: string,
+  token: string,
+  email?: string | null,
+): Promise<unknown> {
+  return invoke("qoder_account_add", { region, uid, name, token, email: email ?? null });
+}
+
+export async function qoderAccountRemove(region: string, id: string): Promise<unknown> {
+  return invoke("qoder_account_remove", { region, id });
+}
+
+export async function qoderAccountRestore(region: string, id: string): Promise<unknown> {
+  return invoke("qoder_account_restore", { region, id });
+}
+
+export async function qoderAccountSetToken(
+  region: string,
+  id: string,
+  token: string,
+): Promise<unknown> {
+  return invoke("qoder_account_set_token", { region, id, token });
+}
+
+export async function qoderAccountRefresh(region: string, id: string): Promise<unknown> {
+  return invoke("qoder_account_refresh", { region, id });
+}
+
+/// 批量刷新一个区域的额度（串行查，单个失败不影响其它账号）。
+export async function qoderAccountsRefreshAll(region: string): Promise<unknown> {
+  return invoke("qoder_accounts_refresh_all", { region });
+}
+
+
+// Qoder 浏览器登录（设备授权 + PKCE）
+export async function qoderLoginStart(region: string): Promise<{
+  loginId: string;
+  verificationUri: string;
+  expiresInSecs: number;
+}> {
+  return invoke("qoder_login_start", { region });
+}
+
+export async function qoderLoginPoll(
+  region: string,
+  loginId: string,
+): Promise<{ done: boolean; result?: unknown; error?: string }> {
+  return invoke("qoder_login_poll", { region, loginId });
+}
+
+export async function qoderLoginCancel(loginId: string): Promise<boolean> {
+  return invoke("qoder_login_cancel", { loginId });
+}
+
+
+// Qoder 账号包导出 / 导入 / 签到
+export async function qoderAccountsExport(region: string): Promise<{
+  count: number;
+  filename: string;
+  path: string;
+  json: string;
+}> {
+  return invoke("qoder_accounts_export", { region });
+}
+
+export async function qoderImportPreview(
+  region: string,
+  jsonText: string,
+): Promise<{
+  region: string;
+  total: number;
+  items: { index: number; uid: string; name: string; hasToken: boolean }[];
+  rejected: { index: number; uid: string; reason: string }[];
+}> {
+  return invoke("qoder_import_preview", { region, json: jsonText });
+}
+
+export async function qoderImportApply(
+  region: string,
+  jsonText: string,
+  indexes?: number[] | null,
+): Promise<{ imported: number; updated: number; skipped: number; rejected: unknown[] }> {
+  return invoke("qoder_import_apply", { region, json: jsonText, indexes: indexes ?? null });
+}
+
+export async function qoderCheckinAll(region: string): Promise<{
+  claimed: number;
+  already: number;
+  blocked: number;
+  blockedReason?: string;
+  failed: number;
+  messages: string[];
+  failures: string[];
+}> {
+  return invoke("qoder_checkin_all", { region });
+}
+
+
+// Qoder token 刷新 / 改名 / 设为默认
+export async function qoderTokenRefresh(region: string, id: string): Promise<unknown> {
+  return invoke("qoder_token_refresh", { region, id });
+}
+
+export async function qoderAccountRename(
+  region: string,
+  id: string,
+  name: string,
+): Promise<unknown> {
+  return invoke("qoder_account_rename", { region, id, name });
+}
+
+export async function qoderAccountSwitch(
+  region: string,
+  id: string,
+): Promise<{ ok: boolean; defaultUid?: string; note: string; launched?: string | null }> {
+  return invoke("qoder_account_switch", { region, id });
+}
+
+
+/// 从本机 Qoder 客户端导入登录态 —— 自动识别国内版 / 国际版，各写各的库。
+export async function qoderImportLocal(): Promise<
+  Record<
+    "cn" | "global",
+    {
+      imported: number;
+      updated: number;
+      accounts: { uid: string; name: string; source: string }[];
+      failed: { uid: string; error: string }[];
+      reason?: string;
+    }
+  >
+> {
+  return invoke("qoder_import_local");
+}
+
+
+// Qoder 会话记录（只读本地 SQLite）
+export async function qoderSessionsList(
+  region: string,
+  includeArchived = false,
+): Promise<
+  {
+    id: string;
+    title: string;
+    cwd: string;
+    model: string;
+    createdAt: number;
+    updatedAt: number;
+    archived: boolean;
+    messageCount: number;
+    bytes: number;
+    source: string;
+    importedFrom: string | null;
+  }[]
+> {
+  return invoke("qoder_sessions_list", { region, includeArchived });
+}
+
+export async function qoderSessionDetail(
+  region: string,
+  sessionId: string,
+): Promise<{
+  id: string;
+  region: string;
+  meta: { title: string; cwd: string; model: string; createdAt: number; updatedAt: number } | null;
+  messages: {
+    messageId: string;
+    role: string;
+    text: string;
+    thinking: string | null;
+    toolCount: number;
+    createdAt: number;
+    status: string;
+  }[];
+}> {
+  return invoke("qoder_session_detail", { region, sessionId });
+}
+
+export async function qoderSessionsCounts(): Promise<Record<"cn" | "global", number>> {
+  return invoke("qoder_sessions_counts");
+}
+
+
+// Qoder 会话写操作（客户端在跑时会拒绝；写前自动备份库）
+export async function qoderSessionRename(
+  region: string,
+  sessionId: string,
+  title: string,
+): Promise<{ ok: boolean; backup: string; title: string }> {
+  return invoke("qoder_session_rename", { region, sessionId, title });
+}
+
+export async function qoderSessionDelete(
+  region: string,
+  sessionId: string,
+): Promise<{ ok: boolean; backup: string; soft: boolean }> {
+  return invoke("qoder_session_delete", { region, sessionId });
+}
+
+export async function qoderSessionDuplicate(
+  region: string,
+  sessionId: string,
+): Promise<{ ok: boolean; id: string }> {
+  return invoke("qoder_session_duplicate", { region, sessionId });
+}
+
+
+/// 存该账号的 Cosy 设备身份（抓包里 cosy-machinetoken / cosy-machinetype）。
+export async function qoderAccountSetCosy(
+  region: string,
+  id: string,
+  machineToken: string,
+  machineType: string,
+): Promise<unknown> {
+  return invoke("qoder_account_set_cosy", { region, id, machineToken, machineType });
+}
+
+
+/** 积分共享总开关（关闭会真的停掉网关）。 */
+export async function gatewaySetEnabled(enabled: boolean): Promise<{ enabled: boolean }> {
+  return invoke("gateway_set_enabled", { enabled });
+}
+
+
+/** 改 Qoder 会话里一条消息的正文。 */
+export async function qoderSessionUpdateMessage(
+  region: string,
+  sessionId: string,
+  messageId: string,
+  text: string,
+): Promise<unknown> {
+  return invoke("qoder_session_update_message", { region, sessionId, messageId, text });
+}
+
+/** 删除 Qoder 会话里的一条消息。 */
+export async function qoderSessionDeleteMessage(
+  region: string,
+  sessionId: string,
+  messageId: string,
+): Promise<unknown> {
+  return invoke("qoder_session_delete_message", { region, sessionId, messageId });
+}
+
+
+/** 首页 Qoder 概况。 */
+export async function qoderHomeSummary(): Promise<{
+  accounts: number;
+  credits: number | null;
+  regions: { region: string; label: string; accounts: number; usable: number; credits: number | null; hasClient: boolean }[];
+  sessions: Record<string, number>;
+  running: boolean;
+  processCount: number;
+}> {
+  return invoke("qoder_home_summary");
+}
+
+
+/** Qoder 本机数据：扫可清理项。 */
+export async function qoderCleanupScan(): Promise<{
+  sides: {
+    region: string;
+    label: string;
+    dataRoot: string | null;
+    bytes: number;
+    items: {
+      key: string;
+      label: string;
+      path: string;
+      bytes: number;
+      defaultOn: boolean;
+      note: string;
+      /** 「清空回收站」项：勾选后是硬删，不可恢复。 */
+      isTrash?: boolean;
+    }[];
+  }[];
+}> {
+  return invoke("qoder_cleanup_scan");
+}
+
+/** Qoder 本机数据清理（只删勾选项）。 */
+export async function qoderCleanupRun(region: string, keys: string[]): Promise<unknown> {
+  return invoke("qoder_cleanup_run", { region, keys });
+}
+
+
+/** 清空 Qoder 清理页的回收站（硬删，不可恢复）。 */
+export async function qoderCleanupEmptyTrash(): Promise<{ ok: boolean; freed: number }> {
+  return invoke("qoder_cleanup_empty_trash");
+}
+
+
+/** 手动添加 WorkBuddy 账号：直接粘 access_token（可选 refresh_token），不走授权流程。 */
+export async function workbuddyAccountAddToken(args: {
+  accessToken: string;
+  refreshToken?: string;
+  domain?: string;
+  name?: string;
+}): Promise<{
+  ok: boolean;
+  accountId: string | null;
+  uid: string | null;
+  nickname: string | null;
+  domain: string | null;
+  expiresAt: number | null;
+  refreshExpiresAt: number | null;
+}> {
+  return invoke("workbuddy_account_add_token", args);
+}
+
+
+/** 使用说明页的真机自检（每步都是现场真实结果）。 */
+export async function gatewayGuideSelftest(args: {
+  key?: string;
+  model?: string;
+}): Promise<{
+  ok: boolean;
+  error?: string;
+  steps: { id: string; label: string; ok: boolean; detail: string; model?: string; sample?: string[] }[];
+  models: { count: number; sample: string[] };
+  chat: { ok: boolean; ms?: number; status?: number; content?: string; error?: string } | null;
+  checkedAt: number;
+}> {
+  return invoke("gateway_guide_selftest", args);
 }

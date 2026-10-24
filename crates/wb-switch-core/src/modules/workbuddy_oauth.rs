@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::config::{http_request, now_ms};
-use crate::modules::workbuddy_auth::API_ENDPOINT;
+use crate::modules::workbuddy_auth::{API_ENDPOINT, LOGIN_ENDPOINT};
 use crate::modules::workbuddy_vault;
 
 const API_PREFIX: &str = "/v2/plugin";
@@ -38,6 +38,14 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthInfo>> {
 
 fn now_secs() -> i64 {
     now_ms() / 1000
+}
+
+/// 官方登录页：`{LOGIN_ENDPOINT}/login/?platform=workbuddy&state=…`。
+///
+/// `state` 必须与 `auth/state` 返回的一致 —— 登录页登录成功后，我们靠这个 state
+/// 轮询 `auth/token`；换域名不影响，但 state 一个字都不能改。
+fn login_page_url(state: &str) -> String {
+    format!("{LOGIN_ENDPOINT}/login/?platform={OAUTH_PLATFORM}&state={state}")
 }
 
 fn state_url() -> String {
@@ -87,7 +95,15 @@ pub async fn oauth_start() -> Result<Value, String> {
         .or_else(|| data.get("auth_url").and_then(|v| v.as_str()))
         .or_else(|| data.get("url").and_then(|v| v.as_str()))
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{API_ENDPOINT}/login?state={state}"));
+        .unwrap_or_else(|| login_page_url(&state));
+
+    // 服务端若回的是 `www.codebuddy.cn/login?state=…`（旧页），统一换成官方登录页，
+    // 否则打开的是旧版页面（用户实测：官方 5.9.x 走 www.workbuddy.cn/login/）。
+    let auth_url = if auth_url.contains("workbuddy.cn/login") {
+        auth_url
+    } else {
+        login_page_url(&state)
+    };
 
     let mut map = oauth_states().lock().unwrap();
     map.insert(

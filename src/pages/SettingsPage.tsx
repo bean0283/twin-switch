@@ -79,6 +79,8 @@ export default function SettingsPage() {
   /** 正在「取运行中的路径」的客户端 key。 */
   const [probing, setProbing] = useState<string | null>(null);
   /** WorkBuddy 主程序路径的草稿（空串 = 走自动探测）。 */
+  /** 切号是否同步定时任务（null = 还没读到设置，界面显示骨架）。 */
+  const [syncAuto, setSyncAuto] = useState<boolean | null>(null);
   const [wbDraft, setWbDraft] = useState<string>("");
   const [probingWb, setProbingWb] = useState(false);
   const [redetecting, setRedetecting] = useState(false);
@@ -106,6 +108,7 @@ export default function SettingsPage() {
       setBeforeWrite(s.backupBeforeWrite);
       setExeDraft({ ...(s.traeExe ?? {}) });
       setWbDraft(s.workbuddyExe ?? "");
+      setSyncAuto(s.syncWorkbuddyAutomations ?? true);
       void loadClients(false);
     } catch (cause) {
       // ⚠️ 撤掉表单与默认值：失败时给用户看「30 天 / 3 份 / 4 GB」，
@@ -114,6 +117,7 @@ export default function SettingsPage() {
       setDraft(null);
       setBeforeWrite(null);
       setExeDraft(null);
+      setSyncAuto(null);
       setError(api.asError(cause));
     } finally {
       setLoading(false);
@@ -135,6 +139,7 @@ export default function SettingsPage() {
         // 空串视为「恢复自动探测」：后端会把它从映射里剔掉。
         traeExe: cleanExeDraft(exeDraft),
         workbuddyExe: wbDraft.trim(),
+        syncWorkbuddyAutomations: syncAuto ?? true,
       });
       setSnap(next);
       // 用**后端回读的实际值**刷表单：手输了离谱的数会被后端夹到合理区间，
@@ -143,6 +148,7 @@ export default function SettingsPage() {
       setBeforeWrite(next.backupBeforeWrite);
       setExeDraft({ ...(next.traeExe ?? {}) });
       setWbDraft(next.workbuddyExe ?? "");
+      setSyncAuto(next.syncWorkbuddyAutomations ?? true);
       // 路径改了 ⇒ 让探测结果跟着刷新（否则下面那几行还挂着「未找到」）。
       void loadClients(true);
       toast.success("设置已保存", {
@@ -169,7 +175,8 @@ export default function SettingsPage() {
       draft.keepDays !== snap.backupRetention.keepDays ||
       draft.keepCount !== snap.backupRetention.keepCount ||
       draft.maxTotalMb !== snap.backupRetention.maxTotalMb ||
-      beforeWrite !== snap.backupBeforeWrite);
+      beforeWrite !== snap.backupBeforeWrite ||
+      (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true));
 
   /** 取某个客户端「正在运行的」主程序路径并填进草稿。 */
   async function pickRunning(key: string) {
@@ -375,6 +382,27 @@ export default function SettingsPage() {
                     );
                   })
               )}
+
+              {/* ── 切号时同步定时任务 ─────────────────────────────────────
+                  WorkBuddy 的定时任务存在 workbuddy.db 的 automations 表里，**按账号归属**
+                  （owner_user_id）。切到另一个账号后原任务在客户端里会「消失」。
+                  默认开启同步：切过去还能看到原来的任务（按名称+周期+提示词去重，不会越积越多）。 */}
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border bg-muted/30 px-3 py-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={syncAuto ?? true}
+                  disabled={syncAuto === null}
+                  onChange={(e) => setSyncAuto(e.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="text-sm font-medium">切换账号时同步 WorkBuddy 定时任务</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    定时任务按账号归属，切号后在客户端里会「消失」。开启后本工具会把它们复制一份给新账号
+                    （同名同周期的已存在就跳过）。关掉则**只切登录态**，不碰定时任务。
+                  </span>
+                </span>
+              </label>
 
               {/* ── WorkBuddy ─────────────────────────────────────────────
                   与上面几行同一套交互：手动指定 → 运行中进程 → 自动探测。

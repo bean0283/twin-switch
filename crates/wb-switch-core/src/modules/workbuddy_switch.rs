@@ -193,6 +193,10 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
     }
     let target_uid = crate::modules::workbuddy_auth::get_str(&acc, "uid").unwrap_or_default();
 
+    // 0) 记下切换前的账号：定时任务是按 `owner_user_id` 归属的，同步时要用它当来源。
+    //    ⚠️ 必须在写登录态**之前**取，写完读到的就是目标账号了。
+    let previous_uid = workbuddy_auth::current_uid();
+
     // 1) 备份当前登录态（可能没有登录态 → None）
     let backup = workbuddy_auth::backup_auth_file();
 
@@ -228,6 +232,24 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
         ));
     }
 
+    // 4.5) 把定时任务同步给新账号（可在设置里关闭）。
+    //
+    // ⚠️ 失败**不阻断**切号：定时任务是附属功能，切号本身已经成功了，
+    //    把报告带回界面照实显示即可（不许静默，也不许因此回滚登录态）。
+    let automation_sync = if settings::sync_workbuddy_automations() {
+        match previous_uid.as_deref().filter(|u| !u.is_empty()) {
+            Some(from) if from != target_uid => {
+                match crate::modules::workbuddy_automations::sync_owner(from, &target_uid) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "ok": false, "error": e }),
+                }
+            }
+            _ => json!({ "ok": true, "notNeeded": true, "reason": "没有切换前的账号或同一个账号" }),
+        }
+    } else {
+        json!({ "ok": true, "notNeeded": true, "reason": "设置里已关闭定时任务同步" })
+    };
+
     // 5) 记录切换点（供回滚）+ 记录使用
     save_last_switch(&json!({
         "accountId": id,
@@ -250,6 +272,7 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
         "backup": backup,
         "killed": killed,
         "relaunched": relaunched,
+        "automationSync": automation_sync,
     }))
 }
 

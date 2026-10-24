@@ -459,6 +459,8 @@ export interface TraeAccountToken {
   uid: string | null;
   /** JWT 本体（`xxx.yyy.zzz`）。 */
   token: string;
+  /** refresh token 明文（仅 `source = "plain"` 时有值）；用于在别处续期。 */
+  refreshToken?: string | null;
   /** 到期时间（毫秒）；null = 解不出 exp。 */
   tokenExp: number | null;
   /** 这份 token 从哪儿读出来的：网页凭证 / 载体登录态。 */
@@ -503,6 +505,8 @@ export interface WbAccountToken {
   name: string;
   /** JWT 本体（`xxx.yyy.zzz`）。 */
   token: string;
+  /** refresh token 明文（仅 `source = "plain"` 时有值）；用于在别处续期。 */
+  refreshToken?: string | null;
   /** 到期时间（毫秒）；null = 解不出 exp。 */
   tokenExp: number | null;
   /** 刷新额度到期（毫秒）；null = 没有这个字段。 */
@@ -541,6 +545,8 @@ export interface WbAccountTokenRefresh {
  */
 export interface AccountTokenInfo {
   token: string;
+  /** refresh token 明文；null/undefined = 这个账号没有可导出的。 */
+  refreshToken?: string | null;
   tokenExp: number | null;
   refreshExpiredAt: number | null;
   /** 来源 / 凭据形态的一句话说明。 */
@@ -1288,6 +1294,18 @@ export interface WorkbuddySwitchResult {
   backup: string | null;
   killed: string[];
   relaunched: boolean;
+  /** 定时任务同步报告（`ok:false` 表示切号成功但同步失败，界面要照实说）。 */
+  automationSync?: {
+    ok: boolean;
+    /** 整体不需要同步（同一账号 / 设置里关闭）——与 `skippedNames`（去重跳过的任务名）不同。 */
+    notNeeded?: boolean;
+    reason?: string;
+    error?: string;
+    copied?: string[];
+    skippedNames?: string[];
+    from?: string;
+    to?: string;
+  } | null;
 }
 
 export interface WorkbuddyOAuthStart {
@@ -2080,6 +2098,13 @@ export interface SettingsSnapshot {
   backupBeforeWrite: boolean;
   /** 与 `backupBeforeWrite` 同源的一句话（后端生成，界面直接显示）。 */
   beforeWriteSummary: string;
+  /**
+   * **切号时是否把 WorkBuddy 的定时任务同步给新账号**（默认 `true`）。
+   *
+   * 定时任务按 `owner_user_id` 归属，切号后原任务在客户端里会「消失」；
+   * 开启后本工具会把它们复制给新账号（去重，不会越积越多）。
+   */
+  syncWorkbuddyAutomations: boolean;
   /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
   path: string;
   /**
@@ -2158,7 +2183,7 @@ export type CheckinStatus =
 
 /** 一个账号的签到结果。 */
 export interface CheckinItem {
-  client: "trae" | "workbuddy";
+  client: "trae" | "workbuddy" | "qoder";
   /** Trae 侧才有（账号库按 `clientKey/<id>` 分目录）。 */
   clientKey: string;
   id: string;

@@ -112,6 +112,10 @@ export function AccountTokenDialog({
   const [error, setError] = useState<string | null>(null);
   const [reveal, setReveal] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** refresh token 是否明文展示（同样默认打码）。 */
+  const [revealRt, setRevealRt] = useState(false);
+  /** 刚导出过 refresh token（按钮上打个勾）。 */
+  const [copiedRt, setCopiedRt] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   /**
    * 续期失败原文（可能很长：后端会把**每一种「凭据 + 设备身份 + 客户端参数」组合**的
@@ -148,6 +152,8 @@ export function AccountTokenDialog({
     if (open && accountId && (provider !== "trae" || targetKey)) {
       setReveal(false);
       setCopied(false);
+      setRevealRt(false);
+      setCopiedRt(false);
       setForceAsk(null);
       setRefreshError(null);
       setRefreshShift(null);
@@ -171,6 +177,28 @@ export function AccountTokenDialog({
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
       toast.error("复制失败", { description: "可以点「显示」后手动全选复制" });
+    }
+  }
+
+  /**
+   * 复制 refresh token（到剪贴板）。
+   *
+   * 用途：在**别的工具/机器**上也登记这个账号，之后由那边负责续期 ——
+   * 不用把账号密码再登一遍。⚠️ 它等同于登录凭据：拿到就能一直续期，
+   * 所以文案里必须写明「只贴到可信工具」。
+   */
+  async function copyRefreshToken() {
+    const rt = info?.refreshToken;
+    if (!rt) return;
+    try {
+      await navigator.clipboard.writeText(rt);
+      setCopiedRt(true);
+      setTimeout(() => setCopiedRt(false), 1600);
+      toast.success("已复制 refresh token", {
+        description: "可粘贴到别的工具里登记同一账号。它等同登录凭据，别贴到不可信的地方。",
+      });
+    } catch {
+      toast.error("复制失败", { description: "点「显示」后手动全选复制" });
     }
   }
 
@@ -215,7 +243,7 @@ export function AccountTokenDialog({
 
   const exp = info?.tokenExp ?? null;
   const token = info?.token ?? "";
-  const masked = token.length > 28 ? `${token.slice(0, 18)}…${token.slice(-10)}` : token;
+  const masked = maskToken(token);
   const what = provider === "trae" ? "Trae" : "WorkBuddy";
   /** 官方签发的有效期天数 —— **按产品分流**，只用于文案举例（判定一律看 token 的 `exp`）。 */
   const issuedDays = ISSUED_VALIDITY_DAYS[provider];
@@ -298,6 +326,58 @@ export function AccountTokenDialog({
                 <div className="max-h-32 min-w-0 overflow-auto rounded-lg border bg-muted/40 px-3 py-2 font-mono text-xs leading-5 break-all whitespace-pre-wrap select-all">
                   {reveal ? token || "（空）" : masked || "（空）"}
                 </div>
+
+              {/* refresh token：可「导出」到别处续期（仅 WorkBuddy 走这条路径） */}
+              {provider === "workbuddy" ? (
+                <div className="grid min-w-0 gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">refresh token</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                      disabled={!info.refreshToken}
+                      onClick={() => setRevealRt((v) => !v)}
+                    >
+                      {revealRt ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                      {revealRt ? "隐藏" : "显示"}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="ml-auto min-w-0 gap-1.5"
+                      disabled={!info.refreshToken}
+                      onClick={() => void copyRefreshToken()}
+                    >
+                      {copiedRt ? <Check className="size-4" /> : <Copy className="size-4" />}
+                      复制 refresh token
+                    </Button>
+                  </div>
+                  <div className="max-h-32 min-w-0 overflow-auto rounded-lg border bg-muted/40 px-3 py-2 font-mono text-xs leading-5 break-all whitespace-pre-wrap select-all">
+                    {info.refreshToken
+                      ? revealRt
+                        ? info.refreshToken
+                        : maskToken(info.refreshToken)
+                      : "（这个账号没有可导出的 refresh token）"}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {info.refreshToken ? (
+                      <>
+                        粘到别的工具里即可登记同一账号、由那边自动续期
+                        {info.refreshExpiredAt
+                          ? `（有效期到 ${new Date(info.refreshExpiredAt).toLocaleString("zh-CN", { hour12: false })}）`
+                          : ""}
+                        。
+                        <span className="ml-1 font-medium text-amber-600">
+                          它等同于登录凭据，只贴到可信工具。
+                        </span>
+                      </>
+                    ) : (
+                      "加密信封 / 未采集到凭据的账号解不出明文 refresh token，无法导出。"
+                    )}
+                  </div>
+                </div>
+              ) : null}
               </div>
 
               {/* 续期 */}
@@ -419,6 +499,7 @@ export function AccountTokenDialog({
 function normalizeTrae(t: TraeAccountToken): AccountTokenInfo {
   return {
     token: t.token ?? "",
+    refreshToken: t.refreshToken ?? null,
     tokenExp: t.tokenExp ?? null,
     refreshExpiredAt: null,
     sourceLabel:
@@ -440,6 +521,7 @@ function normalizeWorkbuddy(t: WbAccountToken): AccountTokenInfo {
         : "本工具账号库（未采集到凭据）";
   return {
     token: t.token ?? "",
+    refreshToken: t.refreshToken ?? null,
     tokenExp: t.tokenExp ?? null,
     refreshExpiredAt: t.refreshExpiredAt ?? null,
     sourceLabel: label,
@@ -451,6 +533,12 @@ function normalizeWorkbuddy(t: WbAccountToken): AccountTokenInfo {
 }
 
 /** 到期时间（绝对）。解不出 exp 时如实说明，不假装有值。 */
+/** 敏感串打码：保留头 18 + 尾 10，中间省略（足够分辨是哪一枚，又抄不走）。 */
+function maskToken(t: string): string {
+  if (!t) return "";
+  return t.length > 28 ? `${t.slice(0, 18)}…${t.slice(-10)}` : t;
+}
+
 function expiryText(ms: number | null): string {
   if (!ms) return "解不出到期时间（不是 JWT 或缺少 exp）";
   return new Date(ms).toLocaleString("zh-CN", { hour12: false });
