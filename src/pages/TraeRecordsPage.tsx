@@ -667,6 +667,31 @@ export default function TraeRecordsPage() {
   }
 
   /**
+   * 可复制的会话 id（「无正文」的复制过去也是空壳，不参与全选）。
+   *
+   * 用户反馈：几百条会话一条条点不动 —— 全选必须只选**真能复制**的那些，
+   * 否则一次全选就会带上一堆必然跳过的空会话，选完还得手动剔。
+   */
+  const copyableIds = useMemo(
+    () => copySrcSessions.filter((s) => (s.messages ?? 0) > 0).map((s) => s.id),
+    [copySrcSessions],
+  );
+  const allCopyPicked = copyableIds.length > 0 && copyableIds.every((id) => copySel.has(id));
+  const someCopyPicked = !allCopyPicked && copyableIds.some((id) => copySel.has(id));
+
+  /** 全选 / 取消全选（只动可复制的那些，其它行的勾选状态保持原样）。 */
+  function toggleAllCopy() {
+    setCopySel((prev) => {
+      if (allCopyPicked) {
+        const next = new Set(prev);
+        for (const id of copyableIds) next.delete(id);
+        return next;
+      }
+      return new Set([...prev, ...copyableIds]);
+    });
+  }
+
+  /**
    * 批量复制：同客户端跨账号 ⇒ src == dst == 当前 clientKey，只把目标账号 uid 传下去
    * （后端据此判定同库复制、生成新 id）。进度走 `trae-import-progress` 事件。
    */
@@ -1243,7 +1268,25 @@ export default function TraeRecordsPage() {
                       <table className="w-full text-sm">
                         <thead className="sticky top-0 border-b bg-muted/40 text-xs text-muted-foreground">
                           <tr>
-                            <th className="w-10 px-3 py-2" />
+                            <th className="w-10 px-3 py-2">
+                              {/* 全选框：只选「可复制」的会话，半选态表示部分勾选 */}
+                              <input
+                                type="checkbox"
+                                className="size-4 cursor-pointer disabled:cursor-not-allowed"
+                                aria-label={allCopyPicked ? "取消全选" : "全选可复制的会话"}
+                                title={
+                                  allCopyPicked
+                                    ? `取消全选（${copyableIds.length} 条可复制）`
+                                    : `全选可复制的 ${copyableIds.length} 条`
+                                }
+                                disabled={copyableIds.length === 0 || copyBusy}
+                                checked={allCopyPicked}
+                                ref={(el) => {
+                                  if (el) el.indeterminate = someCopyPicked;
+                                }}
+                                onChange={toggleAllCopy}
+                              />
+                            </th>
                             <th className="px-3 py-2 text-left font-medium">会话</th>
                             <th className="w-32 px-3 py-2 text-left font-medium">复制状态</th>
                           </tr>
@@ -1285,10 +1328,19 @@ export default function TraeRecordsPage() {
                     </div>
                   )}
 
-                  <div className="flex items-center justify-between rounded-md border bg-muted/40 px-3 py-2 text-sm">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
                     <span>已选 {copySel.size} 个会话</span>
+                    <button
+                      type="button"
+                      onClick={toggleAllCopy}
+                      disabled={copyableIds.length === 0 || copyBusy}
+                      className="text-xs text-primary underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
+                    >
+                      {allCopyPicked ? "取消全选" : `全选可复制的 ${copyableIds.length} 条`}
+                    </button>
                     <Button
                       size="sm"
+                      className="ml-auto"
                       disabled={
                         copyBusy || copySel.size === 0 || linkSrcUid === linkDstUid
                       }

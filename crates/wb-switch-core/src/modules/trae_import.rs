@@ -665,6 +665,26 @@ impl CopyOpts {
     }
 }
 
+/// 目标库 `table.col` 里已经占用的非空值（`chat_turn` 那两列 UNIQUE 冲突的来源）。
+///
+/// 读不出来就当空集合：这是**防御性**探测，不该因为一次读失败就让复制停下 ——
+/// 真有问题下一步的 INSERT 会如实报错。
+fn taken_ref_ids(conn: &Connection, table: &str, col: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let sql = format!("SELECT DISTINCT \"{col}\" FROM \"{table}\" WHERE \"{col}\" IS NOT NULL");
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for v in rows.flatten() {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    out.insert(v);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 复制单个会话（chat_session 一行 + project 归属 + 全部关联表行）。
 /// 返回 (插入行数, 跳过原因)。目标库已有该 session_id 且非同库复制时返回跳过。
 fn copy_session(
@@ -1165,16 +1185,56 @@ fn copy_session(
                     out.push(vals);
                 }
                 let placeholders = (0..cols.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+                // ⚠️⚠️ 目标库里 `chat_turn.reply_to_message_id` / `response_message_id` 带
+                // UNIQUE 约束，而**源库不一定带**（客户端版本不同，schema 也不同）。
+                // 于是当两条会话引用了同一条消息、或源库自己就有重复引用时，第一条能插进去、
+                // 第二条撞 UNIQUE，整批复制就断在这里 —— 用户侧看到的就是
+                // 「复制失败：目标表 chat_turn 插入失败: UNIQUE constraint failed:
+                //   chat_turn.response_message_id」（2026-10-24 用户实测，本机复现不出来，
+                //   因为本机源库恰好没有这种重复引用）。
+                //
+                // 处理原则：**别为了一个坏引用丢掉整条会话**。冲突的那一列置 NULL（轮次行保留），
+                // 并如实计数写进日志 —— 置空等于「这一轮没有对应的消息」，比留一个指向别人
+                // 消息的假引用更安全，也比整条会话复制失败强。
+                let reply_pos = cols.iter().position(|c| *c == "reply_to_message_id");
+                let resp_pos = cols.iter().position(|c| *c == "response_message_id");
+                let mut taken_reply = taken_ref_ids(dst, table, "reply_to_message_id");
+                let mut taken_resp = taken_ref_ids(dst, table, "response_message_id");
+                let mut dropped_refs = 0usize;
                 let mut ins = dst
                     .prepare(&format!("INSERT INTO {table} ({col_list}) VALUES ({placeholders})"))
                     .map_err(|e| format!("目标表 {table} 插入准备失败: {e}"))?;
-                for vals in &out {
+                for vals in out.iter_mut() {
+                    for (pos, taken) in [
+                        (reply_pos, &mut taken_reply),
+                        (resp_pos, &mut taken_resp),
+                    ] {
+                        let Some(pi) = pos else { continue };
+                        let rusqlite::types::Value::Text(t) = vals[pi].clone() else {
+                            continue;
+                        };
+                        let t = t.trim().to_string();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if !taken.insert(t) {
+                            vals[pi] = rusqlite::types::Value::Null;
+                            dropped_refs += 1;
+                        }
+                    }
                     let args: Vec<&dyn rusqlite::types::ToSql> = vals
                         .iter()
                         .map(|v| v as &dyn rusqlite::types::ToSql)
                         .collect();
                     ins.execute(rusqlite::params_from_iter(args))
                         .map_err(|e| format!("目标表 {table} 插入失败: {e}"))?;
+                }
+                if dropped_refs > 0 {
+                    if let Some(log) = on_log {
+                        log(&format!(
+                            "   注意：{sid} 有 {dropped_refs} 处轮次引用已被别处占用（源库允许重复、目标库不允许），已置空；会话本身完整复制"
+                        ));
+                    }
                 }
                 n += out.len();
                 if !turn_map.is_empty() {
@@ -3204,6 +3264,101 @@ mod tests {
     // -----------------------------------------------------------------------
     // 同库多会话复制：每个会话必须各自生成新 id
     // -----------------------------------------------------------------------
+
+    /// ⚠️⚠️ 目标库有 UNIQUE、源库没有时，重复的消息引用不许把整条会话搞挂。
+    ///
+    /// 2026-10-24 用户实测：批量复制 600 条，其中一条报
+    /// `UNIQUE constraint failed: chat_turn.response_message_id`，本机复现不出来。
+    /// 成因是**两条会话引用了同一条消息**（源库允许，目标库的 UNIQUE 不允许），
+    /// 于是第一条占住、第二条撞约束，整条会话复制失败。
+    ///
+    /// 现在的行为：冲突的那一列置 NULL，轮次行与会话都保留（置空 = 「这一轮没有对应
+    /// 消息」，比留一个指向别人消息的假引用安全，也比整条会话丢掉强）。
+    #[test]
+    fn duplicate_turn_refs_are_nulled_instead_of_failing_the_copy() {
+        let dir = std::env::temp_dir().join(format!("ts-turnref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_p = dir.join("src.db");
+        let dst_p = dir.join("dst.db");
+
+        let ddl = "CREATE TABLE chat_session (
+                 session_id TEXT PRIMARY KEY, session_title TEXT, project_id TEXT,
+                 created_at TEXT, updated_at TEXT, last_unread_turn_id TEXT);
+             CREATE TABLE chat_message (
+                 message_id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT,
+                 role TEXT, content TEXT, reply_to_message_id TEXT, response_message_id TEXT);
+             CREATE TABLE chat_message_general (
+                 message_id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, role TEXT, content TEXT);
+             CREATE TABLE chat_message_task (
+                 message_id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, role TEXT, content TEXT);
+             CREATE TABLE chat_turn (
+                 turn_id TEXT PRIMARY KEY, session_id TEXT, conversation_id TEXT,
+                 created_at TEXT, reply_to_message_id TEXT, response_message_id TEXT);
+             CREATE TABLE session_project (session_id TEXT, project_id TEXT);
+             CREATE TABLE agent_run (
+                 agent_run_id TEXT PRIMARY KEY, session_id TEXT, parent_run_id TEXT,
+                 turn_id TEXT, status TEXT);";
+        for p in [&src_p, &dst_p] {
+            let c = Connection::open(p).unwrap();
+            c.execute_batch(ddl).unwrap();
+        }
+        // 只有**目标库**有 UNIQUE —— 这正是用户那台机器的形态（客户端版本不同）
+        Connection::open(&dst_p)
+            .unwrap()
+            .execute_batch("CREATE UNIQUE INDEX ux_turn_resp ON chat_turn(response_message_id);")
+            .unwrap();
+
+        let src = Connection::open(&src_p).unwrap();
+        for sid in ["s1", "s2"] {
+            src.execute(
+                "INSERT INTO chat_session (session_id, session_title) VALUES (?1, ?1)",
+                params![sid],
+            )
+            .unwrap();
+            src.execute(
+                "INSERT INTO chat_message (message_id, session_id, role, content) \
+                 VALUES (?1, ?2, 'assistant', 'x')",
+                params![format!("msg-{sid}"), sid],
+            )
+            .unwrap();
+            src.execute(
+                "INSERT INTO chat_turn (turn_id, session_id, reply_to_message_id, response_message_id) \
+                 VALUES (?1, ?2, 'shared-reply', 'shared-resp')",
+                params![format!("t-{sid}"), sid],
+            )
+            .unwrap();
+        }
+
+        let dst = Connection::open(&dst_p).unwrap();
+        // 跨库复制：id 原样带过去 —— 两条会话的轮次就会抢同一个 response_message_id
+        let opts = CopyOpts::cross_db_for(None);
+        copy_session(&src, &dst, "s1", &opts, None)
+            .unwrap()
+            .expect("s1 应当复制成功");
+        copy_session(&src, &dst, "s2", &opts, None)
+            .unwrap()
+            .expect("s2 不许因为一个重复引用就整条失败");
+
+        let rows: Vec<(String, Option<String>, Option<String>)> = dst
+            .prepare(
+                "SELECT session_id, reply_to_message_id, response_message_id \
+                 FROM chat_turn ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "两条会话的轮次都要在：{rows:?}");
+        assert_eq!(rows[0].0, "s1");
+        assert_eq!(rows[0].1.as_deref(), Some("shared-reply"), "先来的照原样写入");
+        assert_eq!(rows[0].2.as_deref(), Some("shared-resp"));
+        assert_eq!(rows[1].0, "s2", "后来的会话本身也要复制进去");
+        assert_eq!(rows[1].1, None, "重复的 reply 引用要置空");
+        assert_eq!(rows[1].2, None, "重复的 response 引用要置空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 建一个最小的真实 Trae 结构库（chat_session + project + chat_message）。
     ///
