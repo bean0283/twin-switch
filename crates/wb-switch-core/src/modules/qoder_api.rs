@@ -292,13 +292,25 @@ pub async fn refresh_account(account: &QoderAccount) -> Result<QoderAccount, Str
         .map(str::to_string);
 
     let now = crate::modules::qoder_accounts::now_ms();
-    crate::modules::qoder_accounts::update(account.region, &account.id, |a| {
+    let updated = crate::modules::qoder_accounts::update(account.region, &account.id, |a| {
         a.credits = Some(quota.remaining);
         // 上游没给过期时间就不写 —— 不能编一个出来。
         a.plan = plan_name.clone().or_else(|| a.plan.clone());
         a.credits_updated_at = Some(now);
         a.last_used_at = Some(now);
-    })
+    })?;
+
+    // 顺手记一笔快照（10 分钟节流）。Qoder 没有官方用量端点，
+    // 「今天用了多少」只能靠相邻两笔真实额度做差 —— 所以每次成功查询都要留点。
+    crate::modules::qoder_credit_history::record(
+        account.region,
+        &account.uid,
+        &updated.label(),
+        quota.remaining,
+        plan_name.as_deref(),
+        now,
+    );
+    Ok(updated)
 }
 
 #[cfg(test)]

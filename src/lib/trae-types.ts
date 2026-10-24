@@ -1306,6 +1306,26 @@ export interface WorkbuddySwitchResult {
     from?: string;
     to?: string;
   } | null;
+  /**
+   * 会话自动同步报告（设置里「切号时自动同步会话」打开才有实际动作）。
+   *
+   * ⚠️ `ok:false` = **切号成功、会话没同步**：界面必须照实说，不许吞成「切换成功」。
+   */
+  sessionLink?: {
+    ok: boolean;
+    /** 首次自动同步：只登记已有副本，不搬历史存量。 */
+    firstRun?: boolean;
+    /** 没做事（设置关闭 / 只有一个账号 / 已全部同步）。此时 `reason` 有话说。 */
+    notNeeded?: boolean;
+    reason?: string;
+    error?: string;
+    copied?: number;
+    /** 目标账号本来就有同一段对话的副本，只登记了关联、没有复制。 */
+    adopted?: number;
+    planned?: number;
+    skipped?: number;
+    noBody?: number;
+  } | null;
 }
 
 export interface WorkbuddyOAuthStart {
@@ -1601,6 +1621,162 @@ export interface WbSessionCopyReport {
   backup: string;
   edgeSyncSkipped: Array<{ name: string; path: string; size: number }>;
   note: string;
+}
+
+export interface WbSessionLinkAllReport {
+  ok: boolean;
+  /** 复制后所在关联组的 key（`link:<组id>`），供界面换掉手上的旧 key。 */
+  groupKey?: string;
+  /**
+   * `copy` = 全量复制；`incremental` = 只搬新会话；`adoptOnly` = 只登记已有副本。
+   */
+  mode?: "copy" | "incremental" | "adoptOnly" | string;
+  /** 切号流程的第一次自动同步：只登记、不复制（历史存量留给手动一键）。 */
+  firstRun?: boolean;
+  /** WorkBuddy 本来是开着的，是这次写入前由本工具替你退出的。 */
+  clientStopped?: boolean;
+  /** 写完之后本工具已经把它重新拉起来了。 */
+  clientRestarted?: boolean;
+  /** 自动重启失败的原因（有值就说明客户端还是关着的）。 */
+  restartError?: string;
+  /** 同步做完了但进度没写进设置（下次会重复登记一次，无害）。 */
+  progressWarning?: string;
+  /** 没有需要做的（只有一个账号 / 已经全部互通）。此时 `reason` 一定有话说。 */
+  notNeeded?: boolean;
+  reason?: string;
+  /** 本次真正复制出去的副本数。 */
+  copied: number;
+  /** 目标账号本来就有的同内容副本，只登记了组关系、没有复制。 */
+  adopted?: number;
+  /** 目标账号已有同内容副本但已属于别的关联组 —— 不抢过来，跳过。 */
+  alreadyThere?: number;
+  /** 计划里要复制的条数（= 复制数 + 被跳过的条数）。 */
+  planned: number;
+  /** 参与的账号 uid（不含被停用的）。 */
+  accounts: string[];
+  byTarget?: Array<{ uid: string; label: string; count: number }>;
+  skipped?: number;
+  /** 没有正文文件、无法复制的会话数（如实计数，不假装成功）。 */
+  noBody?: number;
+  /** 预览：这次要搬的正文总字节数（按源会话大小累加）。 */
+  totalBytes?: number;
+  /** 预览：WorkBuddy 是否正在运行（在跑时一键互通会被后端拒绝）。 */
+  clientRunning?: boolean;
+  backup?: string;
+  edgeSyncSkipped?: Array<{ name: string; path: string; size: number }>;
+  storePath?: string;
+  note?: string;
+  error?: string;
+}
+
+/**
+ * 关联会话：某个账号下「同一段对话」的一个副本。
+ *
+ * `relation` 是后端比对出来的关系，界面靠它区分「只是落后」（可安全同步）与
+ * 「各写各的」（必须人选来源）。`recordCount` 为 `null` 表示没算过，不是 0 条。
+ */
+export interface WbGroupMember {
+  uid: string;
+  accountName: string;
+  sessionId: string;
+  title: string;
+  project: string;
+  updatedAt: number;
+  recordCount: number | null;
+  /** `ready` 有正文；`missing` 库里有行、正文文件没了；`gone` 会话本身已不存在。 */
+  contentState: "ready" | "missing" | "gone" | string;
+  /** `latest` / `equal` / `behind` / `ahead` / `diverged` / `no-body` / `unknown`。 */
+  relation: string;
+  isNewest: boolean;
+  digest: string;
+  reason: string;
+}
+
+/** 一段对话的关联组：同一段内容在各账号下的副本集合。 */
+export interface WbSessionGroup {
+  key: string;
+  /** 有正式关联记录时是组 id；来自同标题聚类时为 null。 */
+  groupId: string | null;
+  title: string;
+  project: string;
+  updatedAt: number;
+  memberCount: number;
+  accountNames: string[];
+  status: "consistent" | "pending" | "diverged" | "missing" | "unknown" | string;
+  statusText: string;
+  /**
+   * 「待同步」的原因，界面文案据此分开说：
+   * `behind` = 有副本内容真的落后。缺账号不再占用状态（用户要求「显示相同就行」）。
+   */
+  statusReason?: "behind" | "";
+  /** 内容确实落后的副本数（`statusReason === "behind"` 时 > 0）。 */
+  behindCount?: number;
+  /** 推荐来源副本（内容最新）。 */
+  sourceSessionId: string;
+  canUnify: boolean;
+  missingAccounts: Array<{ uid: string; label: string }>;
+  /** 还没有这份会话的账号数（仅用于「关联新账号」，不影响状态）。 */
+  missingCount?: number;
+  members: WbGroupMember[];
+}
+
+export interface WbSessionGroupsReport {
+  ok: boolean;
+  accounts?: Array<{ uid: string; label: string }>;
+  accountTotal?: number;
+  /** WorkBuddy 正在运行：此时「同步」会被后端拒绝（正文会被客户端写回）。 */
+  clientRunning?: boolean;
+  counts?: {
+    all: number;
+    pending: number;
+    diverged: number;
+    consistent: number;
+    missing: number;
+    unknown: number;
+  };
+  items?: WbSessionGroup[];
+  note?: string;
+  error?: string;
+}
+
+export interface WbGroupCandidate {
+  sessionId: string;
+  uid: string;
+  accountName: string;
+  title: string;
+  project: string;
+  updatedAt: number;
+}
+
+export interface WbGroupCandidatesReport {
+  ok: boolean;
+  items?: WbGroupCandidate[];
+  accounts?: Array<{ uid: string; label: string }>;
+  clientRunning?: boolean;
+  error?: string;
+}
+
+export interface WbGroupUnifyReport {
+  ok: boolean;
+  /**
+   * 同步之后的组 key。同标题簇被登记成正式关联组时 key 会从 `dup:标题`
+   * 变成 `link:<组id>`，界面必须换用这个 key，否则详情打不开。
+   */
+  groupKey?: string;
+  source?: { uid: string; sessionId: string };
+  synced?: Array<{ uid: string; sessionId: string }>;
+  syncedCount?: number;
+  /** 被覆盖的原正文备份目录（可人工恢复）。 */
+  backupDir?: string;
+  dbBackup?: string;
+  /** WorkBuddy 本来是开着的，是这次写入前由本工具替你退出的。 */
+  clientStopped?: boolean;
+  /** 写完之后本工具已经把它重新拉起来了（`clientStopped` 为真时才可能有意义）。 */
+  clientRestarted?: boolean;
+  /** 自动重启失败的原因（有值就说明客户端还是关着的，得让用户手动开）。 */
+  restartError?: string;
+  note?: string;
+  error?: string;
 }
 
 export interface WbLinkMemberInfo {
@@ -2105,6 +2281,13 @@ export interface SettingsSnapshot {
    * 开启后本工具会把它们复制给新账号（去重，不会越积越多）。
    */
   syncWorkbuddyAutomations: boolean;
+  /**
+   * 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库，默认关）。
+   *
+   * 打开后每次切号（客户端已关、还没重启那一刻）会自动补齐缺失的会话副本；
+   * 新装与老用户升级都是关 —— 这是写库操作，必须本人亲手打开。
+   */
+  autoLinkWorkbuddySessions: boolean;
   /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
   path: string;
   /**
@@ -2116,6 +2299,13 @@ export interface SettingsSnapshot {
   traeExe: Record<string, string>;
   /** 手动指定的 WorkBuddy 主程序路径（空串 = 没指定，走自动探测）。 */
   workbuddyExe: string;
+  /**
+   * 手动指定的 Qoder 主程序路径：`cn | global → 绝对路径`（空 = 走自动探测）。
+   *
+   * ⚠️ 两个区域的程序名不同（`Qoder CN.exe` / `Qoder.exe`），后端保存时会按区域校验，
+   * 填另一个版本的路径会被拒绝 —— 否则「切换国内版」会去启动国际版。
+   */
+  qoderExe: Record<string, string>;
   /**
    * 自动探测到的 WorkBuddy 主程序；`null` = 没找到。
    *

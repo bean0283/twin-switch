@@ -73,13 +73,23 @@ pub struct WbSession {
     pub is_newest: bool,
     /// 相对最新副本的差异说明（最新副本为「共 N 份重复」，无重复为空串）。
     pub dup_note: String,
+    /// 与同标题最新副本的关系：`latest` / `equal` / `behind` / `ahead` / `diverged`
+    /// / `no-body` / `unknown`（体积或成员数超限没做比对）/ 空串（无同标题副本）。
+    ///
+    /// 关联会话页靠它判断「这份副本是否只是落后」——`behind` 才能安全快进，
+    /// `diverged` 必须让人选来源。
+    pub dup_relation: String,
 }
 
 /// 同标题分组的判定上限：超过这个成员数就不做逐行摘要比对，
 /// 只按 `updated_at` + 行数给结论（避免在大仓库上读上百个 10 MB 级正文）。
 const DUP_MAX_MEMBERS: usize = 8;
 /// 单个正文参与逐行摘要比对的体积上限。
-const DUP_MAX_BYTES: u64 = 64 << 20;
+///
+/// 原来定 64 MB，实测本机有一份 216 MB 的会话 —— 于是整组被判成「未比对」，
+/// 界面显示「无法确认」，而那恰好是最需要看清的一组。摘要已是流式读取，
+/// 放宽到 256 MB 不会带来内存风险；再大的（极少）如实标成未比对，不猜。
+const DUP_MAX_BYTES: u64 = 256 << 20;
 
 /// 正文内容身份：行数 + 逐行摘要 + 总摘要。
 ///
@@ -137,21 +147,47 @@ fn total_digest(line_digests: &[String]) -> String {
     to_hex(&h.finalize())
 }
 
+/// 归一化会话 id 时用的固定标记。
+const SESSION_MARKER: &str = "__wb_session_id__";
+
+/// 把**整组**副本的会话 id 都换成同一个标记。
+///
+/// ⚠️ 只换「自己那个」不够 —— 正文里可能引用**别的副本的 id 文本**。本机实测：
+/// 一段对话里打印过同组另外三个 id（各 30~40 处），于是 A 的副本里留着 B 的原样 id，
+/// 而 B 的副本里那处也被换成了自己的 id ⇒ 两边归一化结果不同 ⇒ **刚同步完就报「有分歧」**。
+/// 所以这里按整组 id 集合归一化：任何一方的 id 都变成同一个标记，谁引用谁都不影响比对。
+fn normalize_ids(line: &str, ids: &[String]) -> String {
+    let mut out = std::borrow::Cow::Borrowed(line);
+    for id in ids {
+        if id.is_empty() || !out.contains(id.as_str()) {
+            continue;
+        }
+        out = std::borrow::Cow::Owned(out.replace(id.as_str(), SESSION_MARKER));
+    }
+    out.into_owned()
+}
+
 /// 读一份正文 JSONL 的内容身份。
 ///
-/// `own_session_id` 会被替换成固定标记再逐行摘要：同一段对话在两个账号里的副本
-/// 会话 id 不同，但其余内容一致，于是能得到相同的摘要。
-fn content_id(path: &std::path::Path, own_session_id: &str) -> Option<ContentId> {
-    const MARKER: &str = "__wb_session_id__";
-    let text = std::fs::read_to_string(path).ok()?;
+/// `ids` 是同一段对话在各账号里的会话 id 集合，全部替换成固定标记再逐行摘要：
+/// 同一段对话的副本除了 id 之外内容一致，于是能得到相同的摘要。
+fn content_id(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
+    use std::io::BufRead;
+    // ⚠️ 必须**流式**逐行读：会话正文单个可达 200 MB 以上（实测本机有一份 216 MB），
+    // 一次 `read_to_string` 会把整份文本 + 行摘要同时压在内存里。逐行读只保留摘要，
+    // 内存与文件大小无关。
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::with_capacity(1 << 20, file);
     let mut line_digests = Vec::new();
-    for raw in text.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+    for raw in reader.split(b'\n') {
+        let bytes = raw.ok()?;
+        let line = String::from_utf8(bytes).ok()?;
+        let line = line.strip_suffix('\r').unwrap_or(&line);
         if line.trim().is_empty() {
             continue;
         }
         // 非 JSON 行也算一条记录（保守：宁可判定为「内容不同」也不视为一致）
-        line_digests.push(line_digest(&line.replace(own_session_id, MARKER)));
+        line_digests.push(line_digest(&normalize_ids(&line, ids)));
     }
     if line_digests.is_empty() {
         return None;
@@ -298,6 +334,9 @@ fn annotate_duplicates(list: &mut [WbSession]) {
         }
         // 逐行摘要只对「有正文且在体积上限内」的成员计算
         let mut ids: Vec<Option<ContentId>> = Vec::with_capacity(idx.len());
+        // ⚠️ 归一化要用**整组**的 id：正文可能引用组内其它副本的 id（实测有过），
+        // 只换自己那个会让「刚同步完的副本」互相比对不上，误报「有分歧」。
+        let group_ids: Vec<String> = idx.iter().map(|&i| list[i].id.clone()).collect();
         let detailed = idx.len() <= DUP_MAX_MEMBERS
             && idx
                 .iter()
@@ -309,7 +348,7 @@ fn annotate_duplicates(list: &mut [WbSession]) {
             }
             if detailed {
                 let id = find_jsonl(&list[i].id)
-                    .and_then(|p| content_id(&p, &list[i].id));
+                    .and_then(|p| content_id(&p, &group_ids));
                 ids.push(id);
             } else {
                 ids.push(None);
@@ -323,12 +362,57 @@ fn annotate_duplicates(list: &mut [WbSession]) {
         let updated: Vec<i64> = idx.iter().map(|&i| list[i].updated_at).collect();
         let (newest_pos, mut notes) = decide_group(&ids, &updated);
         notes[newest_pos] = format!("共 {} 份重复标题副本", idx.len());
+        if !detailed {
+            // 没做逐行比对时，把**为什么没做**写进备注：界面显示「无法确认」时必须
+            // 能回答「为什么」，否则用户只会觉得工具坏了。
+            let why = if idx.iter().any(|&i| !list[i].has_body) {
+                "有副本没有正文文件，未做逐行比对".to_string()
+            } else if idx.len() > DUP_MAX_MEMBERS {
+                format!(
+                    "同标题副本有 {} 份（比对上限 {} 份），未做逐行比对",
+                    idx.len(),
+                    DUP_MAX_MEMBERS
+                )
+            } else {
+                format!(
+                    "有副本体积超过 {} MB，未做逐行比对",
+                    DUP_MAX_BYTES >> 20
+                )
+            };
+            for n in notes.iter_mut() {
+                *n = why.clone();
+            }
+        }
+
+        // 每个成员相对最新副本的关系。`behind` = 有序前缀（可安全快进），
+        // `diverged` = 各写各的（必须人工选来源）。没做逐行比对时一律 `unknown`，
+        // 绝不能因为「没算」就说成「无正文」。
+        let rels: Vec<&'static str> = if !detailed {
+            vec!["unknown"; ids.len()]
+        } else {
+            let top = ids.get(newest_pos).and_then(|v| v.as_ref());
+            ids.iter()
+                .enumerate()
+                .map(|(pos, id)| match (id, top) {
+                    (None, _) => "no-body",
+                    (Some(_), None) => "sole-body",
+                    (Some(_), Some(_)) if pos == newest_pos => "latest",
+                    (Some(me), Some(top)) => match relate(me, top) {
+                        Relation::Equal => "equal",
+                        Relation::Prefix => "behind",
+                        Relation::Extension => "ahead",
+                        Relation::Diverged => "diverged",
+                    },
+                })
+                .collect()
+        };
 
         let group_label: String = key.chars().take(16).collect();
         for (pos, &i) in idx.iter().enumerate() {
             list[i].dup_group = group_label.clone();
             list[i].is_newest = pos == newest_pos;
             list[i].dup_note = std::mem::take(&mut notes[pos]);
+            list[i].dup_relation = rels[pos].to_string();
         }
     }
 
@@ -410,30 +494,34 @@ fn copy_shared(src: &Path, dst: &Path) -> Result<(), String> {
 /// 把 `workbuddy.db`（含 WAL）复制到工具目录后打开，避免与运行中的客户端
 /// 争抢 WAL 锁。复制品可正常回放 WAL，读到最新数据。
 ///
-/// ## 两个必须守住的细节
+/// ## 三个必须守住的细节
 ///
 /// 1. **`-shm` 故意不复制**。它是 WAL 索引，被客户端内存映射着；复制它既会失败
 ///    （见 [`copy_shared`]），又是多余的 —— 复制完主库 + WAL 之后用 SQLite 打开一次，
 ///    SQLite 自己会把索引从 WAL 重建出来（下面第 3 步）。
-/// 2. **先清干净上一轮的快照**。`-wal` 残留会让新快照读到**上一次**的事务帧，
-///    那比「缺文件」严重得多（用户会看到已经删掉的会话又冒出来）。
+/// 2. **`-wal` 必须一起复制**。客户端的写入全在 WAL 里，漏了它就会读到**上一次**的
+///    事务帧，那比「缺文件」严重得多（用户会看到已经删掉的会话又冒出来）。
+/// 3. ⚠️⚠️ **每次调用用独立的文件名**，不再复用固定的 `workbuddy.db`。
+///    同一个页面会并发发起多个扫描（会话列表 + 一键互通预览 + 详情），旧实现先
+///    `remove_file` 再复制固定文件名 —— 两个调用会**互删对方正在读的快照**，结果
+///    是「打不开快照」或者更糟：读到别人刚写了一半的库。用唯一名 + 过期清理，
+///    并发天然安全，也不需要一把全局锁（那把锁还会因为重入而卡死）。
 pub fn snapshot_db() -> Result<PathBuf, String> {
     let root = data_root();
     let dir = store_dir().join("workbuddy_scan");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 WorkBuddy 快照目录失败: {e}"))?;
-    let dst = dir.join("workbuddy.db");
-    for name in ["workbuddy.db", "workbuddy.db-wal", "workbuddy.db-shm"] {
-        let _ = std::fs::remove_file(dir.join(name));
-    }
+    prune_old_snapshots(&dir);
     let main = root.join("workbuddy.db");
     if !main.is_file() {
         return Err(format!("未找到 WorkBuddy 会话库：{}", main.display()));
     }
+    // 唯一名：不同调用之间不共享任何文件。
+    let stem = format!("workbuddy-{}", uuid::Uuid::new_v4().simple());
+    let dst = dir.join(format!("{stem}.db"));
     copy_shared(&main, &dst)?;
-    // 客户端的写入全都还在 WAL 里，漏了它就会读到很久以前的旧数据 ⇒ 硬错误。
     let wal = root.join("workbuddy.db-wal");
     if wal.is_file() {
-        copy_shared(&wal, &dir.join("workbuddy.db-wal"))?;
+        copy_shared(&wal, &dir.join(format!("{stem}.db-wal")))?;
     }
     // 3) 打开一次让 SQLite 依据 WAL 重建 `-shm`。此后 `open_ro()` 才能读这个快照
     //    （只读打开 WAL 库需要一份可用的 WAL 索引）。
@@ -444,6 +532,29 @@ pub fn snapshot_db() -> Result<PathBuf, String> {
             .map_err(|e| format!("校验 WorkBuddy 快照失败: {e}"))?;
     }
     Ok(dst)
+}
+
+/// 清掉一小时前的旧快照（读失败就跳过 —— 清理失败不该让扫描失败）。
+///
+/// 1 小时远大于任何一次扫描的耗时，所以并发中的快照不会被误删。
+fn prune_old_snapshots(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|d| d.as_secs() > 3600)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// 列出本机全部 WorkBuddy 会话（含已删除标记，由前端决定是否展示）。
@@ -508,6 +619,7 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
             dup_group: String::new(),
             is_newest: true,
             dup_note: String::new(),
+            dup_relation: String::new(),
         });
     }
     // 按最后更新时间倒序，与客户端列表观感一致
@@ -1004,6 +1116,7 @@ mod tests {
             dup_group: String::new(),
             is_newest: true,
             dup_note: String::new(),
+            dup_relation: String::new(),
         }
     }
 
@@ -1071,15 +1184,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.jsonl");
         let b = dir.join("b.jsonl");
+        let ids = vec!["aaaa".to_string(), "bbbb".to_string()];
         std::fs::write(&a, "{\"sessionId\":\"aaaa\",\"text\":\"hi\"}\n{\"n\":2}\n").unwrap();
         std::fs::write(&b, "{\"sessionId\":\"bbbb\",\"text\":\"hi\"}\n{\"n\":2}\n").unwrap();
-        let ca = content_id(&a, "aaaa").unwrap();
-        let cb = content_id(&b, "bbbb").unwrap();
+        let ca = content_id(&a, &ids).unwrap();
+        let cb = content_id(&b, &ids).unwrap();
         assert_eq!(ca.total, cb.total);
         assert_eq!(ca.lines, 2);
         // 行序不同则摘要不同（重排必须被识别为差异）
         std::fs::write(&b, "{\"n\":2}\n{\"sessionId\":\"bbbb\",\"text\":\"hi\"}\n").unwrap();
-        assert_ne!(content_id(&b, "bbbb").unwrap().total, ca.total);
+        assert_ne!(content_id(&b, &ids).unwrap().total, ca.total);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_referenced_ids_do_not_create_fake_divergence() {
+        // 正文里引用同组另一副本的 id（本机真实发生过：对话里打印过那三个 id）：
+        // 只归一化「自己那个」时，A 保留字面 bbbb、B 却全变成标记 ⇒ 假分歧。
+        // 按整组归一化后，两份必须完全一致。
+        let dir = std::env::temp_dir().join(format!("wbsrc-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.jsonl");
+        let b = dir.join("b.jsonl");
+        let ids = vec!["aaaa".to_string(), "bbbb".to_string()];
+        std::fs::write(&a, "{\"sessionId\":\"aaaa\",\"text\":\"另见 bbbb\"}\n").unwrap();
+        // B 是 A 的副本：自己的 id 是 bbbb，引用处也成了 bbbb
+        std::fs::write(&b, "{\"sessionId\":\"bbbb\",\"text\":\"另见 bbbb\"}\n").unwrap();
+        let ca = content_id(&a, &ids).unwrap();
+        let cb = content_id(&b, &ids).unwrap();
+        assert_eq!(ca.total, cb.total, "引用了组内别的 id 也不能算分歧");
+        // 对照组：只传自己的 id（旧行为）时两份确实不同 —— 锁住根因，别改回去
+        let ca_old = content_id(&a, &["aaaa".to_string()]).unwrap();
+        let cb_old = content_id(&b, &["bbbb".to_string()]).unwrap();
+        assert_ne!(ca_old.total, cb_old.total);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

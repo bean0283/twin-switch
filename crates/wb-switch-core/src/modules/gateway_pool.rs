@@ -44,6 +44,22 @@ pub struct PoolEntry {
     pub reason: Option<String>,
     /// 冷却截止（毫秒）—— 上游报错后由 [`apply_error`] 写入，`None` = 没在冷却。
     pub cooldown_until: Option<i64>,
+    /// **按模型**记的限额（照 changexbc/workbuddy-switch 的 `limits.rs` 台账口径）。
+    ///
+    /// 上游 429 说的通常是「这个号的这个模型今天用完了」，不是「这个号废了」——
+    /// 只按号冷却会导致「一个模型用完就把整个号打进冷宫」，别的模型明明还能用。
+    /// 这里逐条列出受限模型，选号时按当前请求的模型精确跳过。
+    pub limited_models: Vec<ModelLimit>,
+}
+
+/// 一个账号在某个模型上的限额（`resetAt` 由上游文案给出）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelLimit {
+    pub model: String,
+    /// 官方给的重置时刻（毫秒）。
+    pub reset_at: i64,
+    /// 冷却类型：`balance_exhausted` / `rate_limited` …
+    pub kind: String,
 }
 
 impl PoolEntry {
@@ -85,7 +101,7 @@ pub fn snapshot() -> Vec<PoolEntry> {
             .then_with(|| is_default(b).cmp(&is_default(a)))
             .then_with(|| a.urgency().partial_cmp(&b.urgency()).unwrap_or(std::cmp::Ordering::Equal))
     });
-    with_cooldowns(out)
+    with_cooldowns(out, None)
 }
 
 /// 只有可用的。
@@ -102,10 +118,72 @@ pub fn usable() -> Vec<PoolEntry> {
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+/// 冷却表落盘位置。
+fn cooldowns_path() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join("gateway-cooldowns.json")
+}
+
+/// JSON 里存的是字符串，读回来要还原成静态串（kind 只用于展示）。
+fn kind_static(kind: &str) -> &'static str {
+    match kind {
+        "auth_dead" => "auth_dead",
+        "balance_exhausted" => "balance_exhausted",
+        "rate_limited" => "rate_limited",
+        _ => "transient",
+    }
+}
+
 /// key = 池条目 key（`qoder:<id>` …），value = (解冻时刻, 冷却类型)。
+///
+/// ⚠️⚠️ **必须跨进程重启活下来**：以前这张表只在内存里，重开程序就清空 ——
+/// 刚被上游限流的号立刻又变成「最紧迫、最该先用」，预览照样选中它，用户看到的
+/// 就是「说好的换号呢，预览还是那个被限制的账号」（2026-10-24 用户实测两次）。
 fn cooldowns() -> &'static Mutex<HashMap<String, (i64, &'static str)>> {
     static T: OnceLock<Mutex<HashMap<String, (i64, &'static str)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+    T.get_or_init(|| {
+        let mut map: HashMap<String, (i64, &'static str)> = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(cooldowns_path()) {
+            if let Ok(serde_json::Value::Object(obj)) =
+                serde_json::from_str::<serde_json::Value>(&text)
+            {
+                let now = now_ms();
+                for (k, item) in obj {
+                    let until = item.get("until").and_then(|x| x.as_i64()).unwrap_or(0);
+                    // 过期的不留：盘上越攒越多没有意义。
+                    if until <= now {
+                        continue;
+                    }
+                    let kind = item
+                        .get("kind")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("transient");
+                    map.insert(k, (until, kind_static(kind)));
+                }
+            }
+        }
+        Mutex::new(map)
+    })
+}
+
+/// 把当前冷却表写回磁盘（只留未过期的）。
+fn persist_cooldowns(map: &HashMap<String, (i64, &'static str)>) {
+    use serde_json::json;
+    let now = now_ms();
+    let mut obj = serde_json::Map::new();
+    for (k, (until, kind)) in map {
+        // `{key}#err` 是「最后一次错误」的展示用记录（见 [`mark_last_error`]），
+        // 不是选号依据 —— 写进盘只会让冷却表越来越脏。
+        if *until > now && !k.contains("#err") {
+            obj.insert(k.clone(), json!({ "until": until, "kind": kind }));
+        }
+    }
+    let path = cooldowns_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&obj) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 fn now_ms() -> i64 {
@@ -133,38 +211,233 @@ fn next_reset_window(now: i64) -> i64 {
 /// - `429`：限流 → 冷却 60 秒；
 /// - body 含 `10605` / `isQueued`：上游**排队** → 不冷却（账号没问题）；
 /// - `5xx` / 传输层（status 0）→ 短冷却 60 秒；其余 4xx → 不冷却。
-pub fn apply_error(key: &str, http_status: u16, body_hint: &str) -> Option<(i64, &'static str)> {
-    let now = now_ms();
+/// 从上游文案里抠出「何时重置」（`将在 2026-10-24 22:04:42 UTC+8 重置`）。
+///
+/// 抠不到返回 `None`（调用方按 1 小时兜底）。留 1 分钟余量：正好卡在重置那一秒
+/// 发请求，服务端往往还没翻转。
+fn reset_at_from_hint(text: &str) -> Option<i64> {
+    // ⚠️ 不再靠「将在」定位：真实文案有三种写法都出现过 ——
+    //   ① `…将在 2026-10-25 11:12:02 UTC+8 重置，您也可以切换其他模型继续使用。`
+    //   ② `…将于 2026-10-25 11:12:02 重置`
+    //   ③ JSON 里直接给 `"resetTime":"2026-10-25T11:12:02"`
+    // 只要整段里出现一个时间戳，就拿它当重置时刻 —— 引导词变了也不会瞎。
+    let flat: String = text
+        .chars()
+        .map(|c| match c {
+            '/' => '-',   // 2026/10/25 → 2026-10-25
+            'T' => ' ',   // ISO 的 2026-10-25T11:12:02
+            _ => c,
+        })
+        .collect();
+    let chars: Vec<char> = flat.chars().collect();
+    for start in 0..chars.len() {
+        if !chars[start].is_ascii_digit() {
+            continue;
+        }
+        // 左边界不能还是数字：避免从 `01a16cf7…` 这种长串中间切出假年份。
+        if start > 0 && chars[start - 1].is_ascii_digit() {
+            continue;
+        }
+        for len in [19usize, 18, 17, 16] {
+            if start + len > chars.len() {
+                continue;
+            }
+            let cand: String = chars[start..start + len].iter().collect();
+            let Some(naive) = parse_stamp(&cand) else {
+                continue;
+            };
+            // ⚠️ **优先用文案里的 `UTC+8`**，而不是本机时区。
+            // 上游是固定 UTC+8 给的时间，以前按 `chrono::Local` 解释 —— 只有在
+            // 恰好 UTC+8 的机器上才对，换台机器就把「11:12 恢复」算成别的时刻。
+            let ms = match parse_utc_offset(&flat) {
+                Some(offset_ms) => naive.and_utc().timestamp_millis() - offset_ms,
+                None => match naive.and_local_timezone(chrono::Local).single() {
+                    Some(local) => local.timestamp_millis(),
+                    None => continue,
+                },
+            };
+            // 留 1 分钟余量：正好卡在重置那一秒发请求，服务端往往还没翻转。
+            return Some(ms + 60_000);
+        }
+    }
+    None
+}
+
+/// 文案里的 `UTC±H[:MM]` 偏移（毫秒）。
+///
+/// 上游两种写法都出现过：`UTC+8`、`UTC+08:00`。抠不到就返回 `None`，
+/// 由调用方回落到本机时区（**不是**默认 +8 —— 宁可承认不知道）。
+fn parse_utc_offset(text: &str) -> Option<i64> {
+    let index = text.find("UTC")?;
+    let rest = &text[index + 3..];
+    let sign = match rest.chars().next()? {
+        '+' => 1i64,
+        '-' => -1i64,
+        _ => return None,
+    };
+    let digits: String = rest[1..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ':')
+        .collect();
+    let (hours, minutes) = match digits.split_once(':') {
+        Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+        None => match digits.len() {
+            1 | 2 => (digits.parse::<i64>().ok()?, 0),
+            4 => (
+                digits[..2].parse::<i64>().ok()?,
+                digits[2..].parse::<i64>().ok()?,
+            ),
+            _ => return None,
+        },
+    };
+    Some(sign * (hours * 3600 + minutes * 60) * 1000)
+}
+
+fn parse_stamp(s: &str) -> Option<chrono::NaiveDateTime> {
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt);
+        }
+    }
+    None
+}
+
+/// 记录一次上游失败并置冷却。
+///
+/// **记账粒度按失败性质分叉**（这是「换号换得对不对」的分水岭）：
+/// - `balance_exhausted` / `rate_limited` → 记到 **(账号, 模型)** 上。
+///   上游原话就是「…重置，**您也可以切换其他模型继续使用**」—— 限的是模型不是账号，
+///   按整号停会把一个还能用别的模型的号白白关掉。
+/// - `auth_dead` / `transient` → 记到**整号**上。凭据死了、网络炸了跟模型无关。
+pub fn apply_error(
+    key: &str,
+    http_status: u16,
+    body_hint: &str,
+    model: Option<&str>,
+) -> Option<(i64, &'static str)> {
+    let (until, kind) = classify(http_status, body_hint, now_ms())?;
+    let scoped_model = cooldown_scope(kind, model);
+    if let Ok(mut m) = cooldowns().lock() {
+        m.insert(cooldown_key(key, scoped_model), (until, kind));
+        persist_cooldowns(&m);
+    }
+    Some((until, kind))
+}
+
+/// 这次失败该记在模型上还是整个号上（`None` = 整号）。
+fn cooldown_scope<'a>(kind: &str, model: Option<&'a str>) -> Option<&'a str> {
+    match kind {
+        // 上游明说「您也可以切换其他模型继续使用」⇒ 只是这个模型的额度问题。
+        "balance_exhausted" | "rate_limited" => model,
+        // 凭据死 / 传输炸跟模型无关：锁整个号，别让别的模型去白撞一次 401。
+        _ => None,
+    }
+}
+
+/// 纯判定：这次失败该冷却多久、算什么类型（不碰任何全局状态，便于单测）。
+fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'static str)> {
     // 排队（10605 / isQueued）通常裹在 401/403 信封里 —— 必须先查它，
     // 否则会把「账号没问题、只是排队」误判成「凭据死」打死。
     let hint = body_hint.to_ascii_lowercase();
     if hint.contains("10605") || hint.contains("isqueued") {
         return None;
     }
-    let (kind, until): (&'static str, i64) = match http_status {
-        0 => ("transient", now + 60_000),
-        401 | 403 => ("auth_dead", now + 30 * 60_000),
-        402 => ("balance_exhausted", next_reset_window(now)),
-        429 => ("rate_limited", now + 60_000),
-        500..=599 => ("transient", now + 60_000),
-        _ => return None,
-    };
-    if let Ok(mut m) = cooldowns().lock() {
-        m.insert(key.to_string(), (until, kind));
+
+    // ★★ 额度 / 频率耗尽：**按上游给的重置时间**冷却，不能一律 60 秒。
+    //
+    // 实测两种文案：
+    //   Trae `6804`：「您的使用量已超出频率限制，将在 2026-10-24 22:04:42 UTC+8 重置」
+    //   WorkBuddy 429：「您的使用量已超出频率限制，将在 2026-10-25 11:12:02 UTC+8 重置，
+    //                    您也可以切换其他模型继续使用。 (01a16cf7…/71e874b5-…)」
+    // 都是**当日额度用完**，60 秒后再试必然还是 429。以前按 429 记 60 秒，
+    // 于是「自动换号」在第一轮之后又回到这个号，用户看到的就是「说好的换号呢，
+    // 预览还选它」（2026-10-24 用户实测两次）。
+    //
+    // 判据放宽成「能解析出重置时刻就当额度耗尽」：不再挑文案里的关键词，
+    // 上游换个说法（`将于…` / JSON `resetTime`）也不会退化成 60 秒。
+    let quota_words = hint.contains("6804")
+        || hint.contains("频率限制")
+        || body_hint.contains("使用量已超出")
+        || body_hint.contains("额度不足")
+        || body_hint.contains("额度已用完")
+        || body_hint.contains("余额不足")
+        || hint.contains("quota exceeded");
+    if let Some(until) = reset_at_from_hint(body_hint) {
+        if quota_words || matches!(http_status, 402 | 429) {
+            return Some((until, "balance_exhausted"));
+        }
     }
-    Some((until, kind))
+    if quota_words {
+        // 说了额度但没说什么时候恢复：按 1 小时兜底（绝不编一个精确时间出来）。
+        return Some((now + 60 * 60_000, "balance_exhausted"));
+    }
+
+    match http_status {
+        0 => Some((now + 60_000, "transient")),
+        401 | 403 => Some((now + 30 * 60_000, "auth_dead")),
+        402 => Some((next_reset_window(now), "balance_exhausted")),
+        429 => Some((now + 60_000, "rate_limited")),
+        500..=599 => Some((now + 60_000, "transient")),
+        _ => None,
+    }
+}
+
+/// 冷却键：`{账号key}` = 整号级（凭据死 / 传输炸）；`{账号key}@{模型}` = 只锁这个模型。
+///
+/// 抄自 changexbc/workbuddy-switch 的台账口径：它的键是 `(账号, 模型)`。
+/// 我们额外保留整号级 —— 401 / 网络错跟模型无关，锁整个号才对。
+fn cooldown_key(key: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) if !m.trim().is_empty() => format!("{key}@{}", m.trim()),
+        _ => key.to_string(),
+    }
 }
 
 /// 条目当前是否在冷却中。
-pub fn cooling_until(key: &str) -> Option<i64> {
+///
+/// `model` 为 `Some` 时同时认「该模型的冷却」和「整号冷却」，取较晚的那个 ——
+/// 两个都指向同一个事实：这个号现在接不了这个请求。
+pub fn cooling_until(key: &str, model: Option<&str>) -> Option<i64> {
     let now = now_ms();
-    cooldowns()
-        .lock()
-        .ok()?
-        .get(key)
-        .copied()
-        .filter(|(until, _)| *until > now)
-        .map(|(until, _)| until)
+    let Ok(m) = cooldowns().lock() else {
+        return None;
+    };
+    let get = |k: String| -> Option<i64> {
+        m.get(&k)
+            .copied()
+            .filter(|(until, _)| *until > now)
+            .map(|(until, _)| until)
+    };
+    let whole = get(key.to_string());
+    match model {
+        Some(name) => match (whole, get(cooldown_key(key, Some(name)))) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
+        None => whole,
+    }
+}
+
+/// 某账号所有**模型级**限额（界面展示「哪些模型要等到几点」）。
+pub fn model_limits(key: &str) -> Vec<ModelLimit> {
+    let now = now_ms();
+    let prefix = format!("{key}@");
+    let Ok(m) = cooldowns().lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<ModelLimit> = m
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .filter(|(_, (until, _))| *until > now)
+        .map(|(k, (until, kind))| ModelLimit {
+            model: k[prefix.len()..].to_string(),
+            reset_at: *until,
+            kind: (*kind).to_string(),
+        })
+        .collect();
+    // 最早解锁的排前面（最有行动价值）—— 与参考实现的排序一致。
+    out.sort_by_key(|l| l.reset_at);
+    out
 }
 
 pub fn now_ms_pub() -> i64 {
@@ -178,10 +451,9 @@ pub fn mark_last_error(key: &str, message: &str, kind: &str, seconds_left: i64) 
         format!("{key}#err"),
         (
             now_ms() + seconds_left * 1000,
-            match kind {
-                "auth_dead" => "auth_dead",
-                _ => "transient",
-            },
+            // 以前这里只认 auth_dead、其余一律 transient —— 于是界面上
+            // 「额度用完」和「网络抖一下」长得一模一样，用户没法判断该不该换号。
+            kind_static(kind),
         ),
     );
     if let Ok(mut g) = LAST_ERROR.get_or_init(|| Mutex::new(String::new())).lock() {
@@ -198,9 +470,13 @@ pub fn last_error() -> Option<String> {
 }
 
 /// 冷却中的条目排到最后；`usable` 不动（冷却不等于账号坏了，界面要能看到）。
-fn with_cooldowns(mut entries: Vec<PoolEntry>) -> Vec<PoolEntry> {
+///
+/// `model` = 当前要用的模型：给了就按「整号冷却 或 该模型冷却」算有效冷却，
+/// 这样「只在这个模型上被限」的号会被排到后面，而它在别的模型上仍然能用。
+fn with_cooldowns(mut entries: Vec<PoolEntry>, model: Option<&str>) -> Vec<PoolEntry> {
     for e in entries.iter_mut() {
-        e.cooldown_until = cooling_until(&e.key);
+        e.cooldown_until = cooling_until(&e.key, model);
+        e.limited_models = model_limits(&e.key);
     }
     entries.sort_by(|a, b| {
         a.cooldown_until
@@ -229,6 +505,7 @@ fn qoder_entries() -> Vec<PoolEntry> {
                 expires_at: a.credits_expire_at,
                 usable,
                 cooldown_until: None,
+                limited_models: Vec::new(),
                 reason: if usable {
                     None
                 } else if a.disabled {
@@ -333,6 +610,7 @@ fn workbuddy_entries() -> Vec<PoolEntry> {
                 expires_at,
                 usable,
                 cooldown_until: None,
+                limited_models: Vec::new(),
                 reason: if usable {
                     None
                 } else if revoked {
@@ -454,6 +732,7 @@ fn trae_entries() -> Vec<PoolEntry> {
                 expires_at,
                 usable: has_cred && !expired,
                 cooldown_until: None,
+                limited_models: Vec::new(),
                 reason: if !has_cred {
                     Some("缺少设备凭据".into())
                 } else if expired {
@@ -621,8 +900,14 @@ pub fn catalog() -> Vec<(String, Vec<String>)> {
 /// 选号：在候选作用域里挑**最紧迫且可用**的一个。
 pub fn preview(model: &str) -> Result<Selection, String> {
     let (bare, scopes) = resolve_scopes(model)?;
-    let pool = usable();
+    let mut pool = usable();
     let now = now_ms();
+    // 同 `ordered_candidates`：预览必须按**这个模型**的有效冷却挑，否则会给用户
+    // 展示一个「其实用不了」的号（2026-10-24 用户实测：预览还显示被限制的账号）。
+    for e in pool.iter_mut() {
+        e.cooldown_until = cooling_until(&e.key, Some(&bare));
+        e.limited_models = model_limits(&e.key);
+    }
     // 冷却中的放最后（不是排除：全部在冷却时宁可等最早解冻的，也别误报「没有账号」）。
     let mut candidates: Vec<&PoolEntry> = pool.iter().filter(|e| scopes.contains(&e.scope)).collect();
     candidates.sort_by(|a, b| {
@@ -642,10 +927,58 @@ pub fn preview(model: &str) -> Result<Selection, String> {
         picked
             .as_ref()
             .filter(|p| p.cooldown_until.unwrap_or(0) > now)
-            .map(|p| format!("{} 正在冷却（到 {}），下次请求会换下一个账号",
-                p.label, p.cooldown_until.unwrap_or(0)))
+            .map(|p| {
+                let until = p.cooldown_until.unwrap_or(0);
+                format!(
+                    "{} 正在冷却（{} 秒后解冻），这次只能先用它；换号会优先挑别的账号",
+                    p.label,
+                    ((until - now) / 1000).max(0)
+                )
+            })
     };
     Ok(Selection { model: bare, candidates: scopes, picked, reason })
+}
+
+/// **一个请求内的换号顺序**：同 [`preview`] 的排序，但返回**全部**候选账号。
+///
+/// 为什么需要它：`preview` 只给「这一次挑谁」。而实际上游会临时拒绝某个账号
+/// （最典型的就是 Trae 的 `HTTP 429 / code 6804「使用量已超出频率限制」`，
+/// 以及某个号的额度当天耗尽）—— 这时**同一个请求**就该换下一个号继续，
+/// 而不是把 429 原样抛给用户让他手动再点一次。
+///
+/// 排序：**没在冷却的在前**（同组内保持 `snapshot()` 的紧迫度顺序），
+/// 冷却中的排后面兜底 —— 全在冷却时仍然会试（宁可用最早解冻的，也别直接报「没有账号」）。
+pub fn ordered_candidates(model: &str) -> Result<Vec<PoolEntry>, String> {
+    let (bare, scopes) = resolve_scopes(model)?;
+    let now = now_ms();
+    let mut out: Vec<PoolEntry> = usable()
+        .into_iter()
+        .filter(|e| scopes.contains(&e.scope))
+        .collect();
+    // ⚠️ 必须用**这次请求的模型**重算有效冷却：`usable()` 里算的是整号级，
+    // 而「只在这个模型上被限」的号在那里看起来毫无问题，会被排到队首再撞一次。
+    for e in out.iter_mut() {
+        e.cooldown_until = cooling_until(&e.key, Some(&bare));
+        e.limited_models = model_limits(&e.key);
+    }
+    // stable sort：只按「是否冷却」分组，组内顺序（紧迫度）不变。
+    out.sort_by_key(|e| e.cooldown_until.unwrap_or(0) > now);
+    Ok(out)
+}
+
+/// 某个账号成功过一次 ⇒ 撤掉它的冷却，别让一次偶发失败把它按 60 秒。
+///
+/// 整号级与该模型的冷却一起撤：既然这一次通了，说明两级的判断都过期了。
+pub fn clear_cooldown(key: &str, model: Option<&str>) {
+    if let Ok(mut m) = cooldowns().lock() {
+        let mut changed = m.remove(key).is_some();
+        if let Some(name) = model {
+            changed = m.remove(&cooldown_key(key, Some(name))).is_some() || changed;
+        }
+        if changed {
+            persist_cooldowns(&m);
+        }
+    }
 }
 
 /// Qoder 区域 → 作用域字符串（界面展示用）。
@@ -656,6 +989,24 @@ pub fn qoder_scope(region: QoderRegion) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上游文案里的「将在 2026-10-24 22:04:42 UTC+8 重置」要能抠出来 ——
+    /// 抠得到才能把「当日额度用完」钉到重置时刻，而不是 60 秒后又去撞它。
+    #[test]
+    fn reset_time_is_parsed_from_upstream_hint() {
+        let hint = r#"{"code":6804,"msg":"您的使用量已超出频率限制，将在 2026-10-24 22:04:42 UTC+8 重置"}"#;
+        let at = reset_at_from_hint(hint).expect("应当解析出重置时间");
+        let expect = chrono::NaiveDateTime::parse_from_str("2026-10-24 22:04:42", "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+            + 60_000;
+        assert_eq!(at, expect, "留 1 分钟余量");
+        // 抠不到就交回 None，由调用方按 1 小时兜底（绝不编一个时间出来）
+        assert!(reset_at_from_hint("没有时间的一段话").is_none());
+    }
 
     #[test]
     fn unknown_scope_is_rejected_not_guessed() {
@@ -690,28 +1041,112 @@ mod tests {
         assert!(!is_known_scope("wb-cn-x"));
     }
 
+    /// 2026-10-24 用户贴回来的**上游原文**（WorkBuddy 网关实拍）——
+    /// 逐字抄进来当判据，别再凭记忆写一个理想化的版本。
+    const REAL_WB_429: &str = "上游返回 HTTP 429（上游限流 / 当日额度用完）：\
+        您的使用量已超出频率限制，将在 2026-10-25 11:12:02 UTC+8 重置，\
+        您也可以切换其他模型继续使用。 (01a16cf737ce75ba.../71e874b5-2357-41f9-bfa5-825ffbf2bdfe)";
+
+    #[test]
+    fn real_upstream_429_parks_the_account_until_its_reset_time() {
+        let now = chrono::Local::now().timestamp_millis();
+        let (until, kind) = classify(429, REAL_WB_429, now).expect("额度耗尽必定要冷却");
+        assert_eq!(kind, "balance_exhausted", "不该退化成 60 秒的 rate_limited");
+        // ⚠️ 期望值按文案里的 **UTC+8** 算，不看本机时区 —— 换台机器（UTC+0 / UTC-5）
+        // 这个断言也必须成立，否则「11:12 恢复」会被人家的本地时区解释成别的时刻。
+        let expect = chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(11, 12, 2)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+            - 8 * 3_600_000
+            + 60_000;
+        assert_eq!(until, expect, "应当钉在上游给的重置时刻（按 UTC+8，留 1 分钟余量）");
+        // 关键：不能只停 60 秒 —— 那 60 秒后又会挑回这个号。
+        assert!(until - now > 60_000, "必须超过 60 秒，否则换号等于没换");
+    }
+
+    #[test]
+    fn utc_offset_is_read_from_the_text_not_from_the_machine_timezone() {
+        assert_eq!(parse_utc_offset("2026-10-25 11:12:02 UTC+8 重置"), Some(8 * 3_600_000));
+        assert_eq!(parse_utc_offset("will reset at 2026-10-25 11:12:02 UTC+08:00"), Some(8 * 3_600_000));
+        assert_eq!(parse_utc_offset("UTC-5"), Some(-5 * 3_600_000));
+        assert_eq!(parse_utc_offset("UTC+05:30"), Some(5 * 3_600_000 + 30 * 60_000));
+        // 没有时区就承认不知道，不默认 +8。
+        assert_eq!(parse_utc_offset("2026-10-25 11:12:02"), None);
+    }
+
+    /// 冷却键必须能区分「整号」和「某个模型」：前者锁整个号，后者只锁一个模型。
+    /// 这是「一个模型用完不该把整个号打进冷宫」的唯一判据。
+    /// 记账粒度：额度/限流只锁模型，凭据死锁整个号。
+    ///
+    /// 反例就在用户贴的上游原文里：「…重置，**您也可以切换其他模型继续使用**」——
+    /// 若按整号停，一个还能用别的模型的号会被白白关到明天。
+    #[test]
+    fn quota_errors_lock_the_model_but_auth_errors_lock_the_account() {
+        let m = Some("deepseek-v4.1-flash");
+        assert_eq!(cooldown_scope("balance_exhausted", m), m);
+        assert_eq!(cooldown_scope("rate_limited", m), m);
+        assert_eq!(cooldown_scope("auth_dead", m), None);
+        assert_eq!(cooldown_scope("transient", m), None);
+        // 没有模型名时退化成整号级（不能记到 `@` 这种空模型上）。
+        assert_eq!(cooldown_scope("balance_exhausted", None), None);
+    }
+
+    #[test]
+    fn cooldown_key_separates_account_wide_from_per_model() {
+        assert_eq!(cooldown_key("workbuddy:abc", None), "workbuddy:abc");
+        assert_eq!(
+            cooldown_key("workbuddy:abc", Some("deepseek-v4.1-flash")),
+            "workbuddy:abc@deepseek-v4.1-flash"
+        );
+        // 空白模型名当成整号级（不能生成 `workbuddy:abc@` 这种半截键）。
+        assert_eq!(cooldown_key("workbuddy:abc", Some("   ")), "workbuddy:abc");
+        // 两个模型的键互不相同 —— 只锁一个不会误伤另一个。
+        assert_ne!(
+            cooldown_key("k", Some("a")),
+            cooldown_key("k", Some("b"))
+        );
+    }
+
+    #[test]
+    fn reset_stamp_is_found_without_the_will_reset_wording() {
+        // JSON resetTime（ISO 风格 T 分隔）
+        assert!(reset_at_from_hint(r#"{"resetTime":"2026-10-25T11:12:02"}"#).is_some());
+        // 「将于」
+        assert!(reset_at_from_hint("您的额度已用完，将于 2026-10-25 11:12:02 重置").is_some());
+        // 斜杠 + 单数字月日
+        assert!(reset_at_from_hint("quota exceeded, resets at 2026/10/5 9:03:01").is_some());
+        // 长十六进制串里的假年份不能当成时间
+        assert!(reset_at_from_hint("trace 01a16cf737ce75ba71e874b5").is_none());
+        // 完全没时间 → None（由调用方按 1 小时兜底，绝不编）
+        assert!(reset_at_from_hint("service unavailable").is_none());
+    }
+
     #[test]
     fn error_feedback_puts_each_kind_in_its_lane() {
         let now = now_ms();
-        // 429 → 60 秒档
-        if let Some((until, kind)) = apply_error("k429", 429, "") {
-            assert_eq!(kind, "rate_limited");
-            assert!((until - now - 60_000).abs() < 2_000);
-        }
+        // 429 且文案没说额度 → 60 秒档
+        let (until, kind) = classify(429, "too many requests", now).unwrap();
+        assert_eq!(kind, "rate_limited");
+        assert!((until - now - 60_000).abs() < 2_000);
         // 401 → 30 分钟档
-        if let Some((until, kind)) = apply_error("k401", 401, "") {
-            assert_eq!(kind, "auth_dead");
-            assert!((until - now - 30 * 60_000).abs() < 2_000);
-        }
+        let (until, kind) = classify(401, "", now).unwrap();
+        assert_eq!(kind, "auth_dead");
+        assert!((until - now - 30 * 60_000).abs() < 2_000);
         // 排队（10605）→ 不冷却
-        assert!(apply_error("kq", 403, "code 10605 isQueued").is_none());
+        assert!(classify(403, "code 10605 isQueued", now).is_none());
         // 客户端参数错 → 不冷却
-        assert!(apply_error("k4xx", 400, "bad request").is_none());
+        assert!(classify(400, "bad request", now).is_none());
         // 402 → 停到下一个重置窗口（必定 > 现在 + 1 小时）
-        if let Some((until, kind)) = apply_error("k402", 402, "") {
-            assert_eq!(kind, "balance_exhausted");
-            assert!(until > now + 3_600_000, "402 应停到每日重置窗口");
-        }
+        let (until, kind) = classify(402, "", now).unwrap();
+        assert_eq!(kind, "balance_exhausted");
+        assert!(until > now + 3_600_000, "402 应停到每日重置窗口");
+        // 额度不足但上游没说时间 → 1 小时兜底，不编精确时刻
+        let (until, kind) = classify(403, "额度不足", now).unwrap();
+        assert_eq!(kind, "balance_exhausted");
+        assert!((until - now - 3_600_000).abs() < 2_000);
     }
 
     #[test]
@@ -719,6 +1154,7 @@ mod tests {
         let mk = |expires_at: Option<i64>| PoolEntry {
             key: "k".into(), product: "p".into(), scope: "s".into(), label: "l".into(),
             remaining: None, expires_at, usable: true, reason: None, cooldown_until: None,
+            limited_models: Vec::new(),
         };
         assert!(mk(Some(100)).urgency() < mk(Some(200)).urgency());
         assert!(mk(Some(200)).urgency() < mk(None).urgency());

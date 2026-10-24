@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use tauri::{Manager, WindowEvent};
 mod commands;
+pub mod selfcheck;
 mod update_service;
 #[cfg(target_os = "macos")]
 mod instance_lock;
@@ -174,6 +175,7 @@ pub fn run() {
             commands::qoder_session_delete_message,
             commands::qoder_session_rename,
             commands::qoder_session_delete,
+            commands::qoder_session_delete_many,
             commands::qoder_session_duplicate,
             commands::qoder_import_local,
             commands::qoder_login_start,
@@ -186,6 +188,10 @@ pub fn run() {
             commands::qoder_account_set_token,
             commands::qoder_account_refresh,
             commands::qoder_accounts_refresh_all,
+            commands::qoder_credit_history,
+            commands::qoder_exe_from_running,
+            commands::trae_export_pack,
+            commands::workbuddy_export_pack,
             commands::gateway_status,
             commands::gateway_guide_selftest,
             commands::gateway_set_enabled,
@@ -311,7 +317,16 @@ pub fn run() {
             commands::workbuddy_session_delete,
             commands::workbuddy_session_copy_preview,
             commands::workbuddy_session_copy,
+            commands::workbuddy_session_link_all,
+            commands::workbuddy_session_link_existing,
+            commands::workbuddy_session_link_all_preview,
             commands::workbuddy_session_links_preview,
+            commands::workbuddy_session_groups,
+            commands::workbuddy_session_group_detail,
+            commands::workbuddy_session_group_candidates,
+            commands::workbuddy_session_group_unify,
+            commands::workbuddy_session_group_link_account,
+            commands::workbuddy_session_group_link_session,
             commands::workbuddy_session_unlink,
             commands::workbuddy_session_edge_sync_dbs,
             // T46 · S4：WorkBuddy 会话编辑器

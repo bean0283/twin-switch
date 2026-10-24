@@ -14,6 +14,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
+import { toast } from "sonner";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { CheckinButton } from "@/components/checkin-button";
@@ -33,9 +34,12 @@ import {
   qoderLoginStart,
   qoderRegions,
   qoderTokenRefresh,
+  qoderCreditHistory,
+  traeRevealPath,
   qoderAccountSetCosy,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 
 type Region = { region: string; label: string; domain: string; cli_dir: string };
 
@@ -55,7 +59,30 @@ type QoderAccount = {
   credits_updated_at: number | null;
   last_used_at: number | null;
   disabled: boolean;
+  /** 桌面端登录态里的 user.id 与本条 uid 相同（后端解 auth.v1.dat 得出，解不开就 false）。 */
+  isCurrent?: boolean;
+  /** 客户端自己写下的明文回显（`~/.qoder-cn/.qoder-app-status.json`）。 */
+  appStatus?: {
+    loggedIn: boolean;
+    name: string | null;
+    avatarUrl: string | null;
+    version: string | null;
+    snapshotAt: string | null;
+  } | null;
 };
+
+/**
+ * 卡片上显示的名字。
+ *
+ * 兜底顺序：账号库里的名字 → **只有「当前登录」那条**才用客户端回显里的名字 → 邮箱 → uid 尾号。
+ * ⚠️ 回显里的名字属于**当前登录的那个号**，绝不能给其它账号当名字用（会张冠李戴）。
+ */
+function accountName(a: QoderAccount): string {
+  if (a.name?.trim()) return a.name.trim();
+  if (a.isCurrent && a.appStatus?.name?.trim()) return a.appStatus.name.trim();
+  if (a.email?.trim()) return a.email.trim();
+  return `uid …${a.uid.slice(-6)}`;
+}
 
 /** 只留前 6 / 后 4，中间打码 —— 截图发出去也不会泄露。 */
 function mask(v: string | null): string {
@@ -94,7 +121,6 @@ export default function QoderAccountsPage() {
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorOpen, setErrorOpen] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
 
   const [login, setLogin] = useState<{ loginId: string; url: string } | null>(null);
   const [loginState, setLoginState] = useState<"idle" | "pending" | "ok" | "error">("idle");
@@ -106,6 +132,10 @@ export default function QoderAccountsPage() {
 
   const fileRef = useRef<HTMLInputElement | null>(null);
 
+  /** 近 7 天消耗（本机快照算的，不是官方用量）。 */
+  type Hist = Awaited<ReturnType<typeof qoderCreditHistory>>;
+  const [history, setHistory] = useState<Hist | null>(null);
+
   const reload = useCallback(async () => {
     setBusy(true);
     setError(null);
@@ -113,6 +143,10 @@ export default function QoderAccountsPage() {
       const [rs, list] = await Promise.all([qoderRegions(), qoderAccountsList()]);
       setRegions(rs as Region[]);
       setRows(Array.isArray(list) ? (list as QoderAccount[]) : []);
+      // 历史是**附加信息**：拉不到不影响账号列表，也不弹错（空态由卡片自己说）。
+      void qoderCreditHistory(7)
+        .then(setHistory)
+        .catch(() => setHistory(null));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -143,7 +177,6 @@ export default function QoderAccountsPage() {
   /** 从本机 Qoder 客户端导入登录态 —— 自动识别国内版 / 国际版。 */
   async function doImportLocal() {
     setError(null);
-    setNotice(null);
     try {
       const r = await qoderImportLocal();
       await reload();
@@ -174,7 +207,7 @@ export default function QoderAccountsPage() {
         // 导入成功但令牌失效：必须说清楚，不能只报「导入成功」。
         setError(`${lines.join("；")}。失效原因：${failures.join("；")}`);
       } else {
-        setNotice(`本机导入 —— ${lines.join("；")}`);
+        toast.success("已导入本机账号", { description: lines.join("；") });
       }
     } catch (e) {
       setError(String(e));
@@ -239,20 +272,21 @@ export default function QoderAccountsPage() {
   /** 切换：把凭据写回 Qoder 桌面端登录态（auth.v1.dat）。 */
   async function doSwitch(a: QoderAccount) {
     setError(null);
-    setNotice(null);
     const ver = a.region === "cn" ? "国内版" : "国际版";
     if (
       !confirm(
         `把「${a.name || a.uid}」切换为当前 ${ver} Qoder 登录账号？\n\n` +
           `会自动关闭 ${ver} Qoder（未保存的对话会丢），写好登录态后自动重新打开；` +
-          `原登录态会先备份。另一个版本不受影响。`,
+          `原登录态会先备份。另一个版本不受影响。\n\n` +
+          `注意：Qoder 的会话历史不按账号隔离（main.sqlite 里没有账号字段），` +
+          `切完之后两个账号看到的是同一批历史 —— 这是客户端本身的行为，不是本工具改的。`,
       )
     ) {
       return;
     }
     try {
       const r = await qoderAccountSwitch(a.region, a.id);
-      setNotice(r.note);
+      toast.success("已切换账号", { description: r.note });
       await reload();
     } catch (e) {
       setError(String(e));
@@ -268,7 +302,7 @@ export default function QoderAccountsPage() {
     setError(null);
     try {
       await qoderAccountRename(a.region, a.id, name);
-      setNotice("名字已更新");
+      toast.success("名字已更新");
       await reload();
     } catch (e) {
       setError(String(e));
@@ -279,11 +313,10 @@ export default function QoderAccountsPage() {
   async function doRefreshToken(a: QoderAccount) {
     setRefreshingToken(true);
     setError(null);
-    setNotice(null);
     try {
       const updated = (await qoderTokenRefresh(a.region, a.id)) as QoderAccount;
       setDialog(updated);
-      setNotice("令牌已刷新");
+      toast.success("令牌已刷新");
       await reload();
     } catch (e) {
       setError(String(e));
@@ -333,20 +366,24 @@ export default function QoderAccountsPage() {
   /** 导出账号包：落到 ~/.twin-switch/qoder/exports/，并把 JSON 放进剪贴板。 */
   async function exportPack() {
     setError(null);
-    setNotice(null);
     try {
       const r = await qoderAccountsExport(tab);
-      await navigator.clipboard.writeText(r.json).catch(() => {});
-      setNotice(`已导出 ${r.count} 个账号到 ${r.path}（JSON 也复制到剪贴板）`);
+      // 剪贴板是「附带方便」，写不进去不该影响导出结论（也不能弹成功地说复制了）
+      const copied = await copyText(r.json);
+      toast.success(`已导出 ${r.count} 个账号`, {
+        description: `${r.path}${copied ? "（JSON 已复制到剪贴板）" : ""}`,
+      });
+      // 导出完直接定位到文件 —— 用户下一步就是把它拖走 / 发出去，
+      // 不该再让他自己去 `~/.twin-switch/qoder/exports/` 里翻。
+      void traeRevealPath(r.path).catch(() => {});
     } catch (e) {
-      setError(String(e));
+      toast.error("导出失败", { description: String(e) });
     }
   }
 
   /** 选文件 → 预览（脱敏）→ 确认 → 全量导入。 */
   async function importPack(file: File) {
     setError(null);
-    setNotice(null);
     try {
       const text = await file.text();
       const preview = await qoderImportPreview(tab, text);
@@ -367,9 +404,9 @@ export default function QoderAccountsPage() {
         return;
       }
       const r = await qoderImportApply(tab, text, null);
-      setNotice(
-        `导入完成：新增 ${r.imported}、更新 ${r.updated}、跳过 ${r.skipped}、拒绝 ${r.rejected.length}`,
-      );
+      toast.success(`导入完成：共 ${r.imported + r.updated} 条`, {
+        description: `新增 ${r.imported}、更新 ${r.updated}、跳过 ${r.skipped}、拒绝 ${r.rejected.length}`,
+      });
       await reload();
     } catch (e) {
       setError(String(e));
@@ -504,13 +541,6 @@ export default function QoderAccountsPage() {
         </section>
       )}
 
-      {notice && (
-        <div className="flex items-start gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 text-xs text-emerald-700">
-          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" />
-          <span className="break-all">{notice}</span>
-        </div>
-      )}
-
       {error && (
         <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-xs text-destructive">
           <div className="flex items-start gap-2">
@@ -583,6 +613,66 @@ export default function QoderAccountsPage() {
         </button>
       </div>
 
+      {/* 近 7 天消耗：数据只来自本机快照（Qoder 没有用量接口），样本不足就明说 */}
+      {history && (
+        <section className="rounded-2xl border bg-card px-5 py-4">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 className="text-sm font-semibold">近 {history.windowDays} 天消耗</h2>
+            <span className="text-xs text-muted-foreground">
+              本机快照算出来的（Qoder 没有用量接口）
+            </span>
+            {history.enoughData && history.days.length > 0 ? (
+              <span className="ml-auto font-mono text-sm">{money(history.totalUsed)}</span>
+            ) : (
+              <span className="ml-auto text-xs text-muted-foreground">样本不足</span>
+            )}
+          </div>
+
+          {history.enoughData && history.days.length > 0 ? (
+            <>
+              <div className="mt-3 flex items-end gap-1.5">
+                {history.days.map((d) => {
+                  const max = Math.max(...history.days.map((x) => x.used), 1);
+                  return (
+                    <div key={d.day} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                      <div className="flex h-16 w-full items-end">
+                        <div
+                          className="w-full rounded-t bg-primary/60"
+                          style={{ height: `${Math.max(2, (d.used / max) * 100)}%` }}
+                          title={`${d.day}：${money(d.used)}`}
+                        />
+                      </div>
+                      <span className="text-[10px] text-muted-foreground">{d.day}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              {history.accounts.length > 0 && (
+                <div className="mt-3 space-y-1 border-t border-border/60 pt-2">
+                  {history.accounts.map((x) => (
+                    <div key={x.uid} className="flex items-center gap-2 text-xs">
+                      <span className="min-w-0 flex-1 truncate">{x.name}</span>
+                      <span className="font-mono text-muted-foreground">{money(x.used)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {history.resetEvents > 0 && (
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  有 {history.resetEvents} 次额度上升（充值 / 签到 / 周期重置），这些不计入消耗。
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {history.points > 0
+                ? "采样点还不够两笔（算不出差值），多点几次「刷新积分」就会出曲线。"
+                : "还没有采样点。点一次「刷新积分」开始记录（同一账号 10 分钟记一笔）。"}
+            </p>
+          )}
+        </section>
+      )}
+
       {shown.length === 0 ? (
         <section className="rounded-2xl border bg-card px-5 py-10 text-center text-sm text-muted-foreground">
           这个区域还没有账号。点上面「导入本机账号」，或用「浏览器登录」。
@@ -594,7 +684,7 @@ export default function QoderAccountsPage() {
             return (
               <AccountCard
                 key={a.id}
-                name={a.name || a.email || `uid …${a.uid.slice(-6)}`}
+                name={accountName(a)}
                 identity={`uid ${a.uid}`}
                 identityMono
                 identityTitle={a.uid}
@@ -605,6 +695,7 @@ export default function QoderAccountsPage() {
                 avatarLabel={`查看 ${a.name || a.uid} 的令牌`}
                 chips={
                   <>
+                    {a.isCurrent ? <Chip tone="ok">当前登录</Chip> : null}
                     <Chip tone="outline">{a.source}</Chip>
                     {a.plan ? <Chip tone="ok">{a.plan}</Chip> : null}
                     {!hasToken ? <Chip tone="warn">没有凭据</Chip> : null}
@@ -742,7 +833,9 @@ export default function QoderAccountsPage() {
                   if (!ty?.trim()) return;
                   try {
                     await qoderAccountSetCosy(dialog.region, dialog.id, tk.trim(), ty.trim());
-                    setNotice("Cosy 设备身份已保存，之后签到/查活动会用它");
+                    toast.success("Cosy 设备身份已保存", {
+                      description: "之后签到 / 查活动会用它",
+                    });
                     await reload();
                   } catch (e) {
                     setError(String(e));

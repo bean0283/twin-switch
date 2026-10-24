@@ -318,6 +318,42 @@ pub struct Settings {
     /// [`workbuddy_exe_override`]），这样拔了移动硬盘不会去 spawn 一个不存在的程序。
     #[serde(default)]
     pub workbuddy_exe: String,
+    /// **用户手动指定的 Qoder 主程序路径**（`区域 → 绝对路径`，键是 `cn` / `global`）。
+    ///
+    /// 前两个客户端的 override 论证同样适用。Qoder 的特殊之处只有一条：
+    /// 两个区域的程序名不同（`Qoder CN.exe` / `Qoder.exe`），所以这里按区域分键，
+    /// **绝不允许一个区域填另一个区域的路径**（那会让「切换国内版」去启动国际版）。
+    #[serde(default)]
+    pub qoder_exe: HashMap<String, String>,
+    /// **切号时自动把 WorkBuddy 会话同步到所有账号**（默认**关**）。
+    ///
+    /// 打开后：每次切换账号（客户端已被关掉、还没重新启动的那一刻）都会跑一次
+    /// [`crate::modules::workbuddy_sessions::link_all`]——把「还没同步到某个账号」的
+    /// 会话补过去，并登记成关联组。用户不用再一个个手动复制。
+    ///
+    /// ⚠️⚠️ **默认必须是关**，理由与 [`Settings::backup_before_write`] 不同：
+    /// 这不是留不留备份，而是**真的往其它账号的会话库里写数据**（会话正文 + 库行），
+    /// 一次可能几十上百条。老用户升级后突然发现「每个号里多出一堆别人的会话」
+    /// 是不可接受的；必须是本人看过说明、亲手打开的。
+    ///
+    /// ⚠️ `#[serde(default)]` 让老 `settings.json` 反序列化成 `false`，
+    /// 与新装一致 —— 不允许出现「升级后行为突变」。
+    #[serde(default)]
+    pub auto_link_workbuddy_sessions: bool,
+    /// **自动同步的增量起点**（毫秒时间戳；0 = 还没跑过）。
+    ///
+    /// 切号时的自动同步**只搬这部分之后新建的会话**，绝不搬历史存量：
+    ///
+    /// - 实测本机 4 个账号、25 个会话时，一次全量要复制 **74 个副本、约 2.98 GB**。
+    ///   把这种量级塞进「切号」这种高频动作里，用户会遇到「切个号卡五分钟 + 磁盘少 3 GB」，
+    ///   而且他没有任何确认机会。
+    /// - 所以历史存量走**界面上的「一键互相关联」**（先给数字、再确认）；
+    ///   切号只做「本次之后新产生的会话」这种小额增量。
+    ///
+    /// 首次开启时（本字段为 0）自动同步只登记「已有副本」（0 字节），并把这里推到当前时刻 ——
+    /// 从下一次开始才是真正的增量复制。
+    #[serde(default)]
+    pub wb_link_since: i64,
 }
 
 impl Settings {
@@ -332,6 +368,12 @@ impl Settings {
             .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
             .collect();
         self.workbuddy_exe = self.workbuddy_exe.trim().to_string();
+        self.qoder_exe = self
+            .qoder_exe
+            .into_iter()
+            .map(|(k, v)| (k, v.trim().to_string()))
+            .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
+            .collect();
         self
     }
 }
@@ -342,6 +384,15 @@ impl Settings {
 /// 三条自动探测都得先看它，校验散开就会出现「A 处认了 B 处不认」。
 pub fn trae_exe_override(client_key: &str) -> Option<PathBuf> {
     let p = load().trae_exe.get(client_key).cloned()?;
+    let p = PathBuf::from(p.trim());
+    p.is_file().then_some(p)
+}
+
+/// 用户手动指定的 Qoder 主程序（**唯一出口**）—— 文件不存在就当没指定。
+///
+/// ⚠️ 与另两个客户端同一个纪律：`is_file()` 校验放在这里，调用方不再各写一遍。
+pub fn qoder_exe_override(region: crate::modules::qoder_realm::QoderRegion) -> Option<PathBuf> {
+    let p = load().qoder_exe.get(region.as_str()).cloned()?;
     let p = PathBuf::from(p.trim());
     p.is_file().then_some(p)
 }
@@ -361,6 +412,26 @@ pub fn sync_workbuddy_automations() -> bool {
 
 pub fn backup_before_write() -> bool {
     load().backup_before_write
+}
+
+/// 切号时要不要自动把会话同步给所有账号 —— **唯一出口**。
+///
+/// 与 [`sync_workbuddy_automations`] 同款：调用方一律问它，不许自己 `load()` 再读字段，
+/// 否则「设置里开着、切号时没生效」这种分叉迟早出现。
+pub fn auto_link_workbuddy_sessions() -> bool {
+    load().auto_link_workbuddy_sessions
+}
+
+/// 自动同步的增量起点（见 [`Settings::wb_link_since`]）。
+pub fn wb_link_since() -> i64 {
+    load().wb_link_since
+}
+
+/// 记住「已经同步到这个时刻」。写完必须落盘，否则每次切号都会重复处理同一批。
+pub fn set_wb_link_since(at_ms: i64) -> Result<(), String> {
+    let mut s = load();
+    s.wb_link_since = at_ms;
+    save(&s).map(|_| ())
 }
 
 /// 读设置：**坏文件不报错、退回默认**。

@@ -522,11 +522,17 @@ async fn chat(
         );
     }
 
-    // ⑤ 上游透传。
+    // ⑤ 上游透传 + **同一个请求内的换号重试**。
     //
     // 客户端要流式时，我们**仍然向上游要完整结果**，再把结果包装成一段 SSE 发回去。
     // 理由：两家上游的流格式各不相同（Trae 是私有事件流、WorkBuddy 是 OpenAI SSE），
     // 逐字转发需要两套解析；先把「能不能用」保证住，逐字流式留作后续优化。
+    //
+    // ⚠️⚠️ 换号重试是 2026-10-24 用户实测后补的：上游会临时拒绝某个账号，最典型的是
+    // Trae 的 `HTTP 429 / code 6804「使用量已超出频率限制」`，以及某个号的额度当天耗尽。
+    // 以前这种情况把 429 原样抛回客户端（用户在 Trae 里看到「请求模型供应商失败」，
+    // 得自己再点一次），而池子里明明还有别的号 —— 现在同一个请求里按紧迫度顺序往下换，
+    // **只有全部试完才报错**。
     let want_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut upstream_req = req.clone();
     if want_stream {
@@ -535,26 +541,146 @@ async fn chat(
         }
     }
 
-    match forward(&picked.scope, &bare, &upstream_req).await {
-        Ok(resp) => {
-            REQUESTS.fetch_add(1, Ordering::Relaxed);
-            gateway_keys::touch(&key.id);
-            if want_stream {
-                sse_from_completion(&resp)
-            } else {
-                Json(resp).into_response()
+    // 候选顺序：pool 的紧迫度顺序（没在冷却的在前），并把 preview 选中的挪到队首，
+    // 保证「没有触发换号时挑的还是同一个号」—— 行为对用户可预期。
+    let mut cands: Vec<gateway_pool::PoolEntry> = gateway_pool::ordered_candidates(&model)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| key.allows(&c.scope))
+        .collect();
+    if cands.is_empty() {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_account",
+            format!("这把 Key 授权的范围里没有可用账号（模型 {bare}）"),
+        );
+    }
+    if let Some(pos) = cands.iter().position(|c| c.key == picked.key) {
+        let head = cands.remove(pos);
+        cands.insert(0, head);
+    }
+
+    let mut last_err: Option<(StatusCode, String)> = None;
+    let mut tried = 0usize;
+    for cand in cands.iter().take(MAX_FAILOVER) {
+        tried += 1;
+        match forward(cand, &bare, &upstream_req).await {
+            Ok(resp) => {
+                REQUESTS.fetch_add(1, Ordering::Relaxed);
+                gateway_keys::touch(&key.id);
+                // 成功了就把这个号之前记的冷却撤掉，别让一次偶发失败按它 60 秒。
+                gateway_pool::clear_cooldown(&cand.key, Some(&bare));
+                return if want_stream {
+                    sse_from_completion(&resp)
+                } else {
+                    Json(resp).into_response()
+                };
             }
-        }
-        Err((code, msg)) => {
-            // 上游报错 → 反馈给池子（冷却/标记），下一个请求自动换号 —— 不然还会撞同一个。
-            let status = code.as_u16();
-            if let Some((until, kind)) = gateway_pool::apply_error(&picked.key, status, &msg) {
-                let left = (until - gateway_pool::now_ms_pub()).max(0) / 1000;
-                let _ = gateway_pool::mark_last_error(&picked.key, &msg, kind, left);
+            Err((code, msg)) => {
+                // 上游报错 → 反馈给池子（冷却/标记），下一个请求也不会再撞同一个。
+                // ⚠️ 按 **(账号, 模型)** 记账：429 只锁这个模型，别的模型还能用这个号。
+                if let Some((until, kind)) =
+                    gateway_pool::apply_error(&cand.key, code.as_u16(), &msg, Some(&bare))
+                {
+                    let left = (until - gateway_pool::now_ms_pub()).max(0) / 1000;
+                    let _ = gateway_pool::mark_last_error(&cand.key, &msg, kind, left);
+                }
+                let failover = should_failover(code.as_u16(), &msg);
+                log_failover(&model, &cand.key, code.as_u16(), &msg, failover);
+                last_err = Some((code, msg));
+                if !failover {
+                    break;
+                }
             }
-            api_err(code, "upstream_error", msg)
         }
     }
+
+    let (code, msg) = last_err.unwrap_or((
+        StatusCode::BAD_GATEWAY,
+        "上游没有任何响应".to_string(),
+    ));
+    api_err(
+        code,
+        "upstream_error",
+        if tried > 1 {
+            format!("{msg}（已按积分池顺序换了 {tried} 个账号，全部失败）")
+        } else {
+            msg
+        },
+    )
+}
+
+/// 一个请求最多试几个账号：换号是为了「让用户这次能成」，不是把 10 个号全撸一遍
+/// 把客户端拖到超时。3 个足够覆盖「当天额度用尽的那个 + 一个被限流的」。
+const MAX_FAILOVER: usize = 3;
+
+/// 把每一次换号尝试的失败原因落盘（`~/.twin-switch/gateway-errors.jsonl`）。
+///
+/// ⚠️ 这是「用户说没换号」时唯一的取证入口：以前只记一行 `POST -> 502`，
+/// 看不出是哪个号的错、错在哪、有没有往下试 —— 于是只能靠猜。
+fn log_failover(model: &str, key: &str, status: u16, msg: &str, failover: bool) {
+    let flat: String = msg
+        .replace(['\n', '\r', '\t'], " ")
+        .chars()
+        .take(400)
+        .collect();
+    let line = format!(
+        "{}\tmodel={}\taccount={}\thttp={}\t{}\t{}\n",
+        chrono::Local::now().format("%m-%d %H:%M:%S"),
+        model,
+        key,
+        status,
+        if failover { "换下一个" } else { "停止（不换）" },
+        flat,
+    );
+    let path = crate::modules::config::store_dir().join("gateway-errors.jsonl");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 超过 512 KB 就只留尾部 —— 这文件是给排查用的，不许无限长大。
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 512 * 1024 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let mut cut = text.len().saturating_sub(256 * 1024);
+                // 不能切在多字节字符中间（中文路径/文案很常见）。
+                while cut < text.len() && !text.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                let _ = std::fs::write(&path, &text[cut..]);
+            }
+        }
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 这次失败该不该**换下一个号**继续（而不是把错误抛回客户端）。
+///
+/// 只认两类：
+/// - **账号自身的问题**：`401/403`（凭据死）、`402/429`（额度 / 频率）、`5xx`、传输层 `-1`；
+/// - **上游用业务码说「这个号现在用不了」**：Trae 的 `6804`，以及文案里的
+///   「频率限制 / 使用量已超出 / 额度不足 / 余额不足 / quota exceeded / rate limit」。
+///
+/// 反例（**必须不换**，换了也是白试 + 拖长客户端超时）：`400` 参数错、`404` 模型不存在，
+/// 以及**排队**（`10605` / `isQueued` —— 排队是全局的，换号只会再排一次）。
+fn should_failover(status: u16, msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("10605") || m.contains("isqueued") {
+        return false;
+    }
+    if matches!(status, 0 | 401 | 402 | 403 | 429 | 500..=599) {
+        return true;
+    }
+    m.contains("6804")
+        || m.contains("quota exceeded")
+        || m.contains("rate limit")
+        || msg.contains("频率限制")
+        || msg.contains("使用量已超出")
+        || msg.contains("额度不足")
+        || msg.contains("余额不足")
 }
 
 /// 把一条完整结果包装成 OpenAI 流式事件。
@@ -563,14 +689,42 @@ async fn chat(
 /// 客户端（包括 Trae 的「测试并添加」）看到的是标准 SSE，不会因为
 /// `stream:true` 拿不到流而判定失败。
 ///
+/// ⚠️ **工具调用必须在这里发出去**，而且 `finish_reason` 要照实给 `tool_calls`：
+/// 以前这里写死 `finish_reason: "stop"`、delta 只发 content，流式客户端永远等不到
+/// 工具调用，只会收到一段 `finish_reason=stop` 的空话（2026-10-24 实测）。
+///
 /// ⚠️ 这不是「逐字流式」：内容一次性到达。真流式要按上游分别解析，后续再做。
 fn sse_from_completion(v: &Value) -> axum::response::Response {
     use axum::http::header;
 
+    let body = sse_body(v);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// [`sse_from_completion`] 的正文部分（拆出来才有得测）。
+fn sse_body(v: &Value) -> String {
     let content = v
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let calls = v
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let finish = v
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop")
+        .to_string();
     let model = v.get("model").cloned().unwrap_or_else(|| json!("twin-switch"));
     let id = v
         .get("id")
@@ -581,6 +735,19 @@ fn sse_from_completion(v: &Value) -> axum::response::Response {
         .cloned()
         .unwrap_or_else(|| json!(crate::modules::qoder_accounts::now_ms() / 1000));
 
+    let mut delta = json!({ "role": "assistant" });
+    if calls.is_empty() {
+        delta["content"] = json!(content);
+    } else {
+        // OpenAI 标准：只调用工具时 content 为 null（给空串会被部分客户端当空回答）。
+        delta["content"] = if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        };
+        delta["tool_calls"] = json!(calls);
+    }
+
     let first = json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -588,7 +755,7 @@ fn sse_from_completion(v: &Value) -> axum::response::Response {
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": { "role": "assistant", "content": content },
+            "delta": delta,
             "finish_reason": Value::Null,
         }],
     });
@@ -597,19 +764,10 @@ fn sse_from_completion(v: &Value) -> axum::response::Response {
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish }],
     });
 
-    let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
+    format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n")
 }
 
 /// 上游配置。
@@ -665,10 +823,11 @@ fn builtin_spec(scope: &str) -> Option<UpstreamSpec> {
 /// 优先用 `~/.twin-switch/upstreams.json` 里登记的；没登记时回落到 [`builtin_spec`]，
 /// 两者都没有才 501（并说明这家为什么还需要适配器）。
 async fn forward(
-    scope: &str,
+    cand: &gateway_pool::PoolEntry,
     model: &str,
     req: &Value,
 ) -> Result<Value, (StatusCode, String)> {
+    let scope = cand.scope.as_str();
     let path = crate::modules::config::store_dir().join("upstreams.json");
     let spec = std::fs::read_to_string(&path)
         .ok()
@@ -701,10 +860,16 @@ async fn forward(
         ));
     };
 
-    let token = token_of(scope).ok_or_else(|| {
+    // ⚠️⚠️ 必须按**账号**取凭据：同一个作用域下可能有好几个号（wb-cn 常有 3~4 个），
+    // 按作用域取永远是第一个 —— 那样「自动换号」就是一句空话：候选换了，token 没换，
+    // 上游照样回同一个 429（2026-10-24 用户实测）。
+    let token = token_of_key(&cand.key, scope).ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("{scope} 找不到可用凭据（先在账号页登录或填 PAT）"),
+            format!(
+                "{} 找不到可用凭据（账号「{}」可能在导出后被删或没有 token）",
+                scope, cand.label
+            ),
         )
     })?;
 
@@ -743,10 +908,14 @@ async fn forward(
     if !status.is_success() {
         let hint = match status.as_u16() {
             401 | 403 => "（上游鉴权失败：token 可能已过期，需重新登录该账号）",
+            429 => "（上游限流 / 当日额度用完）",
             _ => "",
         };
+        // ⚠️ **原样保留上游状态码**。以前一律改成 502，于是 429 被当成 5xx 记「60 秒后再说」，
+        // 402 更永远走不到「等到重置窗口」那条分支 —— 冷却判据全被这一个转换废掉了。
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         return Err((
-            StatusCode::BAD_GATEWAY,
+            code,
             format!(
                 "上游返回 HTTP {}{hint}：{}",
                 status.as_u16(),
@@ -783,15 +952,189 @@ fn explain_upstream_error(text: &str) -> String {
     snippet
 }
 
+// ---------------------------------------------------------------------------
+// 工具调用（function calling）聚合
+//
+// 网关对外是**非流式**（上游只吃流式，本地聚合）。但工具调用本来就是「分片到达」的：
+// 以前聚合器只拼 `delta.content`，于是带 tools 的请求会出现三种假故障（2026-10-24 实测）：
+//   - Trae + DeepSeek：上游只发 tool_calls、没有正文 ⇒ 被当成「空回答」报 502；
+//   - glm-5.2：finish_reason 是 tool_calls，但 message 里没有 tool_calls 字段；
+//   - 流式客户端：拿到 finish_reason=stop，永远等不到工具调用。
+// 所以这里按 OpenAI 语义把分片拼回完整调用，三种上游形态（标准分片 / 完整快照 /
+// Trae 的 `function_call`+`partial_arguments`）都要能吃。
+// ---------------------------------------------------------------------------
+
+/// 累积中的一次工具调用。
+#[derive(Debug, Clone, Default)]
+struct ToolCallAcc {
+    index: Option<u64>,
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// `new` 是不是 `acc` 的**结构化扩展**（同一个 JSON 对象，`acc` 的每个键值都在 `new` 里）。
+///
+/// ⚠️ 不能用「前缀」判断快照：`{"city":"上海"}` 扩展成 `{"city":"上海","n":1}` 时，
+/// 原来结尾的 `}` 变成了 `,`，`new.starts_with(acc)` 是 **false**，拼接后得到两段 JSON。
+/// 上游（Trae）恰好是这种「每片给一个更完整的快照」的形态。
+fn json_extends(acc: &str, new: &str) -> bool {
+    let (Ok(Value::Object(a)), Ok(Value::Object(b))) =
+        (serde_json::from_str::<Value>(acc), serde_json::from_str::<Value>(new))
+    else {
+        return false;
+    };
+    a.iter().all(|(k, v)| b.get(k) == Some(v))
+}
+
+/// 合并 `arguments` 分片。三种真实形态都要认：
+///
+/// - **真分片**：`{"city":"` + `上海"}` ⇒ 必须拼接；
+/// - **完整快照**：先给 `{"city":"上海"}`，后面又给一个更完整的完整值 ⇒ 用新的
+///   （拼起来会变成两段 JSON，客户端解析必失败）；
+/// - **重复旧值**：新值是已累积值的「子集或前缀」 ⇒ 丢掉。
+fn merge_arguments(acc: &str, new: &str) -> String {
+    if new.is_empty() {
+        return acc.to_string();
+    }
+    if acc.is_empty() {
+        return new.to_string();
+    }
+    if new.starts_with(acc) || json_extends(acc, new) {
+        return new.to_string();
+    }
+    if acc.starts_with(new) || json_extends(new, acc) {
+        return acc.to_string();
+    }
+    let mut out = acc.to_string();
+    out.push_str(new);
+    out
+}
+
+/// `arguments` 取文本：上游可能给字符串，也可能直接给对象（非标准，但要能吃）。
+fn arg_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// 把一片工具调用并进累积表。按 `index` 对齐（OpenAI 标准），没有 index 时按 `id`，
+/// 都没有就新开一条 —— 宁可多一条，也不要把两次不同的调用合并成一次。
+fn absorb_tool_call(accs: &mut Vec<ToolCallAcc>, raw: &Value) {
+    let Some(obj) = raw.as_object() else { return };
+    let index = obj.get("index").and_then(Value::as_u64);
+    let id = obj
+        .get("id")
+        .or_else(|| obj.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // OpenAI 形态是 `function: { name, arguments }`；Trae 私有流用 `function_call`；
+    // 还有上游把 name/arguments 平铺在顶层 —— 三种都认。
+    let func = obj.get("function").or_else(|| obj.get("function_call"));
+    let (name, args, partial) = match func {
+        Some(f) => (
+            f.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            arg_text(f.get("arguments")),
+            arg_text(f.get("partial_arguments")),
+        ),
+        None => (
+            obj.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            arg_text(obj.get("arguments")),
+            arg_text(obj.get("partial_arguments")),
+        ),
+    };
+    // `partial_arguments` 是「截至目前完整的参数」，比碎片更可信。
+    let next = if partial.trim().len() > args.trim().len() {
+        partial
+    } else {
+        args
+    };
+
+    let mut pos = accs.iter().position(|a| match (a.index, index) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    });
+    if pos.is_none() && !id.is_empty() {
+        pos = accs.iter().position(|a| !a.id.is_empty() && a.id == id);
+    }
+    let pos = match pos {
+        Some(p) => p,
+        None => {
+            accs.push(ToolCallAcc::default());
+            accs.len() - 1
+        }
+    };
+
+    let slot = &mut accs[pos];
+    if slot.index.is_none() {
+        slot.index = index;
+    }
+    if !id.is_empty() {
+        slot.id = id;
+    }
+    if !name.is_empty() {
+        slot.name = name;
+    }
+    slot.arguments = merge_arguments(&slot.arguments, &next);
+}
+
+/// 累积表 → OpenAI `message.tool_calls`。
+///
+/// 没有 `name` 的条目直接丢掉：那是上游的脏数据，编一个名字只会让客户端调用出错的工具。
+fn finalize_tool_calls(accs: &[ToolCallAcc]) -> Vec<Value> {
+    accs.iter()
+        .enumerate()
+        .filter(|(_, a)| !a.name.is_empty())
+        .map(|(i, a)| {
+            let args = if a.arguments.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                a.arguments.clone()
+            };
+            let id = if a.id.is_empty() {
+                format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..24])
+            } else {
+                a.id.clone()
+            };
+            json!({
+                "index": a.index.unwrap_or(i as u64),
+                "id": id,
+                "type": "function",
+                "function": { "name": a.name, "arguments": args }
+            })
+        })
+        .collect()
+}
+
+/// 有工具调用时 `finish_reason` 必须是 `tool_calls` —— 很多客户端只认这个值才去解析
+/// 调用（`stop` 会被当成「模型只说了句话」）。上游有时候确实只给 `stop`。
+fn finish_with_calls(finish: Option<String>, has_calls: bool) -> String {
+    match (finish.as_deref(), has_calls) {
+        (Some("tool_calls"), _) => "tool_calls".to_string(),
+        (Some("length"), _) => "length".to_string(),
+        (Some(other), true) if other != "stop" => other.to_string(),
+        (_, true) => "tool_calls".to_string(),
+        (Some(other), false) => other.to_string(),
+        (None, false) => "stop".to_string(),
+    }
+}
+
 /// 把 SSE 文本聚合成一条非流式 OpenAI 响应。
 ///
-/// 只做「拼 delta.content」这一件事：网关对外是非流式，客户端拿到的是完整回答。
+/// 拼 `delta.content`，同时把 `delta.tool_calls` 的分片拼回完整调用：
+/// 网关对外是非流式，客户端拿到的是完整回答（含工具调用）。
 fn aggregate_sse(text: &str, model: &str) -> Result<Value, (StatusCode, String)> {
     let mut content = String::new();
     let mut role = String::from("assistant");
     let mut finish: Option<String> = None;
     let mut id = String::from("chatcmpl-twinswitch");
     let mut usage = Value::Null;
+    let mut accs: Vec<ToolCallAcc> = Vec::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -830,18 +1173,45 @@ fn aggregate_sse(text: &str, model: &str) -> Result<Value, (StatusCode, String)>
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
                 content.push_str(c);
             }
+            // 工具调用分片（标准 OpenAI 上游就是这么发的）。
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for c in calls {
+                    absorb_tool_call(&mut accs, c);
+                }
+            }
+            // 少数上游用单体形态给：`delta.tool_call` / `delta.function_call`。
+            for key in ["tool_call", "function_call"] {
+                if let Some(c) = delta.get(key) {
+                    if c.is_object() {
+                        absorb_tool_call(&mut accs, c);
+                    }
+                }
+            }
         }
     }
 
-    if content.is_empty() {
+    let calls = finalize_tool_calls(&accs);
+    if content.is_empty() && calls.is_empty() {
         // 上游「成功」但一个字符都没给 —— 不许假装成空回答，要说清楚。
         return Err((
             StatusCode::BAD_GATEWAY,
             format!(
-                "上游返回了流但没有任何文本内容（可能是被安全策略拦了）。原始前 300 字：{}",
+                "上游返回了流但没有任何正文，也没有可用的工具调用（可能是被安全策略拦了）。原始前 300 字：{}",
                 text.chars().take(300).collect::<String>()
             ),
         ));
+    }
+
+    let finish_reason = finish_with_calls(finish, !calls.is_empty());
+    let mut message = json!({ "role": role });
+    // 标准里「只有工具调用」时 content 是 null；给空串会让部分客户端当成空回答吞掉。
+    if content.is_empty() && !calls.is_empty() {
+        message["content"] = Value::Null;
+    } else {
+        message["content"] = json!(content);
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
     }
 
     Ok(json!({
@@ -851,8 +1221,8 @@ fn aggregate_sse(text: &str, model: &str) -> Result<Value, (StatusCode, String)>
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": role, "content": content },
-            "finish_reason": finish.unwrap_or_else(|| "stop".into()),
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": usage,
     }))
@@ -1019,9 +1389,191 @@ async fn qoder_forward(
 
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
     // display_name 直接用模型 key：可读性一般，但上游只认 key。
-    crate::modules::qoder_tools::chat_complete(region, acc, model, model, &messages)
+    let out = crate::modules::qoder_tools::chat_complete(region, acc, model, model, &messages)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Qoder 上游：{e}")))
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Qoder 上游：{e}")))?;
+    // Qoder 的私有协议没有 function calling 通道，模型会把调用**写在正文里**
+    // （`<function_calls><invoke …>`）。原样透出等于给客户端一段话术，这里提成标准 tool_calls。
+    Ok(lift_qoder_tool_calls(out))
+}
+
+// ---------------------------------------------------------------------------
+// Qoder：正文里的 `<function_calls>` → OpenAI `tool_calls`
+//
+// 实测（2026-10-24）Qoder 的「auto」会把工具调用输出成 Claude 风格的 XML 文本：
+//
+// ```text
+// <function_calls>
+//   <invoke name="get_weather">
+//     <parameter name="city">上海</parameter>
+//   </invoke>
+// </function_calls>
+// ```
+//
+// 客户端只认 `message.tool_calls`，看到这段文本只会当成模型在念台词。
+// 所以网关在出口处把它提出来，并从正文里删掉。
+// ---------------------------------------------------------------------------
+
+/// XML 实体还原（顺序不能换：`&amp;` 必须最后，否则 `&amp;lt;` 会被二次还原）。
+fn unescape_xml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// 取标签属性值，允许单双引号。要求 `key` 前面是空白，避免 `pname=` 命中 `name=`。
+fn xml_attr(tag: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=");
+    let mut from = 0usize;
+    while let Some(rel) = tag[from..].find(&pat) {
+        let at = from + rel;
+        let prev_ok = tag[..at].chars().next_back().map(|c| c.is_whitespace()).unwrap_or(false);
+        let rest = &tag[at + pat.len()..];
+        let (quote, rest2) = if let Some(r) = rest.strip_prefix('"') {
+            ('"', r)
+        } else if let Some(r) = rest.strip_prefix('\'') {
+            ('\'', r)
+        } else {
+            from = at + pat.len();
+            continue;
+        };
+        if !prev_ok {
+            from = at + pat.len();
+            continue;
+        }
+        let end = rest2.find(quote)?;
+        return Some(rest2[..end].to_string());
+    }
+    None
+}
+
+/// 参数值：能当 JSON 就按 JSON（模型常给数字/布尔/对象），否则按字符串。
+fn xml_param_value(raw: &str) -> Value {
+    let t = unescape_xml(raw).trim().to_string();
+    if t.is_empty() {
+        return json!("");
+    }
+    let looks_json = t.starts_with('{')
+        || t.starts_with('[')
+        || t.starts_with('"')
+        || t == "true"
+        || t == "false"
+        || t == "null";
+    if looks_json {
+        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+            return v;
+        }
+    }
+    // 纯数字按数字给（`"count": "3"` 会让要求 integer 的 schema 校验失败）。
+    if t.chars().all(|c| c.is_ascii_digit() || "+-.eE".contains(c)) && t.parse::<f64>().is_ok() {
+        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+            return v;
+        }
+    }
+    json!(t)
+}
+
+/// 解析一段 `<invoke …>…</invoke>`。
+fn parse_invoke(seg: &str, index: usize) -> Option<Value> {
+    let name = xml_attr(seg, "name")?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut cur = 0usize;
+    while let Some(rel) = seg[cur..].find("<parameter") {
+        let start = cur + rel;
+        let Some(gt_rel) = seg[start..].find('>') else { break };
+        let head_end = start + gt_rel;
+        let head = &seg[start..head_end];
+        let Some(pname) = xml_attr(head, "name").map(|s| s.trim().to_string()) else {
+            cur = head_end + 1;
+            continue;
+        };
+        // 自闭合 `<parameter name="x"/>` = 空值。
+        if head.trim_end().ends_with('/') {
+            args.insert(pname, json!(""));
+            cur = head_end + 1;
+            continue;
+        }
+        let val_start = head_end + 1;
+        let Some(close_rel) = seg[val_start..].find("</parameter>") else { break };
+        args.insert(pname, xml_param_value(&seg[val_start..val_start + close_rel]));
+        cur = val_start + close_rel + "</parameter>".len();
+    }
+    Some(json!({
+        "index": index,
+        "id": format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
+        }
+    }))
+}
+
+/// 把正文里的 `<function_calls>` 块提出来。返回 `(剩下的正文, 工具调用)`。
+///
+/// 没闭合的块**原样留在正文里**（宁可让用户看到原始文本，也不能吞掉半段内容）。
+fn lift_text_tool_calls(text: &str) -> (String, Vec<Value>) {
+    const OPEN: &str = "<function_calls";
+    const CLOSE: &str = "</function_calls>";
+    let mut calls: Vec<Value> = Vec::new();
+    let mut rest = String::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find(OPEN) {
+        let start = cursor + rel;
+        let Some(close_rel) = text[start..].find(CLOSE) else { break };
+        let end = start + close_rel + CLOSE.len();
+        rest.push_str(&text[cursor..start]);
+        let block = &text[start..end];
+
+        let mut inner = 0usize;
+        while let Some(inv_rel) = block[inner..].find("<invoke") {
+            let inv_start = inner + inv_rel;
+            let Some(inv_close) = block[inv_start..].find("</invoke>") else { break };
+            let inv_end = inv_start + inv_close + "</invoke>".len();
+            if let Some(call) = parse_invoke(&block[inv_start..inv_end], calls.len()) {
+                calls.push(call);
+            }
+            inner = inv_end;
+        }
+        cursor = end;
+    }
+    rest.push_str(&text[cursor..]);
+    (rest.trim().to_string(), calls)
+}
+
+/// 把 Qoder 的完整返回里的正文工具调用提成 `message.tool_calls`。
+fn lift_qoder_tool_calls(mut v: Value) -> Value {
+    let Some(content) = v
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return v;
+    };
+    if !content.contains("<function_calls") {
+        return v;
+    }
+    let (rest, calls) = lift_text_tool_calls(&content);
+    if calls.is_empty() {
+        return v;
+    }
+    if let Some(msg) = v.pointer_mut("/choices/0/message").and_then(Value::as_object_mut) {
+        msg.insert(
+            "content".into(),
+            if rest.is_empty() { Value::Null } else { json!(rest) },
+        );
+        msg.insert("tool_calls".into(), json!(calls));
+    }
+    if let Some(ch) = v.pointer_mut("/choices/0").and_then(Value::as_object_mut) {
+        ch.insert("finish_reason".into(), json!("tool_calls"));
+    }
+    v
 }
 
 async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, String)> {
@@ -1164,9 +1716,10 @@ fn normalize_trae_messages(obj: &mut serde_json::Map<String, Value>) {
 fn aggregate_trae_sse(text: &str, model: &str) -> Result<Value, (StatusCode, String)> {
     let mut answer = String::new();
     let mut event = String::new();
-    let mut finish = String::from("stop");
+    let mut finish: Option<String> = None;
     let mut usage = Value::Null;
     let mut error: Option<String> = None;
+    let mut accs: Vec<ToolCallAcc> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -1202,14 +1755,34 @@ fn aggregate_trae_sse(text: &str, model: &str) -> Result<Value, (StatusCode, Str
                     answer.push_str(t);
                 }
                 // `reasoning_content` 单独存在，**不拼进回答**。
+                //
+                // 工具调用也在这个事件里（`tool_calls`）。**必须收**：模型选了工具时
+                // 正文往往是空的，只收正文就会把「调用了工具」当成「上游给了个空回答」
+                // 报 502（2026-10-24 实测 DeepSeek-V4-Flash）。
+                if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
+                    for c in calls {
+                        absorb_tool_call(&mut accs, c);
+                    }
+                }
+                for key in ["tool_call", "function_call"] {
+                    if let Some(c) = v.get(key) {
+                        if c.is_object() {
+                            absorb_tool_call(&mut accs, c);
+                        }
+                    }
+                }
             }
             "token_usage" => usage = v.clone(),
             "done" => {
                 if let Some(f) = v.get("finish_reason").and_then(Value::as_str) {
-                    finish = f.to_string();
+                    finish = Some(f.to_string());
                 }
             }
-            "turn_completion" => finish = "stop".into(),
+            "turn_completion" => {
+                if finish.is_none() {
+                    finish = Some("stop".into());
+                }
+            }
             "error" => {
                 let code = v.get("code").and_then(Value::as_i64).unwrap_or(0);
                 let msg = v
@@ -1225,14 +1798,27 @@ fn aggregate_trae_sse(text: &str, model: &str) -> Result<Value, (StatusCode, Str
     if let Some(err) = error {
         return Err((StatusCode::BAD_GATEWAY, format!("Trae 上游报错：{err}")));
     }
-    if answer.trim().is_empty() {
+
+    let calls = finalize_tool_calls(&accs);
+    if answer.trim().is_empty() && calls.is_empty() {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!(
-                "Trae 返回了事件流但没有正文（只可能是空回答或被拦）。原始前 500 字：{}",
+                "Trae 返回了事件流，但没有正文也没有工具调用（只可能是空回答或被拦）。原始前 500 字：{}",
                 text.chars().take(500).collect::<String>()
             ),
         ));
+    }
+
+    let finish_reason = finish_with_calls(finish, !calls.is_empty());
+    let mut message = json!({ "role": "assistant" });
+    if answer.is_empty() && !calls.is_empty() {
+        message["content"] = Value::Null;
+    } else {
+        message["content"] = json!(answer);
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
     }
 
     Ok(json!({
@@ -1242,11 +1828,63 @@ fn aggregate_trae_sse(text: &str, model: &str) -> Result<Value, (StatusCode, Str
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": answer },
-            "finish_reason": finish
+            "message": message,
+            "finish_reason": finish_reason
         }],
         "usage": usage,
     }))
+}
+
+/// 从 WorkBuddy 账号数组里挑**指定 uid** 的 token（纯函数，单测直接喂数组）。
+///
+/// ⚠️ 这就是「换号」能不能真生效的分水岭：按 uid 挑，才能把候选账号和实际发出去的
+/// token 对上；按作用域挑永远是数组里第一个 —— 多个 WB 账号时换了号还是同一个 token。
+fn pick_wb_token(accounts: &[Value], uid: &str) -> Option<String> {
+    accounts.iter().find_map(|a| {
+        if a.get("uid").and_then(Value::as_str).map(str::trim) != Some(uid) {
+            return None;
+        }
+        a.get("access_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// 按**账号**取 bearer token。
+///
+/// `key` 是池子条目的全局键：`qoder:{账号id}` / `workbuddy:{uid}` / `trae:{uid}`。
+/// 取不到时回落到 [`token_of`]（按作用域取第一个）—— 那条路只保证「这个作用域还有别的号
+/// 能用」，不保证是我们挑中的那个；所以调用方的错误信息里会带上账号名。
+fn token_of_key(key: &str, scope: &str) -> Option<String> {
+    let ident = key
+        .split_once(':')
+        .map(|(_, v)| v.trim())
+        .unwrap_or("")
+        .to_string();
+    if !ident.is_empty() {
+        match scope {
+            "qoder-cn" | "qoder-global" => {
+                let list = crate::modules::qoder_accounts::list_all().ok()?;
+                return list
+                    .into_iter()
+                    .find(|a| a.id == ident && format!("qoder-{}", a.region.as_str()) == scope)
+                    .and_then(|a| a.access_token)
+                    .filter(|t| !t.trim().is_empty());
+            }
+            "wb-cn" | "wb-global" => {
+                let text = std::fs::read_to_string(
+                    crate::modules::config::store_dir().join("workbuddy-accounts.json"),
+                )
+                .ok()?;
+                let v: Value = serde_json::from_str(&text).ok()?;
+                return pick_wb_token(v.get("accounts")?.as_array()?, &ident);
+            }
+            _ => {}
+        }
+    }
+    token_of(scope)
 }
 
 /// 按作用域取一个可用的 bearer token。
@@ -1286,6 +1924,42 @@ fn token_of(scope: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 该换号的：限流 / 额度耗尽 / 凭据死 / 5xx / 传输失败。
+    #[test]
+    fn failover_on_account_level_errors() {
+        assert!(should_failover(429, "too many requests"));
+        assert!(should_failover(429, r#"{"code":6804,"msg":"您的使用量已超出频率限制"}"#));
+        assert!(should_failover(403, "quota exceeded"));
+        assert!(should_failover(401, "TOKEN_EXPIRE"));
+        assert!(should_failover(402, "balance"));
+        assert!(should_failover(503, "gateway"));
+        assert!(should_failover(0, "error sending request"));
+    }
+
+    /// 不该换号的：参数错（换了也一样错）、模型不存在、以及**排队**。
+    ///
+    /// 排队必须排除：10605 是全局排队，换号只会再排一次，白等一轮。
+    #[test]
+    fn no_failover_on_request_level_errors() {
+        assert!(!should_failover(400, "invalid request: messages[0].content"));
+        assert!(!should_failover(404, "model not found"));
+        assert!(!should_failover(200, r#"{"code":10605,"message":"CALL_COUNT_LIMIT"}"#));
+        assert!(!should_failover(401, r#"{"code":-1,"isQueued":true}"#));
+    }
+
+    /// 换号能不能真生效，取决于「挑 token 用的是 uid 还是作用域」。
+    #[test]
+    fn token_is_picked_by_uid_not_by_position() {
+        let accounts = vec![
+            json!({"uid": "u1", "access_token": "TOKEN-1"}),
+            json!({"uid": "u2", "access_token": "TOKEN-2"}),
+            json!({"uid": "u3", "access_token": "  "}),
+        ];
+        assert_eq!(pick_wb_token(&accounts, "u2").as_deref(), Some("TOKEN-2"));
+        assert_eq!(pick_wb_token(&accounts, "u3"), None, "空 token 不算可用");
+        assert_eq!(pick_wb_token(&accounts, "u9"), None, "不认识的 uid 不许退化成第一个");
+    }
 
     #[test]
     fn status_reports_not_running_before_start() {
@@ -1334,5 +2008,183 @@ mod selftest_probe {
             "模型数={:?}",
             v.pointer("/models/count").and_then(Value::as_u64)
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+
+    /// arguments 的三种真实形态：真分片 / 完整快照 / 重复旧值。
+    #[test]
+    fn merge_arguments_handles_all_three_shapes() {
+        // 真分片：`{"city":"` + `上海"}`
+        assert_eq!(
+            merge_arguments("{\"city\":\"", "上海\"}"),
+            "{\"city\":\"上海\"}"
+        );
+        // 快照扩展：用新的完整值，不能拼接
+        assert_eq!(
+            merge_arguments(r#"{"city":"上海"}"#, r#"{"city":"上海","n":1}"#),
+            r#"{"city":"上海","n":1}"#
+        );
+        // 重复发旧快照
+        assert_eq!(merge_arguments(r#"{"a":1}"#, r#"{"a""#), r#"{"a":1}"#);
+        assert_eq!(merge_arguments("", ""), "");
+    }
+
+    /// 2026-10-24 用户实测：Trae + DeepSeek 带 tools 时**正文为空、只有 tool_calls**，
+    /// 以前被当成「上游给了个空回答」直接 502。
+    #[test]
+    fn trae_tool_only_reply_is_not_an_empty_answer() {
+        let sse = concat!(
+            "id:1 event:output\n",
+            "id:1 data:{\"response\":\"\"}\n",
+            "id:1 data:{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"上海\\\"}\"}}]}\n",
+            "id:2 event:done\n",
+            "id:2 data:{\"finish_reason\":\"tool_calls\"}\n",
+        );
+        let v = aggregate_trae_sse(sse, "deepseek-v4-flash").expect("工具调用不能被当成空回答");
+        let msg = &v["choices"][0]["message"];
+        assert!(msg["content"].is_null(), "只有工具调用时 content 应为 null");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"上海"}"#
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// glm-5.2 的形态：正文有一句「我来帮你查一下」，finish_reason 是 tool_calls，
+    /// 工具调用分两片到达（`partial_arguments` 是完整快照）。
+    #[test]
+    fn trae_partial_arguments_snapshot_is_not_duplicated() {
+        let sse = concat!(
+            "id:1 event:output\n",
+            "id:1 data:{\"response\":\"我来帮你查一下。\"}\n",
+            "id:1 data:{\"tool_calls\":[{\"index\":0,\"id\":\"call_b\",\"function_call\":{\"name\":\"get_weather\",\"partial_arguments\":\"{\\\"city\\\":\"}}]}\n",
+            "id:1 data:{\"tool_calls\":[{\"index\":0,\"id\":\"call_b\",\"function_call\":{\"name\":\"get_weather\",\"partial_arguments\":\"{\\\"city\\\":\\\"上海\\\"}\"}}]}\n",
+            "id:2 event:done\n",
+            "id:2 data:{\"finish_reason\":\"tool_calls\"}\n",
+        );
+        let v = aggregate_trae_sse(sse, "glm-5.2").expect("有正文有工具调用应当成功");
+        let msg = &v["choices"][0]["message"];
+        assert_eq!(msg["content"], "我来帮你查一下。");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"上海"}"#,
+            "partial_arguments 是快照，拼起来会变成两段 JSON"
+        );
+        // `function_call` 必须换成 OpenAI 的 `function`
+        assert!(msg["tool_calls"][0].get("function_call").is_none());
+    }
+
+    /// 标准 OpenAI 上游：delta.tool_calls 真分片，必须按 index 拼回一次调用。
+    #[test]
+    fn openai_style_fragments_are_joined_by_index() {
+        let sse = concat!(
+            "data:{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n",
+            "data:{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n",
+            "data:{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"\"}}]}}]}\n",
+            "data:{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"上海\\\"}\"}}]}}]}\n",
+            "data:{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data:[DONE]\n",
+        );
+        let v = aggregate_sse(sse, "gpt-test").expect("分片工具调用应当聚合成功");
+        let calls = v["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "同一个 index 不能变成两次调用");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"city":"上海"}"#);
+        // 只有工具调用时 content 按标准给 null（空串会被部分客户端当成空回答）
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    /// 流式客户端要看到 tool_calls 与 `finish_reason: tool_calls`，否则永远等不到工具调用。
+    #[test]
+    fn streaming_chunk_carries_tool_calls_and_finish_reason() {
+        let completion = json!({
+            "id": "chatcmpl-1",
+            "model": "glm-5.2",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_x",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{\"city\":\"上海\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let body = sse_body(&completion);
+        assert!(body.contains("\"tool_calls\""), "{body}");
+        assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+    }
+
+    /// Qoder 把工具调用写在正文里（Claude 风格 XML）：要提成标准 tool_calls，
+    /// 并从正文里删掉，别让客户端把它当台词念出来。
+    #[test]
+    fn qoder_text_xml_becomes_real_tool_calls() {
+        let text = concat!(
+            "我先查一下天气。\n",
+            "<function_calls>\n",
+            "  <invoke name=\"get_weather\">\n",
+            "    <parameter name=\"city\">上海</parameter>\n",
+            "    <parameter name=\"days\">3</parameter>\n",
+            "  </invoke>\n",
+            "  <invoke name=\"get_time\">\n",
+            "    <parameter name=\"tz\">\"Asia/Shanghai\"</parameter>\n",
+            "  </invoke>\n",
+            "</function_calls>\n",
+        );
+        let (rest, calls) = lift_text_tool_calls(text);
+        assert_eq!(rest, "我先查一下天气。");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"city":"上海","days":3}"#
+        );
+        assert_eq!(
+            calls[1]["function"]["arguments"],
+            r#"{"tz":"Asia/Shanghai"}"#
+        );
+        // 每个调用都要有 id（客户端拿它回 tool 结果）
+        assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    /// 没闭合的块不能吞掉：宁可原样显示，也不能删用户内容。
+    #[test]
+    fn qoder_unclosed_block_is_left_alone() {
+        let text = "看这个 <function_calls> 后面没了";
+        let (rest, calls) = lift_text_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(rest, text);
+    }
+
+    /// 普通对话里出现 `<function_calls>` 字样但没有 invoke 时，不许改动返回。
+    #[test]
+    fn qoder_completion_without_invoke_is_untouched() {
+        let v = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "普通回答" }, "finish_reason": "stop" }]
+        });
+        let out = lift_qoder_tool_calls(v.clone());
+        assert_eq!(out, v);
+    }
+
+    /// 有工具调用但上游只给 `stop` 时，finish_reason 必须是 `tool_calls`。
+    #[test]
+    fn finish_reason_is_promoted_when_calls_exist() {
+        assert_eq!(finish_with_calls(Some("stop".into()), true), "tool_calls");
+        assert_eq!(finish_with_calls(None, true), "tool_calls");
+        assert_eq!(finish_with_calls(Some("stop".into()), false), "stop");
+        assert_eq!(finish_with_calls(Some("length".into()), true), "length");
     }
 }

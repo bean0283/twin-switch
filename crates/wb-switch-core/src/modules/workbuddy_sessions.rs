@@ -25,7 +25,9 @@
 //! 目标账号正在被客户端使用时写库，运行中的实例看不到写入，继续对话会让会话状态分叉。
 
 use crate::modules::config::{now_ms, store_dir};
-use crate::modules::{workbuddy_accounts, workbuddy_auth, workbuddy_source, workbuddy_switch};
+use crate::modules::{
+    workbuddy_accounts, workbuddy_auth, workbuddy_source, workbuddy_switch, workbuddy_vault,
+};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -688,6 +690,88 @@ pub fn copy_preview(source_uid: &str, target_uid: &str, ids: &[String]) -> Value
 ///
 /// 流程：只读校验 → 占用门禁 → 整份备份 → 逐个（新 UUID → 写正文 → INSERT 行 → 校验）
 /// → 登记关联 → 失败回滚本次写入。云端映射库始终不写。
+/// 复制计划里的一项：源会话 id / 标题 / 磁盘上的正文路径。
+pub(crate) struct CopyItem {
+    pub cid: String,
+    pub title: String,
+    pub src_path: PathBuf,
+}
+
+/// 把一批「源账号 → 目标账号」的会话副本写进库，并登记关联组。
+///
+/// ⚠️ **手动复制（[`copy_sessions`]）与一键互通（[`link_all`]）共用这一条路径**：
+/// 副本落盘、库行插入、归属校验、关联登记只要分叉，迟早出现「手动复制是对的、
+/// 一键互通写出了半截」这种说不清的事故。
+///
+/// `done_rows` / `done_files` 是**回滚账本**，由调用方持有并跨批次累加 ——
+/// 批量（多对账号）中途失败时能一次性撤掉本次全部写入。
+fn write_copies(
+    conn: &Connection,
+    store: &mut LinkStore,
+    source_uid: &str,
+    target_uid: &str,
+    plan: &[CopyItem],
+    now: i64,
+    done_rows: &mut Vec<String>,
+    done_files: &mut Vec<PathBuf>,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut copied: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for item in plan {
+        let cid = &item.cid;
+        let src_row = read_source_row(conn, cid)?
+            .ok_or_else(|| format!("会话 {cid} 在库里没有对应行"))?;
+        // 已建立过关联（目标账号已有副本）→ 跳过，不制造第二个副本。
+        //
+        // ⚠️ **不看副本存活与否**：那个副本被用户在目标账号里删掉了，也是「有成员」。
+        //    自动补回来等于「删除等于没删」（与自动导入的墓碑是同一个教训）。
+        if let Some(existing) = find_group_for(store, source_uid, cid)
+            .and_then(|g| member_for(g, target_uid))
+            .map(|m| m.session_id.clone())
+        {
+            skipped.push(json!({
+                "id": cid, "title": item.title, "reason": "目标账号已有副本",
+                "targetSessionId": existing,
+            }));
+            continue;
+        }
+        let new_cid = uuid::Uuid::new_v4().to_string();
+        let dest = target_body_path(&item.src_path, &new_cid);
+        if dest.exists() {
+            return Err(format!("目标正文已存在同名文件，已停止复制：{}", dest.display()));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("目标工作区目录创建失败: {e}"))?;
+        }
+        let text =
+            std::fs::read_to_string(&item.src_path).map_err(|e| format!("读取源正文失败: {e}"))?;
+        let text = replace_session_id(&text, cid, &new_cid);
+        std::fs::write(&dest, text.as_bytes())
+            .map_err(|e| format!("写入副本正文失败: {e}"))?;
+        done_files.push(dest.clone());
+        insert_copy_row(conn, &src_row, &new_cid, target_uid, now)?;
+        done_rows.push(new_cid.clone());
+        // 写后校验：新行必须存在、归属目标账号、未删除。
+        match row_owner(conn, &new_cid) {
+            Some(owner) if owner == target_uid => {}
+            Some(owner) => {
+                return Err(format!("副本归属校验失败：期望 {target_uid}，实际 {owner}"))
+            }
+            None => return Err("副本写入后不可见，未按成功处理".to_string()),
+        }
+        let group_id = upsert_group(store, source_uid, cid, target_uid, &new_cid, now);
+        copied.push(json!({
+            "sourceId": cid,
+            "targetId": new_cid,
+            "title": item.title,
+            "bodyPath": dest.to_string_lossy(),
+            "groupId": group_id,
+        }));
+    }
+    Ok((copied, skipped))
+}
+
 pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Result<Value, String> {
     if source_uid.trim().is_empty() || target_uid.trim().is_empty() {
         return Err("源账号或目标账号缺少 uid，无法复制会话".to_string());
@@ -708,7 +792,7 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
     if !table_exists(&snap_conn, "sessions") {
         return Err("会话库里没有 sessions 表".to_string());
     }
-    let mut plan: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut plan: Vec<CopyItem> = Vec::new();
     for cid in ids {
         let row = all
             .iter()
@@ -736,7 +820,11 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
         {
             return Err(format!("会话 {cid} 的归属与源账号不一致，未做任何改动"));
         }
-        plan.push((cid.clone(), row.title.clone(), path));
+        plan.push(CopyItem {
+            cid: cid.clone(),
+            title: row.title.clone(),
+            src_path: path,
+        });
         let _ = src_row; // 写入时从真实库重读，避免快照与实时库不一致
     }
     drop(snap_conn);
@@ -755,74 +843,41 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
     let conn = open_rw(&db)?;
     let mut done_rows: Vec<String> = Vec::new();
     let mut done_files: Vec<PathBuf> = Vec::new();
-    let mut copied: Vec<Value> = Vec::new();
-    let mut skipped: Vec<Value> = Vec::new();
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<(Vec<Value>, Vec<Value>), String> {
         let mut store = load_links().unwrap_or_default();
-        for (cid, title, src_path) in &plan {
-            let src_row = read_source_row(&conn, cid)?
-                .ok_or_else(|| format!("会话 {cid} 在库里没有对应行"))?;
-            // 已建立过关联（目标账号已有副本）→ 跳过，不制造第二个副本。
-            if let Some(existing) = find_group_for(&store, source_uid, cid)
-                .and_then(|g| member_for(g, target_uid))
-                .map(|m| m.session_id.clone())
-            {
-                skipped.push(json!({
-                    "id": cid, "title": title, "reason": "目标账号已有副本",
-                    "targetSessionId": existing,
-                }));
-                continue;
-            }
-            let new_cid = uuid::Uuid::new_v4().to_string();
-            let dest = target_body_path(src_path, &new_cid);
-            if dest.exists() {
-                return Err(format!("目标正文已存在同名文件，已停止复制：{}", dest.display()));
-            }
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("目标工作区目录创建失败: {e}"))?;
-            }
-            let text = std::fs::read_to_string(src_path)
-                .map_err(|e| format!("读取源正文失败: {e}"))?;
-            let text = replace_session_id(&text, cid, &new_cid);
-            std::fs::write(&dest, text.as_bytes())
-                .map_err(|e| format!("写入副本正文失败: {e}"))?;
-            done_files.push(dest.clone());
-            insert_copy_row(&conn, &src_row, &new_cid, target_uid, now)?;
-            done_rows.push(new_cid.clone());
-            // 写后校验：新行必须存在、归属目标账号、未删除。
-            match row_owner(&conn, &new_cid) {
-                Some(owner) if owner == target_uid => {}
-                Some(owner) => {
-                    return Err(format!("副本归属校验失败：期望 {target_uid}，实际 {owner}"))
-                }
-                None => return Err("副本写入后不可见，未按成功处理".to_string()),
-            }
-            let group_id = upsert_group(&mut store, source_uid, cid, target_uid, &new_cid, now);
-            copied.push(json!({
-                "sourceId": cid,
-                "targetId": new_cid,
-                "title": title,
-                "bodyPath": dest.to_string_lossy(),
-                "groupId": group_id,
-            }));
-        }
+        let out = write_copies(
+            &conn,
+            &mut store,
+            source_uid,
+            target_uid,
+            &plan,
+            now,
+            &mut done_rows,
+            &mut done_files,
+        )?;
         save_links(&store)?;
-        Ok(())
+        Ok(out)
     })();
 
-    if let Err(e) = result {
-        // 回滚：只撤销本次写入（删新行 + 删新正文），备份保留供人工恢复。
-        let mut rolled: Vec<String> = Vec::new();
-        for cid in &done_rows {
-            let _ = conn.execute("DELETE FROM sessions WHERE id = ?1", [cid]);
-            rolled.push(cid.clone());
+    let (copied, skipped) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            // 回滚：只撤销本次写入（删新行 + 删新正文），备份保留供人工恢复。
+            let mut rolled: Vec<String> = Vec::new();
+            for cid in &done_rows {
+                let _ = conn.execute("DELETE FROM sessions WHERE id = ?1", [cid]);
+                rolled.push(cid.clone());
+            }
+            for f in &done_files {
+                let _ = std::fs::remove_file(f);
+            }
+            return Err(format!(
+                "{e}（已回滚本次复制的 {} 条新记录，备份保留在 {}）",
+                rolled.len(),
+                backup.display()
+            ));
         }
-        for f in &done_files {
-            let _ = std::fs::remove_file(f);
-        }
-        return Err(format!("{e}（已回滚本次复制的 {} 条新记录，备份保留在 {}）", rolled.len(), backup.display()));
-    }
+    };
 
     Ok(json!({
         "ok": true,
@@ -874,7 +929,7 @@ fn links_file() -> PathBuf {
 }
 
 /// 读关联存储；损坏时返回 Err（绝不降级成空表——那样会制造第二个副本）。
-fn load_links() -> Result<LinkStore, String> {
+pub(crate) fn load_links() -> Result<LinkStore, String> {
     let path = links_file();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -893,7 +948,7 @@ fn load_links() -> Result<LinkStore, String> {
     Ok(store)
 }
 
-fn save_links(store: &LinkStore) -> Result<(), String> {
+pub(crate) fn save_links(store: &LinkStore) -> Result<(), String> {
     let path = links_file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建关联存储目录失败: {e}"))?;
@@ -920,7 +975,7 @@ fn member_for<'a>(group: &'a LinkGroup, uid: &str) -> Option<&'a LinkMember> {
 ///
 /// 源会话已有组 → 复用组并替换目标账号的旧成员；否则新建组。
 /// 返回组 id。
-fn upsert_group(
+pub(crate) fn upsert_group(
     store: &mut LinkStore,
     source_uid: &str,
     source_cid: &str,
@@ -1031,6 +1086,408 @@ pub fn links_preview(source_uid: &str, target_uid: &str) -> Value {
         "count": groups.len(),
         "groups": groups,
         "storePath": links_file().to_string_lossy(),
+    })
+}
+
+/// 一键互通的参数。
+#[derive(Debug, Clone, Copy)]
+pub struct LinkOptions {
+    /// 客户端正在运行就拒绝（界面入口 `true`；切号流程 `false`，那时已确认退出）。
+    pub require_closed: bool,
+    /// 是否**复制**缺失副本。`false` = 只登记已有副本（0 字节、完全不碰会话库）。
+    pub copy_missing: bool,
+    /// 只复制这个时刻之后**创建**的会话（`0` = 不限制）。切号自动同步用它做增量。
+    pub since: i64,
+}
+
+/// 关联组成员登记：目标账号**已有同一段对话的副本**，只需登记，不必复制。
+pub(crate) struct LinkAdopt {
+    pub src_uid: String,
+    pub src_cid: String,
+    pub tgt_uid: String,
+    pub tgt_cid: String,
+}
+
+/// 一键互通的目标账号集合 —— [`link_all`] 与 [`link_all_preview`] **同源**。
+///
+/// 只认账号库里**未禁用**的账号：用户删掉 / 停用的账号不该再被写入数据。
+/// 一个可用的都没有时退回「会话库里出现过的 uid」，至少别把功能说成不可用。
+fn link_target_uids(all: &[workbuddy_source::WbSession]) -> Vec<String> {
+    let mut uids: Vec<String> = Vec::new();
+    for acc in workbuddy_vault::load_accounts() {
+        if acc.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(uid) = workbuddy_auth::get_str(&acc, "uid") {
+            if !uid.trim().is_empty() {
+                uids.push(uid);
+            }
+        }
+    }
+    if uids.len() < 2 {
+        uids = all
+            .iter()
+            .filter(|s| !s.deleted && !s.user_id.is_empty())
+            .map(|s| s.user_id.clone())
+            .collect();
+    }
+    uids.sort();
+    uids.dedup();
+    uids
+}
+
+/// 复制计划：`(源账号, 目标账号) → 要复制过去的会话`。
+pub(crate) type LinkPlan = std::collections::BTreeMap<(String, String), Vec<CopyItem>>;
+
+/// 算出「谁复制给谁、谁只需登记」—— **纯逻辑**（正文是否存在由 `body_of` 注入），
+/// 单测因此不用碰磁盘。
+///
+/// `alive` 必须是**按 `updated_at` 倒序**的：同一段对话有多份副本时让最新的先当锚点，
+/// 由它去 adopt 旧副本。顺序反了，关联组就会挂到旧副本上。
+///
+/// 返回 `(复制计划, 只登记项, 无正文数, 已有同内容副本而跳过数)`。
+fn plan_links(
+    alive: &[&workbuddy_source::WbSession],
+    uids: &[String],
+    store: &LinkStore,
+    since: i64,
+    body_of: impl Fn(&str) -> Option<PathBuf>,
+) -> (LinkPlan, Vec<LinkAdopt>, usize, usize) {
+    let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut consumed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut plan: LinkPlan = std::collections::BTreeMap::new();
+    let mut adopts: Vec<LinkAdopt> = Vec::new();
+    let mut no_body = 0usize;
+    let mut already_there = 0usize;
+
+    for s in alive {
+        // 已经被别的副本 adopt 掉 → 它已经是组员，不再当源（否则会互相复制一轮）。
+        if consumed.contains(&(s.user_id.clone(), s.id.clone())) {
+            continue;
+        }
+        let group: Option<(String, std::collections::HashSet<String>)> =
+            find_group_for(store, &s.user_id, &s.id).map(|g| {
+                (
+                    g.id.clone(),
+                    g.members.iter().map(|m| m.uid.clone()).collect(),
+                )
+            });
+        // 没正文的会话复制不了（复制只搬正文 + 库行）：跳过，但要如实计数。
+        let Some(src_path) = body_of(&s.id) else {
+            no_body += 1;
+            continue;
+        };
+        // 同一组只处理一次（组里每个成员都会被遍历到）。
+        if let Some((gid, _)) = &group {
+            if !handled.insert(gid.clone()) {
+                continue;
+            }
+        }
+        let existing = group.map(|(_, m)| m).unwrap_or_default();
+        // 增量模式（`since > 0`）：更早创建的会话**不复制**，但下面仍会做 0 成本的登记。
+        // 用 `created_at` 而不是 `updated_at`：一边聊一边更新的老会话不该每次都被重搬一遍。
+        let too_old = since > 0 && s.created_at <= since;
+        for u in uids {
+            if *u == s.user_id || existing.contains(u) {
+                continue;
+            }
+            // ★ 目标账号里已经有**同一段对话**（同标题 + 同内容摘要）→ 只登记组关系，不复制。
+            //
+            // 少了这一步，历史上手动复制过的那批会话会被再复制一份：每点一次多一批，
+            // 越点越乱。`content_digest` 是项目里既有的「同一段对话」判据
+            // （归一化时把副本自己的会话 id 换成固定标记，于是副本之间摘要相同）。
+            let twin = alive.iter().find(|o| {
+                o.user_id == *u
+                    && o.id != s.id
+                    && !s.content_digest.is_empty()
+                    && o.content_digest == s.content_digest
+                    && o.title == s.title
+            });
+            if let Some(t) = twin {
+                // ⚠️ 那个副本若已经属于**别的**关联组，不抢过来（否则同一个会话会挂在两个组里）。
+                //    它本来就有这段对话的内容，跳过是安全的。
+                if find_group_for(store, &t.user_id, &t.id).is_some() {
+                    already_there += 1;
+                    continue;
+                }
+                consumed.insert((t.user_id.clone(), t.id.clone()));
+                adopts.push(LinkAdopt {
+                    src_uid: s.user_id.clone(),
+                    src_cid: s.id.clone(),
+                    tgt_uid: u.clone(),
+                    tgt_cid: t.id.clone(),
+                });
+                continue;
+            }
+            if too_old {
+                continue;
+            }
+            plan.entry((s.user_id.clone(), u.clone()))
+                .or_default()
+                .push(CopyItem {
+                    cid: s.id.clone(),
+                    title: s.title.clone(),
+                    src_path: src_path.clone(),
+                });
+        }
+    }
+    (plan, adopts, no_body, already_there)
+}
+
+/// 一键互通：把**每个存活会话补齐到其它所有账号**，并登记成关联组。
+///
+/// ## 语义（这是「互相关联」的唯一解释）
+///
+/// 关联组是「同一段对话在各账号上的副本」。所以要把本机所有会话都做成关联，
+/// 只能靠**复制**：每个会话在别处不存在副本，就补一份过去。跑完之后任意账号
+/// 都能看到本机的全部会话，且每一段对话在各账号上被同一组关系统起来。
+///
+/// ## 幂等 / 可反复跑
+///
+/// - 目标账号已是该组员 ⇒ 跳过（`write_copies` 的既有判据），不会造第二个副本。
+/// - 副本被用户在目标账号里**删掉**了 ⇒ 仍是组员，**不复活**（否则「删除等于没删」）。
+/// - 因此：新会话会被补上、已同步的不会被重复复制，切号后自动跑一次是安全的。
+///
+/// ## `require_closed`
+///
+/// 界面入口传 `true`：客户端在跑就**拒绝**写库（正在写的库不能从外面改）。
+/// 切号流程传 `false`：调用点已经 `quit_client` 确认进程退出，且马上要重新启动。
+///
+/// ## 事务边界
+///
+/// 整批只做**一次**整库备份、一次 `save_links`；任何一步失败按回滚账本
+/// （`done_rows` / `done_files`）撤掉本次**全部**写入 —— 不会留下「复制了一半」的
+/// 账号组合，也不会留下指向不存在副本的关联成员。
+pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
+    let db = db_path();
+    assert_not_edge_sync(&db)?;
+    if opt.require_closed && workbuddy_switch::is_running() {
+        return Err(
+            "WorkBuddy 正在运行，一键互通要写会话库。请先退出 WorkBuddy 再操作\
+             （用本工具切换账号时会自动关它，那一步不需要你手动退出）。"
+                .to_string(),
+        );
+    }
+
+    let all = workbuddy_source::list_sessions()?;
+
+    let uids = link_target_uids(&all);
+    if uids.len() < 2 {
+        return Ok(json!({
+            "ok": true,
+            "notNeeded": true,
+            "reason": "只有一个账号，没有可互通的对方",
+            "accounts": uids,
+        }));
+    }
+
+    // 计划：按「最新更新的会话优先」当源 —— 同一组里哪个副本内容最新，就用它补给别人。
+    let mut alive: Vec<_> = all
+        .iter()
+        .filter(|s| !s.deleted && !s.user_id.is_empty())
+        .collect();
+    alive.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut store = load_links()?;
+    let (mut plan, adopts, no_body, already_there) =
+        plan_links(&alive, &uids, &store, opt.since, workbuddy_source::find_jsonl);
+    // 「只登记已有副本」模式：计划出来的复制项一律丢掉（0 字节、不碰会话库）。
+    if !opt.copy_missing {
+        plan.clear();
+    }
+    let mode = if !opt.copy_missing {
+        "adoptOnly"
+    } else if opt.since > 0 {
+        "incremental"
+    } else {
+        "copy"
+    };
+
+    let planned: usize = plan.values().map(|v| v.len()).sum();
+    if planned == 0 {
+        // 只有「登记组关系」，没有复制 → 完全不碰会话库，也不需要备份。
+        if !adopts.is_empty() {
+            for a in &adopts {
+                upsert_group(
+                    &mut store,
+                    &a.src_uid,
+                    &a.src_cid,
+                    &a.tgt_uid,
+                    &a.tgt_cid,
+                    now_ms(),
+                );
+            }
+            save_links(&store)?;
+        }
+        return Ok(json!({
+            "ok": true,
+            "mode": mode,
+            "notNeeded": adopts.is_empty(),
+            "copied": 0,
+            "adopted": adopts.len(),
+            "planned": 0,
+            "accounts": uids,
+            "noBody": no_body,
+            "alreadyThere": already_there,
+            "reason": if adopts.is_empty() {
+                if !opt.copy_missing {
+                    "没有发现「同一段对话在两处各有一份」的副本，无需登记".to_string()
+                } else if opt.since > 0 {
+                    "没有需要同步的新会话（自动同步只搬新产生的会话）".to_string()
+                } else {
+                    "所有会话都已在各账号之间关联，没有需要补的".to_string()
+                }
+            } else {
+                format!("已登记 {} 组关联，未复制新副本", adopts.len())
+            },
+            "storePath": links_file().to_string_lossy(),
+        }));
+    }
+
+    let backup = backup_db("link-all")?;
+    let conn = open_rw(&db)?;
+    let now = now_ms();
+    let mut done_rows: Vec<String> = Vec::new();
+    let mut done_files: Vec<PathBuf> = Vec::new();
+    let mut copied: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut per_target: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let result = (|| -> Result<(), String> {
+        // 先落「只登记」的那批：它们本来就有副本，登记完就不用再复制。
+        // 这里只改内存里的 store，`save_links` 失败时连同复制一起整体作废。
+        for a in &adopts {
+            upsert_group(
+                &mut store,
+                &a.src_uid,
+                &a.src_cid,
+                &a.tgt_uid,
+                &a.tgt_cid,
+                now,
+            );
+        }
+        for ((src, dst), items) in &plan {
+            let (c, s) = write_copies(
+                &conn,
+                &mut store,
+                src,
+                dst,
+                items,
+                now,
+                &mut done_rows,
+                &mut done_files,
+            )?;
+            // 先计数再 move（`extend` 会把 c 吃掉）。
+            *per_target.entry(dst.clone()).or_insert(0) += c.len();
+            copied.extend(c);
+            skipped.extend(s);
+        }
+        save_links(&store)?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let mut rolled = 0usize;
+        for cid in &done_rows {
+            let _ = conn.execute("DELETE FROM sessions WHERE id = ?1", [cid]);
+            rolled += 1;
+        }
+        for f in &done_files {
+            let _ = std::fs::remove_file(f);
+        }
+        return Err(format!(
+            "{e}（已回滚本次互通的 {} 条新记录，备份保留在 {}）",
+            rolled,
+            backup.display()
+        ));
+    }
+
+    let by_target: Vec<Value> = per_target
+        .iter()
+        .map(|(uid, n)| {
+            json!({ "uid": uid, "label": workbuddy_accounts::label_for(uid), "count": n })
+        })
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "mode": mode,
+        "copied": copied.len(),
+        "adopted": adopts.len(),
+        "planned": planned,
+        "accounts": uids,
+        "byTarget": by_target,
+        "skipped": skipped.len(),
+        "noBody": no_body,
+        "alreadyThere": already_there,
+        "backup": backup.to_string_lossy(),
+        "edgeSyncSkipped": edge_sync_databases(),
+        "storePath": links_file().to_string_lossy(),
+        "note": "复制的是会话副本，原会话不受影响；云端映射库未做任何写入",
+    }))
+}
+
+/// 一键互通的**只读预览**：与 [`link_all`] 共用 [`plan_links`] 与 [`link_target_uids`]，
+/// 所以「预览说要复制 N 个」和「真跑复制 N 个」不可能对不上（同屏两个数字必须同源）。
+///
+/// 只读：不写库、不写关联记录、不备份。
+pub fn link_all_preview() -> Value {
+    let all = match workbuddy_source::list_sessions() {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let uids = link_target_uids(&all);
+    if uids.len() < 2 {
+        return json!({
+            "ok": true,
+            "accounts": uids,
+            "planned": 0,
+            "adopted": 0,
+            "reason": "只有一个账号，没有可互通的对方",
+            "clientRunning": workbuddy_switch::is_running(),
+        });
+    }
+    let mut alive: Vec<_> = all
+        .iter()
+        .filter(|s| !s.deleted && !s.user_id.is_empty())
+        .collect();
+    alive.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let store = match load_links() {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let (plan, adopts, no_body, already_there) =
+        plan_links(&alive, &uids, &store, 0, workbuddy_source::find_jsonl);
+
+    let mut per_target: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut total_bytes: u64 = 0;
+    for ((_src, dst), items) in &plan {
+        *per_target.entry(dst.clone()).or_insert(0) += items.len();
+        for i in items {
+            total_bytes += all
+                .iter()
+                .find(|s| s.id == i.cid)
+                .map(|s| s.body_bytes)
+                .unwrap_or(0);
+        }
+    }
+    let by_target: Vec<Value> = per_target
+        .iter()
+        .map(|(uid, n)| json!({ "uid": uid, "label": workbuddy_accounts::label_for(uid), "count": n }))
+        .collect();
+
+    json!({
+        "ok": true,
+        "accounts": uids,
+        "planned": plan.values().map(|v| v.len()).sum::<usize>(),
+        "adopted": adopts.len(),
+        "noBody": no_body,
+        "alreadyThere": already_there,
+        "totalBytes": total_bytes,
+        "byTarget": by_target,
+        // 客户端在跑时按钮要提示「先退出」——这是唯一会被后端直接拒掉的情况。
+        "clientRunning": workbuddy_switch::is_running(),
     })
 }
 
@@ -1232,5 +1689,112 @@ mod tests {
         assert!(find_group_for(&back, "u1", "nope").is_none());
         assert_eq!(member_for(&back.groups[0], "u2").unwrap().session_id, "s2");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── 一键互通（全账号互相关联）的计划逻辑 ────────────────────────────────
+
+    fn ws(
+        id: &str,
+        uid: &str,
+        title: &str,
+        digest: &str,
+        updated: i64,
+    ) -> workbuddy_source::WbSession {
+        workbuddy_source::WbSession {
+            id: id.to_string(),
+            title: title.to_string(),
+            cwd: "D:/p".to_string(),
+            user_id: uid.to_string(),
+            created_at: 1,
+            updated_at: updated,
+            model: "m".to_string(),
+            deleted: false,
+            has_body: true,
+            body_bytes: 10,
+            body_lines: 1,
+            content_digest: digest.to_string(),
+            dup_group: String::new(),
+            is_newest: true,
+            dup_note: String::new(),
+            dup_relation: String::new(),
+        }
+    }
+
+    /// 核心判据：**已有同内容副本的账号只登记、不复制**，且那个副本不再当源。
+    ///
+    /// 少了这条，历史手动复制过的那批会话会被一键再复制一轮 —— 点几次多几批。
+    #[test]
+    fn link_plan_adopts_existing_twin_instead_of_copying_again() {
+        let uids: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+        // 同一段对话：A 上是最新副本，B 上是旧副本（都没登记过关联）。
+        let a1 = ws("s-a1", "A", "方案讨论", "deadbeefdeadbeef", 300);
+        let b1 = ws("s-b1", "B", "方案讨论", "deadbeefdeadbeef", 200);
+        // 另一段对话，只有 C 有。
+        let c1 = ws("s-c1", "C", "别的会话", "cafecafecafecafe", 100);
+        let alive = vec![&a1, &b1, &c1]; // 已按 updated_at 倒序
+
+        let store = LinkStore::default();
+        let (plan, adopts, no_body, already) =
+            plan_links(&alive, &uids, &store, 0, |_| Some(PathBuf::from("x.jsonl")));
+
+        assert_eq!(no_body, 0);
+        assert_eq!(already, 0);
+        assert_eq!(adopts.len(), 1, "B 上的同内容副本应当被登记，而不是复制");
+        assert_eq!(adopts[0].tgt_uid, "B");
+        assert_eq!(adopts[0].tgt_cid, "s-b1");
+
+        let flat: Vec<String> = plan
+            .iter()
+            .flat_map(|((s, d), v)| v.iter().map(move |i| format!("{s}->{d}:{}", i.cid)))
+            .collect();
+        assert!(
+            !flat.iter().any(|x| x.starts_with("B->")),
+            "被登记掉的副本不该再当源，否则会反向复制一轮：{flat:?}"
+        );
+        assert!(flat.contains(&"A->C:s-a1".to_string()), "A 的会话要补给 C");
+        assert!(flat.contains(&"C->A:s-c1".to_string()), "C 的会话要补给 A");
+        assert!(flat.contains(&"C->B:s-c1".to_string()), "C 的会话要补给 B");
+        assert_eq!(flat.len(), 3, "只有真正缺副本的三条：{flat:?}");
+    }
+
+    /// 已经在同一关联组里的账号不再重复计划（幂等：反复点不会膨胀）。
+    #[test]
+    fn link_plan_skips_accounts_already_in_the_group() {
+        let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let a1 = ws("s-a1", "A", "t", "", 200);
+        let b1 = ws("s-b1", "B", "t", "", 100);
+        let store = LinkStore {
+            version: LINK_STORE_VERSION,
+            groups: vec![LinkGroup {
+                id: "g1".to_string(),
+                created_at: 1,
+                members: vec![
+                    LinkMember {
+                        uid: "A".to_string(),
+                        session_id: "s-a1".to_string(),
+                        linked_at: 1,
+                    },
+                    LinkMember {
+                        uid: "B".to_string(),
+                        session_id: "s-b1".to_string(),
+                        linked_at: 1,
+                    },
+                ],
+            }],
+        };
+        let (plan, adopts, _, _) =
+            plan_links(&[&a1, &b1], &uids, &store, 0, |_| Some(PathBuf::from("x.jsonl")));
+        assert!(plan.is_empty(), "两个账号都已在组里，不该再复制");
+        assert!(adopts.is_empty());
+    }
+
+    /// 没有正文文件的会话搬不过去：跳过并如实计数（不许假装成功）。
+    #[test]
+    fn link_plan_counts_sessions_without_body() {
+        let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let a1 = ws("s-a1", "A", "t", "", 100);
+        let (plan, _, no_body, _) = plan_links(&[&a1], &uids, &LinkStore::default(), 0, |_| None);
+        assert_eq!(no_body, 1);
+        assert!(plan.is_empty());
     }
 }

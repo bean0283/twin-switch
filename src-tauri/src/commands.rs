@@ -462,6 +462,13 @@ pub async fn trae_export_account(client_key: String, account_id: String) -> Resu
         .map_err(|e| e.to_string())?
 }
 
+/// 导出**账号包**（写盘版）：把该客户端下所有账号打进一个自包含 JSON 存到磁盘，
+/// 返回文件路径 —— 前端拿它去 `reveal_path` 定位，用户不用自己找下载目录。
+#[tauri::command]
+pub async fn trae_export_pack(client_key: String) -> Result<Value, String> {
+    off_main(move || trae_vault::export_pack(&client_key)).await?
+}
+
 /// 导入账号备份（自包含 JSON，preferName 可选覆盖账号名）。
 #[tauri::command]
 pub async fn trae_import_account(client_key: String, payload: Value, prefer_name: Option<String>) -> Result<Value, String> {
@@ -1028,8 +1035,12 @@ pub struct SettingsPatch {
     pub trae_exe: Option<std::collections::HashMap<String, String>>,
     /// 手动指定的 WorkBuddy 主程序路径（`None` = 不改；空串 = 恢复自动探测）。
     pub workbuddy_exe: Option<String>,
+    /// 手动指定的 Qoder 主程序路径（`区域(cn|global) → 绝对路径`，**整表覆盖**）。
+    pub qoder_exe: Option<std::collections::HashMap<String, String>>,
     /// 切号时是否把 WorkBuddy 的定时任务同步给新账号（`None` = 不改）。
     pub sync_workbuddy_automations: Option<bool>,
+    /// 切号时是否把 WorkBuddy 的会话自动同步给所有账号（`None` = 不改）。
+    pub auto_link_workbuddy_sessions: Option<bool>,
 }
 
 /// 设置快照的**唯一出口** —— `settings_get` 与 `settings_set` 都返回它的形状。
@@ -1049,6 +1060,8 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         "backupBeforeWrite": s.backup_before_write,
         // 切号是否同步定时任务（WorkBuddy 的 automations 按 owner_user_id 归属）。
         "syncWorkbuddyAutomations": s.sync_workbuddy_automations,
+        // 切号是否把会话自动同步给所有账号（写会话库，默认关）。
+        "autoLinkWorkbuddySessions": s.auto_link_workbuddy_sessions,
         "beforeWriteSummary": if s.backup_before_write {
             "开启 —— 每次写库前留一份备份（页级增量，只存变动页，通常几 MB）"
         } else {
@@ -1058,6 +1071,7 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         // 手动指定的主程序路径（前端拿它渲染「已指定 / 自动探测」两种状态）。
         "traeExe": s.trae_exe,
         "workbuddyExe": s.workbuddy_exe,
+        "qoderExe": s.qoder_exe,
         // 自动探测到的 WorkBuddy 主程序（界面在「没手动指定」时显示这一条）。
         // 与真正启动时用的是**同一个出口**，不会出现「显示 A、启动 B」。
         "workbuddyDetected": workbuddy_switch::resolve_exe()
@@ -1104,6 +1118,9 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         if let Some(v) = patch.sync_workbuddy_automations {
             next.sync_workbuddy_automations = v;
         }
+        if let Some(v) = patch.auto_link_workbuddy_sessions {
+            next.auto_link_workbuddy_sessions = v;
+        }
         if let Some(m) = patch.trae_exe {
             // ⚠️ 存之前先校验：一个不存在的路径存进去，等于把「找不到主程序」
             //    换成「找到但启动失败」，错误更难懂。空串视为「清除这一项」。
@@ -1141,6 +1158,45 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
                 }
                 next.workbuddy_exe = v;
             }
+        }
+        if let Some(m) = patch.qoder_exe {
+            // ⚠️ 按区域校验程序名：Qoder 两个区域的 exe 名字不同
+            //    （国内 `Qoder CN.exe` / 国际 `Qoder.exe`），跨区填进来会让
+            //    「切换国内版」去启动国际版 —— 与 MEMORY 里「不许跨区兜底」同一条纪律。
+            let mut clean: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (k, v) in m {
+                let v = v.trim().to_string();
+                if v.is_empty() {
+                    continue;
+                }
+                let region = qoder_realm::QoderRegion::parse(&k)
+                    .ok_or_else(|| format!("未知的 Qoder 区域：{k}（只支持 cn / global）"))?;
+                let p = std::path::Path::new(&v);
+                if !p.is_file() {
+                    return Err(format!("这个路径不是一个文件：{v}"));
+                }
+                if !v.to_ascii_lowercase().ends_with(".exe") {
+                    return Err(format!("请选择 Qoder 的主程序（.exe），当前是：{v}"));
+                }
+                let file = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                let looks_cn = file.contains("cn");
+                if region == qoder_realm::QoderRegion::Cn && !looks_cn {
+                    return Err(format!(
+                        "国内版的主程序叫 `Qoder CN.exe`，选中的是 {file} —— 看起来是另一个版本"
+                    ));
+                }
+                if region == qoder_realm::QoderRegion::Global && looks_cn {
+                    return Err(format!(
+                        "国际版的主程序叫 `Qoder.exe`，选中的是 {file} —— 看起来是国内版"
+                    ));
+                }
+                clean.insert(region.as_str().to_string(), v);
+            }
+            next.qoder_exe = clean;
         }
         let path = settings::save(&next)?;
         // 回读一次：把「实际落盘的值」返回给界面，而不是「用户刚提交的值」
@@ -1202,6 +1258,47 @@ pub async fn workbuddy_exe_from_running() -> Result<Value, String> {
             "WorkBuddy 现在没有在运行。请先打开它，或直接粘贴它的主程序路径（右键桌面快捷方式 → 打开文件所在位置）。"
                 .to_string(),
         )
+    })
+    .await?
+}
+
+/// 取「正在运行的 Qoder」的主程序路径（设置页的「用运行中的」）。
+///
+/// ⚠️ 只认**本区域**的进程名：国内 `Qoder CN.exe`、国际 `Qoder.exe`。
+/// 两个版本可以同时开着，拿另一个版本的路径填进来会让切换去启动错的客户端。
+#[tauri::command]
+pub async fn qoder_exe_from_running(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域（只支持 cn / global）")?;
+    off_main(move || {
+        let want: Vec<String> = match r {
+            qoder_realm::QoderRegion::Cn => {
+                vec!["Qoder CN.exe".to_string(), "Qoder CN Launcher.exe".to_string()]
+            }
+            qoder_realm::QoderRegion::Global => {
+                vec!["Qoder.exe".to_string(), "Qoder Launcher.exe".to_string()]
+            }
+        };
+        for p in wb_switch_core::modules::process_list::find_by_names_ex(&want) {
+            let Some(exe) = wb_switch_core::modules::process_list::exe_path_of_pid(p.pid) else {
+                continue;
+            };
+            if exe.is_file() {
+                // 启动器（`*Launcher.exe`）不是主程序，跳过 —— 填它只会多开一个壳。
+                let name = exe
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if name.contains("launcher") {
+                    continue;
+                }
+                return Ok(json!({ "ok": true, "region": r.as_str(), "path": exe.to_string_lossy() }));
+            }
+        }
+        Err(format!(
+            "{} 现在没有在运行。请先打开它，或直接粘贴主程序路径（默认在 `%LOCALAPPDATA%\\Programs\\{}` 下）。",
+            r.display_name(),
+            if r == qoder_realm::QoderRegion::Cn { "Qoder CN" } else { "Qoder" }
+        ))
     })
     .await?
 }
@@ -1817,6 +1914,16 @@ pub async fn workbuddy_export_accounts() -> Value {
         .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
 }
 
+/// 导出**账号包**（写盘版）：与 Trae / Qoder 同一个交互 —— 先落到磁盘，
+/// 再把路径返回给前端去资源管理器里定位。
+///
+/// ⚠️ 以前是前端拼 Blob 让浏览器下载：落点由 WebView 决定，用户拿完不知道文件在哪，
+/// 也没有路径可以「打开给我看」。
+#[tauri::command]
+pub async fn workbuddy_export_pack() -> Result<Value, String> {
+    off_main(workbuddy_vault::export_pack).await?
+}
+
 /// 导入账号包预览（只读，不写库）。
 #[tauri::command]
 pub async fn workbuddy_preview_import(payload: Value) -> Result<Value, String> {
@@ -1934,12 +2041,150 @@ pub async fn workbuddy_session_copy(
     .map_err(|e| format!("复制任务失败: {e}"))?
 }
 
+/// WorkBuddy：一键把本机所有会话互通到所有账号（补齐缺失副本 + 登记关联组）。
+///
+/// ⚠️ 这是**重操作**：实测本机一次可能复制几十个副本、几个 GB。界面必须先给预览数字
+/// 并让用户确认，再调这里（`link_all_preview` 与它同源）。
+#[tauri::command]
+pub async fn workbuddy_session_link_all() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::workbuddy_sessions::link_all(
+            wb_switch_core::modules::workbuddy_sessions::LinkOptions {
+                require_closed: true,
+                copy_missing: true,
+                since: 0,
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("一键互通任务失败: {e}"))?
+}
+
+/// WorkBuddy：只把「同一段对话已有副本」登记成关联组，**不复制任何文件**（0 字节）。
+///
+/// 适合「我只要关联关系，不想让磁盘翻倍」的场景；不需要备份、也不碰会话库。
+#[tauri::command]
+pub async fn workbuddy_session_link_existing() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::workbuddy_sessions::link_all(
+            wb_switch_core::modules::workbuddy_sessions::LinkOptions {
+                require_closed: false,
+                copy_missing: false,
+                since: 0,
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("登记关联失败: {e}"))?
+}
+
+/// WorkBuddy：一键互通的只读预览（要复制几个、多少字节、客户端是否在运行）。
+///
+/// 会扫一遍会话列表并计算内容摘要，属重活 ⇒ `off_main`。
+#[tauri::command]
+pub async fn workbuddy_session_link_all_preview() -> Value {
+    off_main(|| wb_switch_core::modules::workbuddy_sessions::link_all_preview())
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
 /// 源账号与目标账号之间已建立的会话副本关联（只读）。
 #[tauri::command]
 pub async fn workbuddy_session_links_preview(source_uid: String, target_uid: String) -> Value {
     off_main(move || workbuddy_sessions::links_preview(&source_uid, &target_uid))
         .await
         .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：关联会话列表（按「同一段对话」聚合各账号副本，只读）。
+///
+/// 要扫一遍会话库并计算内容摘要，属重活 ⇒ `off_main`（Tauri 同步命令跑主线程，会冻窗口）。
+#[tauri::command]
+pub async fn workbuddy_session_groups() -> Value {
+    off_main(|| {
+        wb_switch_core::modules::workbuddy_session_groups::list()
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：单个关联组的成员明细（与列表同源）。
+#[tauri::command]
+pub async fn workbuddy_session_group_detail(group_key: String) -> Value {
+    off_main(move || {
+        wb_switch_core::modules::workbuddy_session_groups::detail(&group_key)
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：还没纳入关联组的会话（供「新增关联会话」选择，只读）。
+#[tauri::command]
+pub async fn workbuddy_session_group_candidates() -> Value {
+    off_main(|| {
+        wb_switch_core::modules::workbuddy_session_groups::candidates()
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：以某个副本为准，覆盖组内其它账号的副本（写正文 + 改库行时间）。
+///
+/// 会备份正文与整个会话库；要求客户端已关闭。重活 ⇒ `spawn_blocking`。
+#[tauri::command]
+pub async fn workbuddy_session_group_unify(
+    group_key: String,
+    source_session_id: String,
+    close_client: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::workbuddy_session_groups::unify(
+            &group_key,
+            &source_session_id,
+            close_client.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| format!("统一会话内容失败: {e}"))?
+}
+
+/// WorkBuddy：给关联组里缺的账号补一份副本。
+#[tauri::command]
+pub async fn workbuddy_session_group_link_account(
+    group_key: String,
+    target_uid: String,
+    close_client: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::workbuddy_session_groups::link_account(
+            &group_key,
+            &target_uid,
+            close_client.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| format!("关联新账号失败: {e}"))?
+}
+
+/// WorkBuddy：把一个未关联的会话复制给目标账号（复制后自动进同一个关联组）。
+#[tauri::command]
+pub async fn workbuddy_session_group_link_session(
+    session_id: String,
+    target_uid: String,
+    close_client: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::workbuddy_session_groups::link_session(
+            &session_id,
+            &target_uid,
+            close_client.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| format!("新增关联会话失败: {e}"))?
 }
 
 /// Trae：同客户端下两个账号之间的会话副本关联（只读）。
@@ -2492,13 +2737,33 @@ pub async fn qoder_regions() -> Result<Value, String> {
 }
 
 /// 列出账号（默认两个区域都列）。
+///
+/// 额外补两个**只读**字段（都来自客户端自己写的东西，不解密就不猜）：
+/// - `isCurrent`：桌面端登录态里的 `user.id` 与本条 uid 相同（解不开时整列为 false）；
+/// - `appStatus`：客户端明文回显（名字 / 头像 / 版本），用来给「账号名」兜底。
 #[tauri::command]
 pub async fn qoder_accounts_list(region: Option<String>) -> Result<Value, String> {
     let list = match region.as_deref().and_then(qoder_realm::QoderRegion::parse) {
         Some(r) => qoder_accounts::list(r)?,
         None => qoder_accounts::list_all()?,
     };
-    Ok(json!(list))
+    let cn_cur = qoder_auth_dat::current_desktop_uid(qoder_realm::QoderRegion::Cn);
+    let gl_cur = qoder_auth_dat::current_desktop_uid(qoder_realm::QoderRegion::Global);
+    let cn_st = qoder_auth_dat::app_status(qoder_realm::QoderRegion::Cn);
+    let gl_st = qoder_auth_dat::app_status(qoder_realm::QoderRegion::Global);
+
+    let mut out: Vec<Value> = Vec::with_capacity(list.len());
+    for a in list {
+        let (cur, st) = match a.region {
+            qoder_realm::QoderRegion::Cn => (&cn_cur, &cn_st),
+            qoder_realm::QoderRegion::Global => (&gl_cur, &gl_st),
+        };
+        let mut v = serde_json::to_value(&a).map_err(|e| e.to_string())?;
+        v["isCurrent"] = json!(cur.as_deref() == Some(a.uid.as_str()));
+        v["appStatus"] = st.clone().unwrap_or(Value::Null);
+        out.push(v);
+    }
+    Ok(json!(out))
 }
 
 /// 新增账号（PAT 登录：uid + token 手填）。
@@ -2586,6 +2851,18 @@ pub async fn qoder_accounts_refresh_all(region: String) -> Result<Value, String>
     Ok(json!({ "ok": ok, "failed": failed, "total": list.len() }))
 }
 
+
+/// 近 N 天的 Qoder 积分消耗（**本机快照算出来的真实值**，不是官方用量）。
+///
+/// Qoder 没有用量 / 历史端点，这里的数据来自每次成功查询后留下的一笔额度快照
+/// （`~/.twin-switch/qoder/credit-snapshots.jsonl`，10 分钟节流）。
+/// 样本不足时 `enoughData=false` —— 界面据此显示「样本不足」，而不是画一条 0。
+#[tauri::command]
+pub async fn qoder_credit_history(days: Option<u32>) -> Result<Value, String> {
+    Ok(wb_switch_core::modules::qoder_credit_history::summary(
+        days.unwrap_or(7),
+    ))
+}
 
 /// 发起 Qoder 浏览器登录（设备授权 + PKCE）。**不发网络请求**，只返回授权页地址。
 #[tauri::command]
@@ -2924,6 +3201,22 @@ pub async fn qoder_session_rename(region: String, session_id: String, title: Str
 pub async fn qoder_session_delete(region: String, session_id: String) -> Result<Value, String> {
     let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
     qoder_sessions::remove(r, &session_id)
+}
+
+/// 批量删除会话：一次关客户端、一次备份、一个事务、一次重启。
+///
+/// 必须走 `spawn_blocking`：关客户端 + 重启要十几秒，占住主线程窗口会假死。
+#[tauri::command]
+pub async fn qoder_session_delete_many(
+    region: String,
+    session_ids: Vec<String>,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_sessions::remove_many(r, &session_ids)
+    })
+    .await
+    .map_err(|e| format!("批量删除任务失败: {e}"))?
 }
 
 /// 复制会话（同库新建一条 + 复制全部消息）。

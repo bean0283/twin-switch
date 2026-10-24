@@ -254,10 +254,211 @@ pub fn switch_to(region: QoderRegion, uid: &str, access: &str, refresh: &str) ->
     }
 }
 
+// ---------------------------------------------------------------- 明文回显 / 当前登录
+
+/// 客户端自己写下的**明文**回显：`~/.qoder{,-cn}/.qoder-app-status.json`。
+///
+/// 客户端的 `writer: "main"` 每次切换/登录都会重写这份小文件，内容是
+/// `{logged_in, name, avatar_url, version, snapshot_at}` —— **不加密**。
+/// 用途有两个，都不能靠猜：
+///
+/// 1. 账号名兜底：`auth.v1.dat` 解不开（换机器、DPAPI 变了）时至少还能显示名字；
+/// 2. 「当前登录」旁证：与 [`current_desktop_uid`] 的结论应当一致，不一致说明
+///    客户端刚被切换、回显还没刷新 —— 界面别把它当成权威。
+pub fn app_status(region: QoderRegion) -> Option<Value> {
+    let home = dirs::home_dir()?;
+    let path = home
+        .join(realm_spec(region).cli_home_dir)
+        .join(".qoder-app-status.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    // 统一成 camelCase 给前端，省得前端去记客户端那套 snake_case。
+    Some(serde_json::json!({
+        "loggedIn": v.get("logged_in").and_then(Value::as_bool).unwrap_or(false),
+        "name": v.get("name").cloned().unwrap_or(Value::Null),
+        "avatarUrl": v.get("avatar_url").cloned().unwrap_or(Value::Null),
+        "version": v.get("version").cloned().unwrap_or(Value::Null),
+        "snapshotAt": v.get("snapshot_at").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// 桌面端**当前登录**的 uid：解 `auth.v1.dat` 明文里的 `user.id`。
+///
+/// ⚠️ 这是「当前登录」的唯一权威判据（照 Trae / WorkBuddy 的规矩）。解不开就返回
+/// `None` —— 界面据此**不亮任何徽标**，而不是拿回显里的名字去猜（同名不同号会骗人）。
+pub fn current_desktop_uid(region: QoderRegion) -> Option<String> {
+    let path = auth_dat_path(region)?;
+    let plain = decrypt_auth_dat(&path).ok()?;
+    plain
+        .get("user")
+        .and_then(|u| u.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// ---------------------------------------------------------------- 托管判定
+
+/// 本进程相对 Qoder 客户端的位置 —— **杀进程前必须先问的问题**。
+///
+/// 为什么非要有这道门：TwinSwitch 可能是从 **Qoder 的内嵌终端**、或 Qoder 拉起的脚本里
+/// 启动的。那种情况下「结束 Qoder 进程树」会把本工具自己也杀掉，用户看到的是
+/// **程序闪退 + 客户端没了**，而且没有任何错误信息（进程都没了，谁来报错）。
+///
+/// 判定不出来时一律按危险处理（fail-closed）：「没看到目标」不等于「没被托管」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// 不在目标客户端的进程树里，可以安全终止。
+    Outside,
+    /// 就在目标客户端的进程树里（或带着它的环境标记）。
+    Hosted { evidence: String },
+    /// 判不出来：父链断在某处 / 进程快照读不到。按「不许」处理。
+    Unknown { reason: String },
+}
+
+/// 本区域目标客户端的映像名（比较时**不区分大小写**）。
+fn target_image_names(region: QoderRegion) -> Vec<&'static str> {
+    match region {
+        QoderRegion::Cn => vec!["Qoder CN.exe", "Qoder CN Launcher.exe"],
+        QoderRegion::Global => vec!["Qoder.exe", "Qoder Launcher.exe"],
+    }
+}
+
+/// 读「客户端注入的环境标记」。抽成纯函数只为一件事：可单测（真去读进程环境会污染并行测试）。
+///
+/// 这些键来自对 Qoder 客户端注入子进程的实测：带着它们基本就说明本进程是客户端拉起来的。
+fn env_markers_from(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in [
+        "QODER_PRODUCT_ID",
+        "QODERCN_CLI",
+        "QODER_SESSION_TYPE",
+        "QODERCN_SESSION_TYPE",
+    ] {
+        if let Some(v) = get(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                out.push(format!("{key}={v}"));
+            }
+        }
+    }
+    out
+}
+
+/// `me` 是不是 `root` 的子孙（沿 parent→child 关系往下走，宽度优先）。
+///
+/// ⚠️ 为什么用**反向**遍历而不是从自己往上爬：Windows 上父进程经常先退出
+/// （`explorer.exe` 的父是早已结束的 `userinit.exe`），往上爬一两层就断链，
+/// 而断链在「从桌面图标正常启动」时是**常态** —— 拿它当「判不出来」会把所有正常用户拦住。
+/// 往下走只依赖**当前还活着的** Qoder 进程，托管场景（内嵌终端 / 脚本）里中间那层 shell
+/// 通常也还活着，所以这条路既准又不会误伤。
+pub(crate) fn is_descendant(
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+    root: u32,
+    me: u32,
+) -> bool {
+    let mut queue = std::collections::VecDeque::from([root]);
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        if pid == me {
+            return true;
+        }
+        if let Some(kids) = children.get(&pid) {
+            for &k in kids {
+                if seen.insert(k) {
+                    queue.push_back(k);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 现场判定：环境标记 → **反向子孙遍历** → 正向链兜底。
+///
+/// ⚠️ 全程只用 `process_list::all_processes_ex()` 的**一次** Toolhelp 快照（带 ppid），
+/// 不起 `PowerShell` / `wmic` 子进程 —— 那两条路都有坑：多行脚本经 `-Command` 传进去时
+/// 内嵌引号会被 CreateProcess 的参数拼接破坏、**静默返回空值**，安全门就形同不存在。
+pub fn placement(region: QoderRegion) -> Placement {
+    let env_markers = env_markers_from(&|k| std::env::var(k).ok());
+    if !env_markers.is_empty() {
+        return Placement::Hosted {
+            evidence: format!("环境变量 {}", env_markers.join(" / ")),
+        };
+    }
+
+    let procs = crate::modules::process_list::all_processes_ex();
+    if procs.is_empty() {
+        return Placement::Unknown {
+            reason: "读不到本机进程表".to_string(),
+        };
+    }
+    let targets = target_image_names(region);
+    let me = std::process::id();
+
+    // 反向：从每个目标进程出发，看子树里有没有自己。
+    let mut children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    for p in &procs {
+        children.entry(p.parent).or_default().push(p.pid);
+    }
+    for p in &procs {
+        if !targets.iter().any(|t| p.name.eq_ignore_ascii_case(t)) {
+            continue;
+        }
+        if is_descendant(&children, p.pid, me) {
+            return Placement::Hosted {
+                evidence: format!("本进程是 {} 的子进程（pid {}）", p.name, p.pid),
+            };
+        }
+    }
+
+    // 正向：从自己向上爬，能命中目标也算（覆盖「反向被已退出的中间进程挡住」的极端情况）。
+    let by_pid: std::collections::HashMap<u32, (&str, u32)> =
+        procs.iter().map(|p| (p.pid, (p.name.as_str(), p.parent))).collect();
+    let mut cur = me;
+    for _ in 0..32 {
+        let Some((_, parent)) = by_pid.get(&cur) else { break };
+        let parent = *parent;
+        if parent == 0 || parent == cur {
+            break;
+        }
+        let Some((pname, _)) = by_pid.get(&parent) else { break };
+        if targets.iter().any(|t| pname.eq_ignore_ascii_case(t)) {
+            return Placement::Hosted {
+                evidence: format!("父进程链上有 {pname}"),
+            };
+        }
+        cur = parent;
+    }
+
+    // 两条路都没命中 ⇒ 不在客户端树里。**不把「正向链断了」当 Unknown**：
+    // 那是 Windows 上的常态，拿它拦住用户等于功能不可用。
+    Placement::Outside
+}
+
+/// 把判定结果翻成用户能照做的错误；[`Placement::Outside`] 返回 `None`（放行）。
+fn placement_blocker(region: QoderRegion, p: &Placement) -> Option<String> {
+    match p {
+        Placement::Outside => None,
+        Placement::Hosted { evidence } => Some(format!(
+            "已拒绝：本工具正运行在 {} 的进程树里（{evidence}）—— 现在结束客户端会连本工具一起死。\n\
+             ⇒ ① 先手动退出 {} 再点一次（客户端没在跑时不会触发本拦截）；\
+             ② 或从开始菜单 / 桌面图标单独启动 TwinSwitch 后再操作。",
+            region.display_name(),
+            region.display_name()
+        )),
+        Placement::Unknown { reason } => Some(format!(
+            "已拒绝：读不全本进程的父链（{reason}），无法确认结束 {} 会不会连本工具一起结束。\n\
+             ⇒ 请从开始菜单 / 桌面图标单独启动 TwinSwitch 再操作（在终端或脚本里启动时最容易出现这种情况）。",
+            region.display_name()
+        )),
+    }
+}
+
 // ---------------------------------------------------------------- 进程守卫
 
 /// Qoder 客户端是否在跑 —— **两个版本的进程名都要查**。
-///
 /// ⚠️ 只查 `Qoder.exe` 是**不够的**：国内版的进程叫 **`Qoder CN.exe`**，而且一开就是好几个。
 /// 曾经只查国际版名字 ⇒ 国内版客户端明明开着却被判成「已关闭」⇒ 写库被它退出时覆盖、
 /// 新实例又被单实例机制顶掉，表现为「切换了但客户端账号没变，手动重启才好」。
@@ -292,6 +493,13 @@ pub fn stop_client(region: QoderRegion) -> Result<Vec<String>, String> {
 
     if crate::modules::process_list::find_by_names(&names).is_empty() {
         return Ok(Vec::new());
+    }
+
+    // ★ fail-closed 安全门：先证明「杀掉它不会连本工具一起死」。
+    //   放在「确认有进程要杀」之后 —— 客户端没在跑时这一步根本不触发，
+    //   日常用法（从桌面图标启动、客户端已退出）不会被拦。
+    if let Some(msg) = placement_blocker(region, &placement(region)) {
+        return Err(msg);
     }
 
     let outcome = crate::modules::process_list::kill_tree_and_wait(
@@ -330,6 +538,16 @@ pub fn stop_client(region: QoderRegion) -> Result<Vec<String>, String> {
 /// 国内版切换成功、却报「没能自动启动客户端」。现在一律读 `install.ini` 的
 /// `installDir` + `appExecutable`。
 pub fn launch_desktop(region: QoderRegion) -> Result<String, String> {
+    // ① **用户手动指定的主程序优先**（设置页「Qoder 客户端主程序路径」）。
+    //    为什么会需要：Qoder 允许装到任意目录，`install.ini` 也可能被卸载残留删掉；
+    //    这时自动探测报「没找到启动程序」，用户没有任何可操作的地方。
+    if let Some(exe) = crate::modules::settings::qoder_exe_override(region) {
+        std::process::Command::new(&exe)
+            .spawn()
+            .map_err(|e| format!("启动失败（{}）：{e}", exe.display()))?;
+        return Ok(exe.display().to_string());
+    }
+
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "取不到 LOCALAPPDATA".to_string())?;
@@ -565,6 +783,91 @@ pub fn scan_local(region: QoderRegion) -> Vec<LocalAccount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kids(pairs: &[(u32, u32)]) -> std::collections::HashMap<u32, Vec<u32>> {
+        let mut m: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for &(parent, child) in pairs {
+            m.entry(parent).or_default().push(child);
+        }
+        m
+    }
+
+    /// 父链干净、没有目标进程 ⇒ 放行。
+    #[test]
+    fn placement_outside_is_allowed() {
+        // Qoder(1000) 的子树里没有我(2000)
+        let tree = kids(&[(1000, 1100), (1100, 1101)]);
+        assert!(!is_descendant(&tree, 1000, 2000));
+        let p = Placement::Outside;
+        assert!(placement_blocker(QoderRegion::Cn, &p).is_none());
+    }
+
+    /// 自己是 Qoder 的孙进程（内嵌终端 → shell → 本工具）⇒ 必须判 Hosted，并给出出路。
+    #[test]
+    fn placement_hosted_by_descendant_walk() {
+        let tree = kids(&[(1000, 1100), (1100, 1200)]);
+        assert!(is_descendant(&tree, 1000, 1200), "隔一层也要认出来");
+        let p = Placement::Hosted {
+            evidence: "本进程是 Qoder CN.exe 的子进程（pid 1000）".to_string(),
+        };
+        let msg = placement_blocker(QoderRegion::Cn, &p).expect("必须拦住");
+        assert!(msg.contains("已拒绝"), "{msg}");
+        assert!(msg.contains("开始菜单"), "必须给出独立启动这条出路：{msg}");
+    }
+
+    /// 环境标记优先于树遍历：客户端注入的标记本身就是硬证据。
+    #[test]
+    fn env_marker_is_detected() {
+        let marks = env_markers_from(&|k| {
+            if k == "QODERCN_SESSION_TYPE" {
+                Some("app".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(marks, vec!["QODERCN_SESSION_TYPE=app".to_string()]);
+        // 空值不算标记（客户端可能把它设成空串）
+        let none = env_markers_from(&|_| Some("   ".to_string()));
+        assert!(none.is_empty());
+    }
+
+    /// 兄弟进程 / 自身不在 Qoder 子树里时不许误判（防止把正常用户拦住）。
+    #[test]
+    fn unrelated_process_is_not_descendant() {
+        let tree = kids(&[(1000, 1100), (2000, 2100)]);
+        assert!(is_descendant(&tree, 1000, 1100));
+        assert!(!is_descendant(&tree, 1000, 2100), "另一个 shell 的子树不算");
+        assert!(!is_descendant(&tree, 9999, 2100), "根本不存在的根不算");
+    }
+
+    /// ⚠️ 真判不出来（进程表都读不到）⇒ **必须**拦住（fail-closed）。
+    #[test]
+    fn placement_unknown_blocks_by_default() {
+        let p = Placement::Unknown {
+            reason: "读不到本机进程表".to_string(),
+        };
+        let msg = placement_blocker(QoderRegion::Cn, &p).expect("Unknown 必须拦住");
+        assert!(msg.contains("已拒绝"), "{msg}");
+    }
+
+    /// 现场探针：打印本进程的父链与本区域的判定结果（只打进程名，不碰任何凭据）。
+    ///
+    /// ```text
+    /// cargo test -p wb-switch-core --lib probe_placement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn probe_placement() {
+        for region in [QoderRegion::Cn, QoderRegion::Global] {
+            let p = placement(region);
+            eprintln!("[placement] {} => {p:?}", region.as_str());
+            match &p {
+                Placement::Outside => eprintln!("   → 放行（可以安全杀进程）"),
+                Placement::Hosted { evidence } => eprintln!("   → 拦（{evidence}）"),
+                Placement::Unknown { reason } => eprintln!("   → 拦（{reason}）"),
+            }
+        }
+    }
 
     /// 只**数**进程，绝不调用 `stop_client()` —— 测试不许杀用户正在用的客户端。
     #[test]

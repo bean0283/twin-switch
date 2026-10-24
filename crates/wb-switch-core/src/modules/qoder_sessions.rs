@@ -680,6 +680,137 @@ pub fn remove(region: QoderRegion, session_id: &str) -> Result<Value, String> {
     }))
 }
 
+/// 批量删除：一次关客户端、一次备份、一个事务、一次重启。
+///
+/// ⚠️ 绝不循环调用 [`remove`]：那样每条都要「关客户端 → 备份 → 重启客户端」，
+/// 删 10 条就开关 10 次（每次十几秒，还有 10 份全库备份）。这里全程只做一遍。
+///
+/// ⚠️ 选中的会话在库里不存在时**不算失败**（列表可能是几分钟前读的，期间被客户端删了），
+/// 但要如实放进 `missing` 带回去 —— 不能把「跳过了 3 个」说成「删了 10 个」。
+pub fn remove_many(region: QoderRegion, session_ids: &[String]) -> Result<Value, String> {
+    let ids: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for id in session_ids {
+            let t = id.trim();
+            if !t.is_empty() && !v.iter().any(|x| x == t) {
+                v.push(t.to_string());
+            }
+        }
+        v
+    };
+    if ids.is_empty() {
+        return Err("没有选中任何会话".to_string());
+    }
+    let started = std::time::Instant::now();
+    log_line(&format!(
+        "[remove_many] 开始 region={} 数量={}",
+        region.as_str(),
+        ids.len()
+    ));
+
+    let mut resume = match close_client_for_write(region) {
+        Ok(g) => g,
+        Err(e) => {
+            log_line(&format!("[remove_many] 关闭客户端失败，已中止：{e}"));
+            return Err(e);
+        }
+    };
+    let backup = backup_db(region)?;
+    let conn = open_rw(region)?;
+
+    conn.execute_batch("begin immediate")
+        .map_err(|e| format!("开启事务失败：{e}"))?;
+
+    let mut deleted = 0usize;
+    let mut deleted_msgs = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    let result: Result<(), String> = (|| {
+        for id in &ids {
+            if !session_exists(&conn, id)? {
+                missing.push(id.clone());
+                continue;
+            }
+            deleted_msgs += conn
+                .execute(
+                    "delete from chat_session_messages where session_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| format!("删除消息失败（{id}）：{e}"))?;
+            deleted += conn
+                .execute(
+                    "delete from chat_sessions where session_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| format!("删除会话失败（{id}）：{e}"))?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = conn.execute_batch("rollback");
+        log_line(&format!("[remove_many] 失败并回滚：{e}"));
+        return Err(e);
+    }
+
+    // ★ 逐条复查：还在就是没删掉 ⇒ 回滚整批，报错而不是假装成功。
+    let mut still: Vec<String> = Vec::new();
+    for id in &ids {
+        if missing.iter().any(|m| m == id) {
+            continue;
+        }
+        let left: i64 = conn
+            .query_row(
+                "select count(*) from chat_sessions where session_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        if left != 0 {
+            still.push(format!("{id}（剩 {left} 条）"));
+        }
+    }
+    if !still.is_empty() {
+        let _ = conn.execute_batch("rollback");
+        let msg = format!(
+            "删除未生效，已整批回滚：{} ⇒ 客户端可能仍在运行并回写，请退出该版本 Qoder 后重试",
+            still.join("、")
+        );
+        log_line(&format!("[remove_many] 复查失败：{msg}"));
+        return Err(msg);
+    }
+
+    conn.execute_batch("commit")
+        .map_err(|e| format!("提交事务失败：{e}"))?;
+    let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+
+    let relaunch = match resume.resume_now() {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({ "ok": false, "error": e }),
+    };
+
+    log_line(&format!(
+        "[remove_many] 成功 会话{} 消息{} 跳过{} 用时{}ms 重启={} 备份={}",
+        deleted,
+        deleted_msgs,
+        missing.len(),
+        started.elapsed().as_millis(),
+        relaunch,
+        backup.display()
+    ));
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "backup": backup.display().to_string(),
+        "deletedSessions": deleted,
+        "deletedMessages": deleted_msgs,
+        "missing": missing,
+        "requested": ids.len(),
+        "hard": true,
+        "verified": true,
+        "clientRelaunch": relaunch,
+    }))
+}
+
 /// 复制会话（同库内新建一条 + 复制全部消息）。标题加「（副本）」。
 pub fn duplicate(region: QoderRegion, session_id: &str) -> Result<Value, String> {
     ensure_closed_and_backup(region)?;
