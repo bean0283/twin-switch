@@ -81,8 +81,13 @@ export default function SettingsPage() {
   /** WorkBuddy 主程序路径的草稿（空串 = 走自动探测）。 */
   /** 切号是否同步定时任务（null = 还没读到设置，界面显示骨架）。 */
   const [syncAuto, setSyncAuto] = useState<boolean | null>(null);
+  /** 切号是否自动把会话同步给所有账号（null = 还没读到设置）。 */
+  const [autoLinkSessions, setAutoLinkSessions] = useState<boolean | null>(null);
   const [wbDraft, setWbDraft] = useState<string>("");
   const [probingWb, setProbingWb] = useState(false);
+  /** Qoder 两个区域的主程序路径草稿（`cn | global → 路径`，空 = 自动探测）。 */
+  const [qoderDraft, setQoderDraft] = useState<Record<string, string>>({});
+  const [probingQoder, setProbingQoder] = useState<"cn" | "global" | null>(null);
   const [redetecting, setRedetecting] = useState(false);
 
   /** 重新拉客户端探测结果（`refresh = 真重新看一遍系统`）。 */
@@ -108,7 +113,9 @@ export default function SettingsPage() {
       setBeforeWrite(s.backupBeforeWrite);
       setExeDraft({ ...(s.traeExe ?? {}) });
       setWbDraft(s.workbuddyExe ?? "");
+      setQoderDraft({ ...(s.qoderExe ?? {}) });
       setSyncAuto(s.syncWorkbuddyAutomations ?? true);
+      setAutoLinkSessions(s.autoLinkWorkbuddySessions ?? false);
       void loadClients(false);
     } catch (cause) {
       // ⚠️ 撤掉表单与默认值：失败时给用户看「30 天 / 3 份 / 4 GB」，
@@ -117,7 +124,9 @@ export default function SettingsPage() {
       setDraft(null);
       setBeforeWrite(null);
       setExeDraft(null);
+      setQoderDraft({});
       setSyncAuto(null);
+      setAutoLinkSessions(null);
       setError(api.asError(cause));
     } finally {
       setLoading(false);
@@ -139,7 +148,9 @@ export default function SettingsPage() {
         // 空串视为「恢复自动探测」：后端会把它从映射里剔掉。
         traeExe: cleanExeDraft(exeDraft),
         workbuddyExe: wbDraft.trim(),
+        qoderExe: qoderDraft,
         syncWorkbuddyAutomations: syncAuto ?? true,
+        autoLinkWorkbuddySessions: autoLinkSessions ?? false,
       });
       setSnap(next);
       // 用**后端回读的实际值**刷表单：手输了离谱的数会被后端夹到合理区间，
@@ -148,7 +159,9 @@ export default function SettingsPage() {
       setBeforeWrite(next.backupBeforeWrite);
       setExeDraft({ ...(next.traeExe ?? {}) });
       setWbDraft(next.workbuddyExe ?? "");
+      setQoderDraft({ ...(next.qoderExe ?? {}) });
       setSyncAuto(next.syncWorkbuddyAutomations ?? true);
+      setAutoLinkSessions(next.autoLinkWorkbuddySessions ?? false);
       // 路径改了 ⇒ 让探测结果跟着刷新（否则下面那几行还挂着「未找到」）。
       void loadClients(true);
       toast.success("设置已保存", {
@@ -170,13 +183,15 @@ export default function SettingsPage() {
     beforeWrite !== null &&
     exeDraft !== null &&
     ((wbDraft.trim() !== (snap.workbuddyExe ?? "").trim()) ||
+      JSON.stringify(qoderDraft) !== JSON.stringify(snap.qoderExe ?? {}) ||
       !sameExeMap(cleanExeDraft(exeDraft), snap.traeExe ?? {}) ||
       draft.enabled !== snap.backupRetention.enabled ||
       draft.keepDays !== snap.backupRetention.keepDays ||
       draft.keepCount !== snap.backupRetention.keepCount ||
       draft.maxTotalMb !== snap.backupRetention.maxTotalMb ||
       beforeWrite !== snap.backupBeforeWrite ||
-      (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true));
+      (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true) ||
+      (autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false));
 
   /** 取某个客户端「正在运行的」主程序路径并填进草稿。 */
   async function pickRunning(key: string) {
@@ -203,6 +218,20 @@ export default function SettingsPage() {
       toast.error("没取到路径", { description: api.asError(cause).split("\n")[0] });
     } finally {
       setProbingWb(false);
+    }
+  }
+
+  /** 取「正在运行的 Qoder」主程序路径（按区域）。 */
+  async function pickRunningQoder(region: "cn" | "global") {
+    setProbingQoder(region);
+    try {
+      const r = await api.qoderExeFromRunning(region);
+      setQoderDraft((prev) => ({ ...prev, [region]: r.path }));
+      toast.success("已填入运行中的 Qoder 路径", { description: r.path });
+    } catch (cause) {
+      toast.error("没取到路径", { description: api.asError(cause).split("\n")[0] });
+    } finally {
+      setProbingQoder(null);
     }
   }
 
@@ -404,6 +433,35 @@ export default function SettingsPage() {
                 </span>
               </label>
 
+              {/* ── 切号时自动同步会话 ───────────────────────────────────
+                  会话是在各账号的库里各存一份的（按 user_id 归属），切号后默认只看到
+                  那个账号自己的会话。打开后每次切号（WorkBuddy 已关闭、尚未重启那刻）
+                  自动补齐缺失的会话副本；一键入口在「WorkBuddy 会话记录 → 复制与关联」。
+                  ⚠️ 默认关：这是**往别的账号库里写数据**，必须由本人亲手打开。 */}
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border bg-muted/30 px-3 py-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={autoLinkSessions ?? false}
+                  disabled={autoLinkSessions === null}
+                  onChange={(e) => setAutoLinkSessions(e.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="text-sm font-medium">
+                    切换账号时自动同步 WorkBuddy 会话到所有账号
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    会话按账号归属，切号后在客户端里只看到新账号自己的那部分。开启后本工具会在切号
+                    （客户端已关闭、尚未重启）时自动同步
+                    <span className="font-medium text-foreground">之后新产生的会话</span>
+                    —— 历史存量要复制好几个 GB，所以不放进切号里，请在「WorkBuddy 会话记录 →
+                    复制与关联」点一次「一键互相关联」（会先给你数字再确认）。
+                    <span className="font-medium text-foreground">默认关闭</span>
+                    ：它会往其它账号的会话库里写数据。
+                  </span>
+                </span>
+              </label>
+
               {/* ── WorkBuddy ─────────────────────────────────────────────
                   与上面几行同一套交互：手动指定 → 运行中进程 → 自动探测。
                   WorkBuddy 也能装到自定义目录，同一个问题给它同一个入口。 */}
@@ -480,6 +538,82 @@ export default function SettingsPage() {
                   )}
                 </p>
               </div>
+
+              {/* Qoder：两个区域分开填。程序名不同（Qoder CN.exe / Qoder.exe），
+                  后端保存时按区域校验 —— 填另一个版本的路径会被拒绝，
+                  否则「切换国内版」会去启动国际版。 */}
+              {(["cn", "global"] as const).map((rg) => {
+                const label = rg === "cn" ? "Qoder CN（国内版）" : "Qoder（国际版）";
+                const val = qoderDraft[rg] ?? "";
+                const manual = val.trim().length > 0;
+                return (
+                  <div
+                    key={rg}
+                    className="space-y-1.5 rounded-xl border border-border px-3 py-2.5"
+                    data-qoder-exe={rg}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">{label}</span>
+                      <span
+                        className={
+                          manual
+                            ? "rounded bg-primary/10 px-1.5 py-0.5 text-[11px] text-foreground"
+                            : "rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                        }
+                      >
+                        {manual ? "手动指定" : "自动探测"}
+                      </span>
+                      <span className="ml-auto flex items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void pickRunningQoder(rg)}
+                          disabled={probingQoder === rg}
+                          title="取正在运行的客户端主程序路径（它没在跑就取不到，会如实报错）"
+                        >
+                          {probingQoder === rg ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="size-3.5" />
+                          )}
+                          用运行中的
+                        </Button>
+                        {manual ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setQoderDraft((p) => ({ ...p, [rg]: "" }))}
+                            title="清掉手动指定，回到自动探测"
+                          >
+                            恢复自动
+                          </Button>
+                        ) : null}
+                      </span>
+                    </div>
+
+                    <Input
+                      value={val}
+                      onChange={(e) =>
+                        setQoderDraft((p) => ({ ...p, [rg]: e.target.value }))
+                      }
+                      placeholder={
+                        rg === "cn"
+                          ? "留空即可（读 install.ini）；非默认目录时填 …\\Qoder CN\\Qoder CN.exe"
+                          : "留空即可（读 install.ini）；非默认目录时填 …\\Qoder\\Qoder.exe"
+                      }
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+
+                    <p className="text-xs text-muted-foreground">
+                      留空 = 读客户端自己的 <code className="font-mono">install.ini</code>
+                      自动定位；只有装在非常规目录、或 install.ini 被卸载残留删掉时才需要手填。
+                    </p>
+                  </div>
+                );
+              })}
 
               <div className="flex flex-wrap items-center gap-2">
                 <Button
@@ -712,6 +846,7 @@ export default function SettingsPage() {
                   setBeforeWrite(snap.backupBeforeWrite);
                   setExeDraft({ ...(snap.traeExe ?? {}) });
                   setWbDraft(snap.workbuddyExe ?? "");
+                  setQoderDraft({ ...(snap.qoderExe ?? {}) });
                 }}
                 data-action="reset"
               >

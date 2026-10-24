@@ -33,6 +33,9 @@ type PoolEntry = {
   expires_at: number | null;
   usable: boolean;
   reason: string | null;
+  cooldown_until: number | null;
+  /// 按模型记的限额（后端 `gateway_pool::model_limits`）——只锁这几个模型，号还能用。
+  limited_models: { model: string; reset_at: number; kind: string }[];
 };
 
 type KeyRow = {
@@ -80,6 +83,24 @@ function fmtExpiry(ms: number | null): string {
   if (h >= 48) return `${Math.round(h / 24)} 天后`;
   if (h >= 1) return `${h} 小时后`;
   return `${Math.max(1, Math.round(diff / 60_000))} 分钟后`;
+}
+
+/// 限额恢复倒计时的人话：`5h39m 后恢复（22:04）`。
+///
+/// 口径照 changexbc/workbuddy-switch 的限额 chip：**剩余时长 + 几点恢复**都要给 ——
+/// 只有「还剩 5 小时」看不出要不要等，只有「22:04」看不出还要等多久。
+function fmtRecover(ms: number): string {
+  const diff = ms - Date.now();
+  if (diff <= 0) return "已恢复";
+  const h = Math.floor(diff / 3_600_000);
+  const m = Math.round((diff % 3_600_000) / 60_000);
+  const left = h > 0 ? `${h}h${m}m` : `${Math.max(1, m)}m`;
+  const at = new Date(ms).toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${left} 后恢复（${at}）`;
 }
 
 /// 作用域 → 中文名 / 短标签 / 前缀别名（与后端 `gateway_pool::scope_alias` 一致）。
@@ -550,7 +571,26 @@ export default function GatewayPage() {
                               </td>
                               <td className="px-3 py-2">{fmtExpiry(r.expires_at)}</td>
                               <td className="px-3 py-2">
-                                {r.usable ? (
+                                {r.cooldown_until && r.cooldown_until > Date.now() ? (
+                                  /* 整号冷却：上游明确拒绝了这个账号（凭据死 / 传输炸） */
+                                  <span
+                                    className="cursor-help text-amber-600"
+                                    title={`上游报错后暂停到 ${new Date(r.cooldown_until).toLocaleString()}，期间不会选它`}
+                                  >
+                                    {fmtRecover(r.cooldown_until)}
+                                  </span>
+                                ) : r.limited_models.length > 0 ? (
+                                  /* 模型级冷却：只有这几个模型用完，别的模型照常能用 */
+                                  <span
+                                    className="cursor-help text-amber-600"
+                                    title={r.limited_models
+                                      .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
+                                      .join("\n")}
+                                  >
+                                    {r.limited_models.length} 个模型受限 ·{" "}
+                                    {fmtRecover(r.limited_models[0].reset_at)}
+                                  </span>
+                                ) : r.usable ? (
                                   <span className="text-emerald-600">可用</span>
                                 ) : (
                                   /* 原因可能很长（401 / 过期 / 无凭据），放 title，表格不被撑宽 */
@@ -879,6 +919,18 @@ export default function GatewayPage() {
                     </span>
                   )}
                   <span className="text-muted-foreground"> · {fmtExpiry(preview.picked.expires_at)}</span>
+                  {/* 这个号在当前模型上的限额：有就说明为什么它不是「完全没问题」 */}
+                  {(preview.picked.limited_models?.length ?? 0) > 0 && (
+                    <span
+                      className="ml-2 rounded bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-600"
+                      title={preview.picked.limited_models
+                        .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
+                        .join("\n")}
+                    >
+                      {preview.picked.limited_models[0].model} ·{" "}
+                      {fmtRecover(preview.picked.limited_models[0].reset_at)}
+                    </span>
+                  )}
                 </>
               ) : (
                 <span className="text-muted-foreground">{preview.reason ?? "没有可用账号"}</span>

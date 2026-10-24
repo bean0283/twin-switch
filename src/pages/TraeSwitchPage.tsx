@@ -512,48 +512,26 @@ export default function TraeSwitchPage() {
    * 一个个成功才收进来，**失败的账号要单独列出来**，绝不悄悄少几个
    * （「少导出了 3 个」和「导出了 3 个」在界面上长得一样，是最典型的坑）。
    */
+  /**
+   * 导出**账号包**：交给后端写盘（`~/.twin-switch/trae/exports/`），拿到路径后
+   * 直接在资源管理器里定位到那个文件 —— 与 Qoder 页同一个交互。
+   *
+   * ⚠️ 以前是前端拼 Blob 走浏览器下载：落点由 WebView 决定（用户拿完不知道文件去哪了），
+   *    也没有任何本地路径可以「打开给我看」。
+   * ⚠️ 失败账号必须单独报出来：少导出 3 个和导出 3 个在界面上长得一样。
+   */
   async function onExportPack() {
     if (!clientKey || busy) return;
-    const entries = overview?.vault ?? [];
-    if (!entries.length) {
-      toast.error("账号库是空的", { description: "先在客户端登录一次，然后点「导入本机登录态」" });
-      return;
-    }
     setBusy(true);
     try {
-      const accounts: Record<string, unknown>[] = [];
-      const failed: string[] = [];
-      for (const e of entries) {
-        try {
-          const r = await api.traeExportAccount(clientKey, e.id);
-          if (r.payload) accounts.push(r.payload);
-          else failed.push(e.id);
-        } catch {
-          failed.push(e.id);
-        }
-      }
-      if (!accounts.length) {
-        toast.error("导出失败", { description: `所有账号都没导出成功：${failed.join("、")}` });
-        return;
-      }
-      const pack = {
-        format: "trae-account-pack",
-        version: 1,
-        client: clientKey,
-        exported_at: new Date().toISOString(),
-        count: accounts.length,
-        accounts,
-      };
-      const blob = new Blob([JSON.stringify(pack, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `trae-accounts-${clientKey}-${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      toast.success(`账号包已导出（${accounts.length} 个账号）`, {
-        description: failed.length ? `${failed.length} 个失败未包含：${failed.join("、")}` : undefined,
+      const r = await api.traeExportPack(clientKey);
+      toast.success(`账号包已导出（${r.count} 个账号）`, {
+        description: r.failed.length
+          ? `${r.failed.length} 个失败未包含：${r.failed.map((f) => f.id).join("、")}`
+          : r.path,
       });
+      // 文件已经在磁盘上了，定位失败不该把导出结论改成失败。
+      void api.traeRevealPath(r.path).catch(() => {});
     } catch (cause) {
       toast.error("导出账号包失败", { description: api.asError(cause) });
     } finally {
@@ -890,7 +868,7 @@ export default function TraeSwitchPage() {
   async function onExportAccount(accountId: string) {
     try {
       const res = await api.traeExportAccount(clientKey!, accountId);
-      const text = JSON.stringify(res.payload ?? {}, null, 2);
+      const text = JSON.stringify(res ?? {}, null, 2);
       await navigator.clipboard.writeText(text);
       toast.success("已导出账号备份到剪贴板", {
         description: `粘贴到文本文件保存即可（含 base64 载体，可再导入）`,

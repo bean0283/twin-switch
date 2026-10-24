@@ -829,6 +829,36 @@ fn merge_reference_accounts(
 // ---------------------------------------------------------------------------
 
 /// 导出：只导出可导出的账号（有凭据的），返回可写盘的 JSON。
+/// 导出账号包并**写到磁盘**，返回 `{count, filename, path}`。
+///
+/// 与 Trae / Qoder 同一个交互：文件有确定落点（`~/.twin-switch/workbuddy/exports/`），
+/// 前端拿到 `path` 就能在资源管理器里定位 —— Blob 下载做不到这件事。
+pub fn export_pack() -> Result<Value, String> {
+    let payload = export_accounts();
+    let count = payload
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if count == 0 {
+        return Err("账号库里没有可导出的账号（只有带凭据的账号会被导出）".to_string());
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let dir = crate::modules::config::store_dir()
+        .join("workbuddy")
+        .join("exports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建导出目录失败：{e}"))?;
+    let filename = format!("workbuddy-accounts-{stamp}.json");
+    let path = dir.join(&filename);
+    let text = serde_json::to_string_pretty(&payload).map_err(|e| format!("序列化失败：{e}"))?;
+    std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写文件失败：{e}"))?;
+    Ok(json!({
+        "count": count,
+        "filename": filename,
+        "path": path.display().to_string(),
+    }))
+}
+
 pub fn export_accounts() -> Value {
     let accounts: Vec<Value> = load_accounts()
         .into_iter()

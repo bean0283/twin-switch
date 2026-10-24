@@ -55,6 +55,11 @@ function DialogContent({
 }) {
   if (typeof document === "undefined") return null;
 
+  // ⚠️ 宽度写法（别改回去）：外层 `w-[calc(100%-2rem)]` 管「窄屏两边各留 1rem」，
+  //    `max-w-lg` 只是**默认上限**，调用方传的 `max-w-2xl` / `max-w-6xl` 由 cn()
+  //    （tailwind-merge）覆盖它。以前默认上限写成 `sm:max-w-lg`（带 sm: 变体），
+  //    而调用方传的是无变体类名 —— merge 认为两者不冲突，于是 ≥640px 时 sm 那条
+  //    照样生效，**所有弹窗都被钉死在 512px**（2026-10-24 用户报「Qoder 会话编辑太窄」）。
   // Keep positioning separate from the animated surface. Percentage translation
   // plus a changing height can jump at the end of scale animations in WebView.
   // Overlay and Content own their Radix Presence: a non-animated wrapper inside
@@ -73,7 +78,7 @@ function DialogContent({
         <DialogPrimitive.Content
           data-slot="dialog-content"
           className={cn(
-            "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 pointer-events-auto relative z-50 grid max-h-[85vh] w-full max-w-[calc(100%-2rem)] gap-4 overflow-y-auto rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
+            "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 pointer-events-auto relative z-50 grid max-h-[85vh] w-[calc(100%-2rem)] max-w-lg gap-4 overflow-y-auto rounded-lg border p-6 shadow-lg duration-200",
             className,
           )}
           {...props}

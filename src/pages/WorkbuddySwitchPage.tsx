@@ -308,7 +308,26 @@ export default function WorkbuddySwitchPage() {
         if (copied === 0 && dup === 0) return "；没有需要同步的定时任务";
         return `；定时任务同步 ${copied} 个${dup > 0 ? `（${dup} 个已存在，跳过）` : ""}`;
       })();
-      toast.success(`已切换到 ${acc.name}`, syncNote ? { description: syncNote.replace(/^；/, "") } : undefined);
+      // 会话互通的结果同样要报：它写的是会话库，失败必须让用户看见，不许只报「切换成功」。
+      const link = r.sessionLink;
+      const linkNote = (() => {
+        if (!link) return "";
+        if (link.ok === false) return `会话未同步：${link.error ?? "未知原因"}`;
+        // 首次只登记、不搬历史（历史存量要人工确认后才搬，见会话页）。
+        if (link.firstRun)
+          return "会话自动同步已启用（首次只登记已有副本；历史会话请在「会话记录 → 复制与关联」点一键互通补齐）";
+        // 没开开关 / 只有一个账号 / 已全部同步 —— 都不值得占一行。
+        if (link.notNeeded) return "";
+        const n = link.copied ?? 0;
+        const ad = link.adopted ?? 0;
+        if (n > 0) return `会话互通 ${n} 个副本`;
+        if (ad > 0) return `会话登记 ${ad} 组关联`;
+        return "";
+      })();
+      const notes = [syncNote.replace(/^；/, ""), linkNote]
+        .filter((s) => s.length > 0)
+        .join("；");
+      toast.success(`已切换到 ${acc.name}`, notes ? { description: notes } : undefined);
       await load();
       // 切换已经结束，这扇窗没有剩余职责：留着只会挡住下面已经变成「当前登录」的账号卡。
       // 成功结果同时以 toast 形式留在屏幕上，关掉窗不会丢信息。
@@ -381,21 +400,20 @@ export default function WorkbuddySwitchPage() {
     }
   };
 
+  /**
+   * 导出账号包：后端写盘 → 资源管理器定位到文件。
+   *
+   * ⚠️ 以前是 Blob + `a.download` 让浏览器下载：落点由 WebView 决定，
+   *    用户拿完根本不知道文件在哪，也没有路径能「打开给我看」。
+   */
   const runExport = async () => {
     setBusyId("export");
     try {
-      const payload = await api.workbuddyExportAccounts();
-      const text = JSON.stringify(payload, null, 2);
-      const blob = new Blob([text], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `workbuddy-accounts-${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      toast.success("账号包已导出");
+      const r = await api.workbuddyExportPack();
+      toast.success(`账号包已导出（${r.count} 个账号）`, { description: r.path });
+      void api.traeRevealPath(r.path).catch(() => {});
     } catch (e) {
-      toast.error(api.asError(e));
+      toast.error("导出账号包失败", { description: api.asError(e) });
     } finally {
       setBusyId(null);
     }
@@ -815,6 +833,11 @@ export default function WorkbuddySwitchPage() {
               <span className="mt-1 block text-xs text-emerald-700/80">
                 此窗口即将自动关闭（结果也会留在右下角提示里）。
               </span>
+              {switchResult.sessionLink?.ok === false && (
+                <span className="mt-1 block text-xs text-destructive">
+                  会话未同步：{switchResult.sessionLink.error ?? "未知原因"}
+                </span>
+              )}
             </div>
           )}
           <DialogFooter>

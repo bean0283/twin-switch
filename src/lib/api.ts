@@ -62,7 +62,12 @@ import type {
   WbSessionListByAccount,
   WbSessionDetail,
   WbSessionCopyPreview,
+  WbGroupCandidatesReport,
+  WbGroupUnifyReport,
   WbSessionCopyReport,
+  WbSessionGroup,
+  WbSessionGroupsReport,
+  WbSessionLinkAllReport,
   WbLinksPreview,
   WbSessionDeleteReport,
   WbEditColumn,
@@ -186,8 +191,27 @@ export function traeRenameAccount(
 export function traeExportAccount(
   clientKey: string,
   accountId: string,
-): Promise<{ ok: boolean; id: string; payload: Record<string, unknown> }> {
+): Promise<Record<string, unknown>> {
+  // ⚠️ 后端 `trae_vault::export_account` 返回的**就是整份载荷本身**
+  //    （顶层 `format` / `version` / `entries` / `files`），没有 `{ok, payload}` 这层信封。
+  //    以前这里声明成 `{ok,id,payload}`，前端读 `r.payload` 永远是 `undefined`
+  //    ⇒ 「导出账号包」把每个账号都当成失败（2026-10-24 用户报的 oauth_* 全军覆没）。
   return call("trae_export_account", { clientKey, accountId });
+}
+
+/**
+ * 导出**账号包**（写盘版）：后端把所有账号打进一个 JSON 存到磁盘，返回路径。
+ *
+ * 比前端拼 Blob 下载好在两点：文件有确定的落点（`~/.twin-switch/trae/exports/`），
+ * 而且拿到路径就能 `traeRevealPath` 在资源管理器里定位它。
+ */
+export function traeExportPack(clientKey: string): Promise<{
+  count: number;
+  failed: { id: string; error: string }[];
+  filename: string;
+  path: string;
+}> {
+  return call("trae_export_pack", { clientKey });
 }
 
 /** 导入账号备份（自包含 JSON，preferName 可选覆盖账号名）。 */
@@ -856,6 +880,15 @@ export function traeWbCleanupEmptyTrash(): Promise<{
  * ⚠️ **会如实报错**：「文件不存在」= 全新安装 = 默认值；「文件在但坏了」= 抛错。
  *    调用方不能把失败当成「用了默认值」——那会让用户以为自己的设置被重置了。
  */
+/** 取「正在运行的 Qoder」主程序路径（设置页「用运行中的」，按区域分开）。 */
+export function qoderExeFromRunning(region: "cn" | "global"): Promise<{
+  ok: boolean;
+  region: string;
+  path: string;
+}> {
+  return call("qoder_exe_from_running", { region });
+}
+
 export function settingsGet(): Promise<SettingsSnapshot> {
   return call("settings_get", {});
 }
@@ -881,8 +914,12 @@ export function settingsSet(patch: {
   traeExe?: Record<string, string>;
   /** 手动指定的 WorkBuddy 主程序路径（空串 = 恢复自动探测）。 */
   workbuddyExe?: string;
+  /** 手动指定的 Qoder 主程序路径（`cn | global → 绝对路径`，整表覆盖）。 */
+  qoderExe?: Record<string, string>;
   /** 切号时是否同步 WorkBuddy 的定时任务。 */
   syncWorkbuddyAutomations?: boolean;
+  /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */
+  autoLinkWorkbuddySessions?: boolean;
 }): Promise<SettingsSnapshot> {
   return call("settings_set", { patch });
 }
@@ -1077,6 +1114,15 @@ export function workbuddyExportAccounts(): Promise<Record<string, unknown>> {
   return call("workbuddy_export_accounts");
 }
 
+
+/** 导出账号包（写盘版）：后端存到 `~/.twin-switch/workbuddy/exports/` 并返回路径。 */
+export function workbuddyExportPack(): Promise<{
+  count: number;
+  filename: string;
+  path: string;
+}> {
+  return call("workbuddy_export_pack", {});
+}
 export function workbuddyPreviewImport(payload: unknown): Promise<WorkbuddyImportPreview> {
   return call("workbuddy_preview_import", { payload });
 }
@@ -1149,6 +1195,89 @@ export function workbuddySessionLinksPreview(
   targetUid: string,
 ): Promise<WbLinksPreview> {
   return call("workbuddy_session_links_preview", { sourceUid, targetUid });
+}
+
+/**
+ * 一键互通：把本机所有会话补齐到所有 WorkBuddy 账号，并登记成关联组。
+ *
+ * 幂等：已同步过的账号不会被重复复制；副本被删掉的也不会被「复活」。
+ * 客户端正在运行时后端**直接拒绝**（要写会话库），返回的错误文案可直接展示。
+ */
+export function workbuddySessionLinkAll(): Promise<WbSessionLinkAllReport> {
+  return call("workbuddy_session_link_all", {});
+}
+
+/**
+ * 只登记「同一段对话已有副本」的关联，**不复制任何文件**（0 字节）。
+ *
+ * 客户端在跑也能用（不碰会话库）：适合「只要关联关系、不想让磁盘翻倍」。
+ */
+export function workbuddySessionLinkExisting(): Promise<WbSessionLinkAllReport> {
+  return call("workbuddy_session_link_existing", {});
+}
+
+/**
+ * 一键互通的只读预览：与真跑**同一份计划函数**，所以两个数字必然一致。
+ *
+ * 只读，不写库；客户端是否在运行也一并带回来（那是唯一会被后端拒掉的情况）。
+ */
+/** 关联会话：按「同一段对话」聚合各账号副本（只读）。 */
+export function workbuddySessionGroups(): Promise<WbSessionGroupsReport> {
+  return call("workbuddy_session_groups");
+}
+
+/** 关联会话：单个组的成员明细（与列表同源）。 */
+export function workbuddySessionGroupDetail(groupKey: string): Promise<WbSessionGroupsReport & WbSessionGroup> {
+  return call("workbuddy_session_group_detail", { groupKey });
+}
+
+/** 关联会话：还没纳入关联组的会话（供「新增关联会话」选择）。 */
+export function workbuddySessionGroupCandidates(): Promise<WbGroupCandidatesReport> {
+  return call("workbuddy_session_group_candidates");
+}
+
+/** 关联会话：以某个副本为准，覆盖组内其它账号的副本（要求客户端已关闭）。 */
+export function workbuddySessionGroupUnify(
+  groupKey: string,
+  sourceSessionId: string,
+  /** 客户端在跑时由后端主动退出它再写（用户在确认框里点过才传 true）。 */
+  closeClient = false,
+): Promise<WbGroupUnifyReport> {
+  return call("workbuddy_session_group_unify", {
+    groupKey,
+    sourceSessionId,
+    closeClient,
+  });
+}
+
+/** 关联会话：给组里缺的账号补一份副本。 */
+export function workbuddySessionGroupLinkAccount(
+  groupKey: string,
+  targetUid: string,
+  closeClient = false,
+): Promise<WbSessionLinkAllReport> {
+  return call("workbuddy_session_group_link_account", {
+    groupKey,
+    targetUid,
+    closeClient,
+  });
+}
+
+/** 关联会话：把一个未关联的会话复制给目标账号（复制后自动进同一个组）。 */
+export function workbuddySessionGroupLinkSession(
+  sessionId: string,
+  targetUid: string,
+  closeClient = false,
+): Promise<WbSessionLinkAllReport> {
+  return call("workbuddy_session_group_link_session", {
+    sessionId,
+    targetUid,
+    closeClient,
+  });
+}
+
+export function workbuddySessionLinkAllPreview(): Promise<WbSessionLinkAllReport> {
+  return call("workbuddy_session_link_all_preview", {});
 }
 
 export function workbuddySessionUnlink(groupId: string): Promise<{ ok: boolean; remaining: number }> {
@@ -1440,6 +1569,21 @@ export async function qoderAccountsRefreshAll(region: string): Promise<unknown> 
   return invoke("qoder_accounts_refresh_all", { region });
 }
 
+/** 近 N 天积分消耗（本机快照算出来的，不是官方用量）。 */
+export function qoderCreditHistory(days = 7): Promise<{
+  ok: boolean;
+  windowDays: number;
+  days: { day: string; used: number }[];
+  accounts: { uid: string; name: string; region: string; used: number }[];
+  totalUsed: number;
+  resetEvents: number;
+  points: number;
+  enoughData: boolean;
+  file: string;
+}> {
+  return invoke("qoder_credit_history", { days });
+}
+
 
 // Qoder 浏览器登录（设备授权 + PKCE）
 export async function qoderLoginStart(region: string): Promise<{
@@ -1604,6 +1748,34 @@ export async function qoderSessionDelete(
   sessionId: string,
 ): Promise<{ ok: boolean; backup: string; soft: boolean }> {
   return invoke("qoder_session_delete", { region, sessionId });
+}
+
+/**
+ * 批量真删会话。**单条也走这里** —— 只有一条写入路径，行为与批量完全一致
+ * （后端一次关客户端、一次备份、一个事务、一次重启）。
+ */
+export async function qoderSessionDeleteMany(
+  region: string,
+  sessionIds: string[],
+): Promise<{
+  ok: boolean;
+  backup: string;
+  deletedSessions: number;
+  deletedMessages: number;
+  /** 选中的会话里，库里已经不存在的（列表过期或被客户端删了）。 */
+  missing?: string[];
+  requested?: number;
+  hard?: boolean;
+  verified?: boolean;
+  clientRelaunch?: {
+    ok: boolean;
+    action?: "launched" | "already-running" | "skipped";
+    exe?: string;
+    error?: string;
+    wasRunning?: boolean;
+  };
+}> {
+  return invoke("qoder_session_delete_many", { region, sessionIds });
 }
 
 export async function qoderSessionDuplicate(

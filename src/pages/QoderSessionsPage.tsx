@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Pencil, RefreshCw, Save, Trash2, XCircle } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -13,7 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  qoderSessionDelete,
+  qoderSessionDeleteMany,
   qoderSessionDetail,
   qoderSessionRename,
   qoderSessionsList,
@@ -99,10 +99,15 @@ export default function QoderSessionsPage() {
   const [savingId, setSavingId] = useState<string | null>(null);
   /** 右栏正在编辑哪条消息（与 WorkBuddy 编辑器同一套「左列表 / 右编辑」布局）。 */
   const [selMsg, setSelMsg] = useState<string | null>(null);
-  /** 待删除的会话（**弹窗二次确认**）。
+  /** 待删除的会话（**弹窗二次确认**）。单条删除也走这个数组（长度 1）——
+   *  不能出现「单条能删、批量删不了」两条路径。
    *  ⚠️ 不用 `window.confirm` —— Tauri 的 WebView 里它可能被拦掉直接返回 false，
    *     表现就是「点了删除没有任何反应、也没报错、会话还在」（踩过）。 */
-  const [confirmRow, setConfirmRow] = useState<SessionRow | null>(null);
+  const [pending, setPending] = useState<SessionRow[]>([]);
+  /** 勾选的会话 id（批量删除用）。 */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 表头复选框要能显示「部分选中」的横杠，React 只能通过 ref 设置。 */
+  const allRef = useRef<HTMLInputElement>(null);
   /** 正在删（关客户端可能要十几秒，弹窗里必须有可见进度）。 */
   const [deleting, setDeleting] = useState(false);
   /** 删除失败原因，显示在弹窗内（不关弹窗，用户能看到到底为什么）。 */
@@ -159,6 +164,37 @@ export default function QoderSessionsPage() {
 
   const shown = useMemo(() => (cwd ? rows.filter((r) => r.cwd === cwd) : rows), [rows, cwd]);
 
+  const allChecked = shown.length > 0 && shown.every((r) => selected.has(r.id));
+  const someChecked = shown.some((r) => selected.has(r.id));
+  useEffect(() => {
+    if (allRef.current) allRef.current.indeterminate = someChecked && !allChecked;
+  }, [someChecked, allChecked]);
+  // 换版本 / 换「含归档」/ 换工作目录 ⇒ 勾选清空：留着会删到屏幕上看不见的行。
+  useEffect(() => {
+    setSelected(new Set());
+  }, [region, includeArchived, cwd]);
+
+  const toggleAll = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allChecked) {
+        shown.forEach((r) => next.delete(r.id));
+      } else {
+        shown.forEach((r) => next.add(r.id));
+      }
+      return next;
+    });
+  };
+
+  const toggleOne = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   /** 保存标题（编辑器里）。 */
   async function saveTitle() {
     if (!detail) return;
@@ -213,26 +249,34 @@ export default function QoderSessionsPage() {
 
 
 
-  async function doDelete(row: SessionRow) {
+  /**
+   * 删除（单条 / 批量**同一条路径**）。
+   *
+   * ⚠️ 一次调用处理完所有选中项：后端一次关客户端、一次备份、一个事务、一次重启。
+   * 循环调单条接口会把客户端开关 N 次（每次十几秒），并产生 N 份全库备份。
+   */
+  async function doDeleteRows(targets: SessionRow[]) {
+    if (targets.length === 0) return;
     setDeleting(true);
     setDeleteError(null);
     try {
-      const res = (await qoderSessionDelete(region, row.id)) as {
-        deletedMessages?: number;
-        deletedSessions?: number;
-        backup?: string;
-        clientRelaunch?: {
-          ok: boolean;
-          action?: "launched" | "already-running" | "skipped";
-          exe?: string;
-          error?: string;
-          wasRunning?: boolean;
-        };
-      };
+      const res = await qoderSessionDeleteMany(
+        region,
+        targets.map((r) => r.id),
+      );
       const rl = res.clientRelaunch;
-      setConfirmRow(null);
+      const one = targets.length === 1;
+      const skipped = res.missing?.length ?? 0;
+      setPending([]);
+      setSelected(new Set());
       setNotice(
-        `已删除「${row.title || "该会话"}」：会话 ${res.deletedSessions ?? 1} 条、消息 ${res.deletedMessages ?? 0} 条` +
+        (one && targets[0].title
+          ? `已删除「${targets[0].title}」：`
+          : `已删除 ${res.deletedSessions ?? targets.length} 个会话：`) +
+          `会话 ${res.deletedSessions ?? 0} 条、消息 ${res.deletedMessages ?? 0} 条` +
+          (skipped > 0
+            ? `；另有 ${skipped} 个在库里已不存在，已跳过`
+            : "") +
           (res.backup ? `；备份在 ${res.backup}` : "") +
           (rl
             ? !rl.ok
@@ -331,6 +375,17 @@ export default function QoderSessionsPage() {
             <table className="w-full text-sm">
               <thead className="bg-muted/40 text-xs text-muted-foreground">
                 <tr>
+                  <th className="w-9 px-2 py-2 text-left font-medium">
+                    <input
+                      ref={allRef}
+                      type="checkbox"
+                      aria-label="全选当前列表"
+                      checked={allChecked}
+                      onChange={toggleAll}
+                      disabled={shown.length === 0 || deleting}
+                      className="size-3.5 cursor-pointer align-middle accent-destructive disabled:cursor-not-allowed"
+                    />
+                  </th>
                   <th className="px-3 py-2 text-left font-medium">标题</th>
                   <th className="px-3 py-2 text-left font-medium whitespace-nowrap">更新时间</th>
                   <th className="px-3 py-2 text-right font-medium whitespace-nowrap">正文</th>
@@ -340,13 +395,28 @@ export default function QoderSessionsPage() {
               <tbody>
                 {shown.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="px-3 py-10 text-center text-xs text-muted-foreground">
+                    <td colSpan={5} className="px-3 py-10 text-center text-xs text-muted-foreground">
                       {busy ? "读取中…" : "这个版本没有会话记录。"}
                     </td>
                   </tr>
                 ) : (
                   shown.map((r) => (
-                    <tr key={r.id} className="border-t border-border/60 align-top">
+                    <tr
+                      key={r.id}
+                      className={cn(
+                        "border-t border-border/60 align-top",
+                        selected.has(r.id) && "bg-destructive/[0.03]",
+                      )}
+                    >
+                      <td className="px-2 py-2 align-middle">
+                        <input
+                          type="checkbox"
+                          checked={selected.has(r.id)}
+                          onChange={() => toggleOne(r.id)}
+                          aria-label={`选择 ${r.title || "会话"}`}
+                          className="size-3.5 cursor-pointer align-middle accent-destructive"
+                        />
+                      </td>
                       <td className="px-3 py-2">
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className="font-medium">{r.title || "（无标题）"}</span>
@@ -387,7 +457,7 @@ export default function QoderSessionsPage() {
                             disabled={deleting}
                             onClick={() => {
                               setDeleteError(null);
-                              setConfirmRow(r);
+                              setPending([r]);
                             }}
                             title="删除（会弹窗确认）"
                             aria-label={`删除 ${r.title || "会话"}`}
@@ -403,6 +473,42 @@ export default function QoderSessionsPage() {
               </tbody>
             </table>
           </div>
+          {selected.size > 0 && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/30 px-3 py-2">
+              <span className="text-xs text-muted-foreground">
+                已选 {selected.size} 个会话
+                {" · "}
+                共{" "}
+                {shown
+                  .filter((r) => selected.has(r.id))
+                  .reduce((n, r) => n + (r.messageCount || 0), 0)}{" "}
+                条消息
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => setSelected(new Set())}
+                >
+                  取消选择
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  className="h-7 gap-1.5 px-2.5 text-xs"
+                  onClick={() => {
+                    setDeleteError(null);
+                    setPending(shown.filter((r) => selected.has(r.id)));
+                  }}
+                >
+                  <Trash2 className="size-3.5" />
+                  删除所选
+                </Button>
+              </div>
+            </div>
+          )}
+
           <p className="mt-2 text-[11px] text-muted-foreground">
             编辑 / 删除会**写客户端库**：程序会先**主动关闭该版本 Qoder**（不要求你手动退），
             写前自动备份 <span className="font-mono">main.sqlite</span>，写完自动重启客户端；
@@ -413,10 +519,10 @@ export default function QoderSessionsPage() {
 
       {/* 删除确认：**弹窗**二次确认，说明与结果都写在弹窗内 */}
       <Dialog
-        open={confirmRow !== null}
+        open={pending.length > 0}
         onOpenChange={(o) => {
           if (!o && !deleting) {
-            setConfirmRow(null);
+            setPending([]);
             setDeleteError(null);
           }
         }}
@@ -425,22 +531,47 @@ export default function QoderSessionsPage() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Trash2 className="size-4 text-destructive" />
-              确认删除会话
+              {pending.length > 1
+                ? `确认删除 ${pending.length} 个会话`
+                : "确认删除会话"}
             </DialogTitle>
             <DialogDescription>这会改动 Qoder 客户端本地库，请确认。</DialogDescription>
           </DialogHeader>
 
-          {confirmRow && (
+          {pending.length > 0 && (
             <div className="space-y-3 text-xs">
-              <div className="rounded-lg border border-border px-3 py-2">
-                <div className="font-medium break-all">
-                  {confirmRow.title || "（无标题会话）"}
+              {pending.length === 1 ? (
+                <div className="rounded-lg border border-border px-3 py-2">
+                  <div className="font-medium break-all">
+                    {pending[0].title || "（无标题会话）"}
+                  </div>
+                  <div className="mt-1 text-muted-foreground">
+                    {pending[0].messageCount} 条消息 · {fmtSize(pending[0].bytes)} · 更新于{" "}
+                    {fmtTime(pending[0].updatedAt)}
+                  </div>
                 </div>
-                <div className="mt-1 text-muted-foreground">
-                  {confirmRow.messageCount} 条消息 · {fmtSize(confirmRow.bytes)} · 更新于{" "}
-                  {fmtTime(confirmRow.updatedAt)}
-                </div>
-              </div>
+              ) : (
+                <>
+                  <div className="rounded-lg border border-border px-3 py-2">
+                    <div className="font-medium">
+                      将删除 {pending.length} 个会话
+                    </div>
+                    <div className="mt-1 text-muted-foreground">
+                      共{" "}
+                      {pending.reduce((n, r) => n + (r.messageCount || 0), 0)}{" "}
+                      条消息 ·{" "}
+                      {fmtSize(pending.reduce((n, r) => n + (r.bytes || 0), 0))}
+                    </div>
+                  </div>
+                  <ul className="max-h-40 space-y-0.5 overflow-y-auto rounded-lg border border-border px-3 py-2">
+                    {pending.map((r) => (
+                      <li key={r.id} className="truncate text-muted-foreground">
+                        · {r.title || "（无标题会话）"}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
               <ul className="space-y-1 text-muted-foreground">
                 <li>· 会从 Qoder 客户端库里**真删**（会话 + 全部消息），不是只隐藏</li>
                 <li>· 写库前自动备份 main.sqlite，删错可从备份恢复</li>
@@ -461,7 +592,7 @@ export default function QoderSessionsPage() {
               size="sm"
               disabled={deleting}
               onClick={() => {
-                setConfirmRow(null);
+                setPending([]);
                 setDeleteError(null);
               }}
             >
@@ -471,7 +602,7 @@ export default function QoderSessionsPage() {
               variant="destructive"
               size="sm"
               disabled={deleting}
-              onClick={() => confirmRow && void doDelete(confirmRow)}
+              onClick={() => void doDeleteRows(pending)}
               className="gap-1.5"
             >
               {deleting ? (
@@ -480,7 +611,8 @@ export default function QoderSessionsPage() {
                 </>
               ) : (
                 <>
-                  <Trash2 className="size-3.5" /> 确认删除
+                  <Trash2 className="size-3.5" />
+                  {pending.length > 1 ? `确认删除 ${pending.length} 个` : "确认删除"}
                 </>
               )}
             </Button>
@@ -489,6 +621,7 @@ export default function QoderSessionsPage() {
       </Dialog>
 
       <Dialog open={open} onOpenChange={setOpen}>
+        {/* 编辑会话要同时看「消息列表 + 正文」，窄了就是两栏互相挤 —— 用 6xl（1152px）。 */}
         <DialogContent className="max-w-6xl">
           <DialogHeader>
             <DialogTitle>编辑会话</DialogTitle>
@@ -519,9 +652,9 @@ export default function QoderSessionsPage() {
             </button>
           </div>
 
-          <div className="grid min-h-0 grid-cols-[300px_minmax(0,1fr)] gap-3">
+          <div className="grid min-h-0 grid-cols-[minmax(240px,340px)_minmax(0,1fr)] gap-3">
             {/* 左栏：消息列表（点选后在右栏编辑） */}
-            <div className="max-h-[58vh] overflow-y-auto rounded-lg border">
+            <div className="max-h-[64vh] overflow-y-auto rounded-lg border">
               {loadingDetail ? (
                 <div className="flex items-center justify-center py-10 text-xs text-muted-foreground">
                   <Loader2 className="mr-2 size-4 animate-spin" />

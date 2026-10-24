@@ -158,6 +158,72 @@ pub fn list_vault_accounts(client_key: &str) -> Vec<String> {
         .collect()
 }
 
+/// **账号包导出（写盘版）**：把这个客户端下所有账号的载体逐个导出，聚合成一个
+/// 自包含 JSON，落进 `~/.twin-switch/trae/exports/`，返回路径与统计。
+///
+/// ## 为什么在后端写盘，而不是前端拼 Blob 下载
+///
+/// ① WebView 的下载落点由浏览器自己决定（默认下载目录 / 弹「另存为」），用户拿完
+///    根本不知道文件去哪了；
+/// ② 导完要能**在资源管理器里定位这个文件**（`reveal_path` 需要真实磁盘路径），
+///    而 Blob URL 没有路径可给。
+///
+/// ⚠️ 失败账号**必须单独列出来**：少导出 3 个和导出 3 个在界面上长得一样，
+/// 是最典型的坑（用户拿着残缺的包去换机器，缺的那个永远找不回来）。
+pub fn export_pack(client_key: &str) -> Result<Value, String> {
+    let ids = list_vault_accounts(client_key);
+    if ids.is_empty() {
+        return Err("账号库是空的 —— 先用「导入本机登录态」收一个进来，再导出".into());
+    }
+    let mut accounts: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for id in &ids {
+        match export_account(client_key, id) {
+            Ok(v) => accounts.push(v),
+            Err(e) => failed.push(json!({ "id": id, "error": e })),
+        }
+    }
+    if accounts.is_empty() {
+        let why: Vec<String> = failed
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}（{}）",
+                    f.get("id").and_then(Value::as_str).unwrap_or("?"),
+                    f.get("error").and_then(Value::as_str).unwrap_or("未知原因")
+                )
+            })
+            .collect();
+        return Err(format!("所有账号都没导出成功：{}", why.join("；")));
+    }
+
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let filename = format!("trae-accounts-{client_key}-{stamp}.json");
+    let dir = crate::modules::config::store_dir()
+        .join("trae")
+        .join("exports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建导出目录失败：{e}"))?;
+    let path = dir.join(&filename);
+
+    let pack = json!({
+        "format": "trae-account-pack",
+        "version": 1,
+        "client": client_key,
+        "exported_at": chrono::Local::now().to_rfc3339(),
+        "count": accounts.len(),
+        "accounts": accounts,
+    });
+    let text = serde_json::to_string_pretty(&pack).map_err(|e| format!("序列化失败：{e}"))?;
+    std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写文件失败：{e}"))?;
+
+    Ok(json!({
+        "count": accounts.len(),
+        "failed": failed,
+        "filename": filename,
+        "path": path.display().to_string(),
+    }))
+}
+
 fn uid_suffix(uid: &str) -> String {
     uid[uid.len().saturating_sub(6)..].to_string()
 }
@@ -898,6 +964,21 @@ fn unused_trae_client_guard(_c: &TraeClient) {}
 
 #[cfg(test)]
 mod tests {
+    /// 现场探针：真导出一份账号包（写到 `~/.twin-switch/trae/exports/`），打印统计。
+    ///
+    /// ```text
+    /// cargo test -p wb-switch-core --lib probe_export_pack -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn probe_export_pack() {
+        match super::export_pack("trae-cn") {
+            Ok(v) => eprintln!("[export-pack] {v}"),
+            Err(e) => eprintln!("[export-pack] 失败：{e}"),
+        }
+    }
+
+
     use super::*;
 
     fn src(key: &str, accounts: &[(&str, Option<&str>)]) -> (String, Vec<(String, Option<String>)>) {

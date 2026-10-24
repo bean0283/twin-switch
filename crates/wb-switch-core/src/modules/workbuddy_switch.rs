@@ -250,6 +250,53 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
         json!({ "ok": true, "notNeeded": true, "reason": "设置里已关闭定时任务同步" })
     };
 
+    // 4.6) 会话同步（设置里打开才做）—— **只做增量，绝不搬历史存量**。
+    //
+    // 位置**不能挪**：必须在 `quit_client` 之后（会话库没有客户端在写）、
+    // `launch` 之前（新账号起来后库又被占用）。放到「切号成功之后」是错的：
+    // 那时目标账号正是当前登录账号，会被 `TARGET_IN_USE` 门禁直接拒掉。
+    //
+    // ⚠️⚠️ 为什么切号只做增量：实测本机 4 账号 / 25 会话时，一次全量要复制
+    //    **74 个副本、约 2.98 GB**。把它塞进「切号」这种高频动作，用户会遇到
+    //    「切个号卡几分钟 + 磁盘少 3 GB」，而且没有任何确认机会。
+    //    历史存量走会话页的「一键互相关联」（先给数字、再确认）；
+    //    切号只搬 `wb_link_since` 之后新建的会话，首次（起点为 0）连复制都不做、
+    //    只登记已有副本（0 字节）。
+    // ⚠️ 失败**不阻断**切号：切号本身已经成功，会话同步是附属动作，照实带回去。
+    let session_link = if settings::auto_link_workbuddy_sessions() {
+        let since = settings::wb_link_since();
+        let first = since <= 0;
+        match crate::modules::workbuddy_sessions::link_all(
+            crate::modules::workbuddy_sessions::LinkOptions {
+                require_closed: false,
+                copy_missing: !first,
+                since,
+            },
+        ) {
+            Ok(mut v) => {
+                // 成功才推进起点（失败时下次还会重试这批，不会漏）。
+                // 这里写不进去只影响「下次重复登记一次」（幂等、无害），不阻断切号。
+                if let Err(e) = settings::set_wb_link_since(now_ms()) {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert(
+                            "progressWarning".to_string(),
+                            json!(format!("没记住同步进度（下次会重复登记一次，无害）：{e}")),
+                        );
+                    }
+                }
+                if first {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("firstRun".to_string(), json!(true));
+                    }
+                }
+                v
+            }
+            Err(e) => json!({ "ok": false, "error": e }),
+        }
+    } else {
+        json!({ "ok": true, "notNeeded": true, "reason": "设置里未开启「切号时自动同步会话」" })
+    };
+
     // 5) 记录切换点（供回滚）+ 记录使用
     save_last_switch(&json!({
         "accountId": id,
@@ -273,6 +320,7 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
         "killed": killed,
         "relaunched": relaunched,
         "automationSync": automation_sync,
+        "sessionLink": session_link,
     }))
 }
 

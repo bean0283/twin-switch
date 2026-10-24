@@ -5,6 +5,7 @@ import {
   Copy,
   Eye,
   FileDown,
+  Link2,
   Link2Off,
   Loader2,
   Pencil,
@@ -33,6 +34,7 @@ import {
 } from "@/components/ui/dialog";
 import { ResizableDialogContent } from "@/components/ui/resizable-dialog-content";
 import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
+import { WorkbuddySessionGroups } from "@/components/workbuddy-session-groups";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -46,6 +48,7 @@ import type {
   WbSessionDeleteReport,
   WbSessionDetail,
   WbSessionItem,
+  WbSessionLinkAllReport,
 } from "@/lib/trae-types";
 
 function humanSize(bytes: number): string {
@@ -110,6 +113,14 @@ export default function WorkbuddyRecordsPage() {
   const [copyReport, setCopyReport] = useState<WbSessionCopyReport | null>(null);
   const [edgeDbs, setEdgeDbs] = useState<{ name: string; path: string; size: number }[]>([]);
 
+  // 全账号互通（一键 + 切号自动跑）。`autoLink === null` = 设置还没读到/读失败，
+  // 此时开关**禁用**并保持未知 —— 不能显示成「关着」（那是两种不同的状态）。
+  const [linkAllBusy, setLinkAllBusy] = useState(false);
+  const [linkAllReport, setLinkAllReport] = useState<WbSessionLinkAllReport | null>(null);
+  const [linkPreview, setLinkPreview] = useState<WbSessionLinkAllReport | null>(null);
+  const [confirmLink, setConfirmLink] = useState(false);
+  const [autoLink, setAutoLink] = useState<boolean | null>(null);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -122,6 +133,11 @@ export default function WorkbuddyRecordsPage() {
       setDstUid((prev) => prev || res.accounts?.[1]?.uid || res.accounts?.[0]?.uid || "");
       const ed = await api.workbuddySessionEdgeSyncDbs();
       setEdgeDbs(ed.items || []);
+      // 预览与主流程并行、失败也不影响列表（但绝不显示旧/假数字：失败就清空）。
+      void api
+        .workbuddySessionLinkAllPreview()
+        .then((p) => setLinkPreview(p.ok ? p : null))
+        .catch(() => setLinkPreview(null));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -132,6 +148,19 @@ export default function WorkbuddyRecordsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 读「切号自动同步会话」开关的当前值（真实值来自后端 settings.json）。
+  useEffect(() => {
+    void (async () => {
+      try {
+        const s = await api.settingsGet();
+        setAutoLink(!!s.autoLinkWorkbuddySessions);
+      } catch {
+        // 读不出来就让开关保持未知（禁用），不要假装它是「关着的」。
+        setAutoLink(null);
+      }
+    })();
+  }, []);
 
   const sessions = useMemo(
     () => accounts.find((a) => a.uid === uid)?.sessions ?? [],
@@ -251,6 +280,82 @@ export default function WorkbuddyRecordsPage() {
     }
   };
 
+  /** 把一次互通的结果统一报出去（两个入口共用，避免同样的结果两种说法）。 */
+  const reportLink = async (r: WbSessionLinkAllReport) => {
+    setLinkAllReport(r);
+    const adopted = r.adopted ?? 0;
+    if (r.notNeeded) {
+      toast.info(r.reason || "所有会话都已在各账号之间关联");
+    } else if ((r.copied ?? 0) === 0 && adopted > 0) {
+      // 只登记、没复制：目标账号本来就有同一段对话的副本。
+      toast.success(`已登记 ${adopted} 组关联`, {
+        description: "这些账号本来就有同一段对话的副本，没有复制新的",
+      });
+    } else {
+      const extra = adopted > 0 ? `，另登记 ${adopted} 组已有副本` : "";
+      toast.success(`已互通 ${r.copied} 个会话副本${extra}`, {
+        description: `写到 ${r.byTarget?.length ?? 0} 个账号，源会话未做任何改动`,
+      });
+    }
+    await load();
+    await loadLinks();
+  };
+
+  /**
+   * 一键互通：把本机所有会话补齐到所有账号（后端幂等，可反复点）。
+   *
+   * ⚠️ 这是**重操作**（本机实测一次 74 个副本 / 约 2.98 GB），所以入口先弹确认框
+   * 把数字摆出来 —— 不能点一下就默默往磁盘写几个 GB。
+   * `skipConfirm` 只在「预览显示没有要复制的」时用（那时只是登记，0 字节）。
+   */
+  const runLinkAll = async (skipConfirm = false) => {
+    if (!skipConfirm && (linkPreview?.planned ?? 0) > 0) {
+      setConfirmLink(true);
+      return;
+    }
+    setConfirmLink(false);
+    setLinkAllBusy(true);
+    try {
+      await reportLink(await api.workbuddySessionLinkAll());
+    } catch (e) {
+      // 最常见的就是「WorkBuddy 正在运行」—— 后端文案已经说清下一步，原样展示。
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLinkAllBusy(false);
+    }
+  };
+
+  /** 只登记「同一段对话已有副本」：0 字节、不碰会话库，客户端开着也能用。 */
+  const runLinkExisting = async () => {
+    setConfirmLink(false);
+    setLinkAllBusy(true);
+    try {
+      await reportLink(await api.workbuddySessionLinkExisting());
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLinkAllBusy(false);
+    }
+  };
+
+  /** 开关直接落盘到 `settings.json`：切号流程每次都会问后端，不依赖页面是否打开。 */
+  const toggleAutoLink = async (next: boolean) => {
+    const prev = autoLink;
+    setAutoLink(next); // 乐观更新，失败再滚回去
+    try {
+      const s = await api.settingsSet({ autoLinkWorkbuddySessions: next });
+      setAutoLink(!!s.autoLinkWorkbuddySessions);
+      toast.success(next ? "已开启：切号时自动同步会话" : "已关闭：切号时不再自动同步会话", {
+        description: next
+          ? "每次切换账号都会自动补一次（WorkBuddy 关闭期间写入）"
+          : "仍可在本页手动点「一键互相关联」",
+      });
+    } catch (e) {
+      setAutoLink(prev);
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const unlink = async (g: WbLinkGroup) => {
     try {
       const r = await api.workbuddySessionUnlink(g.groupId);
@@ -302,6 +407,7 @@ export default function WorkbuddyRecordsPage() {
         <TabsList>
           <TabsTrigger value="records">会话记录</TabsTrigger>
           <TabsTrigger value="copy">复制与关联</TabsTrigger>
+          <TabsTrigger value="groups">关联会话</TabsTrigger>
         </TabsList>
 
         {/* --------------------------------------------------------------- */}
@@ -625,6 +731,122 @@ export default function WorkbuddyRecordsPage() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
+              {/* ── 全账号互通 ───────────────────────────────────────────
+                  关联组 = 「同一段对话在各账号上的副本」。要把本机所有会话都做成关联，
+                  只能靠复制补齐；这一块就是「不用再一个个手动选、手动复制」的入口。
+                  开关落在 settings.json（后端 `auto_link_workbuddy_sessions`），
+                  切号流程自己会问后端，页面关着也生效。 */}
+              <div className="rounded-lg border bg-muted/30 px-3 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">全账号互通</div>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      把本机所有会话补一份到其它账号，并登记成关联组 —— 之后任意账号登录都能看到
+                      同一批会话。已同步过的不会重复复制；在某个账号里主动删掉的副本不会被自动恢复。
+                    </p>
+                  </div>
+                  <Button onClick={() => void runLinkAll()} disabled={linkAllBusy}>
+                    {linkAllBusy ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Link2 className="size-4" />
+                    )}
+                    一键互相关联
+                  </Button>
+                </div>
+                {/* 预览与真跑同源（后端同一个计划函数）：说 N 个就是 N 个。 */}
+                {linkPreview && !linkPreview.notNeeded && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {(linkPreview.planned ?? 0) > 0 ? (
+                      <>
+                        将复制 {linkPreview.planned} 个副本
+                        {(linkPreview.byTarget?.length ?? 0) > 0 &&
+                          `（${linkPreview.byTarget?.map((t) => `${t.label} ${t.count} 个`).join(" · ")}）`}
+                        {(linkPreview.totalBytes ?? 0) > 0 &&
+                          `，约 ${humanSize(linkPreview.totalBytes ?? 0)}`}
+                        {(linkPreview.adopted ?? 0) > 0 &&
+                          `；另 ${linkPreview.adopted} 组已有副本只需登记`}
+                      </>
+                    ) : (linkPreview.adopted ?? 0) > 0 ? (
+                      <>
+                        {linkPreview.adopted} 组已有副本只需登记，不会复制新副本
+                      </>
+                    ) : (
+                      "没有需要补的会话"
+                    )}
+                  </p>
+                )}
+                {linkPreview?.clientRunning && (
+                  <p className="mt-1 text-xs text-amber-600">
+                    WorkBuddy 正在运行 —— 这一步要写会话库，请先退出（用本工具切号时会自动关它）
+                  </p>
+                )}
+                <label className="mt-3 flex cursor-pointer items-start gap-2.5 border-t pt-3">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={autoLink ?? false}
+                    disabled={autoLink === null}
+                    onChange={(e) => void toggleAutoLink(e.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="text-sm font-medium">切换账号时自动同步所有账号</span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      开启后每次切号（WorkBuddy 已关闭、还没重启的那一刻）自动同步
+                      <b className="font-medium text-foreground">之后新产生的会话</b>
+                      —— 历史存量请先用上面的「一键互相关联」补齐一次（要复制几个 GB，
+                      所以不放进切号这种高频动作里）。这一步会写会话库，默认关闭。
+                      {autoLink === null && (
+                        <span className="text-destructive">
+                          {" "}
+                          （设置读取失败，开关不可用 —— 这不是「已关闭」）
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                </label>
+                {linkAllReport && (
+                  <div className="mt-3 space-y-1 border-t pt-3 text-xs text-muted-foreground">
+                    {linkAllReport.notNeeded ? (
+                      <p>{linkAllReport.reason || "没有需要补的会话"}</p>
+                    ) : (
+                      <>
+                        {(linkAllReport.copied ?? 0) > 0 && (
+                          <p>
+                            本次复制 {linkAllReport.copied} 个副本（跳过{" "}
+                            {linkAllReport.skipped ?? 0} 个已同步的）
+                          </p>
+                        )}
+                        {(linkAllReport.adopted ?? 0) > 0 && (
+                          <p>
+                            登记 {linkAllReport.adopted} 组已有副本
+                            （目标账号本来就有同一段对话，没有复制）
+                          </p>
+                        )}
+                        {(linkAllReport.alreadyThere ?? 0) > 0 && (
+                          <p>
+                            {linkAllReport.alreadyThere} 个账号的同内容副本已属于别的关联组，未改动
+                          </p>
+                        )}
+                        {(linkAllReport.byTarget?.length ?? 0) > 0 && (
+                          <p>
+                            {linkAllReport.byTarget
+                              ?.map((t) => `${t.label} ${t.count} 个`)
+                              .join(" · ")}
+                          </p>
+                        )}
+                        {(linkAllReport.noBody ?? 0) > 0 && (
+                          <p>
+                            {linkAllReport.noBody} 个会话没有正文文件，未复制（没有正文就搬不过去）
+                          </p>
+                        )}
+                        {linkAllReport.backup && <p>备份：{linkAllReport.backup}</p>}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
               {links?.error ? (
                 <Alert variant="destructive">
                   <AlertTriangle className="size-4" />
@@ -713,6 +935,11 @@ export default function WorkbuddyRecordsPage() {
               </CardContent>
             </Card>
           )}
+        </TabsContent>
+
+        <TabsContent value="groups" className="space-y-4">
+          {/* 按「同一段对话」聚合各账号副本：看谁落后、谁分叉，并直接补齐/统一。 */}
+          <WorkbuddySessionGroups />
         </TabsContent>
       </Tabs>
 
@@ -807,6 +1034,65 @@ export default function WorkbuddyRecordsPage() {
               {busy === "delete" ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
               确认删除
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── 一键互通的确认框 ────────────────────────────────────────────
+          本机实测一次可能是「74 个副本 / 约 2.98 GB」。这种量级必须先把数字摆出来，
+          再让用户选「复制」还是「只登记（0 字节）」。点一下就默默写几 GB 是不可接受的。 */}
+      <Dialog open={confirmLink} onOpenChange={setConfirmLink}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>要把会话复制到其它账号吗？</DialogTitle>
+            <DialogDescription>
+              把本机会话补一份给其它账号，并登记成关联组 —— 之后任意账号登录都能看到同一批会话。
+              源会话不会被改动；已同步过的不会重复复制。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+            <p>
+              将复制 <b>{linkPreview?.planned ?? 0}</b> 个会话副本
+              {(linkPreview?.totalBytes ?? 0) > 0 && (
+                <>（正文共约 <b>{humanSize(linkPreview?.totalBytes ?? 0)}</b>）</>
+              )}
+            </p>
+            {(linkPreview?.byTarget?.length ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                写入：{linkPreview?.byTarget?.map((t) => `${t.label} ${t.count} 个`).join(" · ")}
+              </p>
+            )}
+            {(linkPreview?.adopted ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                另有 {linkPreview?.adopted} 组「同一段对话已各有一份」，只需登记、不占空间。
+              </p>
+            )}
+            <p className="text-xs text-muted-foreground">
+              会先整份备份会话库；写入期间 WorkBuddy 必须处于关闭状态。
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:justify-between">
+            <Button
+              variant="outline"
+              disabled={linkAllBusy}
+              onClick={() => void runLinkExisting()}
+              title="只把「同一段对话已有副本」登记成关联组，不复制任何文件"
+            >
+              只登记已有副本（0 字节）
+            </Button>
+            <div className="flex gap-2">
+              <Button variant="ghost" onClick={() => setConfirmLink(false)}>
+                取消
+              </Button>
+              <Button disabled={linkAllBusy} onClick={() => void runLinkAll(true)}>
+                {linkAllBusy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Link2 className="size-4" />
+                )}
+                确认复制并关联
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
