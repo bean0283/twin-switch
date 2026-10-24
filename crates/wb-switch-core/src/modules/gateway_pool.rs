@@ -334,12 +334,23 @@ fn cooldown_scope<'a>(kind: &str, model: Option<&'a str>) -> Option<&'a str> {
     }
 }
 
+/// 「上游在排队」的唯一判据。
+///
+/// ⚠️ 三处必须同源：冷却归类（[`classify`]）、是否换号（`gateway_server::should_failover`）、
+/// 以及文案展示。以前只认 `10605` / `isQueued`，而 Qoder 私有协议回的是
+/// `QUEUED|30|上游排队中…`（我们已经把信封里的 `isQueued` 转成了这句中文标记），
+/// 于是排队被当成 429 限流：既冷却了账号，又换了一轮号（2026-10-24 实测）。
+pub fn is_queued_hint(text: &str) -> bool {
+    let m = text.to_ascii_lowercase();
+    m.contains("10605") || m.contains("isqueued") || m.contains("queued") || text.contains("排队")
+}
+
 /// 纯判定：这次失败该冷却多久、算什么类型（不碰任何全局状态，便于单测）。
 fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'static str)> {
     // 排队（10605 / isQueued）通常裹在 401/403 信封里 —— 必须先查它，
     // 否则会把「账号没问题、只是排队」误判成「凭据死」打死。
     let hint = body_hint.to_ascii_lowercase();
-    if hint.contains("10605") || hint.contains("isqueued") {
+    if is_queued_hint(body_hint) {
         return None;
     }
 
@@ -831,32 +842,54 @@ pub fn resolve_scopes(model: &str) -> Result<(String, Vec<String>), String> {
                 .into(),
         );
     }
-    // ① 精确匹配
-    let mut scopes: Vec<String> = catalog
-        .iter()
-        .filter(|(_, models)| models.iter().any(|m| m == model))
-        .map(|(k, _)| k.clone())
-        .collect();
-    let mut canonical = model.to_string();
+    // 清单三元组（作用域 / 代号 / 公开名）—— 与界面分组、`/v1/models` 同一个出口。
+    // Qoder 的公开名是客户端里显示的名字（`GLM-5.3`），代号 `gmodel` 不外露。
+    let rows = crate::modules::gateway_models::catalog_rows(None);
 
-    // ② 精确匹配不到时，按归一化指纹再找一次（大小写 / 连字符差异是常见输入误差）。
+    // ① 代号精确匹配
+    let mut scopes: Vec<String> = rows
+        .iter()
+        .filter(|(_, code, _)| code == model)
+        .map(|(scope, _, _)| scope.clone())
+        .collect();
+    let mut canonical = rows
+        .iter()
+        .find(|(_, code, _)| code == model)
+        .map(|(_, _, public)| public.clone())
+        .unwrap_or_else(|| model.to_string());
+
+    // ② 公开名精确匹配（Qoder 客户端里那个名字）
+    if scopes.is_empty() {
+        scopes = rows
+            .iter()
+            .filter(|(_, _, public)| public == model)
+            .map(|(scope, _, _)| scope.clone())
+            .collect();
+        if !scopes.is_empty() {
+            canonical = model.to_string();
+        }
+    }
+
+    // ③ 精确匹配不到时，按归一化指纹再找一次（大小写 / 连字符差异是常见输入误差）。
     //    找到就用**清单里的规范名**，避免把 `DeepSeek-V4-Flash` 原样转给只认小写的上游。
     if scopes.is_empty() {
         let want = normalize_model_key(model);
-        for (k, models) in &catalog {
-            if let Some(hit) = models.iter().find(|m| normalize_model_key(m) == want) {
-                if !scopes.contains(k) {
-                    scopes.push(k.clone());
+        for (scope, code, public) in &rows {
+            if normalize_model_key(code) == want || normalize_model_key(public) == want {
+                if !scopes.contains(scope) {
+                    scopes.push(scope.clone());
                 }
-                canonical = hit.clone();
+                if canonical == model {
+                    canonical = public.clone();
+                }
             }
         }
     }
 
     if scopes.is_empty() {
-        let known = catalog
+        let known = rows
             .iter()
-            .flat_map(|(k, ms)| ms.iter().map(move |m| format!("{k}:{m}")))
+            .map(|(scope, _, public)| format!("{scope}:{public}"))
             .collect::<Vec<_>>()
             .join("、");
         return Err(format!("模型 {model:?} 不在模型目录里。已知：{known}"));
@@ -870,7 +903,10 @@ pub fn resolve_scopes(model: &str) -> Result<(String, Vec<String>), String> {
 ///
 /// 用途：用户从客户端抄来的名字和上游清单常差在大小写或连字符上 ——
 /// `DeepSeek-V4-Flash` / `deepseek_v4_flash` / `deepseek-v4-flash` 应该被认成同一个。
-fn normalize_model_key(s: &str) -> String {
+///
+/// ⚠️ 界面（`GatewayPage.tsx` 的分组）抄的是同一条规则 —— 改这里必须同步改前端，
+/// 否则「通用模型」里会出现两个只差大小写的同名条目。
+pub fn normalize_model_key(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())

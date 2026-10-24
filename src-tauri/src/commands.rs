@@ -2616,7 +2616,19 @@ pub async fn gateway_pool() -> Result<Value, String> {
 /// 选号预览：只算不发，不消耗额度。
 #[tauri::command]
 pub async fn gateway_preview(model: String) -> Result<Value, String> {
-    gateway_pool::preview(&model).map(|s| json!(s))
+    // 预览要和真正发请求走**同一套名字归一化**：否则界面里填显示名（`DeepSeek-Flash`）
+    // 预览报「不认识这个模型」，而实际发出去又能通 —— 两套判据等于骗人。
+    let canonical = gateway_models::canonical_model(&model);
+    gateway_pool::preview(&canonical).map(|s| json!(s))
+}
+
+/// 模型显示名表：`{ 作用域: { 代号: 界面显示名 } }`。
+///
+/// 界面要用它把 `dfmodel` 显示成 `DeepSeek-Flash`（Qoder 客户端里就是这个名字），
+/// 否则用户对着两个列表根本对不上号（2026-10-24 用户反馈）。
+#[tauri::command]
+pub async fn gateway_model_labels() -> Result<Value, String> {
+    Ok(json!(gateway_models::label_map()))
 }
 
 #[tauri::command]

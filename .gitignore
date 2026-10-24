@@ -57,3 +57,8 @@ latest-*.json
 .codex/
 .grok/
 /AGENTS.md
+
+# 本地备份 / 缓存：`*.bak-<时间>` 是改文件前的手工备份，`__pycache__` 是 Python 缓存，
+# 都不属于源码（曾出现在 `git status` 里，靠 `git add -A` 就可能被误带进提交）。
+*.bak-*
+tools/__pycache__/

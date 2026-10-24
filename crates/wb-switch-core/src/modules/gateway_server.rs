@@ -414,18 +414,31 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn models() -> impl IntoResponse {
-    let catalog = gateway_pool::catalog();
-    let mut seen: Vec<String> = Vec::new();
-    for (_, list) in &catalog {
-        for m in list {
-            if !seen.contains(m) {
-                seen.push(m.clone());
-            }
+    // ⚠️ 列出去的 **id 只能是公开名**：Qoder 的 `gmodel` 用户认不出，客户端里也搜不到
+    // （2026-10-24 用户要求「只显示正常的模型名」）。代号只在网关内部发上游时用。
+    // 去重时**按归一化指纹**：`GLM-5.3`（qoder）与 `glm-5.3`（trae）是同一个模型。
+    let mut seen: Vec<(String, String, String)> = Vec::new(); // (公开名, 作用域, 代号)
+    let norm = gateway_pool::normalize_model_key;
+    for (scope, code, public) in crate::modules::gateway_models::catalog_rows(None) {
+        if seen.iter().any(|(p, _, _)| norm(p) == norm(&public)) {
+            continue;
         }
+        seen.push((public, scope, code));
     }
     let data: Vec<Value> = seen
         .iter()
-        .map(|m| json!({ "id": m, "object": "model", "owned_by": "twin-switch" }))
+        .map(|(public, scope, code)| {
+            // 显示名照旧给客户端里的名字（Trae / WB 的 `DeepSeek-V4-Flash 正式版` 之类）——
+            // 有的客户端只读 `display_name`，缺了就会退化成一串代号。
+            let display = crate::modules::gateway_models::display_of(scope, code);
+            json!({
+                "id": public,
+                "object": "model",
+                "owned_by": "twin-switch",
+                "display_name": display,
+                "name": display,
+            })
+        })
         .collect();
     (
         StatusCode::OK,
@@ -447,6 +460,34 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 fn api_err(code: StatusCode, kind: &str, msg: impl Into<String>) -> axum::response::Response {
     (code, Json(json!({ "error": { "type": kind, "message": msg.into() } }))).into_response()
+}
+
+/// 把**最近一次** `/v1/chat/completions` 的请求体落盘（覆盖式，只留一次）。
+///
+/// 排障用：客户端带附件时到底发的是 `image_url` / `file` / 纯文本，光看「空白」猜不出来
+/// （2026-10-24 Qoder 带 xlsx「已完成但空白」）。每个字符串截到 2000 字，避免把
+/// 几十 MB 的 base64 写进磁盘；`gateway-last-request.json` 每次覆盖，不累积历史。
+fn snapshot_request(req: &Value) {
+    fn trim(v: &Value, budget: usize) -> Value {
+        match v {
+            // 按**字符**截，不能按字节切 —— 切在 UTF-8 中间会 panic。
+            Value::String(s) if s.chars().count() > budget => {
+                let head: String = s.chars().take(budget).collect();
+                json!(format!("{head}…<已截断，原长 {} 字>", s.chars().count()))
+            }
+            Value::Array(a) => Value::Array(a.iter().map(|x| trim(x, budget)).collect()),
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), trim(x, budget)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let path = crate::modules::config::store_dir().join("gateway-last-request.json");
+    if let Ok(text) = serde_json::to_string_pretty(&trim(req, 2000)) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 async fn chat(
@@ -476,11 +517,15 @@ async fn chat(
     let Some(Json(req)) = body else {
         return api_err(StatusCode::BAD_REQUEST, "invalid_request_error", "请求体不是合法 JSON");
     };
+    snapshot_request(&req);
     let model = req
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // 显示名 → 代号：有人会照客户端界面填 `Qwen3.8-Max`，而上游只认 `qmodel_38max`。
+    // 归一化放在选号之前，后面 `resolve_scopes` / 上游请求体拿到的都是代号。
+    let model = crate::modules::gateway_models::canonical_model(&model);
 
     // ② 模型名 → 候选作用域
     let (bare, scopes) = match gateway_pool::resolve_scopes(&model) {
@@ -667,10 +712,12 @@ fn log_failover(model: &str, key: &str, status: u16, msg: &str, failover: bool) 
 /// 反例（**必须不换**，换了也是白试 + 拖长客户端超时）：`400` 参数错、`404` 模型不存在，
 /// 以及**排队**（`10605` / `isQueued` —— 排队是全局的，换号只会再排一次）。
 fn should_failover(status: u16, msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    if m.contains("10605") || m.contains("isqueued") {
+    // 排队是**模型维度**的：换号只会再排一次，白等一轮还拖长客户端超时。
+    // 判据与冷却归类同源（`gateway_pool::is_queued_hint`），别再各写一套。
+    if crate::modules::gateway_pool::is_queued_hint(msg) {
         return false;
     }
+    let m = msg.to_ascii_lowercase();
     if matches!(status, 0 | 401 | 402 | 403 | 429 | 500..=599) {
         return true;
     }
@@ -828,6 +875,12 @@ async fn forward(
     req: &Value,
 ) -> Result<Value, (StatusCode, String)> {
     let scope = cand.scope.as_str();
+    // ⚠️⚠️ **公开名 → 这一家的代号**，必须在这里做、且每家各算一次。
+    //
+    // Qoder 对外叫 `GLM-5.3`（客户端里那个名字），上游只认 `gmodel`；而同一行在
+    // Trae 那边就是 `glm-5.3`。选号之前不知道会落到哪一家，所以只能在这里换。
+    let model = crate::modules::gateway_models::upstream_model(scope, model);
+    let model = model.as_str();
     let path = crate::modules::config::store_dir().join("upstreams.json");
     let spec = std::fs::read_to_string(&path)
         .ok()
@@ -966,11 +1019,11 @@ fn explain_upstream_error(text: &str) -> String {
 
 /// 累积中的一次工具调用。
 #[derive(Debug, Clone, Default)]
-struct ToolCallAcc {
-    index: Option<u64>,
-    id: String,
-    name: String,
-    arguments: String,
+pub(crate) struct ToolCallAcc {
+    pub(crate) index: Option<u64>,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 /// `new` 是不是 `acc` 的**结构化扩展**（同一个 JSON 对象，`acc` 的每个键值都在 `new` 里）。
@@ -1022,7 +1075,7 @@ fn arg_text(v: Option<&Value>) -> String {
 
 /// 把一片工具调用并进累积表。按 `index` 对齐（OpenAI 标准），没有 index 时按 `id`，
 /// 都没有就新开一条 —— 宁可多一条，也不要把两次不同的调用合并成一次。
-fn absorb_tool_call(accs: &mut Vec<ToolCallAcc>, raw: &Value) {
+pub(crate) fn absorb_tool_call(accs: &mut Vec<ToolCallAcc>, raw: &Value) {
     let Some(obj) = raw.as_object() else { return };
     let index = obj.get("index").and_then(Value::as_u64);
     let id = obj
@@ -1086,7 +1139,7 @@ fn absorb_tool_call(accs: &mut Vec<ToolCallAcc>, raw: &Value) {
 /// 累积表 → OpenAI `message.tool_calls`。
 ///
 /// 没有 `name` 的条目直接丢掉：那是上游的脏数据，编一个名字只会让客户端调用出错的工具。
-fn finalize_tool_calls(accs: &[ToolCallAcc]) -> Vec<Value> {
+pub(crate) fn finalize_tool_calls(accs: &[ToolCallAcc]) -> Vec<Value> {
     accs.iter()
         .enumerate()
         .filter(|(_, a)| !a.name.is_empty())
@@ -1113,7 +1166,7 @@ fn finalize_tool_calls(accs: &[ToolCallAcc]) -> Vec<Value> {
 
 /// 有工具调用时 `finish_reason` 必须是 `tool_calls` —— 很多客户端只认这个值才去解析
 /// 调用（`stop` 会被当成「模型只说了句话」）。上游有时候确实只给 `stop`。
-fn finish_with_calls(finish: Option<String>, has_calls: bool) -> String {
+pub(crate) fn finish_with_calls(finish: Option<String>, has_calls: bool) -> String {
     match (finish.as_deref(), has_calls) {
         (Some("tool_calls"), _) => "tool_calls".to_string(),
         (Some("length"), _) => "length".to_string(),
@@ -1361,8 +1414,10 @@ fn trae_model_config(model: &str) -> (String, String) {
 /// Trae 对话：专用请求体 + 私有 SSE。
 /// Qoder 转发：COSY 签名 + 信封 SSE 聚合。
 ///
-/// 账号取自 Qoder 账号库（两个区域各自一份），模型名就是 `/v1/models` 里那套代号
-/// （`qmodel` / `dmodel` / `gmodel` …）。真机已验证：正文与 usage 都能取到。
+/// 账号取自 Qoder 账号库（两个区域各自一份）。⚠️ 这里的 `model` 必须是**上游代号**
+/// （`qmodel` / `dmodel` / `gmodel` …）—— 调用方 `forward()` 已经用
+/// `gateway_models::upstream_model()` 把对外的 `GLM-5.3` 换成了代号。
+/// 真机已验证：正文与 usage 都能取到。
 async fn qoder_forward(
     scope: &str,
     model: &str,
@@ -1388,13 +1443,45 @@ async fn qoder_forward(
         })?;
 
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
-    // display_name 直接用模型 key：可读性一般，但上游只认 key。
-    let out = crate::modules::qoder_tools::chat_complete(region, acc, model, model, &messages)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Qoder 上游：{e}")))?;
+    // 客户端给的工具定义原样下发（Qoder 模板 `model_config.format = openai`，
+    // 吃 OpenAI 形状的 tools）。之前完全没传 ⇒ 模型看不到工具 ⇒ 只会吐 XML 正文，
+    // 提升成 tool_calls 后 content 变 null，客户端显示「已完成但空白」。
+    let tools = req.get("tools").cloned().unwrap_or(Value::Null);
+    let has_tools = tools
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    // `display_name` 只是给上游做界面/日志显示，但填真名比填代号更像官方客户端
+    // （`DeepSeek-Flash` 而不是 `dfmodel`）。
+    let shown = crate::modules::gateway_models::display_of(scope, model);
+    let out = crate::modules::qoder_tools::chat_complete_ex(
+        region,
+        acc,
+        model,
+        &shown,
+        &messages,
+        Some(&tools),
+    )
+    .await
+    .map_err(|e| {
+            // 排队不是「网关坏了」，也不是「账号坏了」：换成 429 + 原话，
+            // 客户端就会显示「请求过多/稍后重试」，而不是含糊的 502 服务器错误。
+            // 状态码必须照实（「空」和「失败」不许长得一样）。
+            let status = if e.contains("QUEUED|") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            let text = e
+                .split_once("QUEUED|")
+                .and_then(|(_, rest)| rest.split_once('|'))
+                .map(|(_, msg)| format!("Qoder 上游排队中：{msg}"))
+                .unwrap_or_else(|| format!("Qoder 上游：{e}"));
+            (status, text)
+        })?;
     // Qoder 的私有协议没有 function calling 通道，模型会把调用**写在正文里**
     // （`<function_calls><invoke …>`）。原样透出等于给客户端一段话术，这里提成标准 tool_calls。
-    Ok(lift_qoder_tool_calls(out))
+    Ok(lift_qoder_tool_calls(out, has_tools))
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,7 +1635,11 @@ fn lift_text_tool_calls(text: &str) -> (String, Vec<Value>) {
 }
 
 /// 把 Qoder 的完整返回里的正文工具调用提成 `message.tool_calls`。
-fn lift_qoder_tool_calls(mut v: Value) -> Value {
+///
+/// ⚠️ `allow_tools` = 本次请求**客户端真的给了工具定义**。没给却提升成 `tool_calls`，
+/// 调用无处可去，客户端只会显示「已完成 + 一片空白」（2026-10-24 用户：带文件分析
+/// 那两次 7 秒就结束、什么都不出）。那种情况剥掉 XML、写明原因，至少不是空白。
+fn lift_qoder_tool_calls(mut v: Value, allow_tools: bool) -> Value {
     let Some(content) = v
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -1561,6 +1652,29 @@ fn lift_qoder_tool_calls(mut v: Value) -> Value {
     }
     let (rest, calls) = lift_text_tool_calls(&content);
     if calls.is_empty() {
+        return v;
+    }
+    if !allow_tools {
+        let names: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| c.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        let hint = if names.is_empty() {
+            "（模型想调用工具，但这次请求没有带工具定义，无法执行。）".to_string()
+        } else {
+            format!(
+                "（模型想调用工具 {}，但这次请求没有带工具定义，无法执行。）",
+                names.join("、")
+            )
+        };
+        let text = if rest.is_empty() {
+            hint
+        } else {
+            format!("{rest}\n\n{hint}")
+        };
+        if let Some(msg) = v.pointer_mut("/choices/0/message").and_then(Value::as_object_mut) {
+            msg.insert("content".into(), json!(text));
+        }
         return v;
     }
     if let Some(msg) = v.pointer_mut("/choices/0/message").and_then(Value::as_object_mut) {
@@ -1587,11 +1701,15 @@ async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, St
     let (config_name, model_name) = trae_model_config(model);
     let mut body = req.clone();
     if let Some(obj) = body.as_object_mut() {
-        // 上游要求 `messages[].content` 是数组（字符串形态会回 4001）。
+        // 上游要求 `messages[].content` 是数组（字符串形态会回 4001），
+        // 且历史里的 `assistant.tool_calls[].function` 必须改成 `function_call`
+        // —— 不改第二轮带工具结果就 502（proto `LLMRawMessage read field 5 'ToolCalls'`）。
         normalize_trae_messages(obj);
         // 上游要求 `tools[].function.parameters` 是字符串（OpenAI 标准是对象，
         // WorkBuddy 发对象过来不转就 400：cannot unmarshal object into ... parameters of type string）。
         normalize_trae_tools(obj);
+        // `tool_choice` 只认 auto / required / 具体函数名；`none` 要连 tools 一起删。
+        normalize_trae_tool_choice(obj);
         obj.insert("config_name".into(), json!(config_name));
         obj.insert("model_name".into(), json!(model_name));
         // 上游只支持流式；本地聚合。
@@ -1673,6 +1791,15 @@ fn normalize_trae_tools(obj: &mut serde_json::Map<String, Value>) {
     let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) else {
         return;
     };
+    // 没有函数名的 tool 是上游会直接拒的脏数据（`FunctionDefinition.name` 必填），
+    // 留着只会让整条请求 400，不如丢掉（照参考实现 `payload.rs::normalize_tools`）。
+    tools.retain(|tool| {
+        tool.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(|n| !n.trim().is_empty())
+            .unwrap_or(false)
+    });
     for tool in tools.iter_mut() {
         let Some(func) = tool.get_mut("function") else { continue };
         let Some(params) = func.get("parameters") else { continue };
@@ -1686,12 +1813,108 @@ fn normalize_trae_tools(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// `tool_choice` 归一化：上游只认 `auto` / `required` / **具体函数名** / 缺省。
+///
+/// OpenAI 的 `{"type":"function","function":{"name":"x"}}` 和 `"none"` 上游都不吃：
+/// `none` 要连 `tools` 一起删掉，具名要拍平成字符串。
+fn normalize_trae_tool_choice(obj: &mut serde_json::Map<String, Value>) {
+    let Some(choice) = obj.remove("tool_choice") else {
+        return;
+    };
+    let suppress = |object: &mut serde_json::Map<String, Value>| {
+        object.remove("tools");
+        object.remove("functions");
+    };
+    match choice {
+        Value::String(text) => {
+            if text.trim().eq_ignore_ascii_case("none") {
+                suppress(obj);
+            } else {
+                obj.insert("tool_choice".into(), Value::String(text));
+            }
+        }
+        Value::Object(map) => {
+            let kind = map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            match kind.as_str() {
+                "none" => suppress(obj),
+                "auto" | "required" => {
+                    obj.insert("tool_choice".into(), Value::String(kind));
+                }
+                "function" => {
+                    let name = map
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .or_else(|| map.get("name").and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("auto")
+                        .to_string();
+                    obj.insert("tool_choice".into(), Value::String(name));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 消息数组的改写：`content` 字符串 → 数组、`assistant.tool_calls[].function` → `function_call`。
+///
+/// ⚠️⚠️ **`function_call` 这一步是硬要求，不是审美问题**。Trae 的 proto 里
+/// `LLMRawMessage` 的 `ToolCalls`（field 5）元素类型与我们发过去的 OpenAI 形态不兼容，
+/// 原样回传会得到（2026-10-24 用户真机报错原文）：
+///
+/// ```text
+/// code 2001: LLMUtilsChatStreamFailed ... rpc error: code = 7
+/// desc = 'idecopilot.LLMRawChatV2Request read field 8 'Messages' error:
+/// 'idecopilot.LLMRawMessage read field 5 'ToolCalls' error:
+/// 'idecopilot.ToolCall read field 4' error ...'
+/// ```
+///
+/// 症状很有欺骗性：**第一轮（模型发起工具调用）正常，第二轮把工具结果带回去就 502**，
+/// 所以看起来像「选中 Trae 模型就报 502，WorkBuddy 的模型正常」。
+/// 同一件事在参考实现 `buddy-switch-gateway/src/trae/payload.rs` 的模块头部也写着：
+/// 「`assistant.tool_calls[].function` 要改成 `function_call`（历史消息回传时）」。
 fn normalize_trae_messages(obj: &mut serde_json::Map<String, Value>) {
     let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
     for m in messages.iter_mut() {
         let Some(m) = m.as_object_mut() else { continue };
+
+        if m.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(calls) = m.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                let mut kept: Vec<Value> = Vec::with_capacity(calls.len());
+                for call in calls.iter_mut() {
+                    let Some(call) = call.as_object_mut() else { continue };
+                    // `function` → `function_call`（不能两者并存，否则上游按未知字段处理）
+                    if let Some(function) = call.remove("function") {
+                        call.insert("function_call".into(), function);
+                    }
+                    // 没有函数名的调用上游一定拒，留着会拖垮整条请求。
+                    let named = call
+                        .get("function_call")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .map(|n| !n.trim().is_empty())
+                        .unwrap_or(false);
+                    if named {
+                        kept.push(Value::Object(call.clone()));
+                    }
+                }
+                if kept.is_empty() {
+                    m.remove("tool_calls");
+                } else {
+                    *calls = kept;
+                }
+            }
+        }
+
         if let Some(text) = m.get("content").and_then(Value::as_str) {
             let text = text.to_string();
             m.insert("content".into(), json!([{ "type": "text", "text": text }]));
@@ -2175,7 +2398,7 @@ mod tool_call_tests {
         let v = json!({
             "choices": [{ "message": { "role": "assistant", "content": "普通回答" }, "finish_reason": "stop" }]
         });
-        let out = lift_qoder_tool_calls(v.clone());
+        let out = lift_qoder_tool_calls(v.clone(), true);
         assert_eq!(out, v);
     }
 

@@ -737,32 +737,84 @@ pub async fn chat_complete(
     display_name: &str,
     messages: &Value,
 ) -> Result<Value, String> {
-    // 上游排队（10605 isQueued）时**等一等再重试**，而不是直接报错 ——
-    // 免费热门模型经常排几千人，用户宁等 40 秒也不想看到失败。
-    // 最多 3 轮，单轮等待上限 40s，总预算 ~120s（客户端自己的超时更短就自然结束）。
+    chat_complete_ex(region, account, model_key, display_name, messages, None).await
+}
+
+/// [`chat_complete`] + **工具定义透传**。
+///
+/// ⚠️ 2026-10-24 之前这里**从来没把 `tools` 发给上游**：`build_chat_body` 只拼
+/// `messages`，模板里 `tools` 永远是 `[]`。于是客户端带工具（尤其带文件、
+/// 让模型读表）时，模型看不到任何工具，只能凭空吐一段
+/// `<function_calls><invoke …>` 正文 —— 经 [`lift_qoder_tool_calls`] 提升后
+/// `content` 变 `null`，客户端拿到的就是「已完成但一片空白」。
+///
+/// 模板里 `model_config.format = "openai"`，所以 `tools` 按 OpenAI 形状塞：
+/// `[{type:"function",function:{name,description,parameters}}]`。
+///
+/// 带工具失败（非排队）时**降级重试一次不带工具**：某些模型/账号不支持工具，
+/// 不能让一个格式差异把整家 Qoder 变成不可用。降级不是静默 —— 错误原文留在
+/// 最后一次失败里，`degraded` 会带回去让上层能说清「这轮没工具」。
+pub async fn chat_complete_ex(
+    region: QoderRegion,
+    account: &QoderAccount,
+    model_key: &str,
+    display_name: &str,
+    messages: &Value,
+    tools: Option<&Value>,
+) -> Result<Value, String> {
+    let empty = |t: &Option<&Value>| {
+        t.and_then(Value::as_array)
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+    };
+    let mut send_tools: Option<&Value> = if empty(&tools) { None } else { tools };
+    let mut degraded = false;
     let mut last = String::new();
     for attempt in 0..3 {
-        match chat_once(region, account, model_key, display_name, messages).await {
+        match chat_once(region, account, model_key, display_name, messages, send_tools).await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if let Some(rest) = e.strip_prefix("QUEUED|") {
+                if let Some(rest) = queue_marker(&e) {
                     let mut parts = rest.splitn(2, '|');
                     let wait: u64 = parts.next().unwrap_or("30").trim().parse().unwrap_or(30);
                     let msg = parts.next().unwrap_or("上游排队中").to_string();
                     last = format!("{msg}（已重试 {attempt} 次仍排队）");
                     if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_secs(wait.min(40))).await;
+                        // 单轮最多等 12 秒：等太久会让客户端的「测试连接」先超时，
+                        // 用户看到的是「连接失败」而不是「排队中」。
+                        tokio::time::sleep(std::time::Duration::from_secs(wait.min(12))).await;
                         continue;
                     }
                     return Err(format!(
-                        "{msg}，已等待重试 {attempt} 次仍排队；建议换 qmodel / gmodel / kmodel"
+                        // ⚠️ 文案里**不许出现代号**（`qmodel` / `dfmodel`）：界面和复制都
+                        // 已经只用客户端里的名字，提示再给代号等于让用户去认一个界面
+                        // 上根本看不到的字符串（2026-10-24）。
+                        "QUEUED|{wait}|{msg}（已等待重试 {attempt} 次仍排队 —— 这是上游排队不是额度不足；\
+                         换个冷门模型试试，如 GLM-5.3 / Qwen3.8-Max）"
                     ));
+                }
+                // 非排队失败：第一次先把 tools 摘掉重试（不支持工具的模型/账号），
+                // 还失败就如实报错。
+                if send_tools.is_some() && !degraded {
+                    degraded = true;
+                    send_tools = None;
+                    last = e;
+                    continue;
                 }
                 return Err(e);
             }
         }
     }
     Err(last)
+}
+
+/// 从错误文本里取排队标记后面的内容（`<秒>|<文案>`）。
+///
+/// 标记不一定在开头：`chat_once` 会把它包成 `上游报错：QUEUED|30|…`。
+/// 只看开头就等于「自动等待重试」永远不生效（线上踩过）。
+fn queue_marker(err: &str) -> Option<&str> {
+    const MARK: &str = "QUEUED|";
+    err.find(MARK).map(|i| &err[i + MARK.len()..])
 }
 
 /// 单次尝试（不做重试）。解析见 [`chat_complete`]。
@@ -772,8 +824,16 @@ pub async fn chat_once(
     model_key: &str,
     display_name: &str,
     messages: &Value,
+    tools: Option<&Value>,
 ) -> Result<Value, String> {
     let mut body = build_chat_body(model_key, display_name, "")?;
+    // 工具定义按 OpenAI 形状塞进模板的 `tools`（模板默认 `[]`，等于「没有工具」）。
+    // 不塞的话模型看不到任何工具，只会把调用写成 XML 正文 —— 客户端就只剩空白。
+    if let Some(list) = tools.and_then(Value::as_array) {
+        if !list.is_empty() {
+            body["tools"] = Value::Array(list.clone());
+        }
+    }
     if let Some(arr) = messages.as_array() {
         if let Some(list) = body.get_mut("messages").and_then(Value::as_array_mut) {
             // 模板自带 system；客户的 messages 全部接在后面（含 system 时它会变成两条，可接受）。
@@ -848,6 +908,11 @@ pub async fn chat_once(
     let mut upstream_model = String::new();
     let mut errors: Vec<String> = Vec::new();
     let mut finished = false;
+    // ⚠️ 工具调用在 `delta.tool_calls` 里（按 index 分片），以前**完全不收**：
+    //    带 tools 的请求上游 2 秒内返回空正文 + 两个 tool_call 分片，我们只拿到
+    //    「正文 = ""」，返回 200 ⇒ 客户端「已完成 + 一片空白」（2026-10-24 实测）。
+    let mut calls: Vec<crate::modules::gateway_server::ToolCallAcc> = Vec::new();
+    let mut finish: Option<String> = None;
 
     let handle_line = |line: &str,
                        content: &mut String,
@@ -856,7 +921,9 @@ pub async fn chat_once(
                        completion_tokens: &mut i64,
                        upstream_model: &mut String,
                        errors: &mut Vec<String>,
-                       finished: &mut bool| {
+                       finished: &mut bool,
+                       calls: &mut Vec<crate::modules::gateway_server::ToolCallAcc>,
+                       finish: &mut Option<String>| {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("data:") else {
             return;
@@ -947,11 +1014,26 @@ pub async fn chat_once(
                     if let Some(t) = d.get("reasoning_content").and_then(Value::as_str) {
                         reasoning.push_str(t);
                     }
+                    // 工具调用：OpenAI 分片形态（同一个 index 多片，名字只在第一片）。
+                    if let Some(list) = d.get("tool_calls").and_then(Value::as_array) {
+                        for one in list {
+                            crate::modules::gateway_server::absorb_tool_call(calls, one);
+                        }
+                    }
                 }
                 if let Some(m) = c.get("message") {
                     if let Some(t) = m.get("content").and_then(Value::as_str) {
                         content.push_str(t);
                     }
+                    // 非流式形态的完整调用也收（有的模型直接一次给全）。
+                    if let Some(list) = m.get("tool_calls").and_then(Value::as_array) {
+                        for one in list {
+                            crate::modules::gateway_server::absorb_tool_call(calls, one);
+                        }
+                    }
+                }
+                if let Some(fr) = c.get("finish_reason").and_then(Value::as_str) {
+                    *finish = Some(fr.to_string());
                 }
                 // 有 finish_reason 就说明这一轮说完了，不必等连接关闭。
                 if c.get("finish_reason").map(|v| !v.is_null()).unwrap_or(false) {
@@ -965,11 +1047,13 @@ pub async fn chat_once(
     // 会一直等到总超时（真机：qmodel 等了 122s）。所以用「空闲超时」：
     // 已经有正文后，连续 3 秒没有新 chunk 就认为这一轮说完了。
     while let Some(item) = tokio::time::timeout(
-        std::time::Duration::from_secs(if content.is_empty() && reasoning.is_empty() {
-            90
-        } else {
-            3
-        }),
+        std::time::Duration::from_secs(
+            if content.is_empty() && reasoning.is_empty() && calls.is_empty() {
+                90
+            } else {
+                3
+            },
+        ),
         stream.next(),
     )
     .await
@@ -978,7 +1062,7 @@ pub async fn chat_once(
         let chunk = match item {
             Ok(c) => c,
             Err(e) => {
-                if content.is_empty() && reasoning.is_empty() {
+                if content.is_empty() && reasoning.is_empty() && calls.is_empty() {
                     return Err(format!("读取上游流出错：{e}"));
                 }
                 break;
@@ -996,6 +1080,8 @@ pub async fn chat_once(
                 &mut upstream_model,
                 &mut errors,
                 &mut finished,
+                &mut calls,
+                &mut finish,
             );
         }
         if finished {
@@ -1013,15 +1099,36 @@ pub async fn chat_once(
             &mut upstream_model,
             &mut errors,
             &mut finished,
+            &mut calls,
+            &mut finish,
         );
     }
     drop(stream);
 
-    if content.is_empty() && !errors.is_empty() {
+    if content.is_empty() && calls.is_empty() && !errors.is_empty() {
         return Err(format!("上游报错：{}", errors.join("；")));
     }
-    if content.is_empty() && reasoning.is_empty() {
-        return Err("上游没有返回内容（这条流里没有可解析的 chunk）".to_string());
+    // 「只有思考没有正文」也要当失败，不能返回空串 —— 客户端那边「空」和「成功」
+    // 长得一模一样，用户只会看到「已完成」加一片空白（2026-10-24 带文件实测）。
+    if content.is_empty() && calls.is_empty() {
+        if reasoning.trim().is_empty() {
+            return Err("上游没有返回内容（这条流里没有可解析的 chunk）".to_string());
+        }
+        return Err(format!(
+            "模型只返回了思考过程（{} 字），没有正文 —— 这次请求可能带了上游不认的附件或参数",
+            reasoning.chars().count()
+        ));
+    }
+
+    let tool_calls = crate::modules::gateway_server::finalize_tool_calls(&calls);
+    let has_calls = !tool_calls.is_empty();
+    let mut message = json!({ "role": "assistant", "content": content });
+    if has_calls {
+        // 有调用时正文给 null：空串会被部分客户端当成「空回答」直接吞掉。
+        if content.trim().is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = json!(tool_calls);
     }
 
     Ok(json!({
@@ -1031,8 +1138,8 @@ pub async fn chat_once(
         "model": if upstream_model.is_empty() { model_key.to_string() } else { upstream_model },
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": crate::modules::gateway_server::finish_with_calls(finish, has_calls),
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,

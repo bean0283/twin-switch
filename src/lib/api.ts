@@ -1494,6 +1494,16 @@ export async function gatewayModelsSet(value: unknown): Promise<void> {
   return invoke("gateway_models_set", { value });
 }
 
+/**
+ * 模型显示名表：`{ 作用域: { 上游代号: 界面显示名 } }`。
+ *
+ * Qoder 上游只认 `dfmodel` 这类代号，而它自己客户端里显示的是 `DeepSeek-Flash` ——
+ * 不把显示名带出来，用户对着两个列表根本对不上号。
+ */
+export async function gatewayModelLabels(): Promise<Record<string, Record<string, string>>> {
+  return invoke("gateway_model_labels");
+}
+
 export async function gatewayUpstreamsGet(): Promise<unknown> {
   return invoke("gateway_upstreams_get");
 }
@@ -1504,8 +1514,18 @@ export async function gatewayUpstreamsSet(value: unknown): Promise<void> {
 
 
 /// 自动识别本机客户端里的模型（附带每家来源说明）。
+///
+/// `public` = 对外公开名：Qoder 给客户端里显示的名字（`GLM-5.3`），其余家等于 `model`。
+/// 界面分组、复制、`/v1/models` 都只认它，代号不外露。
 export async function gatewayModelsDiscover(): Promise<{
-  models: { scope: string; product: string; model: string; display: string; source: string }[];
+  models: {
+    scope: string;
+    product: string;
+    model: string;
+    display: string;
+    public: string;
+    source: string;
+  }[];
   reports: { product: string; scope: string; found: number; note: string }[];
 }> {
   return invoke("gateway_models_discover");
