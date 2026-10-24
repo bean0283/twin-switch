@@ -225,6 +225,13 @@ fn body_message(body: &Value) -> String {
 
 /// 失败描述：**HTTP 状态码 + 业务 code + 服务端 message 一个都不许吞**。
 fn describe(resp: &Resp) -> String {
+    // ★ 1001 = Trae 侧「认证失败」。**不是过期**（过期在发请求前就被 `expiry_state` 拦掉了），
+    // 而是服务端不认这条 token：多半是在别处重新登录 / 换了设备，旧 token 被吊销。
+    // 四档设备候选（上次成功 / 派生 / 派生回退 / 客户端设备）都试过才走到这里，
+    // 所以不必再让用户去折腾设备 —— 直接告诉他重新登录。
+    if body_code(&resp.body) == Some(1001) {
+        return "登录态被服务端拒绝（code=1001，token 已在别处失效）⇒ 请在该客户端重新登录一次".into();
+    }
     if resp.http_status == 0 {
         return format!("网络请求失败：{}", body_message(&resp.body));
     }
@@ -1096,8 +1103,9 @@ fn trae_account_key(client_key: &str, id: &str) -> String {
 
 pub async fn run(scope: Option<&str>, only_client: Option<&str>) -> Value {
     let scope = scope.unwrap_or("all").trim();
-    let do_trae = scope != "workbuddy";
-    let do_wb = scope != "trae";
+    let do_trae = scope != "workbuddy" && scope != "qoder";
+    let do_wb = scope != "trae" && scope != "qoder";
+    let do_qoder = scope == "qoder" || scope == "all";
 
     let started_at = chrono::Utc::now().timestamp_millis();
     let mut items: Vec<Value> = Vec::new();
@@ -1131,6 +1139,53 @@ pub async fn run(scope: Option<&str>, only_client: Option<&str>) -> Value {
             }
             first = false;
             items.push(checkin_workbuddy(&acc).await.to_value());
+        }
+    }
+
+    if do_qoder {
+        // Qoder 是**活动制**（`/sash/api/v1/me/campaigns`），两个版本各一套账号库。
+        // 签完顺手刷一次额度 —— 否则界面上的积分要等用户手动点「刷新积分」才更新，
+        // 同屏会出现「刚领了 100 但还显示旧数」的自相矛盾。
+        for region in [
+            crate::modules::qoder_realm::QoderRegion::Cn,
+            crate::modules::qoder_realm::QoderRegion::Global,
+        ] {
+            let accounts = crate::modules::qoder_accounts::list(region).unwrap_or_default();
+            for acc in accounts.iter().filter(|a| a.is_usable()) {
+                let outcome = crate::modules::qoder_tools::checkin_claim(region, acc).await;
+                let balance = crate::modules::qoder_api::refresh_account(acc)
+                    .await
+                    .ok()
+                    .and_then(|a| a.credits);
+
+                let mut item = Item::new("qoder", &acc.id, &acc.name);
+                item.uid = acc.uid.clone();
+                item.balance = balance;
+                match outcome {
+                    Ok(v) => {
+                        item.gained = v.get("gained").and_then(Value::as_f64);
+                        let msg = v
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                            if v.get("already").and_then(Value::as_bool) == Some(true) {
+                                item = item.done(status::ALREADY, msg);
+                            } else {
+                                item = item.done(status::SUCCESS, msg);
+                            }
+                        } else if v.get("blocked").and_then(Value::as_bool) == Some(true) {
+                            // 有活动但前置条件没达成：不是失败，重试也没用。
+                            item = item.done(status::INACTIVE, msg);
+                        } else {
+                            item = item.done(status::FAILED, msg);
+                        }
+                    }
+                    Err(e) => item = item.done(status::FAILED, e),
+                }
+                items.push(item.to_value());
+            }
         }
     }
 

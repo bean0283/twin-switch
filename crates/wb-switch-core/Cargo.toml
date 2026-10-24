@@ -1,13 +1,16 @@
 [package]
 name = "wb-switch-core"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 description = "TwinSwitch（双栖）核心逻辑（账号 / 切换 / 会话 / 解密 / 导入 / 清理），不依赖 Tauri，可被桌面端与 CLI 复用"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+axum = "0.8"
+# Qoder 的信封 SSE 必须**逐块读**（等整条流结束会一直挂着，真机踩过）。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # v5：Trae 的 agent_run_id 实测是 UUID v5（第三段首字符为 5），需按同构生成。
 uuid = { version = "1", features = ["v4", "v5"] }
@@ -18,6 +21,10 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 会话关联的内容版本（归一化行摘要 / 全文摘要）。不能改用 DefaultHasher：跨进程
 # 与跨版本都不稳定，无法作为持久化内容身份。
 sha2 = "0.10"
+# Qoder 的 X-Machine-ID / X-Session-ID 必须与官方客户端同构：md5("{salt}:{uid}")。
+# 参考实现明确注明不要改成自创摘要（值会发给上游，上游只认这个形态）。
+md-5 = "0.10"
+hex = "0.4"
 hmac = "0.12"
 
 # Trae 会话导出：批量打包为 zip。
@@ -30,6 +37,8 @@ pbkdf2 = "0.12"
 sha1 = "0.10"
 aes-gcm = "0.10"
 base64 = "0.22"
+# Qoder COSY：官方客户端内置的 1024 位 RSA 公钥做 PKCS#1 v1.5 包裹。
+rsa = "0.9"
 getrandom = "0.2"
 
 # Trae 网页登录：全机无客户端设备密钥时自建 P-256 设备身份（对齐 trae-switch 原版）。

@@ -6,6 +6,7 @@ import {
   ExternalLink,
   FileDown,
   FileUp,
+  KeyRound,
   Loader2,
   LogIn,
   PencilLine,
@@ -201,8 +202,55 @@ export default function WorkbuddySwitchPage() {
 
   // OAuth 扫码
   const [oauth, setOauth] = useState<WorkbuddyOAuthStart | null>(null);
+  /** 手动添加 token 弹窗。走这条路径**不消耗 re 额度**（不再走一次授权）。 */
+  const [tokenOpen, setTokenOpen] = useState(false);
+  const [tokenAccess, setTokenAccess] = useState("");
+  const [tokenRefresh, setTokenRefresh] = useState("");
+  const [tokenDomain, setTokenDomain] = useState("");
+  const [tokenName, setTokenName] = useState("");
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
   const [oauthNote, setOauthNote] = useState<string>("等待浏览器完成授权…");
   const pollRef = useRef<number | null>(null);
+
+  /** 提交手动 token：后端只做本地校验（三段式 / sub / 未过期 / 同源），不联网。 */
+  async function submitToken() {
+    setTokenBusy(true);
+    setTokenError(null);
+    try {
+      const r = await api.workbuddyAccountAddToken({
+        accessToken: tokenAccess,
+        refreshToken: tokenRefresh.trim() || undefined,
+        domain: tokenDomain.trim() || undefined,
+        name: tokenName.trim() || undefined,
+      });
+      const exp = r.expiresAt
+        ? new Date(Number(r.expiresAt)).toLocaleString("zh-CN", { hour12: false })
+        : "未知";
+      const autoRefresh = !tokenRefresh.trim() && !!r.refreshExpiresAt;
+      toast.success("已添加账号", {
+        description: `${r.nickname || r.uid || "（无昵称）"} · access 到期 ${exp}${
+          r.refreshExpiresAt
+            ? autoRefresh
+              ? " · 已从本机登录态自动补上 refresh（可自动续期）"
+              : " · 已带 refresh（可自动续期）"
+            : " · 无 refresh：该账号一旦在别处登录就会失效，且只能重新粘贴"
+        }`,
+      });
+      setTokenOpen(false);
+      setTokenAccess("");
+      setTokenRefresh("");
+      setTokenName("");
+      await load();
+      void credits.refresh();
+    } catch (e) {
+      // 失败留在弹窗里，改完可以立刻重试。
+      const msg = String(e);
+      setTokenError(msg.startsWith("Error: ") ? msg.slice(7) : msg);
+    } finally {
+      setTokenBusy(false);
+    }
+  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -249,7 +297,18 @@ export default function WorkbuddySwitchPage() {
     try {
       const r = await api.workbuddySwitchTo(acc.id, true);
       setSwitchResult(r);
-      toast.success(`已切换到 ${acc.name}`);
+      // 定时任务同步的结果要一起报：删/增都对用户有影响，不能只说「切换成功」。
+      const sync = r.automationSync;
+      const syncNote = (() => {
+        if (!sync) return "";
+        if (sync.ok === false) return `；定时任务未同步：${sync.error ?? "未知原因"}`;
+        if (sync.notNeeded) return sync.reason ? `；${sync.reason}` : "";
+        const copied = sync.copied?.length ?? 0;
+        const dup = sync.skippedNames?.length ?? 0;
+        if (copied === 0 && dup === 0) return "；没有需要同步的定时任务";
+        return `；定时任务同步 ${copied} 个${dup > 0 ? `（${dup} 个已存在，跳过）` : ""}`;
+      })();
+      toast.success(`已切换到 ${acc.name}`, syncNote ? { description: syncNote.replace(/^；/, "") } : undefined);
       await load();
       // 切换已经结束，这扇窗没有剩余职责：留着只会挡住下面已经变成「当前登录」的账号卡。
       // 成功结果同时以 toast 形式留在屏幕上，关掉窗不会丢信息。
@@ -455,6 +514,19 @@ export default function WorkbuddySwitchPage() {
             {busyId === "oauth" ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
             扫码添加账号
           </Button>
+          {/* 手上已有 token 时用这条：不重新走授权，也就不消耗 re 额度 */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setTokenError(null);
+              setTokenOpen(true);
+            }}
+            disabled={busyId !== null}
+          >
+            <KeyRound className="size-4" />
+            手动填 Token
+          </Button>
           {/* ⚠️ 这里曾经有个「导入参考工具账号」按钮，2026-10-09 起**删掉了** ——
               改为 `main.tsx` 启动时自动导入（幂等，只搬明文，本地已可用的不覆盖）。
               删按钮时**必须**同步改掉指着它的文案（积分卡片红字 + 首页注意事项），
@@ -502,6 +574,125 @@ export default function WorkbuddySwitchPage() {
           </AlertDescription>
         </Alert>
       )}
+
+      {/* 手动添加 token：不走授权流程，不消耗 re 额度 */}
+      <Dialog
+        open={tokenOpen}
+        onOpenChange={(v) => {
+          if (!v && !tokenBusy) {
+            setTokenOpen(false);
+            setTokenError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>手动添加账号（Token）</DialogTitle>
+            <DialogDescription className="break-words">
+              从已登录的 WorkBuddy 里复制 token 填进来即可，<span className="text-foreground">不重新走授权</span>（也就不会消耗 re 额度）。
+              添加后可以像其它账号一样切换。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">
+                access_token <span className="text-destructive">*</span>
+              </span>
+              <textarea
+                value={tokenAccess}
+                onChange={(e) => setTokenAccess(e.target.value)}
+                placeholder="eyJhbGciOiJSUzI1NiIs…（三段式 JWT，可带 Bearer 前缀）"
+                rows={3}
+                spellCheck={false}
+                className="w-full resize-y rounded-lg border border-border bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed outline-none focus:border-primary"
+              />
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">
+                refresh_token（<span className="text-amber-600 dark:text-amber-400">强烈建议填</span>）
+              </span>
+              <textarea
+                value={tokenRefresh}
+                onChange={(e) => setTokenRefresh(e.target.value)}
+                placeholder="不填也能查积分，但一旦这个账号在别处登录 / 客户端刷新，服务端就会把这枚 access_token 判失效，本工具没有东西可续期，只能重新抓一次"
+                rows={3}
+                spellCheck={false}
+                className="w-full resize-y rounded-lg border border-border bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed outline-none focus:border-primary"
+              />
+              <span className="block text-[10px] leading-4 text-muted-foreground">
+                留空时本工具会去本机 WorkBuddy 登录态里找同账号的 refresh_token 自动补上；找不到就按「一次性」处理。
+              </span>
+            </label>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block space-y-1">
+                <span className="text-xs font-medium">域名（可留空）</span>
+                <Input
+                  value={tokenDomain}
+                  onChange={(e) => setTokenDomain(e.target.value)}
+                  placeholder="留空＝按 token 自动判断（codebuddy.cn / workbuddy.cn）"
+                  className="h-8 font-mono text-xs"
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-xs font-medium">显示名（可选）</span>
+                <Input
+                  value={tokenName}
+                  onChange={(e) => setTokenName(e.target.value)}
+                  placeholder="留空则用 token 里的昵称"
+                  className="h-8 text-xs"
+                />
+              </label>
+            </div>
+
+            <div className="rounded-lg bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
+              <div className="font-medium text-foreground">怎么拿到 token</div>
+              <div className="mt-1">
+                在已登录的 WorkBuddy 里打开 DevTools（Ctrl+Shift+I）→ Application → Local Storage，
+                或看 Network 里任意请求的{" "}
+                <code className="font-mono">authorization: Bearer …</code>；整段复制即可（带不带
+                Bearer 都认）。
+              </div>
+              <div className="mt-1">
+                token 会存进本工具账号库；校验只做本地判断（是否三段、是否过期、两个 token
+                是否同一账号），不发网络请求。
+              </div>
+            </div>
+
+            {tokenError && (
+              <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                <span className="break-all">{tokenError}</span>
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={tokenBusy}
+              onClick={() => {
+                setTokenOpen(false);
+                setTokenError(null);
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              size="sm"
+              disabled={tokenBusy || tokenAccess.trim().length === 0}
+              onClick={() => void submitToken()}
+              className="gap-1.5"
+            >
+              {tokenBusy ? <Loader2 className="size-3.5 animate-spin" /> : <KeyRound className="size-3.5" />}
+              添加
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {oauth && (
         <Alert className="mb-4">

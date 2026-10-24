@@ -267,6 +267,242 @@ pub(crate) fn upsert_into(accounts: &mut Vec<Value>, mut collected: Value) -> Re
     Ok(collected)
 }
 
+/// 去掉用户可能一起粘进来的 `Bearer ` 前缀与首尾空白。
+fn strip_bearer(raw: &str) -> String {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix("Bearer ")
+        .or_else(|| t.strip_prefix("bearer "))
+        .unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// 毫秒时间戳 → `2026-11-04 12:30`（本地时区，给错误提示用）。
+fn fmt_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// 记录 / 清除「服务端已拒绝这枚凭据」的状态（`authError` + `authErrorAt`）。
+///
+/// ## 为什么不能只看 `exp`
+///
+/// 401 是服务端**提前**作废凭据（账号在别处重新登录、会话被踢）。此时 token 里的
+/// `exp` 仍然在未来 —— 账号池若只比 `exp`，就会把这个号显示成「可用」，
+/// 用户切过去必然失败（真机：130****9226 剩余「未知」、到期「21 天后」，状态却是「可用」）。
+///
+/// ⚠️ 状态没变就不写盘：`save_accounts` 会顺带清积分缓存，频繁写会让界面反复重查。
+pub fn mark_auth_error(id: &str, reason: Option<&str>) {
+    let mut accounts = load_accounts();
+    let Some(pos) = accounts.iter().position(|a| account_id(a) == id) else {
+        return;
+    };
+    let current = accounts[pos]
+        .get("authError")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let next = reason.unwrap_or("").trim().to_string();
+    if current == next {
+        return;
+    }
+    if next.is_empty() {
+        if let Some(obj) = accounts[pos].as_object_mut() {
+            obj.remove("authError");
+            obj.remove("authErrorAt");
+        }
+    } else {
+        accounts[pos]["authError"] = json!(next);
+        accounts[pos]["authErrorAt"] = json!(now_ms());
+    }
+    let _ = save_accounts(&accounts);
+}
+
+/// **手动添加账号**：直接粘 `access_token`（可选 `refresh_token`），不再走一次登录。
+///
+/// ## 为什么需要这条路径
+///
+/// 扫码 / 导入本机登录态都会走一次完整授权流程（消耗 re 额度）。有时用户手上
+/// 已经有可用 token（从已登录的客户端或浏览器里复制），只想把它登记进来用于切换。
+///
+/// ## 校验（只做本地能做的，绝不假装成功）
+///
+/// - 必须是三段式 JWT（复制不完整是最常见的错）；
+/// - `sub` 必须存在 —— 没有它无法识别身份，切号也没法对齐；
+/// - `exp` 必须**还没过期**（已过期直接拒绝，并把到期时间写进错误里）；
+/// - 给了 `refresh_token` 时：同样要三段、没过期，且 `sub` 与 access 一致
+///   （两个 token 来自不同账号拼在一起，会得到一个永远刷不新的账号）。
+pub fn add_manual_token(
+    access: &str,
+    refresh: Option<&str>,
+    domain: Option<&str>,
+    display_name: Option<&str>,
+) -> Result<Value, String> {
+    let access = strip_bearer(access);
+    if access.is_empty() {
+        return Err("access_token 不能为空".into());
+    }
+    if access.split('.').count() != 3 {
+        return Err("access_token 不是三段式 JWT（应为 xxx.yyy.zzz）——多半是复制时被截断了".into());
+    }
+    let ap = crate::modules::jwt::payload(&access)
+        .ok_or_else(|| "解不开 access_token 的 payload（可能复制不完整或不是 JWT）".to_string())?;
+    let uid = ap
+        .get("sub")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if uid.is_empty() {
+        return Err("access_token 里没有 sub（账号 id），无法识别身份".into());
+    }
+    let Some(exp) = ap.get("exp").and_then(Value::as_i64) else {
+        return Err("access_token 里没有 exp（过期时间），不像是登录 token".into());
+    };
+    let exp_ms = crate::modules::jwt::normalize_ms(exp);
+    let now = now_ms();
+    if exp_ms <= now {
+        return Err(format!(
+            "这枚 access_token 已在 {} 过期，请重新获取一枚",
+            fmt_ms(exp_ms)
+        ));
+    }
+
+    // refresh_token（可选）
+    let mut refresh_token = String::new();
+    let mut refresh_exp_ms: Option<i64> = None;
+    if let Some(raw) = refresh {
+        let r = strip_bearer(raw);
+        if !r.is_empty() {
+            if r.split('.').count() != 3 {
+                return Err("refresh_token 不是三段式 JWT —— 要么留空，要么粘贴完整".into());
+            }
+            let rp = crate::modules::jwt::payload(&r)
+                .ok_or_else(|| "解不开 refresh_token 的 payload（可能复制不完整）".to_string())?;
+            let sub = rp.get("sub").and_then(Value::as_str).unwrap_or("").trim();
+            if !sub.is_empty() && sub != uid {
+                return Err(format!(
+                    "refresh_token 属于另一个账号（sub={sub}），与 access_token（sub={uid}）不是同一个 —— 请别混用",
+                ));
+            }
+            if let Some(rexp) = rp.get("exp").and_then(Value::as_i64) {
+                let ms = crate::modules::jwt::normalize_ms(rexp);
+                if ms <= now {
+                    return Err(format!(
+                        "这枚 refresh_token 已在 {} 过期；可以只填 access_token（但到期后需重新获取）",
+                        fmt_ms(ms)
+                    ));
+                }
+                refresh_exp_ms = Some(ms);
+            }
+            refresh_token = r;
+        }
+    }
+
+    // ⚠️⚠️ 没填 refresh_token 时，尽量从**本机客户端登录态**里补一枚同账号的。
+    //
+    // 为什么必须补：只带 access_token 的账号是「一次性」的 —— 只要该账号在别处登录过、
+    // 或客户端把自己的 session 刷新了一次，服务端就会把这枚 access 判失效；而本工具
+    // 手上没有任何 refresh token，刷新请求无从发起，**只能等用户重新去抓一次**。
+    // 本机登录的正好是这个 uid 时能直接补齐，用户不用再翻 DevTools。
+    // 补不到也照旧允许保存（用户可能就是想临时加一下），但不会假装它「长期有效」。
+    let mut refresh_filled_locally = false;
+    if refresh_token.is_empty() {
+        if let Some(local) = crate::modules::workbuddy_auth::import_from_auth_file() {
+            let luid = crate::modules::workbuddy_auth::get_str(&local, "uid").unwrap_or_default();
+            let lrt =
+                crate::modules::workbuddy_auth::get_str(&local, "refresh_token").unwrap_or_default();
+            if luid == uid && !lrt.is_empty() && lrt.split('.').count() == 3 {
+                if let Some(rp) = crate::modules::jwt::payload(&lrt) {
+                    let sub = rp.get("sub").and_then(Value::as_str).unwrap_or("").trim();
+                    let rexp = rp.get("exp").and_then(Value::as_i64).map(crate::modules::jwt::normalize_ms);
+                    // 同账号 + 没过期才敢用；否则宁可不填，也不能塞一枚必然失败的续期令牌。
+                    if sub == uid && rexp.map(|ms| ms > now).unwrap_or(true) {
+                        refresh_token = lrt;
+                        refresh_exp_ms = rexp;
+                        refresh_filled_locally = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let nickname = ap
+        .get("nickname")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let email = ap
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // `preferred_username` 通常是手机号；只在确实是纯数字时才当手机号用。
+    let preferred = ap
+        .get("preferred_username")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let phone = if preferred.len() >= 6 && preferred.chars().all(|c| c.is_ascii_digit()) {
+        preferred
+    } else {
+        String::new()
+    };
+    // 域名：留空时**按 token 自己的 `iss` 推**，别一律塞 codebuddy.cn。
+    // workbuddy.cn 签发的 token 拿去打 codebuddy.cn 虽然眼下也能通，但那是两个域各自的
+    // 登录中心（iss 不同），跨域用只是碰巧被接受，出问题时最难查。
+    let iss = ap.get("iss").and_then(Value::as_str).unwrap_or("");
+    let dom = match domain.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
+        None if iss.contains("workbuddy.cn") => "www.workbuddy.cn".to_string(),
+        None => "www.codebuddy.cn".to_string(),
+    };
+
+    let mut account = serde_json::json!({
+        "uid": uid,
+        "nickname": nickname,
+        "email": if email.is_empty() { Value::Null } else { Value::String(email) },
+        "domain": dom,
+        "access_token": access,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expiresAt": exp_ms,
+        "source": "manual-token",
+        "auth_raw": {
+            "accessToken": access,
+            "refreshToken": refresh_token,
+            "domain": dom,
+            "tokenType": "Bearer",
+            "expiresIn": (exp_ms - now) / 1000,
+            "refreshExpiresIn": refresh_exp_ms.map(|t| (t - now) / 1000),
+            "scope": ap.get("scope").cloned().unwrap_or(Value::Null),
+            "sessionState": ap.get("session_state").cloned().unwrap_or(Value::Null),
+            "tokenSource": if refresh_filled_locally { "manual+local-refresh" } else { "manual" },
+        },
+        "profile_raw": {
+            "uid": uid,
+            "nickname": nickname,
+            "phoneNumber": phone,
+            "type": "",
+            "uin": "",
+            "lastLogin": true,
+            "pluginEnabled": true,
+        },
+    });
+    if let Some(t) = refresh_exp_ms {
+        account["refreshExpiresAt"] = serde_json::json!(t);
+    }
+    if let Some(n) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+        account["display_name"] = serde_json::json!(n);
+    }
+
+    upsert(account)
+}
+
 /// 删除账号。
 ///
 /// ⚠️ 删完必须**立墓碑**（[`block_identity`]），否则下次启动的自动导入会把它从参考库
@@ -432,14 +668,37 @@ fn unavailable_report(total: usize, note: &str) -> Value {
 /// `createdAt` / `lastUsedAt` 是本工具这边的历史，来源那份没有意义。
 const KEEP_LOCAL_FIELDS: [&str; 4] = ["id", "display_name", "createdAt", "lastUsedAt"];
 
-/// 这条记录的凭据是不是**可以直接使用**的明文。
+/// 从 token 里取 Keycloak 的 `sid`（登录会话 id）；解不出返回空串。
 ///
-/// ⚠️ 加密信封（`{"$wbEncrypted":…}`）不算：它连本地都解不开，拿去查积分必然失败。
-/// 判定与 `workbuddy_credits::token_state_of` 同源（都是「非空字符串」）。
-fn has_plain_credentials(acc: &Value) -> bool {
-    ["access_token", "refresh_token"].iter().all(|k| {
-        matches!(acc.get(*k), Some(Value::String(s)) if !s.trim().is_empty())
-    })
+/// 用途只有一个：判断一枚 `refresh_token` 能不能配这条 `access_token` 用。
+/// 两者必须来自**同一次登录**，否则续期请求会回 `invalid_grant`，然后被上层
+/// 误报成「账号在别处重新登录过」——比没有 refresh 更难查。
+fn jwt_sid(token: &str) -> String {
+    crate::modules::jwt::payload(token)
+        .and_then(|p| p.get("sid").and_then(Value::as_str).map(|s| s.trim().to_string()))
+        .unwrap_or_default()
+}
+
+/// 本地这条记录的凭据**现在还能不能用** —— 启动时自动搬家的「别覆盖」判据。
+///
+/// ⚠️⚠️ 只看 `access_token` 是否「非空字符串 + 未过期」，**不要求有 refresh_token**。
+///
+/// 2026-10-24 真 bug：这里原来要求 access + refresh 都在（`has_plain_credentials`），
+/// 于是「用户手动粘贴、只填了 access_token」的账号被判成「凭据不完整」，启动时的自动
+/// 搬家就拿参考库里那份**更旧的** token 把它整个盖掉 —— 用户每次重启都发现刚加好的
+/// 账号又 401，还被告知「refresh token 被作废」（其实它压根没有 refresh token）。
+///
+/// 加密信封（`access_token` 是对象）与已过期的明文仍然允许被覆盖，那才是搬家本来的目的。
+fn local_token_still_good(acc: &Value) -> bool {
+    let plain = matches!(acc.get("access_token"), Some(Value::String(s)) if !s.trim().is_empty());
+    if !plain {
+        return false;
+    }
+    match acc.get("expiresAt").and_then(Value::as_i64) {
+        Some(exp) => exp > now_ms(),
+        // 没有到期时间时不要拿「未知」当「失效」——那会把人家刚贴的 token 覆盖掉。
+        None => true,
+    }
 }
 
 /// [`import_reference_accounts`] 的纯函数部分：解析 + 合并，不碰磁盘（单测直接塞 JSON）。
@@ -488,10 +747,43 @@ fn merge_reference_accounts(
             continue;
         }
         let existing = accounts.iter().find(|a| identity_key(a) == key).cloned();
-        // ⚠️ 本地这条**已经是可用的明文凭据**（access + refresh 都在）时不许覆盖。
-        // 搬家只解决「本地是加密信封、查不了」的问题；对已经能查的账号，本地那份
-        // 往往是刚刚刷新过的，而对方那份可能更旧 —— 无条件覆盖等于把好的换成差的。
-        if existing.as_ref().is_some_and(has_plain_credentials) {
+        // ⚠️⚠️ 本地这条的 access token **现在还能用**（非空且没过期）时，绝不整条覆盖。
+        //
+        // 搬家只解决「本地是加密信封 / 没有凭据 / 已过期、查不了」的问题。对已经能查的
+        // 账号，本地那份往往是刚刚刷新或**用户刚手填**的，而对方那份可能更旧 ——
+        // 无条件覆盖等于把好的换成差的。
+        //
+        // 判据**不要求有 refresh_token**。2026-10-24 真事：这里原来要求 access + refresh
+        // 都在，于是「手动粘贴、只填 access_token」的账号被判成「凭据不完整」，参考库里
+        // 那份旧 token 每次启动都把它盖掉，用户看到的就是「重启一次账号就失效」。
+        //
+        // 但「本地缺 refresh_token」这个洞该补：只把来源的 refresh 塞进去（来源就是同一个
+        // uid），access 与其他字段一个都不动。补到 = updated，补不到 = kept。
+        if existing.as_ref().is_some_and(local_token_still_good) {
+            let missing_refresh = existing
+                .as_ref()
+                .map(|e| get_str(e, "refresh_token").unwrap_or_default().trim().is_empty())
+                .unwrap_or(false);
+            let source_refresh = get_str(&record, "refresh_token").unwrap_or_default();
+            let local_sid = existing
+                .as_ref()
+                .map(|e| jwt_sid(&get_str(e, "access_token").unwrap_or_default()))
+                .unwrap_or_default();
+            let refresh_sid = jwt_sid(source_refresh.trim());
+            if missing_refresh
+                && !source_refresh.trim().is_empty()
+                && !local_sid.is_empty()
+                && local_sid == refresh_sid
+            {
+                if let Some(local) = accounts.iter_mut().find(|a| identity_key(a) == key) {
+                    local["refresh_token"] = json!(source_refresh.trim());
+                    if let Some(rt) = record.get("refreshExpiresAt") {
+                        local["refreshExpiresAt"] = rt.clone();
+                    }
+                    updated += 1;
+                    continue;
+                }
+            }
             kept += 1;
             continue;
         }
@@ -935,14 +1227,20 @@ mod tests {
         assert_eq!(accs[0]["refresh_token"], json!("LOCAL-REFRESH"));
     }
 
-    /// 边界：本地只有半个凭据（有 access 没 refresh）时，仍然要把对方那一对搬过来。
-    /// 否则「跳过」会把「本地刷新能力都丢了」的账号永久卡死。
+    /// 边界：本地只有半个凭据（有 access 没 refresh）时，仍要把**同一个登录会话**的
+    /// refresh 补进来 —— 否则「本地刷新能力都丢了」的账号会被永久卡死。
+    ///
+    /// ⚠️ 必须同 `sid`：随手塞一枚别的 session 的 refresh 只会换来 `invalid_grant`，
+    /// 然后被上层误报成「账号在别处重新登录过」。
     #[test]
     fn reference_merge_still_fills_in_incomplete_local_credentials() {
+        let access = fake_jwt("u-1", "sid-1");
+        let refresh = fake_jwt("u-1", "sid-1");
+
         let mut accs: Vec<Value> = Vec::new();
         upsert_into(
             &mut accs,
-            json!({"id": "local-id", "uid": "u-1", "access_token": "LOCAL-ACCESS"}),
+            json!({"id": "local-id", "uid": "u-1", "access_token": access}),
         )
         .unwrap();
 
@@ -950,8 +1248,8 @@ mod tests {
             &mut accs,
             &json!([{
                 "uid": "u-1",
-                "access_token": "THEIR-ACCESS",
-                "refresh_token": "THEIR-REFRESH",
+                "access_token": fake_jwt("u-1", "sid-1"),
+                "refresh_token": refresh,
             }])
             .to_string(),
         )
@@ -959,8 +1257,20 @@ mod tests {
 
         assert_eq!(report["updated"], json!(1));
         assert_eq!(report["skipped"], json!(0));
-        assert_eq!(accs[0]["refresh_token"], json!("THEIR-REFRESH"), "补齐刷新凭据");
+        assert_eq!(accs[0]["refresh_token"], json!(refresh), "补齐刷新凭据");
         assert_eq!(accs[0]["id"], json!("local-id"));
+        assert_eq!(
+            accs[0]["access_token"], json!(access),
+            "只补 refresh，本地这枚 access 不许被换"
+        );
+    }
+
+    /// 构造一枚只有 payload 有意义的假 JWT（`jwt::payload` 不验签）。
+    fn fake_jwt(sub: &str, sid: &str) -> String {
+        use base64::Engine;
+        let payload = json!({"sub": sub, "sid": sid, "exp": (now_ms() / 1000) + 3600}).to_string();
+        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("eyJhbGciOiJub25lIn0.{seg}.sig")
     }
 
     #[test]
@@ -1029,6 +1339,58 @@ mod tests {
         );
     }
 
+    /// ⚠️⚠️ 手动粘贴的账号（只有 `access_token`、没有 `refresh_token`）**不许被启动时的
+    /// 自动搬家覆盖**。
+    ///
+    /// 2026-10-24 真事：用户手填 token 后账号能查积分，重启一次就 401，还被告知
+    /// 「refresh token 被作废」—— 它根本没有 refresh token。根因是「别覆盖」的判据
+    /// 要求 access + refresh 都在，只有 access 的账号被判成「凭据不完整」，于是参考库
+    /// 里那份更旧的 token 被搬进来，把刚贴的这枚盖掉了。
+    #[test]
+    fn manual_access_only_account_is_not_overwritten_by_reference_store() {
+        let mut accs = vec![json!({
+            "id": "manual-id",
+            "uid": "u-manual",
+            "access_token": "FRESH-ACCESS",
+            "refresh_token": "",
+            "expiresAt": now_ms() + 86_400_000,
+            "source": "manual-token",
+        })];
+        let src = json!([{
+            "uid": "u-manual",
+            "access_token": "STALE-ACCESS",
+            "refresh_token": "STALE-REFRESH",
+        }])
+        .to_string();
+
+        let r = merge_ref(&mut accs, &src).unwrap();
+        assert_eq!(
+            accs[0]["access_token"],
+            json!("FRESH-ACCESS"),
+            "刚贴的 access_token 绝不许被旧 token 盖掉（updated={}, kept={}）",
+            r["updated"],
+            r["kept"],
+        );
+        assert_eq!(accs[0]["id"], json!("manual-id"), "id 不能被换掉");
+        assert_eq!(accs[0]["uid"], json!("u-manual"));
+    }
+
+    /// 本地明文**已过期** ⇒ 允许被来源覆盖（搬家本来的目的仍然是「救回查不了的账号」）。
+    #[test]
+    fn expired_local_token_may_be_replaced() {
+        let mut accs = vec![json!({
+            "id": "manual-id",
+            "uid": "u-exp",
+            "access_token": "EXPIRED",
+            "refresh_token": "",
+            "expiresAt": 1,
+        })];
+        let src = json!([{"uid": "u-exp", "access_token": "NEWER", "refresh_token": "R"}]).to_string();
+        let r = merge_ref(&mut accs, &src).unwrap();
+        assert_eq!(r["updated"], json!(1), "{r}");
+        assert_eq!(accs[0]["access_token"], json!("NEWER"));
+    }
+
     /// 墓碑名单的读写往返：写进去的要能读出来，**坏 JSON 当空名单**（护栏坏了不能让账号页打不开）。
     #[test]
     fn blocklist_roundtrips_and_broken_json_is_an_empty_list() {
@@ -1070,5 +1432,80 @@ mod tests {
         assert_eq!(r["blocked"], json!(0), "这条路径上不该有护栏命中");
         assert_eq!(r["total"], json!(2), "总数仍是本工具账号库自己的");
         assert!(r["note"].as_str().unwrap().contains("没有找到"));
+    }
+}
+
+#[cfg(test)]
+mod manual_token_tests {
+    use super::*;
+    use base64::Engine;
+
+    /// 造一个**只解 payload、不验签**的假 JWT（校验逻辑只看 payload）。
+    fn fake_jwt(payload: Value) -> String {
+        let enc = |v: &Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+        };
+        format!(
+            "{}.{}.{}",
+            enc(&serde_json::json!({"alg": "none", "typ": "JWT"})),
+            enc(&payload),
+            "sig"
+        )
+    }
+
+    fn now_s() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    #[test]
+    fn rejects_incomplete_and_expired() {
+        // 不是三段
+        assert!(add_manual_token("abc", None, None, None).is_err());
+        // 已过期
+        let expired = fake_jwt(serde_json::json!({"sub": "u1", "exp": now_s() - 60}));
+        let err = add_manual_token(&expired, None, None, None).unwrap_err();
+        assert!(err.contains("过期"), "实际：{err}");
+        // 没有 sub
+        let no_sub = fake_jwt(serde_json::json!({"exp": now_s() + 3600}));
+        assert!(add_manual_token(&no_sub, None, None, None).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_refresh() {
+        let a = fake_jwt(serde_json::json!({"sub": "ua", "exp": now_s() + 3600}));
+        let r = fake_jwt(serde_json::json!({"sub": "ub", "exp": now_s() + 7200}));
+        let err = add_manual_token(&a, Some(&r), None, None).unwrap_err();
+        assert!(err.contains("另一个账号"), "实际：{err}");
+    }
+
+    /// 真机自检：造一个假账号走完整流程（添加 → 重复添加应 upsert → 删除），
+    /// 全程不碰任何真实账号。
+    #[test]
+    #[ignore]
+    fn probe_add_manual_token_roundtrip() {
+        let uid = format!("twinswitch-manual-probe-{}", uuid::Uuid::new_v4());
+        let access = fake_jwt(serde_json::json!({
+            "sub": uid, "exp": now_s() + 3600,
+            "nickname": "手动测试", "preferred_username": "13800000000"
+        }));
+        let refresh = fake_jwt(serde_json::json!({"sub": uid, "exp": now_s() + 86400}));
+
+        let saved = add_manual_token(&access, Some(&refresh), Some("www.codebuddy.cn"), Some("自检"))
+            .expect("添加应成功");
+        eprintln!(
+            "[probe] 已添加 uid={:?} nickname={:?} expiresAt={:?} refreshExpiresAt={:?}",
+            saved.get("uid"),
+            saved.get("nickname"),
+            saved.get("expiresAt"),
+            saved.get("refreshExpiresAt")
+        );
+
+        let before = load_accounts().len();
+        let _ = add_manual_token(&access, Some(&refresh), None, None).expect("重复添加应更新");
+        let after = load_accounts().len();
+        eprintln!("[probe] 重复添加前后账号数：{before} → {after}（应相等）");
+
+        delete_account(&account_id(&saved)).expect("清理失败");
+        eprintln!("[probe] 已清理（账号数 {}）", load_accounts().len());
     }
 }

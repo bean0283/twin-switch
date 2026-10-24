@@ -756,6 +756,14 @@ pub fn account_token_info(account_id: &str) -> Result<Value, String> {
         "uid": str_at(&acc, "uid"),
         "name": workbuddy_accounts::label_for(&str_at(&acc, "uid")),
         "token": token,
+        // ★ 导出 refresh token：账号卡片头像弹窗里可以复制到别处续期。
+        //   只在**明文**时给：加密信封（`{"$wbEncrypted":…}`）本地解不开，导出去也用不了，
+        //   给出去反而让人以为「拿到了一枚能用的 token」。
+        "refreshToken": if has_rt && state == TokenState::Plain {
+            json!(str_at(&acc, "refresh_token"))
+        } else {
+            Value::Null
+        },
         "tokenExp": if exp > 0 { json!(exp) } else { Value::Null },
         "refreshExpiredAt": if rt_exp > 0 { json!(rt_exp) } else { Value::Null },
         // 「来源」在这里是**凭据形态**，不是文件——WorkBuddy 的账号档就在我们自己的库里。
@@ -1102,6 +1110,27 @@ async fn query_account(account: &CreditAccount) -> Value {
                 if is_unauthorized(&free) {
                     free = fetch_free(&working).await;
                 }
+            } else {
+                // ★ 自愈：刷新失败时，如果**本机客户端当前登录的就是这个 uid**，
+                // 直接用它登录态文件里的凭据 —— 「在别处重新登录过」唯一能自动救回来的路径。
+                // （refresh 报 `invalid_grant: issued before the user session` 就是这种情况。）
+                if let Some(fresh) = crate::modules::workbuddy_auth::import_from_auth_file() {
+                    let want = working.get("uid").and_then(Value::as_str).map(str::to_string);
+                    let got = fresh.get("uid").and_then(Value::as_str).map(str::to_string);
+                    if want.is_some() && want == got && !str_at(&fresh, "access_token").is_empty() {
+                        working = fresh;
+                        refresh_attempted = true;
+                        if is_unauthorized(&summary) {
+                            summary = fetch_summary(&working).await;
+                        }
+                        if is_unauthorized(&paid) {
+                            paid = fetch_paid(&working).await;
+                        }
+                        if is_unauthorized(&free) {
+                            free = fetch_free(&working).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1116,6 +1145,8 @@ async fn query_account(account: &CreditAccount) -> Value {
         out["account"] = account.public_info();
         out["source"] = json!("summary");
         out["refreshed"] = json!(refresh_attempted);
+        // 查得到积分 ⇒ 这枚凭据是好的，清掉以前记的失效标记。
+        crate::modules::workbuddy_vault::mark_auth_error(&account.id, None);
         return out;
     }
 
@@ -1132,15 +1163,44 @@ async fn query_account(account: &CreditAccount) -> Value {
         out["account"] = account.public_info();
         out["source"] = json!("legacy");
         out["refreshed"] = json!(refresh_attempted);
+        crate::modules::workbuddy_vault::mark_auth_error(&account.id, None);
         return out;
     }
 
     // 404 说明两代接口都不认识这个账号档位；其余情况报原始错误更利于排查。
-    let error = if is_route_missing(&legacy) || is_route_missing(&summary) {
+    // 刷新/自愈都试过仍然 401 ⇒ 会话在别处被重登作废（invalid_grant），自动救不回来。
+    let still_unauthorized =
+        is_unauthorized(&summary) || is_unauthorized(&paid) || is_unauthorized(&free);
+    // ⚠️ 没有 refresh_token 的账号（手动粘贴的）不许说「refresh token 被作废」——
+    //    它压根没有 refresh token，那句话只会把人引到「去点导入本机登录态」的死路上。
+    let no_refresh = str_at(&working, "refresh_token").is_empty();
+    let error = if still_unauthorized {
+        if no_refresh {
+            "这枚 access_token 已被服务端判为失效（401）。该账号是手动添加的、没有 refresh_token，\
+             本工具无法自动续期 ⇒ 请重新复制一枚 access_token 填进来；\
+             想让它长期有效，添加时请一并粘贴 refresh_token（本工具会在快到期时自动续期）"
+                .to_string()
+        } else {
+            "该账号的登录会话已在别处重新登录而失效（refresh token 被作废）\
+             ⇒ 请点「导入本机登录态」（若该账号正是当前客户端登录的号）或「扫码添加账号」重新登录"
+                .to_string()
+        }
+    } else if is_route_missing(&legacy) || is_route_missing(&summary) {
         "积分接口不可用（404）：该域名下没有当前的计费接口，可能账号档位不符".to_string()
     } else {
         response_error(&legacy)
     };
+    // 401 落盘：账号池/账号页据此显示「不可用」，别让用户切到一个必然失败的号。
+    if still_unauthorized {
+        crate::modules::workbuddy_vault::mark_auth_error(
+            &account.id,
+            Some(if no_refresh {
+                "手填的 access_token 已失效（401，且没有 refresh_token 可续期）"
+            } else {
+                "登录态已被服务端作废（401，账号在别处重新登录过）"
+            }),
+        );
+    }
     json!({
         "ok": false,
         "account": account.public_info(),
@@ -1630,5 +1690,40 @@ mod tests {
         assert!(free["PackageCodes"].as_array().unwrap().len() >= 10);
         assert!(free["SlicePeriodStartTime"].as_str().unwrap().ends_with("00:00:00"));
         assert!(free["SlicePeriodEndTime"].as_str().unwrap().ends_with("23:59:59"));
+    }
+}
+
+#[cfg(test)]
+mod refresh_export_probe {
+    use super::*;
+
+    /// 真机自检：确认 `account_token_info` 现在会带出 **refresh token 明文**
+    /// （只打印长度与是否为空，不打印内容）。
+    #[test]
+    #[ignore]
+    fn probe_token_info_has_refresh() {
+        let accs = crate::modules::workbuddy_vault::load_accounts();
+        let Some(first) = accs.first() else {
+            eprintln!("账号库为空，跳过");
+            return;
+        };
+        let id = crate::modules::workbuddy_vault::account_id(first);
+        match account_token_info(&id) {
+            Ok(v) => {
+                let rt = v.get("refreshToken").and_then(Value::as_str);
+                eprintln!(
+                    "[probe] uid={:?} source={:?} access长度={:?} refresh={:?}",
+                    v.get("uid").and_then(Value::as_str),
+                    v.get("source").and_then(Value::as_str),
+                    v.get("token").and_then(Value::as_str).map(|s| s.len()),
+                    rt.map(|s| s.len())
+                );
+                assert!(
+                    rt.map(|s| !s.is_empty()).unwrap_or(false),
+                    "明文账号应能导出 refresh token"
+                );
+            }
+            Err(e) => eprintln!("[probe] 读取失败：{e}"),
+        }
     }
 }

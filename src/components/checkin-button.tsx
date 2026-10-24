@@ -56,6 +56,7 @@ const STATUS_META: Record<CheckinStatus, { label: string; className: string }> =
 const CLIENT_LABEL: Record<CheckinItem["client"], string> = {
   trae: "Trae",
   workbuddy: "WorkBuddy",
+  qoder: "Qoder",
 };
 
 /** 积分显示：`null` 是**未知**，不能画成 0。 */
@@ -79,7 +80,7 @@ function summarize(r: CheckinResult): string {
 
 export interface CheckinButtonProps {
   /** 签哪一边。 */
-  scope?: "all" | "trae" | "workbuddy";
+  scope?: "all" | "trae" | "workbuddy" | "qoder";
   /** Trae 侧限定客户端；`null` / 不传 = 全部客户端。 */
   clientKey?: string | null;
   /** 按钮文案，默认按 `scope` 推。 */

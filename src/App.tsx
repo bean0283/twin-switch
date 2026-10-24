@@ -1,27 +1,32 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
 import {
-  Eraser,
-  HardDriveDownload,
-  HardDriveUpload,
-  Home,
-  Repeat2,
-  ScrollText,
-  Settings,
-  Trash2,
-  UserRound,
-} from "lucide-react";
+  BrowserRouter,
+  Navigate,
+  NavLink,
+  Outlet,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
+import { ArrowLeft, Home, Settings, Share2, Users, Wrench } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 
 import { cn } from "@/lib/utils";
 import HomePage from "@/pages/HomePage";
+import AccountsHubPage from "@/pages/AccountsHubPage";
+import MaintenanceHubPage from "@/pages/MaintenanceHubPage";
 import TraeSwitchPage from "@/pages/TraeSwitchPage";
 import TraeRecordsPage from "@/pages/TraeRecordsPage";
 import WorkbuddyImportPage from "@/pages/WorkbuddyImportPage";
 import WorkbuddyExportPage from "@/pages/WorkbuddyExportPage";
 import WorkbuddyCleanupPage from "@/pages/WorkbuddyCleanupPage";
+import QoderCleanupPage from "@/pages/QoderCleanupPage";
 import TraeCleanupPage from "@/pages/TraeCleanupPage";
 import SettingsPage from "@/pages/SettingsPage";
+import GatewayPage from "@/pages/GatewayPage";
+import GatewayGuidePage from "@/pages/GatewayGuidePage";
+import QoderAccountsPage from "@/pages/QoderAccountsPage";
+import QoderSessionsPage from "@/pages/QoderSessionsPage";
 import WorkbuddySwitchPage from "@/pages/WorkbuddySwitchPage";
 import WorkbuddyRecordsPage from "@/pages/WorkbuddyRecordsPage";
 import { AppIconMark } from "@/components/product-marks";
@@ -29,17 +34,90 @@ import { UpdateEntry } from "@/components/update-entry";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+/**
+ * 侧栏**两级导航**。
+ *
+ * 一级只有 5 项（首页 / 账号及会话管理 / 数据迁移及维护 / 积分共享 / 设置）；
+ * 三个产品的账号与会话、迁移与清理都收进分组，避免侧栏被 20 多个入口拉成一长条
+ * （用户反馈的原问题）。进入某组后，该组自动展开二级项，其余组保持收起。
+ */
+type NavChild = { to: string; label: string };
+type NavGroup = {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  root: string;
+  children: NavChild[];
+};
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    key: "accounts",
+    label: "账号及会话管理",
+    icon: <Users className="size-4" />,
+    root: "/accounts",
+    children: [
+      { to: "/trae-switch", label: "Trae 账号" },
+      { to: "/trae-records", label: "Trae 会话" },
+      { to: "/workbuddy-switch", label: "WorkBuddy 账号" },
+      { to: "/workbuddy-records", label: "WorkBuddy 会话" },
+      { to: "/qoder-accounts", label: "Qoder 账号" },
+      { to: "/qoder-sessions", label: "Qoder 会话" },
+    ],
+  },
+  {
+    key: "maintenance",
+    label: "数据迁移及维护",
+    icon: <Wrench className="size-4" />,
+    root: "/migrate",
+    children: [
+      { to: "/workbuddy-import", label: "WorkBuddy → Trae" },
+      { to: "/workbuddy-export", label: "Trae → WorkBuddy" },
+      { to: "/workbuddy-cleanup", label: "WorkBuddy 清理" },
+      { to: "/trae-cleanup", label: "Trae 清理" },
+      { to: "/qoder-cleanup", label: "Qoder 清理" },
+    ],
+  },
+];
+
+/** 侧栏类别之间的小横杠（比分组标题时代的粗线更细，只做视觉分组）。 */
+function NavDivider() {
+  return <div className="my-1.5 h-px shrink-0 bg-sidebar-border" role="presentation" />;
+}
+
+/** 二级项（含分组首页本身）的链接样式：比一级小一号、带左侧竖线。 */
+function SidebarSubLink({ to, label }: NavChild) {
+  return (
+    <NavLink
+      to={to}
+      className={({ isActive }) =>
+        cn(
+          "block truncate rounded-md px-2 py-1.5 text-[13px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+          isActive
+            ? "bg-foreground/[0.06] font-medium text-foreground"
+            : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+        )
+      }
+    >
+      {label}
+    </NavLink>
+  );
+}
+
 /** 侧栏导航项：统一激活态样式，避免每个入口重复一份 className 计算。 */
 function SidebarLink({
   to,
   end,
   icon,
   label,
+  active,
 }: {
   to: string;
   end?: boolean;
   icon: ReactNode;
   label: string;
+  /** 外部强制指定激活态（分组头在子页里也要高亮，而不是只看精确路径）。 */
+  active?: boolean;
 }) {
   return (
     <NavLink
@@ -48,7 +126,7 @@ function SidebarLink({
       className={({ isActive }) =>
         cn(
           "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-          isActive
+          (active ?? isActive)
             ? "bg-foreground/[0.06] font-medium text-foreground"
             : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
         )
@@ -62,6 +140,12 @@ function SidebarLink({
 
 function Layout() {
   const [version, setVersion] = useState("");
+  const { pathname } = useLocation();
+  /** 当前是否在某个分组里（含分组首页）—— 决定「首页」是否变成「返回」。 */
+  const activeGroup = NAV_GROUPS.find(
+    (g) => pathname === g.root || g.children.some((c) => c.to === pathname),
+  );
+  const inGroup = Boolean(activeGroup);
   const hasUnifiedTitleBar =
     typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
 
@@ -107,86 +191,42 @@ function Layout() {
             </div>
           </div>
         </div>
-        <nav className="flex min-h-0 flex-1 flex-col gap-0.5" aria-label="主导航">
-          <SidebarLink to="/" end icon={<Home className="size-4" />} label="首页" />
-
-          {/* Trae 自身的账号 / 会话能力 */}
-          <div className="mt-3 flex items-center gap-2 px-3 pb-1" role="presentation">
-            <span className="text-[11px] font-medium tracking-wide text-sidebar-foreground/40">
-              Trae
-            </span>
-            <span className="h-px flex-1 bg-sidebar-border" />
-          </div>
+        <nav
+          className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto"
+          aria-label="主导航"
+        >
+          {/* 在分组内时，「首页」变成「返回」—— 一眼就知道能退回上一层 */}
           <SidebarLink
-            to="/trae-switch"
-            icon={<Repeat2 className="size-4" />}
-            label="Trae 账号管理"
-          />
-          <SidebarLink
-            to="/trae-records"
-            icon={<ScrollText className="size-4" />}
-            label="Trae 会话记录"
+            to="/"
+            end
+            icon={inGroup ? <ArrowLeft className="size-4" /> : <Home className="size-4" />}
+            label={inGroup ? "返回" : "首页"}
           />
 
-          {/* 独立区域：WorkBuddy 自身的账号能力（与 Trae 区分开） */}
-          <div className="mt-3 flex items-center gap-2 px-3 pb-1" role="presentation">
-            <span className="text-[11px] font-medium tracking-wide text-sidebar-foreground/40">
-              WorkBuddy
-            </span>
-            <span className="h-px flex-1 bg-sidebar-border" />
-          </div>
-          <SidebarLink
-            to="/workbuddy-switch"
-            icon={<UserRound className="size-4" />}
-            label="WorkBuddy 账号管理"
-          />
-          <SidebarLink
-            to="/workbuddy-records"
-            icon={<ScrollText className="size-4" />}
-            label="WorkBuddy 会话记录"
-          />
+          {/* 类别之间用小横杠分开：首页/返回 | 账号及会话管理 | 数据迁移及维护 | 积分共享·设置 */}
+          <NavDivider />
 
-          {/* 独立区域：跨工具的数据迁移，与 Trae 自身的账号 / 会话功能分开 */}
-          <div className="mt-3 flex items-center gap-2 px-3 pb-1" role="presentation">
-            <span className="text-[11px] font-medium tracking-wide text-sidebar-foreground/40">
-              数据迁移
-            </span>
-            <span className="h-px flex-1 bg-sidebar-border" />
-          </div>
-          <SidebarLink
-            to="/workbuddy-import"
-            icon={<HardDriveDownload className="size-4" />}
-            label="WorkBuddy → Trae"
-          />
-          <SidebarLink
-            to="/workbuddy-export"
-            icon={<HardDriveUpload className="size-4" />}
-            label="Trae → WorkBuddy"
-          />
+          {NAV_GROUPS.map((g, i) => {
+            const open = activeGroup?.key === g.key;
+            return (
+              <div key={g.key} className="flex flex-col gap-0.5">
+                {i > 0 ? <NavDivider /> : null}
+                <SidebarLink to={g.root} icon={g.icon} label={g.label} active={open} />
+                {open ? (
+                  // 二级：左侧竖线 + 缩进，数量固定（账号组 6 个、维护组 5 个）
+                  <div className="mt-0.5 ml-4 flex flex-col gap-0.5 border-l border-sidebar-border pl-2">
+                    {g.children.map((c) => (
+                      <SidebarSubLink key={c.to} to={c.to} label={c.label} />
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
 
-          {/* 独立区域：本机数据清理，与「迁移」不是一类事 */}
-          <div className="mt-3 flex items-center gap-2 px-3 pb-1" role="presentation">
-            <span className="text-[11px] font-medium tracking-wide text-sidebar-foreground/40">
-              本机维护
-            </span>
-            <span className="h-px flex-1 bg-sidebar-border" />
-          </div>
-          <SidebarLink
-            to="/workbuddy-cleanup"
-            icon={<Trash2 className="size-4" />}
-            label="WorkBuddy 清理"
-          />
-          <SidebarLink
-            to="/trae-cleanup"
-            icon={<Eraser className="size-4" />}
-            label="Trae 清理"
-          />
-          {/* 设置放在最后：它是全局偏好，不属于上面任何一组功能。 */}
-          <SidebarLink
-            to="/settings"
-            icon={<Settings className="size-4" />}
-            label="设置"
-          />
+          <NavDivider />
+          <SidebarLink to="/gateway" icon={<Share2 className="size-4" />} label="积分共享" />
+          <SidebarLink to="/settings" icon={<Settings className="size-4" />} label="设置" />
         </nav>
         <UpdateEntry fallbackVersion={version} />
       </aside>
@@ -220,6 +260,8 @@ export default function App() {
             <Route path="/" element={<HomePage />} />
             {/* 首页占用了 `/`，Trae 账号管理迁到显式路径；旧书签靠 /home 别名兜底 */}
             <Route path="/home" element={<HomePage />} />
+            <Route path="/accounts" element={<AccountsHubPage />} />
+            <Route path="/migrate" element={<MaintenanceHubPage />} />
             <Route path="/trae-switch" element={<TraeSwitchPage />} />
             <Route path="/trae-records" element={<TraeRecordsPage />} />
             <Route path="/workbuddy-switch" element={<WorkbuddySwitchPage />} />
@@ -228,6 +270,11 @@ export default function App() {
             <Route path="/workbuddy-export" element={<WorkbuddyExportPage />} />
             <Route path="/workbuddy-cleanup" element={<WorkbuddyCleanupPage />} />
             <Route path="/trae-cleanup" element={<TraeCleanupPage />} />
+            <Route path="/qoder-cleanup" element={<QoderCleanupPage />} />
+            <Route path="/qoder-accounts" element={<QoderAccountsPage />} />
+            <Route path="/qoder-sessions" element={<QoderSessionsPage />} />
+            <Route path="/gateway" element={<GatewayPage />} />
+            <Route path="/gateway-guide" element={<GatewayGuidePage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

@@ -26,10 +26,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Skeleton } from "@/components/ui/skeleton";
 import { CheckinButton } from "@/components/checkin-button";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
-import * as api from "@/lib/api";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { selectableClients } from "@/lib/trae-client-list";
 import { refreshOverview, rememberReclaim, useOverviewState } from "@/lib/overview-store";
+import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { OverviewTraeClient, WbCreditResource, WbCreditsResult } from "@/lib/trae-types";
 
@@ -359,9 +359,32 @@ export default function HomePage() {
     // reclaim?.at 变了说明扫完了，此时不该再触发一次 —— 依赖里只放 reclaim
   }, [reclaim, loadReclaim]);
 
+  /// Qoder 概况：纯本地读（账号库 + sqlite 计数 + 进程名），毫秒级，不需要缓存。
+  /// 失败也**不要把界面卡在「加载中」** —— 置成空对象让卡片显示 0 / 未知。
+  const loadQoder = useCallback(async () => {
+    try {
+      setQoderSummary(await api.qoderHomeSummary());
+    } catch {
+      setQoderSummary({
+        accounts: 0,
+        credits: null,
+        regions: [],
+        sessions: {},
+        running: false,
+        processCount: 0,
+      });
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
     await Promise.allSettled([refreshOverview(), loadReclaim()]);
-  }, [loadReclaim]);
+    void loadQoder();
+  }, [loadReclaim, loadQoder]);
+
+  // Qoder 概况：**挂载就取**（之前只挂在刷新按钮上 ⇒ 每次打开首页都「加载中」）。
+  useEffect(() => {
+    void loadQoder();
+  }, [loadQoder]);
 
   const refreshCredits = useCallback(async () => {
     setCreditsBusy(true);
@@ -382,6 +405,16 @@ export default function HomePage() {
   const trae = ov?.trae;
   const totalSessions = (trae?.sessionTotal ?? 0) + (wb?.sessionCount ?? 0);
   const reclaimTotal = reclaim?.totalBytes ?? 0;
+
+  /** 首页的 Qoder 概况（账号数 / 积分 / 会话 / 客户端状态）。 */
+  const [qoderSummary, setQoderSummary] = useState<{
+    accounts: number;
+    credits: number | null;
+    regions: { region: string; label: string; accounts: number; usable: number; credits: number | null; hasClient: boolean }[];
+    sessions: Record<string, number>;
+    running: boolean;
+    processCount: number;
+  } | null>(null);
 
   /** 本机已安装的 Trae 客户端（后端已排序：使用记忆 + 能不能跑起来，`[0]` 就是默认要看的那一个）。 */
   const traeClients = useMemo(() => trae?.clients ?? [], [trae]);
@@ -519,8 +552,8 @@ export default function HomePage() {
         </Alert>
       ) : null}
 
-      {/* 四个大数字 */}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 五个大数字（Trae / WorkBuddy / Qoder / 会话 / 可回收） */}
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <Stat
           icon={<Users className="size-4" />}
           label="Trae 账号"
@@ -536,13 +569,28 @@ export default function HomePage() {
           loading={!wb}
         />
         <Stat
+          icon={<Users className="size-4" />}
+          label="Qoder 账号"
+          value={String(qoderSummary?.accounts ?? 0)}
+          sub={
+            qoderSummary
+              ? `国内 ${qoderSummary.regions?.find((r) => r.region === "cn")?.accounts ?? 0} · 国际 ${
+                  qoderSummary.regions?.find((r) => r.region === "global")?.accounts ?? 0
+                }`
+              : "加载中…"
+          }
+          loading={!qoderSummary}
+        />
+        <Stat
           icon={<MessageSquare className="size-4" />}
           label="会话总数"
           value={totalSessions.toLocaleString("zh-CN")}
           sub={
             trae?.anyDecrypted
-              ? `Trae 已解密客户端 ${trae.sessionTotal} · WorkBuddy ${wb?.sessionCount ?? "—"}`
-              : `Trae 未解密 · WorkBuddy ${wb?.sessionCount ?? "—"}`
+              ? `Trae ${trae.sessionTotal} · WB ${wb?.sessionCount ?? "—"} · Qoder ${
+                  (qoderSummary?.sessions?.cn ?? 0) + (qoderSummary?.sessions?.global ?? 0)
+                }`
+              : `Trae 未解密 · WB ${wb?.sessionCount ?? "—"}`
           }
           loading={!ov}
         />
@@ -564,7 +612,7 @@ export default function HomePage() {
       {/* 双栏状态卡。
           ⚠️ `items-start`：Trae 侧是「每个客户端一块」，客户端多的时候会比 WorkBuddy
           侧高出一大截；默认的 `stretch` 会把矮的那张拉成同高，中间留一块空白。 */}
-      <div className="grid items-start gap-4 lg:grid-cols-2">
+      <div className="grid items-start gap-4 md:grid-cols-2 lg:grid-cols-3">
         {/* Trae */}
         <Card className="flex flex-col">
           <CardHeader className="pb-3">
@@ -758,6 +806,64 @@ export default function HomePage() {
             </div>
           </CardContent>
         </Card>
+        {/* Qoder */}
+        <Card className="flex flex-col">
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Cpu className="size-4" />
+                  Qoder 客户端
+                </CardTitle>
+                <CardDescription>
+                  {qoderSummary
+                    ? `账号 ${qoderSummary.accounts} 个 · 会话 ${(qoderSummary.sessions?.cn ?? 0) + (qoderSummary.sessions?.global ?? 0)} 个`
+                    : "加载中…"}
+                </CardDescription>
+              </div>
+              <Dot
+                on={qoderSummary?.running ?? false}
+                label={
+                  qoderSummary?.running
+                    ? `${qoderSummary.processCount} 个进程`
+                    : "已退出"
+                }
+              />
+            </div>
+          </CardHeader>
+          <CardContent className="flex flex-1 flex-col gap-3">
+            {!qoderSummary ? (
+              <Skeleton className="h-24 rounded-lg" />
+            ) : (
+              <>
+                <div className="divide-y rounded-lg border px-3">
+                  <Row label="积分合计">
+                    {qoderSummary.credits != null ? `${qoderSummary.credits.toFixed(2)} credits` : "未知"}
+                  </Row>
+                  {qoderSummary.regions.map((r) => (
+                    <Row key={r.region} label={r.label}>
+                      {r.accounts} 个账号 · {r.usable} 个可用
+                      {r.credits != null ? ` · ${r.credits.toFixed(2)}` : ""}
+                      {r.hasClient ? "" : " · 未装客户端"}
+                    </Row>
+                  ))}
+                  <Row label="会话">
+                    国内 {qoderSummary.sessions?.cn ?? 0} · 国际 {qoderSummary.sessions?.global ?? 0}
+                  </Row>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to="/qoder-accounts">Qoder 账号管理</Link>
+                  </Button>
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to="/qoder-sessions">Qoder 会话</Link>
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
       </div>
 
       {/* 底部：可回收空间 + 注意事项 + 快捷入口 */}

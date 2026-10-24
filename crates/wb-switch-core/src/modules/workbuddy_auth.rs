@@ -50,6 +50,13 @@ pub const WINDOWS_IMAGE_NAMES: [&str; 1] = ["WorkBuddy"];
 /// 国内版 API 基址（OAuth 与刷新用）。
 pub const API_ENDPOINT: &str = "https://www.codebuddy.cn";
 
+/// **登录页**域名（与 API 域名分开）。
+///
+/// 官方 5.9.x 客户端的登录页是 `https://www.workbuddy.cn/login/?platform=workbuddy&state=…`
+/// （用户实测的地址）；而 API 仍在 `www.codebuddy.cn`。之前拿 API 域名拼登录页，
+/// 打开的是旧页面，登录后 state 对不上。
+pub const LOGIN_ENDPOINT: &str = "https://www.workbuddy.cn";
+
 // ---------------------------------------------------------------------------
 // 路径
 // ---------------------------------------------------------------------------

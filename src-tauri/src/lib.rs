@@ -118,6 +118,32 @@ pub fn run() {
             // 后台周期检查：启动 15 秒后首检，此后每 30 分钟一次（多数轮次命中
             // core 的 6 小时缓存，不发网络请求）。
             update_service::spawn_periodic_check(app.handle().clone());
+            // 模型目录：**后台空闲时自动刷新并落盘**（启动 20 秒后首跑，此后每 6 小时）。
+            // 用户不点「重新识别」也能保持 models.json 是最新的；失败静默（下次再试）。
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let _ = wb_switch_core::modules::gateway_models::discover_and_save().await;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    let _ = wb_switch_core::modules::gateway_models::discover_and_save().await;
+                }
+            });
+
+            // 积分共享网关：**受开关控制**（`~/.twin-switch/gateway.json` 的 enabled）。
+            // 关掉时不监听任何端口；绑定失败只记日志，不影响主界面。
+            if !wb_switch_core::modules::gateway_server::enabled() {
+                eprintln!("[gateway] 积分共享已关闭（设置里可开启），本次不启动网关");
+            } else {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = wb_switch_core::modules::gateway_server::serve(
+                    wb_switch_core::modules::gateway_keys::GATEWAY_PORT,
+                )
+                .await
+                {
+                    eprintln!("[gateway] {e}");
+                }
+            });
+            }
             Ok(())
         })
         // 点窗口关闭按钮：隐藏到托盘，不退出程序
@@ -128,6 +154,55 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::qoder_regions,
+            commands::qoder_token_refresh,
+            commands::qoder_account_rename,
+            commands::qoder_account_switch,
+            commands::qoder_accounts_export,
+            commands::qoder_import_preview,
+            commands::qoder_import_apply,
+            commands::qoder_checkin_all,
+            commands::qoder_sessions_list,
+            commands::qoder_session_detail,
+            commands::qoder_sessions_counts,
+            commands::qoder_cleanup_scan,
+            commands::qoder_cleanup_empty_trash,
+            commands::qoder_cleanup_run,
+            commands::qoder_home_summary,
+            commands::qoder_account_set_cosy,
+            commands::qoder_session_update_message,
+            commands::qoder_session_delete_message,
+            commands::qoder_session_rename,
+            commands::qoder_session_delete,
+            commands::qoder_session_duplicate,
+            commands::qoder_import_local,
+            commands::qoder_login_start,
+            commands::qoder_login_poll,
+            commands::qoder_login_cancel,
+            commands::qoder_accounts_list,
+            commands::qoder_account_add,
+            commands::qoder_account_remove,
+            commands::qoder_account_restore,
+            commands::qoder_account_set_token,
+            commands::qoder_account_refresh,
+            commands::qoder_accounts_refresh_all,
+            commands::gateway_status,
+            commands::gateway_guide_selftest,
+            commands::gateway_set_enabled,
+            commands::gateway_pool,
+            commands::gateway_preview,
+            commands::gateway_keys_list,
+            commands::gateway_key_create,
+            commands::gateway_key_revoke,
+            commands::gateway_key_restore,
+            commands::gateway_key_delete,
+            commands::gateway_models_discover,
+            commands::gateway_models_selected,
+            commands::gateway_models_save,
+            commands::gateway_models_get,
+            commands::gateway_models_set,
+            commands::gateway_upstreams_get,
+            commands::gateway_upstreams_set,
             commands::relaunch_app,
             commands::log_error,
             commands::get_error_log_path,
@@ -214,6 +289,7 @@ pub fn run() {
             commands::trae_import_all_local_logins,
             // WorkBuddy 账号管理（国内版）
             commands::workbuddy_account_list,
+            commands::workbuddy_account_add_token,
             commands::workbuddy_switch_precheck,
             commands::workbuddy_switch_to,
             commands::workbuddy_rollback,

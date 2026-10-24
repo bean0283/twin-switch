@@ -261,6 +261,16 @@ pub fn excess_with_reasons(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// **切号时把定时任务同步给新账号**（默认**开**）。
+    ///
+    /// WorkBuddy 的定时任务按 `owner_user_id` 归属（见
+    /// [`crate::modules::workbuddy_automations`]），切到别的账号后原任务会「消失」。
+    /// 默认同步 = 切过去还能看到原来的任务；不想要这份「自动复制」的人可以在这里关掉。
+    ///
+    /// ⚠️ 用 `default = "yes"` 而不是 `#[serde(default)]`：后者的 bool 默认是 `false`，
+    /// 老用户的 `settings.json` 里没有这个键，升级后会**悄悄变成关**（行为突变）。
+    #[serde(default = "yes")]
+    pub sync_workbuddy_automations: bool,
     #[serde(default)]
     pub backup_retention: BackupRetention,
     /// **写库前的整库备份**开关（T66）。**默认关闭**。
@@ -344,6 +354,11 @@ pub fn trae_exe_override(client_key: &str) -> Option<PathBuf> {
 /// ⚠️ 读盘失败（设置文件坏了）时 [`load`] 退回默认 = **不备份**。这是故意的：
 /// 备份是「留历史」，不是「保命」（保命靠 `trae_backup::swap_in_place` 的原子替换），
 /// 所以坏文件下宁可不动用户的磁盘，也不能凭空写出一堆 609 MB。
+/// 切号时是否同步定时任务（默认开）。读不到设置文件也按「开」处理。
+pub fn sync_workbuddy_automations() -> bool {
+    load().sync_workbuddy_automations
+}
+
 pub fn backup_before_write() -> bool {
     load().backup_before_write
 }
