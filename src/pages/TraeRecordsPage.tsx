@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
@@ -14,6 +14,8 @@ import {
   HardDrive,
   Import,
   KeyRound,
+  Layers,
+  LayoutList,
   Link2Off,
   Loader2,
   Pencil,
@@ -22,6 +24,7 @@ import {
   Search,
   Trash2,
   Wrench,
+  X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
@@ -40,6 +43,7 @@ import {
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ResizableDialogContent } from "@/components/ui/resizable-dialog-content";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -111,6 +115,11 @@ export default function TraeRecordsPage() {
   const [decryptHint, setDecryptHint] = useState("");
   // 归属账号筛选（会话列表）
   const [ownerFilter, setOwnerFilter] = useState("");
+  // 搜索 / 工作空间（与 WorkBuddy 会话页同一套交互）：
+  // `wsFilter === ""` = 全部空间；`byWorkspace` = 按空间分组视图（默认开，和客户端列表一致）。
+  const [query, setQuery] = useState("");
+  const [wsFilter, setWsFilter] = useState("");
+  const [byWorkspace, setByWorkspace] = useState(true);
   // 导出目录（默认路径提示 + 打开按钮）
   const [exportDir, setExportDir] = useState("");
   // 解密库的表清单默认收起（~180 张表的标签墙会占掉半屏）
@@ -513,9 +522,92 @@ export default function TraeRecordsPage() {
   const ownerOptions = sessions
     ? Array.from(new Set(sessions.map((s) => s.owner_label))).sort()
     : [];
-  const visibleSessions = sessions?.filter(
-    (s) => !ownerFilter || s.owner_label === ownerFilter,
-  );
+
+  // ---------------------------------------------------------------------------
+  // 工作空间：归并 / 搜索 / 分组（与 WorkBuddy 会话页同一套口径）
+  // ---------------------------------------------------------------------------
+  //
+  // 空间键与展示名都由后端 `modules::workspace` 给（Trae 优先用 `project.name`），
+  // 前端只按 `workspace_key` 分组、用 `workspace` 显示 —— 不重复实现路径归一化，
+  // 否则同一目录在不同页面会被拆成两个空间。
+
+  /** 当前客户端涉及的工作空间（最近活动的排前面）。 */
+  const wsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; last: string }
+    >();
+    for (const s of sessions ?? []) {
+      const key = s.workspace_key ?? "";
+      // Trae 的时间是 `YYYY-MM-DD HH:mm:ss` 字符串，可以直接比字典序
+      const at = s.updated || "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        if (at > cur.last) cur.last = at;
+      } else {
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspace_path || "",
+          count: 1,
+          last: at,
+        });
+      }
+    }
+    const list = [...map.values()];
+    // 同名空间（两个不同目录都叫 `bin`）补一级目录区分
+    const dup = new Map<string, number>();
+    for (const w of list) dup.set(w.label, (dup.get(w.label) ?? 0) + 1);
+    return list
+      .map((w) => {
+        if ((dup.get(w.label) ?? 0) <= 1) return w;
+        const segs = (w.path || "").split("/").filter(Boolean);
+        return { ...w, label: segs.slice(-2).join("/") || w.label };
+      })
+      .sort((a, b) => b.last.localeCompare(a.last) || a.label.localeCompare(b.label));
+  }, [sessions]);
+
+  const visibleSessions = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return (sessions ?? []).filter((s) => {
+      if (ownerFilter && s.owner_label !== ownerFilter) return false;
+      if (wsFilter && (s.workspace_key ?? "") !== wsFilter) return false;
+      if (!q) return true;
+      return [s.title, s.workspace, s.workspace_path, s.id, s.owner_label].some((v) =>
+        (v ?? "").toLowerCase().includes(q),
+      );
+    });
+  }, [sessions, ownerFilter, wsFilter, query]);
+
+  /** 按空间分组（分组顺序 = 组内第一条的时间，列表本来就按最后活动倒序）。 */
+  const wsGroups = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; items: TraeSessionInfo[] }
+    >();
+    for (const s of visibleSessions) {
+      const key = s.workspace_key ?? "";
+      const g = map.get(key);
+      if (g) g.items.push(s);
+      else
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspace_path || "",
+          items: [s],
+        });
+    }
+    const order = new Map(wsOptions.map((w, i) => [w.key, i]));
+    return [...map.values()].sort(
+      (a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+    );
+  }, [visibleSessions, wsOptions]);
+
+  /** 表格要渲染的「块」：分组视图按空间分块；平铺视图合成一块。 */
+  const renderGroups = byWorkspace
+    ? wsGroups
+    : [{ key: "__flat__", label: "", path: "", items: visibleSessions }];
 
   // ---------------------------------------------------------------------------
   // 批量删除的勾选
@@ -548,7 +640,7 @@ export default function TraeRecordsPage() {
   // 切客户端 / 换筛选后清空勾选（理由见上）。依赖里放的是「会改变可见集合」的那两个。
   useEffect(() => {
     setRecordSel(new Set());
-  }, [clientKey, ownerFilter]);
+  }, [clientKey, ownerFilter, wsFilter, query]);
 
   // 列表刷新后把已经不存在的会话 id 从勾选里摘掉（例如在别处删过了）。
   useEffect(() => {
@@ -973,8 +1065,14 @@ export default function TraeRecordsPage() {
                 <CardTitle className="text-base">会话列表</CardTitle>
                 <CardDescription>
                   {sessions
-                    ? `共 ${sessions.length} 个会话，按最后活动倒序${
-                        ownerFilter ? `；当前筛选：${ownerFilter}` : ""
+                    ? `共 ${sessions.length} 个会话${
+                        visibleSessions.length !== sessions.length
+                          ? `（当前筛选 ${visibleSessions.length} 个）`
+                          : ""
+                      }，按最后活动倒序${
+                        wsFilter
+                          ? `；空间：${wsOptions.find((w) => w.key === wsFilter)?.label ?? "（已不存在）"}`
+                          : ""
                       }`
                     : "正在读取…"}
                 </CardDescription>
@@ -994,6 +1092,68 @@ export default function TraeRecordsPage() {
                     ))}
                   </select>
                 ) : null}
+
+                {/* 搜索：只搜元数据（正文在 SQLite 里，逐条读代价太高，占位符已写明） */}
+                <div className="relative">
+                  <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="搜索标题 / 空间 / 会话 id"
+                    className="h-8 w-[230px] pl-7 pr-7 text-xs"
+                  />
+                  {query ? (
+                    <button
+                      type="button"
+                      title="清除搜索"
+                      className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                      onClick={() => setQuery("")}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+
+                {/* 工作空间筛选（数量与分组表头同源：都来自当前 sessions） */}
+                <select
+                  value={wsFilter}
+                  onChange={(e) => setWsFilter(e.target.value)}
+                  className="h-8 max-w-[220px] rounded-md border border-border bg-background px-2 text-xs"
+                  title="按工作空间筛选"
+                >
+                  <option value="">全部工作空间（{wsOptions.length}）</option>
+                  {wsOptions.map((w) => (
+                    <option key={w.key} value={w.key}>
+                      {w.label} · {w.count}
+                    </option>
+                  ))}
+                </select>
+
+                {/* 视图切换：按空间分组 / 平铺 */}
+                <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                      byWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setByWorkspace(true)}
+                  >
+                    <Layers className="size-3" />
+                    按空间
+                  </button>
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                      !byWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setByWorkspace(false)}
+                  >
+                    <LayoutList className="size-3" />
+                    平铺
+                  </button>
+                </div>
               </div>
             </div>
           </CardHeader>
@@ -1029,7 +1189,31 @@ export default function TraeRecordsPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {visibleSessions.map((s) => (
+                      {renderGroups.map((g) => (
+                        <Fragment key={g.key}>
+                          {/* 分组表头（只有「按空间」视图才画）。点一下 = 只看这个空间。 */}
+                          {byWorkspace ? (
+                            <TableRow className="bg-muted/50">
+                              <TableCell colSpan={5} className="py-1.5">
+                                <button
+                                  type="button"
+                                  className="flex w-full items-center gap-2 text-left"
+                                  title="只看这个工作空间"
+                                  onClick={() => setWsFilter(g.key)}
+                                >
+                                  <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                                  <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                                  <Badge variant="secondary" className="shrink-0">
+                                    {g.items.length}
+                                  </Badge>
+                                  <span className="truncate text-xs text-muted-foreground" title={g.path}>
+                                    {g.path}
+                                  </span>
+                                </button>
+                              </TableCell>
+                            </TableRow>
+                          ) : null}
+                          {g.items.map((s) => (
                         <TableRow key={s.id} data-picked={recordSel.has(s.id) ? "1" : undefined}>
                           <TableCell className="w-10">
                             <input
@@ -1044,7 +1228,17 @@ export default function TraeRecordsPage() {
                             <div className="truncate font-medium" title={s.title}>
                               {s.title || "（无标题）"}
                             </div>
-                            <div className="truncate font-mono text-[11px] text-muted-foreground">{s.id}</div>
+                            <div className="flex items-center gap-1.5">
+                              {!byWorkspace ? (
+                                <span className="inline-flex shrink-0 items-center gap-1 rounded border px-1 py-0.5 text-[11px] text-muted-foreground">
+                                  <FolderOpen className="size-3" />
+                                  {s.workspace || "（未归属）"}
+                                </span>
+                              ) : null}
+                              <span className="truncate font-mono text-[11px] text-muted-foreground">
+                                {s.id}
+                              </span>
+                            </div>
                           </TableCell>
                           <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                             {s.updated || "—"}
@@ -1092,6 +1286,8 @@ export default function TraeRecordsPage() {
                             </div>
                           </TableCell>
                         </TableRow>
+                          ))}
+                        </Fragment>
                       ))}
                     </TableBody>
                   </Table>
@@ -1127,11 +1323,27 @@ export default function TraeRecordsPage() {
                 ) : null}
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">
-                {sessions?.length
-                  ? "当前筛选下没有会话记录。"
-                  : "解密库中没有会话记录。"}
-              </p>
+              /* ⚠️「筛选后为空」与「本来就没有会话」必须长得不一样：前者给清除入口。 */
+              <div className="space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  {sessions?.length
+                    ? `没有匹配的会话 —— 筛选后 0 条，该客户端共 ${sessions.length} 条。`
+                    : "解密库中没有会话记录。"}
+                </p>
+                {sessions?.length ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setQuery("");
+                      setWsFilter("");
+                      setOwnerFilter("");
+                    }}
+                  >
+                    清除搜索与筛选
+                  </Button>
+                ) : null}
+              </div>
             )}
           </CardContent>
         </Card>

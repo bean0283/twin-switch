@@ -8,12 +8,13 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { ArrowLeft, Home, Settings, Share2, Users, Wrench } from "lucide-react";
+import { ArrowLeft, Home, MessagesSquare, Settings, Share2, Users, Wrench } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 
 import { cn } from "@/lib/utils";
 import HomePage from "@/pages/HomePage";
 import AccountsHubPage from "@/pages/AccountsHubPage";
+import SessionsHubPage from "@/pages/SessionsHubPage";
 import MaintenanceHubPage from "@/pages/MaintenanceHubPage";
 import TraeSwitchPage from "@/pages/TraeSwitchPage";
 import TraeRecordsPage from "@/pages/TraeRecordsPage";
@@ -37,7 +38,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 /**
  * 侧栏**两级导航**。
  *
- * 一级只有 5 项（首页 / 账号及会话管理 / 数据迁移及维护 / 积分共享 / 设置）；
+ * 一级只有 6 项（首页 / 账号管理 / 会话管理 / 数据迁移及维护 / 积分共享 / 设置）；
  * 三个产品的账号与会话、迁移与清理都收进分组，避免侧栏被 20 多个入口拉成一长条
  * （用户反馈的原问题）。进入某组后，该组自动展开二级项，其余组保持收起。
  */
@@ -52,16 +53,25 @@ type NavGroup = {
 
 const NAV_GROUPS: NavGroup[] = [
   {
+    // 账号与会话**拆成两组**（用户要求）：一个分组里 6 个入口、账号和会话混排，点错率高。
     key: "accounts",
-    label: "账号及会话管理",
+    label: "账号管理",
     icon: <Users className="size-4" />,
     root: "/accounts",
     children: [
       { to: "/trae-switch", label: "Trae 账号" },
-      { to: "/trae-records", label: "Trae 会话" },
       { to: "/workbuddy-switch", label: "WorkBuddy 账号" },
-      { to: "/workbuddy-records", label: "WorkBuddy 会话" },
       { to: "/qoder-accounts", label: "Qoder 账号" },
+    ],
+  },
+  {
+    key: "sessions",
+    label: "会话管理",
+    icon: <MessagesSquare className="size-4" />,
+    root: "/sessions",
+    children: [
+      { to: "/trae-records", label: "Trae 会话" },
+      { to: "/workbuddy-records", label: "WorkBuddy 会话" },
       { to: "/qoder-sessions", label: "Qoder 会话" },
     ],
   },
@@ -203,7 +213,7 @@ function Layout() {
             label={inGroup ? "返回" : "首页"}
           />
 
-          {/* 类别之间用小横杠分开：首页/返回 | 账号及会话管理 | 数据迁移及维护 | 积分共享·设置 */}
+          {/* 类别之间用小横杠分开：首页/返回 | 账号管理 | 会话管理 | 数据迁移及维护 | 积分共享·设置 */}
           <NavDivider />
 
           {NAV_GROUPS.map((g, i) => {
@@ -272,6 +282,7 @@ export default function App() {
             <Route path="/trae-cleanup" element={<TraeCleanupPage />} />
             <Route path="/qoder-cleanup" element={<QoderCleanupPage />} />
             <Route path="/qoder-accounts" element={<QoderAccountsPage />} />
+            <Route path="/sessions" element={<SessionsHubPage />} />
             <Route path="/qoder-sessions" element={<QoderSessionsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />
             <Route path="/gateway-guide" element={<GatewayGuidePage />} />

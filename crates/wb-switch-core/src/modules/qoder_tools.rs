@@ -769,8 +769,16 @@ pub async fn chat_complete_ex(
     };
     let mut send_tools: Option<&Value> = if empty(&tools) { None } else { tools };
     let mut degraded = false;
-    let mut last = String::new();
-    for attempt in 0..3 {
+    // ⚠️ 排队按**官方语义**处理（2026-10-24 改造）：
+    //   官方客户端收到 10605 不是「失败」，而是 sleep(retryAfterSeconds) → 查 queue/status →
+    //   没空位就继续等，**不放弃、也不换号**（队列是模型级的，换号只会把几个号一起打进冷却）。
+    //   我们以前一律砍到 12 秒 × 3 轮 = 36 秒就放弃，而热门模型真实排队是 60 秒到几分钟，
+    //   于是日志里一大片 429「排队中」。
+    let budget = queue_budget_secs();
+    let started = std::time::Instant::now();
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
         match chat_once(region, account, model_key, display_name, messages, send_tools).await {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -778,19 +786,18 @@ pub async fn chat_complete_ex(
                     let mut parts = rest.splitn(2, '|');
                     let wait: u64 = parts.next().unwrap_or("30").trim().parse().unwrap_or(30);
                     let msg = parts.next().unwrap_or("上游排队中").to_string();
-                    last = format!("{msg}（已重试 {attempt} 次仍排队）");
-                    if attempt < 2 {
-                        // 单轮最多等 12 秒：等太久会让客户端的「测试连接」先超时，
-                        // 用户看到的是「连接失败」而不是「排队中」。
-                        tokio::time::sleep(std::time::Duration::from_secs(wait.min(12))).await;
+                    let spent = started.elapsed().as_secs();
+                    let nap = wait.clamp(1, MAX_QUEUE_SLEEP);
+                    if attempts <= MAX_QUEUE_ATTEMPTS && spent + nap <= budget {
+                        tokio::time::sleep(std::time::Duration::from_secs(nap)).await;
                         continue;
                     }
                     return Err(format!(
                         // ⚠️ 文案里**不许出现代号**（`qmodel` / `dfmodel`）：界面和复制都
                         // 已经只用客户端里的名字，提示再给代号等于让用户去认一个界面
                         // 上根本看不到的字符串（2026-10-24）。
-                        "QUEUED|{wait}|{msg}（已等待重试 {attempt} 次仍排队 —— 这是上游排队不是额度不足；\
-                         换个冷门模型试试，如 GLM-5.3 / Qwen3.8-Max）"
+                        "QUEUED|{wait}|{msg}（已等 {spent} 秒仍在排队 —— 这是上游排队，不是额度不足，\
+                         也不是账号坏了；换号没用，队列是模型级的。可换冷门模型试试，如 GLM-5.3 / Qwen3.8-Max）"
                     ));
                 }
                 // 非排队失败：第一次先把 tools 摘掉重试（不支持工具的模型/账号），
@@ -798,15 +805,33 @@ pub async fn chat_complete_ex(
                 if send_tools.is_some() && !degraded {
                     degraded = true;
                     send_tools = None;
-                    last = e;
+                    // 降级重试也要说清：错误原文留在最后一次失败里，不吞。
+                    eprintln!("[qoder] 带工具失败，降级为不带工具重试一次：{e}");
                     continue;
                 }
                 return Err(e);
             }
         }
     }
-    Err(last)
 }
+
+/// 排队总预算（秒）：默认 240，可用 `TWIN_TS_QUEUE_BUDGET` 覆盖。
+///
+/// 给到 4 分钟的理由：客户端自己愿意等 10 分钟，我们只等 36 秒等于**主动放弃**
+/// 一个本来能成的请求，然后把失败写进冷却、还换个号再排一次。
+fn queue_budget_secs() -> u64 {
+    std::env::var("TWIN_TS_QUEUE_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(240)
+}
+
+/// 单次睡眠上限：照上游给的 `retryAfterSeconds` 等，但一次别睡太久
+/// （中途可能就排到了，也可能用户已经关掉了客户端）。
+const MAX_QUEUE_SLEEP: u64 = 45;
+/// 最多问几次（预算是主闸，这个是兜底防止上游一直回极短的 wait 把循环跑成死转）。
+const MAX_QUEUE_ATTEMPTS: usize = 12;
 
 /// 从错误文本里取排队标记后面的内容（`<秒>|<文案>`）。
 ///
@@ -818,13 +843,17 @@ fn queue_marker(err: &str) -> Option<&str> {
 }
 
 /// 单次尝试（不做重试）。解析见 [`chat_complete`]。
-pub async fn chat_once(
-    region: QoderRegion,
-    account: &QoderAccount,
+/// 拼出**完整的** Qoder 对话请求体（模板 + 工具 + 全部消息 + `chat_context`）。
+///
+/// `session_id` 用**指纹派生**（同一段对话每轮复用同一个 ID）：上游才认得出「还是这个会话」，
+/// 前缀缓存才有机会命中。`request_id` / `chat_record_id` 仍然每次新生成 ——
+/// 它们是**请求**身份而不是会话身份，复用会让上游把两次请求当成同一次重试。
+fn full_body(
     model_key: &str,
     display_name: &str,
     messages: &Value,
     tools: Option<&Value>,
+    uid: &str,
 ) -> Result<Value, String> {
     let mut body = build_chat_body(model_key, display_name, "")?;
     // 工具定义按 OpenAI 形状塞进模板的 `tools`（模板默认 `[]`，等于「没有工具」）。
@@ -860,7 +889,22 @@ pub async fn chat_once(
             }
         }
     }
-    let plain = body.to_string();
+    let seed = crate::modules::gateway_stream::session_seed(model_key, uid, messages, tools);
+    body["session_id"] = json!(crate::modules::gateway_stream::session_id(&seed, "qoder-sess"));
+    Ok(body)
+}
+
+/// 发出去并返回**未读的响应**（状态码已判）。
+///
+/// `timeout_s` 分两档：聚合路径 180 s，流式路径 900 s。流式下 reqwest 的超时管的是
+/// **整条流**，用 180 s 卡会把「模型在慢慢写」当成「上游挂了」。
+async fn post_stream(
+    region: QoderRegion,
+    account: &QoderAccount,
+    plain: &str,
+    model_key: &str,
+    timeout_s: u64,
+) -> Result<reqwest::Response, String> {
     let encoded = crate::modules::qoder_cosy::qoder_encode(plain.as_bytes());
     let sign_path = "/algo/api/v2/service/pro/sse/agent_chat_generation";
     let headers =
@@ -872,7 +916,7 @@ pub async fn chat_once(
         let mut req = client()?
             .post(format!("{host}{sign_path}?Encode=1"))
             .body(encoded.clone())
-            .timeout(std::time::Duration::from_secs(180));
+            .timeout(std::time::Duration::from_secs(timeout_s));
         for (k, v) in headers.iter() {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -894,6 +938,35 @@ pub async fn chat_once(
             text.chars().take(200).collect::<String>()
         ));
     }
+    Ok(resp)
+}
+
+/// 打开 Qoder 的流式对话：把**没读过的响应**交给网关，由 `gateway_stream` 边读边发。
+///
+/// 为什么不在这里聚合：聚合等于「等整段生成完再回」，首字延迟 = 整段生成时间，
+/// 客户端十几分钟看不到一个字就会判定卡住、重试，再排一次队（报告 §3.1）。
+pub async fn chat_open(
+    region: QoderRegion,
+    account: &QoderAccount,
+    model_key: &str,
+    display_name: &str,
+    messages: &Value,
+    tools: Option<&Value>,
+) -> Result<reqwest::Response, String> {
+    let body = full_body(model_key, display_name, messages, tools, &account.uid)?;
+    post_stream(region, account, &body.to_string(), model_key, 900).await
+}
+
+pub async fn chat_once(
+    region: QoderRegion,
+    account: &QoderAccount,
+    model_key: &str,
+    display_name: &str,
+    messages: &Value,
+    tools: Option<&Value>,
+) -> Result<Value, String> {
+    let body = full_body(model_key, display_name, messages, tools, &account.uid)?;
+    let resp = post_stream(region, account, &body.to_string(), model_key, 180).await?;
 
     // ⚠️ **必须逐块读**：上游是长连接 SSE，`resp.text()` 会等整条流结束 ⇒ 一直挂着
     // （真机：curl 90s 超时、WorkBuddy 报「模型服务响应超时」）。
@@ -951,23 +1024,15 @@ pub async fn chat_once(
                     .unwrap_or_default()
                     .to_string();
                 let note = if raw.contains("isQueued") || raw.contains("10605") {
-                    // 尽量把排队人数与等待秒数抠出来。
-                    let q = raw
-                        .split("queueCount\\\":")
-                        .nth(1)
-                        .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
-                        .unwrap_or("");
-                    let w = raw
-                        .split("waitTime\\\":")
-                        .nth(1)
-                        .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
-                        .unwrap_or("");
-                    let wait = w.parse::<u64>().unwrap_or(30);
+                    // 排队人数与等待秒数**必须**从信封里读出来：读不到就退化成默认 30 秒，
+                    // 而真实队列可能是 64 秒甚至 300 秒（两种转义形态都要认，
+                    // 唯一出口 `gateway_stream::queue_wait_of`）。
+                    let (wait, count) = crate::modules::gateway_stream::queue_wait_of(&raw);
                     // 约定：`QUEUED|<秒>|<可读文案>` —— 外层 chat_complete 据此等待重试。
                     format!(
                         "QUEUED|{}|上游排队中（前面约 {} 人，预计等 {} 秒）",
                         wait,
-                        if q.is_empty() { "?" } else { q },
+                        count.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
                         wait
                     )
                 } else {

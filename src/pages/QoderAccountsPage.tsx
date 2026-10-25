@@ -18,6 +18,12 @@ import { toast } from "sonner";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { CheckinButton } from "@/components/checkin-button";
+import {
+  CreditBlock as CreditBlockView,
+  CreditsDialog as CreditsDialogView,
+  type CreditPack,
+  type CreditView,
+} from "@/components/credits-ui";
 import { Button } from "@/components/ui/button";
 import {
   qoderAccountsExport,
@@ -34,7 +40,6 @@ import {
   qoderLoginStart,
   qoderRegions,
   qoderTokenRefresh,
-  qoderCreditHistory,
   traeRevealPath,
   qoderAccountSetCosy,
 } from "@/lib/api";
@@ -57,6 +62,11 @@ type QoderAccount = {
   credits: number | null;
   credits_expire_at: number | null;
   credits_updated_at: number | null;
+  /**
+   * 积分包明细（上游 `userQuota` / `addOnQuota` 两块，各算一个包）。
+   * 空数组 = 还没查过额度 / 旧数据（查询后就会被填上）。
+   */
+  credit_parts?: { name: string; total: number; used: number; remaining: number }[];
   last_used_at: number | null;
   disabled: boolean;
   /** 桌面端登录态里的 user.id 与本条 uid 相同（后端解 auth.v1.dat 得出，解不开就 false）。 */
@@ -113,6 +123,66 @@ function fmtAgo(ms: number | null): string {
   return `${Math.round(diff / 86_400_000)} 天前更新`;
 }
 
+/**
+ * Qoder 额度 → 统一展示模型（`credits-ui`，与 Trae / WorkBuddy 共用同一个组件）。
+ *
+ * 差异只有两点：
+ * 1. 积分包 = 上游的**两块**（`userQuota` 用户额度 / `addOnQuota` 加购额度），不是一长串资源；
+ * 2. **到期时间上游不给** —— `expireAt` 一律 `null`（界面显示「未提供」），绝不编一个出来。
+ */
+function qoderToView(a: QoderAccount): CreditView {
+  if (a.credits == null) {
+    // 还没查过：这是「不知道」，不是「0 分」，也不该长得像出错。
+    return {
+      ok: true,
+      unavailable: "还没查到额度：点上面的「刷新积分」",
+      remaining: null,
+      packCount: 0,
+      packs: [],
+    };
+  }
+  // 到期时间来自上游顶层 `expiresAt`（整个套餐周期共用），由后端写进 credits_expire_at。
+  // 没有才说「未提供」——**不能一律说未提供**（2026-10-25 之前就是这么错的）。
+  const exp = a.credits_expire_at ?? null;
+  const parts = a.credit_parts ?? [];
+  // 老数据（还没重新查过）没有分块明细：用合计出一行「额度合计」，
+  // 而不是显示「暂无可用积分」——额度明明已经查到了，说没有就是骗人。
+  const packs: CreditPack[] =
+    parts.length > 0
+      ? parts.map((p, i) => ({
+          key: `${a.id}-${i}`,
+          name: p.name || "积分包",
+          // 0 总量当成「没有额度信息」，不要显示成 0/0
+          total: p.total > 0 ? p.total : null,
+          used: p.used,
+          remaining: p.remaining,
+          expireAt: exp,
+          expiryUnavailable: exp == null,
+        }))
+      : [
+          {
+            key: `${a.id}-total`,
+            name: "额度合计（未分块）",
+            total: null,
+            used: 0,
+            remaining: a.credits,
+            expireAt: exp,
+            expiryUnavailable: exp == null,
+          },
+        ];
+  const totalSum = parts.reduce((n, p) => n + (p.total || 0), 0);
+  return {
+    ok: true,
+    remaining: a.credits,
+    total: totalSum > 0 ? totalSum : null,
+    packCount: packs.filter((p) => (p.remaining ?? 0) > 0).length,
+    packs,
+    updatedAt: a.credits_updated_at ?? null,
+    expiryUnavailable: exp == null,
+    notes: parts.length === 0 ? ["点「刷新积分」可看到分块明细"] : [],
+  };
+}
+
 export default function QoderAccountsPage() {
   const [regions, setRegions] = useState<Region[]>([]);
   const [rows, setRows] = useState<QoderAccount[]>([]);
@@ -131,10 +201,11 @@ export default function QoderAccountsPage() {
   const [refreshingToken, setRefreshingToken] = useState(false);
 
   const fileRef = useRef<HTMLInputElement | null>(null);
+  /** 已自动查过额度的区域（每个区域只自动查一次，避免 reload 后自我循环）。 */
+  const autoRefreshedRef = useRef<string>("");
 
-  /** 近 7 天消耗（本机快照算的，不是官方用量）。 */
-  type Hist = Awaited<ReturnType<typeof qoderCreditHistory>>;
-  const [history, setHistory] = useState<Hist | null>(null);
+  /** 展开「全部积分包」的账号（与 Trae / WorkBuddy 同一个弹窗）。 */
+  const [expand, setExpand] = useState<QoderAccount | null>(null);
 
   const reload = useCallback(async () => {
     setBusy(true);
@@ -143,10 +214,6 @@ export default function QoderAccountsPage() {
       const [rs, list] = await Promise.all([qoderRegions(), qoderAccountsList()]);
       setRegions(rs as Region[]);
       setRows(Array.isArray(list) ? (list as QoderAccount[]) : []);
-      // 历史是**附加信息**：拉不到不影响账号列表，也不弹错（空态由卡片自己说）。
-      void qoderCreditHistory(7)
-        .then(setHistory)
-        .catch(() => setHistory(null));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -171,6 +238,28 @@ export default function QoderAccountsPage() {
     );
     return { queried: queried.length, sum, latest };
   }, [shown]);
+
+  // 进页面 / 切区域时自动查一次额度。
+  //
+  // 为什么必须有：Trae 与 WorkBuddy 的账号页进页面就会自己查一次积分；Qoder 原来只有
+  // 手动「刷新积分」一个入口，于是升级后看到的还是旧数据 —— 卡片会显示
+  // 「额度合计（未分块）」，看起来就像「没有积分包」。
+  // 节流：同一区域只自动触发一次；10 分钟内查过的不重复打接口。
+  useEffect(() => {
+    if (busy || refreshingAll || shown.length === 0) return;
+    if (autoRefreshedRef.current === tab) return;
+    const stale = shown.some(
+      (r) =>
+        r.credits == null ||
+        !r.credits_updated_at ||
+        Date.now() - r.credits_updated_at > 10 * 60_000,
+    );
+    if (!stale) return;
+    autoRefreshedRef.current = tab;
+    void refreshAll();
+    // refreshAll / shown 每次渲染都是新引用，故意只依赖这几个「事件级」的量。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, shown, busy, refreshingAll]);
 
   // ---------------------------------------------------------------- 动作
 
@@ -613,66 +702,6 @@ export default function QoderAccountsPage() {
         </button>
       </div>
 
-      {/* 近 7 天消耗：数据只来自本机快照（Qoder 没有用量接口），样本不足就明说 */}
-      {history && (
-        <section className="rounded-2xl border bg-card px-5 py-4">
-          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 className="text-sm font-semibold">近 {history.windowDays} 天消耗</h2>
-            <span className="text-xs text-muted-foreground">
-              本机快照算出来的（Qoder 没有用量接口）
-            </span>
-            {history.enoughData && history.days.length > 0 ? (
-              <span className="ml-auto font-mono text-sm">{money(history.totalUsed)}</span>
-            ) : (
-              <span className="ml-auto text-xs text-muted-foreground">样本不足</span>
-            )}
-          </div>
-
-          {history.enoughData && history.days.length > 0 ? (
-            <>
-              <div className="mt-3 flex items-end gap-1.5">
-                {history.days.map((d) => {
-                  const max = Math.max(...history.days.map((x) => x.used), 1);
-                  return (
-                    <div key={d.day} className="flex min-w-0 flex-1 flex-col items-center gap-1">
-                      <div className="flex h-16 w-full items-end">
-                        <div
-                          className="w-full rounded-t bg-primary/60"
-                          style={{ height: `${Math.max(2, (d.used / max) * 100)}%` }}
-                          title={`${d.day}：${money(d.used)}`}
-                        />
-                      </div>
-                      <span className="text-[10px] text-muted-foreground">{d.day}</span>
-                    </div>
-                  );
-                })}
-              </div>
-              {history.accounts.length > 0 && (
-                <div className="mt-3 space-y-1 border-t border-border/60 pt-2">
-                  {history.accounts.map((x) => (
-                    <div key={x.uid} className="flex items-center gap-2 text-xs">
-                      <span className="min-w-0 flex-1 truncate">{x.name}</span>
-                      <span className="font-mono text-muted-foreground">{money(x.used)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {history.resetEvents > 0 && (
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  有 {history.resetEvents} 次额度上升（充值 / 签到 / 周期重置），这些不计入消耗。
-                </p>
-              )}
-            </>
-          ) : (
-            <p className="mt-2 text-xs text-muted-foreground">
-              {history.points > 0
-                ? "采样点还不够两笔（算不出差值），多点几次「刷新积分」就会出曲线。"
-                : "还没有采样点。点一次「刷新积分」开始记录（同一账号 10 分钟记一笔）。"}
-            </p>
-          )}
-        </section>
-      )}
-
       {shown.length === 0 ? (
         <section className="rounded-2xl border bg-card px-5 py-10 text-center text-sm text-muted-foreground">
           这个区域还没有账号。点上面「导入本机账号」，或用「浏览器登录」。
@@ -723,19 +752,8 @@ export default function QoderAccountsPage() {
                   </>
                 }
               >
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-[22px] leading-none font-semibold tracking-tight">
-                    {money(a.credits)}
-                  </span>
-                  <span className="text-[11px] text-muted-foreground">
-                    {fmtAgo(a.credits_updated_at)}
-                  </span>
-                </div>
-
-                <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span>到期 {fmtTime(a.credits_expire_at)}</span>
-                  <span>{a.credits == null ? "点「刷新积分」获取" : "Qoder 额度"}</span>
-                </div>
+                {/* 与 Trae / WorkBuddy 同一个积分块：大数字 + 包数 + 每包剩余/到期 + 「全部积分包」 */}
+                <CreditBlockView item={qoderToView(a)} onExpand={() => setExpand(a)} />
 
                 <p className="mt-2 text-[11px] text-muted-foreground">
                   上次使用 {fmtTime(a.last_used_at)}
@@ -848,6 +866,13 @@ export default function QoderAccountsPage() {
           </div>
         </div>
       )}
+
+      {/* 全部积分包（与 Trae / WorkBuddy 同一个弹窗） */}
+      <CreditsDialogView
+        item={expand ? qoderToView(expand) : null}
+        name={expand ? accountName(expand) : ""}
+        onClose={() => setExpand(null)}
+      />
 
       <section className="rounded-2xl border bg-card px-5 py-4">
         <h2 className="text-sm font-semibold">这个账号库是怎么存的</h2>

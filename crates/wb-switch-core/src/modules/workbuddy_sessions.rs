@@ -25,6 +25,7 @@
 //! 目标账号正在被客户端使用时写库，运行中的实例看不到写入，继续对话会让会话状态分叉。
 
 use crate::modules::config::{now_ms, store_dir};
+use crate::modules::workspace::workspace_of;
 use crate::modules::{
     workbuddy_accounts, workbuddy_auth, workbuddy_source, workbuddy_switch, workbuddy_vault,
 };
@@ -283,11 +284,19 @@ fn move_body_to_trash(cid: &str) -> Result<bool, String> {
 // 一、会话记录：列出 / 详情 / 导出 / 删除
 // ---------------------------------------------------------------------------
 
+/// 工作空间判定统一走 [`crate::modules::workspace`]（三产品同一套规则）。
+
 fn session_item(s: &workbuddy_source::WbSession) -> Value {
+    let (workspace_key, workspace) = workspace_of(&s.cwd);
     json!({
         "id": s.id,
         "title": s.title,
         "cwd": s.cwd,
+        // 归属工作空间（键 + 展示名 + 原样路径）。前端只按 `workspaceKey` 分组，
+        // 展示一律用 `workspace`，两者都来自后端 ⇒ 不会出现「同一空间两个名字」。
+        "workspace": workspace,
+        "workspaceKey": workspace_key,
+        "workspacePath": s.cwd.replace('\\', "/"),
         "model": s.model,
         "createdAt": s.created_at,
         "updatedAt": s.updated_at,

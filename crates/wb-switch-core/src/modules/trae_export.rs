@@ -825,6 +825,15 @@ pub struct SessionInfo {
     pub owner_uid: String,
     /// 归属账号显示名（昵称或 uid 尾号；无归属为「（无归属）」）。
     pub owner_label: String,
+    /// 归属工作空间（Trae 的 `project.name` 优先，没有名字才退回目录名）。
+    ///
+    /// 三页（Trae / WorkBuddy / Qoder）共用 `modules::workspace` 的判定，
+    /// 保证同一个目录在三个页面上是同一个空间、同一个名字。
+    pub workspace: String,
+    /// 工作空间的稳定键（`project.absolute_path` 归一化后小写）。分组只认它。
+    pub workspace_key: String,
+    /// 原样路径（正斜杠），用于提示与定位。
+    pub workspace_path: String,
 }
 
 /// 列出全部会话（按最后活动时间倒序），带归属账号信息。
@@ -833,7 +842,9 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT s.session_id, s.session_title, s.created_at, s.updated_at, \
-                    COALESCE(p.user_id, '') AS owner_uid \
+                    COALESCE(p.user_id, '') AS owner_uid, \
+                    COALESCE(p.absolute_path, '') AS project_path, \
+                    COALESCE(p.name, '') AS project_name \
              FROM chat_session s \
              LEFT JOIN project p ON s.project_id = p.project_id \
              ORDER BY ifnull(s.updated_at, s.created_at) DESC",
@@ -847,6 +858,8 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
                 row.get::<_, rusqlite::types::Value>(2)?,
                 row.get::<_, rusqlite::types::Value>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })
         .map_err(|e| format!("会话列表查询失败: {e}"))?
@@ -878,12 +891,15 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, title, created, updated, owner_uid)| {
+        .map(|(id, title, created, updated, owner_uid, project_path, project_name)| {
             let owner_label = if owner_uid.is_empty() {
                 "（无归属）".into()
             } else {
                 crate::modules::trae_vault::account_label(client_key, &owner_uid)
             };
+            // 空间名优先用 Trae 自己记的 `project.name`（用户改过名就得以他改的为准）。
+            let (workspace_key, workspace) =
+                crate::modules::workspace::workspace_with_name(&project_name, &project_path);
             SessionInfo {
                 id: id.clone(),
                 title: title.trim().to_string(),
@@ -893,6 +909,9 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
                 messages: messages_map.get(&id).copied().unwrap_or(0),
                 owner_uid,
                 owner_label,
+                workspace,
+                workspace_key,
+                workspace_path: project_path.replace('\\', "/"),
             }
         })
         .collect())

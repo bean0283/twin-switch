@@ -1,17 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
   Copy,
   Eye,
   FileDown,
+  FolderOpen,
+  LayoutList,
+  Layers,
   Link2,
   Link2Off,
   Loader2,
   Pencil,
   RefreshCw,
   ScrollText,
+  Search,
   Trash2,
+  X,
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -37,6 +42,7 @@ import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { WorkbuddySessionGroups } from "@/components/workbuddy-session-groups";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -68,6 +74,20 @@ function timeLabel(ms: number): string {
 /** 账号下拉标签：后端给出的显示名（昵称/手机号 + uid 尾号）。 */
 type WbAccountGroup = { uid: string; label?: string; count: number; sessions: WbSessionItem[] };
 
+/**
+ * 页面级快照缓存（**模块作用域**，跨「离开页面再回来」保留）。
+ *
+ * 为什么需要：原来每次进入页面都会 `loading=true` → 整表变成骨架屏，等于"重载"。
+ * 现在：有缓存 ⇒ 立刻用缓存渲染，同时在后台刷新（stale-while-revalidate）；
+ * 没有缓存 ⇒ 才显示骨架屏。
+ *
+ * ⚠️ 两条纪律：
+ * ① 列表本身永远来自后端（不在这里拼接、不本地推算数量），缓存只是"上一次的结果 + 时间"；
+ * ② 后台刷新失败**不许静默**：保留旧数据的同时必须写明「这是几点读的、刷新失败了」。
+ */
+type WbAccountsCache = { at: number; accounts: WbAccountGroup[] };
+let wbAccountsCache: WbAccountsCache | null = null;
+
 /** 长 id 的缩写（仅用于展示会话 id，账号名一律走 `accountLabel`）。 */
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -90,9 +110,17 @@ const VERDICT: Record<string, { label: string; tone: string }> = {
 
 export default function WorkbuddyRecordsPage() {
   // 会话记录
-  const [accounts, setAccounts] = useState<WbAccountGroup[]>([]);
+  // 初始值直接吃模块级缓存 ⇒ 从别的页面切回来时**立刻有内容**，不再闪骨架屏。
+  const [accounts, setAccounts] = useState<WbAccountGroup[]>(
+    () => wbAccountsCache?.accounts ?? [],
+  );
+  const [loadedAt, setLoadedAt] = useState<number>(() => wbAccountsCache?.at ?? 0);
   const [uid, setUid] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(() => wbAccountsCache === null);
+  /** 后台刷新中（已有缓存时不显示骨架屏，只让刷新图标转）。 */
+  const [refreshing, setRefreshing] = useState(false);
+  /** 后台刷新失败：保留旧数据，但必须说清「这是几点读的、刷新失败了」。 */
+  const [staleNote, setStaleNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -103,6 +131,12 @@ export default function WorkbuddyRecordsPage() {
   // 编辑器打开即载入（不再有「先开空编辑器再挑会话」那一步）。
   const [editSeed, setEditSeed] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
+
+  // 搜索 / 工作空间（用户需求：会话可搜索、可查看归属空间、可按空间分类查看）
+  // `wsFilter === ""` = 全部空间；`byWorkspace` = 按空间分组视图（默认开，和客户端列表一致）。
+  const [query, setQuery] = useState("");
+  const [wsFilter, setWsFilter] = useState("");
+  const [byWorkspace, setByWorkspace] = useState(true);
 
   // 复制与关联
   const [srcUid, setSrcUid] = useState("");
@@ -121,16 +155,28 @@ export default function WorkbuddyRecordsPage() {
   const [confirmLink, setConfirmLink] = useState(false);
   const [autoLink, setAutoLink] = useState<boolean | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  /**
+   * 读会话列表。
+   *
+   * `force = false`（进入页面 / 后台刷新）：有缓存就**不显示骨架屏**，只让刷新图标转；
+   * `force = true`（点「刷新」/ 做完删除、复制、互通之后）：数据一定变了，必须重新读。
+   */
+  const load = useCallback(async (force = false) => {
+    const hasCache = wbAccountsCache !== null;
+    if (force || !hasCache) setLoading(true);
+    else setRefreshing(true);
     setError(null);
     try {
       const res = await api.workbuddySessionListByAccount();
       if (!res.ok) throw new Error(res.error || "读取会话列表失败");
-      setAccounts(res.accounts || []);
-      setUid((prev) => prev || res.accounts?.[0]?.uid || "");
-      setSrcUid((prev) => prev || res.accounts?.[0]?.uid || "");
-      setDstUid((prev) => prev || res.accounts?.[1]?.uid || res.accounts?.[0]?.uid || "");
+      const list = res.accounts || [];
+      setAccounts(list);
+      wbAccountsCache = { at: Date.now(), accounts: list };
+      setLoadedAt(wbAccountsCache.at);
+      setStaleNote(null);
+      setUid((prev) => prev || list[0]?.uid || "");
+      setSrcUid((prev) => prev || list[0]?.uid || "");
+      setDstUid((prev) => prev || list[1]?.uid || list[0]?.uid || "");
       const ed = await api.workbuddySessionEdgeSyncDbs();
       setEdgeDbs(ed.items || []);
       // 预览与主流程并行、失败也不影响列表（但绝不显示旧/假数字：失败就清空）。
@@ -139,14 +185,19 @@ export default function WorkbuddyRecordsPage() {
         .then((p) => setLinkPreview(p.ok ? p : null))
         .catch(() => setLinkPreview(null));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      // ⚠️ 有缓存时不能把列表清空（那会变成「数据没了」的假象），
+      //    而是保留旧数据 + 说明这是几点读的、这次为什么没刷新成功。
+      if (hasCache || wbAccountsCache !== null) setStaleNote(msg);
+      else setError(msg);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
+    void load(false);
   }, [load]);
 
   // 读「切号自动同步会话」开关的当前值（真实值来自后端 settings.json）。
@@ -166,6 +217,98 @@ export default function WorkbuddyRecordsPage() {
     () => accounts.find((a) => a.uid === uid)?.sessions ?? [],
     [accounts, uid],
   );
+
+  // ---------------------------------------------------------------------------
+  // 工作空间：归并 / 搜索 / 分组
+  // ---------------------------------------------------------------------------
+  //
+  // ⚠️ 三个派生值全部只吃 `sessions` 这一份数据（不另查后端）：
+  //    下拉里的「N 个」、分组表头里的「N 个」、右上角的总数，都是同一批行算出来的，
+  //    所以不会出现「下拉说 5 个、列表只有 4 个」这种两处不同源的问题。
+  //    工作空间的键 / 展示名由后端 `workspace_of()` 给（cwd 归一化后小写），
+  //    前端不重复实现那套规则，否则 `D:/x` 与 `d:\x` 又会被拆成两个空间。
+
+  /** 当前账号涉及的工作空间（最近活动的排前面）。 */
+  const wsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; lastAt: number }
+    >();
+    for (const s of sessions) {
+      const key = s.workspaceKey ?? "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.lastAt = Math.max(cur.lastAt, s.updatedAt || 0);
+      } else {
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspacePath || "",
+          count: 1,
+          lastAt: s.updatedAt || 0,
+        });
+      }
+    }
+    const list = [...map.values()].sort(
+      (a, b) => b.lastAt - a.lastAt || a.label.localeCompare(b.label),
+    );
+    // 同名空间（两个不同目录都叫 `bin`）在下拉里必须能区分 —— 否则会出现两行一模一样的字，
+    // 只能靠顺序猜哪个是哪个。重名时补上一级目录（`old/bin` / `new/bin`）。
+    const dupLabel = new Map<string, number>();
+    for (const w of list) dupLabel.set(w.label, (dupLabel.get(w.label) ?? 0) + 1);
+    return list.map((w) => {
+      if ((dupLabel.get(w.label) ?? 0) <= 1) return w;
+      const segs = (w.path || "").split("/").filter(Boolean);
+      const tail = segs.slice(-2).join("/");
+      return tail ? { ...w, label: tail } : w;
+    });
+  }, [sessions]);
+
+  /**
+   * 搜索 + 空间筛选后的行。
+   *
+   * 搜的是**元数据**（标题 / 工作空间名 / 路径 / 会话 id / 模型）——正文在
+   * `projects/*.jsonl` 里，要搜正文得逐个读文件，不放在这个输入框里（占位符已写明）。
+   */
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return sessions
+      .filter((s) => {
+        if (wsFilter && (s.workspaceKey ?? "") !== wsFilter) return false;
+        if (!q) return true;
+        return [s.title, s.workspace, s.workspacePath, s.id, s.model].some((v) =>
+          (v ?? "").toLowerCase().includes(q),
+        );
+      })
+      .slice()
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }, [sessions, query, wsFilter]);
+
+  /** 按工作空间分组（分组顺序 = 组内最新一条的时间降序）。 */
+  const wsGroups = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; items: WbSessionItem[] }
+    >();
+    for (const s of filtered) {
+      const key = s.workspaceKey ?? "";
+      const g = map.get(key);
+      if (g) g.items.push(s);
+      else
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspacePath || "",
+          items: [s],
+        });
+    }
+    return [...map.values()].sort((a, b) => {
+      const at = a.items[0]?.updatedAt ?? 0;
+      const bt = b.items[0]?.updatedAt ?? 0;
+      return bt - at || a.label.localeCompare(b.label);
+    });
+  }, [filtered]);
 
   const loadLinks = useCallback(async () => {
     if (!srcUid || !dstUid || srcUid === dstUid) {
@@ -212,11 +355,24 @@ export default function WorkbuddyRecordsPage() {
     setter(next);
   };
 
-  /** 全选：会话列表当前账号下的全部行（与 Trae 会话记录页同款）。 */
-  const allSelected = sessions.length > 0 && sessions.every((s) => selected.has(s.id));
+  /**
+   * 全选：只作用于**当前可见**的行（搜索 / 空间筛选之后）。
+   *
+   * ⚠️ 勾选与「可见行」是两件事（Trae 会话页踩过的坑）：筛选会把一部分勾中的行藏起来，
+   *    所以①表头全选只覆盖可见行；②改搜索词 / 换空间 / 换账号时清空勾选 ——
+   *    否则用户会在看不见那些行的情况下把它们删掉。
+   */
+  const allSelected = filtered.length > 0 && filtered.every((s) => selected.has(s.id));
+  /** 可见行里被勾中的数量（表头复选框的「半选」只看这个，不看被筛掉的勾选）。 */
+  const pickedVisible = filtered.filter((s) => selected.has(s.id)).length;
   const toggleAll = () => {
-    setSelected(allSelected ? new Set() : new Set(sessions.map((s) => s.id)));
+    setSelected(allSelected ? new Set() : new Set(filtered.map((s) => s.id)));
   };
+
+  /** 表格要渲染的「块」：分组视图按空间分块；平铺视图合成一块（表头行不渲染）。 */
+  const renderGroups = byWorkspace
+    ? wsGroups
+    : [{ key: "__flat__", label: "", path: "", items: filtered }];
 
   const openDetail = async (item: WbSessionItem) => {
     setBusy(item.id);
@@ -255,7 +411,7 @@ export default function WorkbuddyRecordsPage() {
       });
       setConfirmDelete(null);
       setSelected(new Set());
-      await load();
+      await load(true);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
     } finally {
@@ -271,7 +427,7 @@ export default function WorkbuddyRecordsPage() {
       setCopyReport(r);
       toast.success(`已复制 ${r.count} 个会话`, { description: "源账号数据未做任何改动" });
       setCopySel(new Set());
-      await load();
+      await load(true);
       await loadLinks();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
@@ -297,7 +453,7 @@ export default function WorkbuddyRecordsPage() {
         description: `写到 ${r.byTarget?.length ?? 0} 个账号，源会话未做任何改动`,
       });
     }
-    await load();
+    await load(true);
     await loadLinks();
   };
 
@@ -387,11 +543,38 @@ export default function WorkbuddyRecordsPage() {
               <code className="text-xs">projects/*.jsonl</code> 正文，按账号 uid 分组。
             </CardDescription>
           </div>
-          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
-            <RefreshCw className={cn("size-4", loading && "animate-spin")} />
-            刷新
-          </Button>
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void load(true)}
+              disabled={loading || refreshing}
+              title="重新读取会话库（会绕过缓存）"
+            >
+              <RefreshCw className={cn("size-4", (loading || refreshing) && "animate-spin")} />
+              刷新
+            </Button>
+            {/* 缓存状态必须可见：用户得知道眼前这份是「刚读的」还是「上次的」。 */}
+            {loadedAt > 0 && (
+              <span className="text-xs text-muted-foreground">
+                {refreshing ? "后台更新中…" : `读取于 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}`}
+              </span>
+            )}
+          </div>
         </CardHeader>
+        {staleNote && (
+          <CardContent className="pb-0">
+            <Alert>
+              <AlertTriangle className="size-4" />
+              <AlertTitle>这次刷新失败，显示的是上一次读取的数据</AlertTitle>
+              <AlertDescription className="break-all">
+                {staleNote}
+                {loadedAt > 0 &&
+                  `（数据读取于 ${new Date(loadedAt).toLocaleString("zh-CN", { hour12: false })}）`}
+              </AlertDescription>
+            </Alert>
+          </CardContent>
+        )}
         {error && (
           <CardContent>
             <Alert variant="destructive">
@@ -414,13 +597,15 @@ export default function WorkbuddyRecordsPage() {
         <TabsContent value="records" className="space-y-4">
           <Card>
             <CardHeader className="pb-3">
-              <div className="flex flex-wrap items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="text-sm text-muted-foreground">账号</span>
                 <select
-                  className="h-9 min-w-[260px] rounded-md border border-input bg-background px-3 text-sm"
+                  className="h-9 min-w-[220px] rounded-md border border-input bg-background px-3 text-sm"
                   value={uid}
                   onChange={(e) => {
                     setUid(e.target.value);
+                    // 换账号 = 换一批工作空间，旧的筛选键在新账号里没有意义。
+                    setWsFilter("");
                     setSelected(new Set());
                   }}
                 >
@@ -430,7 +615,89 @@ export default function WorkbuddyRecordsPage() {
                     </option>
                   ))}
                 </select>
-                <Badge variant="secondary">{sessions.length} 条</Badge>
+
+                {/* 搜索：只搜元数据，正文不在这里（占位符里写清） */}
+                <div className="relative">
+                  <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={query}
+                    onChange={(e) => {
+                      setQuery(e.target.value);
+                      setSelected(new Set());
+                    }}
+                    placeholder="搜索标题 / 工作空间 / 会话 id"
+                    className="h-9 w-[250px] pl-8 pr-8"
+                  />
+                  {query && (
+                    <button
+                      type="button"
+                      title="清除搜索"
+                      className="text-muted-foreground absolute top-1/2 right-2 -translate-y-1/2"
+                      onClick={() => {
+                        setQuery("");
+                        setSelected(new Set());
+                      }}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* 工作空间筛选：数量来自当前列表（与分组表头同源） */}
+                <select
+                  className="h-9 min-w-[190px] rounded-md border border-input bg-background px-3 text-sm"
+                  value={wsFilter}
+                  onChange={(e) => {
+                    setWsFilter(e.target.value);
+                    setSelected(new Set());
+                  }}
+                  title="按工作空间筛选"
+                >
+                  <option value="">全部工作空间（{wsOptions.length}）</option>
+                  {wsOptions.map((w) => (
+                    <option key={w.key} value={w.key}>
+                      {w.label} · {w.count}
+                    </option>
+                  ))}
+                </select>
+
+                {/* 视图切换：按空间分组 / 平铺 */}
+                <div className="ml-auto flex items-center gap-0.5 rounded-md border p-0.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-2 py-1 text-xs",
+                      byWorkspace
+                        ? "bg-muted font-medium text-foreground"
+                        : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setByWorkspace(true)}
+                  >
+                    <Layers className="size-3.5" />
+                    按空间
+                  </button>
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-2 py-1 text-xs",
+                      !byWorkspace
+                        ? "bg-muted font-medium text-foreground"
+                        : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setByWorkspace(false)}
+                  >
+                    <LayoutList className="size-3.5" />
+                    平铺
+                  </button>
+                </div>
+                <Badge variant="secondary">
+                  {filtered.length === sessions.length
+                    ? `${sessions.length} 条`
+                    : `${filtered.length} / ${sessions.length} 条`}
+                </Badge>
+                {wsOptions.length > 0 && (
+                  <Badge variant="outline">{wsOptions.length} 个空间</Badge>
+                )}
               </div>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -440,6 +707,25 @@ export default function WorkbuddyRecordsPage() {
                 <p className="py-6 text-center text-sm text-muted-foreground">
                   该账号下没有未删除的会话
                 </p>
+              ) : filtered.length === 0 ? (
+                /* ⚠️「筛选后为空」与「本来就没有会话」必须长得不一样（硬规则：空 ≠ 失败）：
+                   前者给一个清除筛选的出口，后者说明库里确实没有。 */
+                <div className="space-y-2 py-6 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    没有匹配的会话 —— 筛选后 0 条，该账号共 {sessions.length} 条
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setQuery("");
+                      setWsFilter("");
+                      setSelected(new Set());
+                    }}
+                  >
+                    清除搜索与筛选
+                  </Button>
+                </div>
               ) : (
                 <div className="rounded-md border">
                   <table className="w-full text-sm">
@@ -453,7 +739,7 @@ export default function WorkbuddyRecordsPage() {
                             title="全选当前列表"
                             checked={allSelected}
                             ref={(el) => {
-                              if (el) el.indeterminate = selected.size > 0 && !allSelected;
+                              if (el) el.indeterminate = pickedVisible > 0 && !allSelected;
                             }}
                             onChange={toggleAll}
                           />
@@ -465,72 +751,115 @@ export default function WorkbuddyRecordsPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sessions.map((s) => (
-                        <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
-                          <td className="px-3 py-2">
-                            <input
-                              type="checkbox"
-                              className="size-4"
-                              checked={selected.has(s.id)}
-                              onChange={() => toggle(s.id, setSelected, selected)}
-                            />
-                          </td>
-                          <td className="max-w-[420px] px-3 py-2">
-                            <div className="truncate font-medium">{s.title}</div>
-                            <div className="truncate text-xs text-muted-foreground">{s.cwd}</div>
-                          </td>
-                          <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
-                            {timeLabel(s.updatedAt)}
-                          </td>
-                          <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
-                            {s.hasBody ? humanSize(s.bodyBytes) : "无正文"}
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <div className="flex justify-end gap-1">
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                title="编辑这条会话"
-                                disabled={!s.hasBody || busy === s.id}
-                                onClick={() => {
-                                  setEditSeed(s.id);
-                                  setEditOpen(true);
-                                }}
-                              >
-                                <Pencil className="size-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                title="查看详情"
-                                disabled={busy === s.id}
-                                onClick={() => void openDetail(s)}
-                              >
-                                {busy === s.id ? (
-                                  <Loader2 className="size-4 animate-spin" />
-                                ) : (
-                                  <Eye className="size-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                disabled={!s.hasBody || busy === s.id}
-                                onClick={() => void exportOne(s)}
-                              >
-                                <FileDown className="size-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="text-destructive"
-                                onClick={() => setConfirmDelete([s])}
-                              >
-                                <Trash2 className="size-4" />
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
+                      {renderGroups.map((g) => (
+                        <Fragment key={g.key}>
+                          {/* 分组表头（只有「按空间」视图才画）。点一下 = 只看这个空间，
+                              相当于把上面的下拉设成它 —— 不用再去下拉里找。 */}
+                          {byWorkspace && (
+                            <tr className="border-b bg-muted/50">
+                              <td colSpan={5} className="px-3 py-1.5">
+                                <button
+                                  type="button"
+                                  className="flex w-full items-center gap-2 text-left"
+                                  title="只看这个工作空间"
+                                  onClick={() => {
+                                    setWsFilter(g.key);
+                                    setSelected(new Set());
+                                  }}
+                                >
+                                  <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                                  <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                                  <Badge variant="secondary" className="shrink-0">
+                                    {g.items.length}
+                                  </Badge>
+                                  <span
+                                    className="truncate text-xs text-muted-foreground"
+                                    title={g.path}
+                                  >
+                                    {g.path}
+                                  </span>
+                                </button>
+                              </td>
+                            </tr>
+                          )}
+                          {g.items.map((s) => (
+                            <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
+                              <td className="px-3 py-2">
+                                <input
+                                  type="checkbox"
+                                  className="size-4"
+                                  checked={selected.has(s.id)}
+                                  onChange={() => toggle(s.id, setSelected, selected)}
+                                />
+                              </td>
+                              <td className="max-w-[420px] px-3 py-2">
+                                <div className="truncate font-medium">{s.title}</div>
+                                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                  {!byWorkspace && (
+                                    <span className="inline-flex shrink-0 items-center gap-1 rounded border px-1 py-0.5">
+                                      <FolderOpen className="size-3" />
+                                      {s.workspace || "（未归属）"}
+                                    </span>
+                                  )}
+                                  <span className="truncate" title={s.workspacePath}>
+                                    {s.workspacePath || "（没有工作目录）"}
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
+                                {timeLabel(s.updatedAt)}
+                              </td>
+                              <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
+                                {s.hasBody ? humanSize(s.bodyBytes) : "无正文"}
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <div className="flex justify-end gap-1">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    title="编辑这条会话"
+                                    disabled={!s.hasBody || busy === s.id}
+                                    onClick={() => {
+                                      setEditSeed(s.id);
+                                      setEditOpen(true);
+                                    }}
+                                  >
+                                    <Pencil className="size-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    title="查看详情"
+                                    disabled={busy === s.id}
+                                    onClick={() => void openDetail(s)}
+                                  >
+                                    {busy === s.id ? (
+                                      <Loader2 className="size-4 animate-spin" />
+                                    ) : (
+                                      <Eye className="size-4" />
+                                    )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={!s.hasBody || busy === s.id}
+                                    onClick={() => void exportOne(s)}
+                                  >
+                                    <FileDown className="size-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="text-destructive"
+                                    onClick={() => setConfirmDelete([s])}
+                                  >
+                                    <Trash2 className="size-4" />
+                                  </Button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
@@ -998,7 +1327,7 @@ export default function WorkbuddyRecordsPage() {
         onOpenChange={(o) => {
           setEditOpen(o);
           // 关闭时重读列表：可能有覆写/新增，标题与行数都变了。
-          if (!o) void load();
+          if (!o) void load(true);
         }}
         uid={uid || null}
         sessionId={editSeed}
