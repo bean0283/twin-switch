@@ -305,6 +305,15 @@ export interface TraeSessionInfo {
   owner_uid: string;
   /** 归属账号显示名（昵称或 uid 尾号）。 */
   owner_label: string;
+  /**
+   * 归属工作空间（Trae 的 `project.name` 优先，没有名字才退回目录名）。
+   * 三页共用后端 `modules::workspace` 的判定，所以同一目录在哪个页面都是同一个空间。
+   */
+  workspace: string;
+  /** 工作空间的稳定键（`project.absolute_path` 归一化后小写）。分组只认它。 */
+  workspace_key: string;
+  /** 原样路径（正斜杠）。 */
+  workspace_path: string;
 }
 
 /** Trae 详情里的一个「提问 + 回答」回合（形态对齐 WbSessionTurn，好让两端共用渲染）。 */
@@ -1529,6 +1538,15 @@ export interface WbSessionItem {
   id: string;
   title: string;
   cwd: string;
+  /**
+   * 归属的工作空间（后端 `workspace_of()` 算的展示名，取 cwd 最后一段）。
+   * `cwd` 为空时是「（未归属）」，不是一个空字符串 —— 界面不要自己再猜。
+   */
+  workspace: string;
+  /** 工作空间的稳定键（cwd 归一化后小写）。分组只认它，展示只认 `workspace`。 */
+  workspaceKey: string;
+  /** 原样路径（正斜杠），用于提示与快速定位目录。 */
+  workspacePath: string;
   model: string;
   createdAt: number;
   updatedAt: number;

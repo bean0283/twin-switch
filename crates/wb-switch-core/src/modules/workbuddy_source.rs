@@ -86,10 +86,15 @@ pub struct WbSession {
 const DUP_MAX_MEMBERS: usize = 8;
 /// 单个正文参与逐行摘要比对的体积上限。
 ///
-/// 原来定 64 MB，实测本机有一份 216 MB 的会话 —— 于是整组被判成「未比对」，
-/// 界面显示「无法确认」，而那恰好是最需要看清的一组。摘要已是流式读取，
-/// 放宽到 256 MB 不会带来内存风险；再大的（极少）如实标成未比对，不猜。
-const DUP_MAX_BYTES: u64 = 256 << 20;
+/// 曾经从 64 MB 放宽到 256 MB（为了让最大的那份也参与比对），但实测代价不可接受：
+/// 全账号互通之后同一段对话有 2–4 份副本，本机 20 个待比对文件合计 **1.06 GB**，
+/// 其中 4 份各 **227 MB** 是同一段对话 —— 一次列表要读 1 GB、耗时 35 秒。
+///
+/// 现在收紧到 32 MB：超过即「不逐行比对」，界面如实显示
+/// 「有副本体积超过 32 MB，未做逐行比对」（这本来就是一个明确状态，不是猜）。
+/// 超过 32 MB 的会话，副本新旧只按 `updated_at` 判断 —— 对这么大的对话，
+/// 逐行比对能给出的价值远小于它带来的等待。
+const DUP_MAX_BYTES: u64 = 32 << 20;
 
 /// 正文内容身份：行数 + 逐行摘要 + 总摘要。
 ///
@@ -167,10 +172,80 @@ fn normalize_ids(line: &str, ids: &[String]) -> String {
     out.into_owned()
 }
 
-/// 读一份正文 JSONL 的内容身份。
+/// 正文摘要缓存（进程内）。
 ///
-/// `ids` 是同一段对话在各账号里的会话 id 集合，全部替换成固定标记再逐行摘要：
-/// 同一段对话的副本除了 id 之外内容一致，于是能得到相同的摘要。
+/// ## 为什么必须有
+///
+/// [`annotate_duplicates`] 对每一组「同标题副本」都要**逐行读正文**算摘要，而
+/// `DUP_MAX_BYTES` 是 256 MB（基本等于不限制）。全账号互通之后本机同一段对话常有
+/// 2–4 份副本 —— 实测 40 条会话一次列表要 **24 秒**，界面表现就是「每次点进会话页
+/// 都在重载」，而且一次进入页面会跑两三遍（列表 + 一键互通预览 + 关联预检）。
+///
+/// ## 为什么这样缓存是安全的
+///
+/// 摘要只取决于「文件内容」和「参与归一化的 id 集」，所以键就是
+/// `路径 + 长度 + 修改时间 + id 集`：文件被编辑/替换/重写、或组成员变了 ⇒ 键变 ⇒
+/// 自动重算。**不设过期时间**——过期时间只会让「刚改完的会话」读到旧摘要，
+/// 反而制造出「显示与内容不一致」这种最难查的问题。
+fn content_id_cached(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_CACHED_BYTES: usize = 256 << 20;
+
+    struct Cache {
+        map: std::collections::HashMap<String, ContentId>,
+        bytes: usize,
+    }
+
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new(Cache {
+            map: std::collections::HashMap::new(),
+            bytes: 0,
+        })
+    });
+
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // id 集用「排序后哈希」入键：组内顺序不影响归一化结果，避免仅仅换个顺序就 miss。
+    let mut ids_sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    ids_sorted.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ids_sorted.hash(&mut h);
+    let key = format!(
+        "{}|{}|{}|{:x}",
+        path.to_string_lossy(),
+        meta.len(),
+        mtime,
+        h.finish()
+    );
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.map.get(&key) {
+            return Some(hit.clone());
+        }
+    }
+
+    let id = content_id(path, ids)?;
+    // 估算：每条行摘要约 48 字节 + 结构体开销
+    let cost = id.line_digests.len() * 48 + id.total.len() + 64;
+    if let Ok(mut guard) = cache.lock() {
+        if guard.bytes + cost > MAX_CACHED_BYTES {
+            guard.map.clear();
+            guard.bytes = 0;
+        }
+        guard.bytes += cost;
+        guard.map.insert(key, id.clone());
+    }
+    Some(id)
+}
+
 fn content_id(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
     use std::io::BufRead;
     // ⚠️ 必须**流式**逐行读：会话正文单个可达 200 MB 以上（实测本机有一份 216 MB），
@@ -348,7 +423,7 @@ fn annotate_duplicates(list: &mut [WbSession]) {
             }
             if detailed {
                 let id = find_jsonl(&list[i].id)
-                    .and_then(|p| content_id(&p, &group_ids));
+                    .and_then(|p| content_id_cached(&p, &group_ids));
                 ids.push(id);
             } else {
                 ids.push(None);
@@ -1175,6 +1250,33 @@ mod tests {
         let (newest, notes) = decide_group(&ids, &[900, 100]);
         assert_eq!(newest, 1);
         assert_eq!(notes[0], "无正文，不参与比对");
+    }
+
+    #[test]
+    fn content_id_cache_hits_and_never_serves_stale() {
+        // 缓存必须做到两件事：① 同一份文件重复取摘要不重读；② 文件变了立刻失效。
+        let dir = std::env::temp_dir().join(format!("wbsrc-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("c.jsonl");
+        let ids = vec!["aaaa".to_string()];
+        std::fs::write(&f, "{\"sessionId\":\"aaaa\",\"t\":1}\n").unwrap();
+
+        let first = content_id_cached(&f, &ids).unwrap();
+        let again = content_id_cached(&f, &ids).unwrap();
+        assert_eq!(first.total, again.total);
+        assert_eq!(first.lines, 1);
+
+        // 改写文件（长度也变）⇒ 键变 ⇒ 必须重算，绝不能返回旧摘要
+        std::fs::write(&f, "{\"sessionId\":\"aaaa\",\"t\":1}\n{\"t\":2}\n").unwrap();
+        let after = content_id_cached(&f, &ids).unwrap();
+        assert_eq!(after.lines, 2);
+        assert_ne!(after.total, first.total);
+
+        // id 集不同 ⇒ 归一化结果不同 ⇒ 摘要不同（键必须包含 id 集）
+        let other = content_id_cached(&f, &["zzzz".to_string()]).unwrap();
+        assert_ne!(other.total, after.total);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

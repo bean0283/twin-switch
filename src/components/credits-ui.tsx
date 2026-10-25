@@ -45,6 +45,13 @@ export interface CreditPack {
   expired?: boolean;
   /** 7 天内到期。缺省时按 `expireAt` 现算。 */
   expiringSoon?: boolean;
+  /**
+   * 上游**没提供**到期时间（不是「长期有效」）。
+   *
+   * ⚠️ 这两件事必须分开显示：`expireAt === null` 在老口径里一律显示「长期有效」，
+   * 而 Qoder 的额度接口根本不给到期时间 —— 显示成「长期有效」就是编事实。
+   */
+  expiryUnavailable?: boolean;
 }
 
 export interface CreditView {
@@ -70,6 +77,8 @@ export interface CreditView {
   expiringSoonRemaining?: number | null;
   /** 卡片底部的补充说明（来源 / 回退提示）。 */
   notes?: string[];
+  /** 整份数据都没有到期时间（见 `CreditPack.expiryUnavailable`）。 */
+  expiryUnavailable?: boolean;
 }
 
 /** 7 天 = 快到期的界。 */
@@ -160,7 +169,7 @@ function PackageRow({ p }: { p: CreditPack }) {
           </span>
         </span>
         <span className={cn("shrink-0 text-[11px] tabular-nums", expiryTone(p))}>
-          {p.expired ? "已到期" : fmtExpiry(p.expireAt)}
+          {p.expired ? "已到期" : p.expiryUnavailable ? "到期未提供" : fmtExpiry(p.expireAt)}
         </span>
       </div>
       {p.total == null ? (
@@ -182,7 +191,13 @@ function PackageDetailRow({ p }: { p: CreditPack }) {
         <div className="min-w-0">
           <div className="truncate text-sm font-medium">{p.name}</div>
           <div className="mt-1 text-[11px] text-muted-foreground">
-            {p.expired ? "已到期" : p.expireAt ? `到期 ${fmtFullDateTime(p.expireAt)}` : "长期有效"}
+            {p.expired
+              ? "已到期"
+              : p.expireAt
+                ? `到期 ${fmtFullDateTime(p.expireAt)}`
+                : p.expiryUnavailable
+                  ? "到期时间未提供（上游不返回）"
+                  : "长期有效"}
           </div>
         </div>
         <div className="shrink-0 text-right text-xs">
@@ -280,7 +295,9 @@ export function CreditBlock({
             ? `近期到期 ${credits(soonAmount)} 积分`
             : shown[0]?.expireAt
               ? `最近到期 ${fmtExpiry(shown[0].expireAt)}`
-              : "当前积分长期有效"}
+              : item.expiryUnavailable || shown[0]?.expiryUnavailable
+                ? "到期时间未提供"
+                : "当前积分长期有效"}
         </span>
         {active.length > 2 ? (
           <button

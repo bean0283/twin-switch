@@ -1,5 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Pencil, RefreshCw, Save, Trash2, XCircle } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FolderOpen,
+  Layers,
+  LayoutList,
+  Loader2,
+  Pencil,
+  RefreshCw,
+  Save,
+  Search,
+  Trash2,
+  X,
+  XCircle,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,12 +32,19 @@ import {
   qoderSessionUpdateMessage,
   qoderSessionDeleteMessage,
 } from "@/lib/api";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
 type SessionRow = {
   id: string;
   title: string;
   cwd: string;
+  /** 归属工作空间（后端 `modules::workspace` 判定，Qoder 只有 cwd ⇒ 展示名是目录名）。 */
+  workspace: string;
+  /** 空间稳定键（cwd 归一化后小写）。筛选/分组只认它。 */
+  workspaceKey: string;
+  /** 原样路径（正斜杠）。 */
+  workspacePath: string;
   model: string;
   createdAt: number;
   updatedAt: number;
@@ -113,7 +132,12 @@ export default function QoderSessionsPage() {
   /** 删除失败原因，显示在弹窗内（不关弹窗，用户能看到到底为什么）。 */
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
-  const [cwd, setCwd] = useState<string>("");
+  // 工作空间筛选 / 搜索 / 视图（与 Trae、WorkBuddy 会话页同一套交互）
+  // 原来这里是按 `cwd` **精确字符串**筛选，同一个目录换个写法（`D:/x` vs `d://x`）
+  // 就会被拆成两项；改用后端给的 `workspaceKey` 后不会再有这个问题。
+  const [ws, setWs] = useState<string>("");
+  const [query, setQuery] = useState<string>("");
+  const [byWorkspace, setByWorkspace] = useState<boolean>(true);
   const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -156,23 +180,93 @@ export default function QoderSessionsPage() {
 
   const messages = useMemo(() => detail?.messages ?? [], [detail]);
 
-  const cwds = useMemo(() => {
-    const set = new Set<string>();
-    rows.forEach((r) => r.cwd && set.add(r.cwd));
-    return Array.from(set).sort();
+  /** 空间清单（最近活动的排前面；同名空间补一级目录区分）。 */
+  const wsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; lastAt: number }
+    >();
+    for (const r of rows) {
+      const key = r.workspaceKey ?? "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.lastAt = Math.max(cur.lastAt, r.updatedAt || 0);
+      } else {
+        map.set(key, {
+          key,
+          label: r.workspace || "（未归属）",
+          path: r.workspacePath || "",
+          count: 1,
+          lastAt: r.updatedAt || 0,
+        });
+      }
+    }
+    const list = [...map.values()];
+    const dup = new Map<string, number>();
+    for (const w of list) dup.set(w.label, (dup.get(w.label) ?? 0) + 1);
+    return list
+      .map((w) => {
+        if ((dup.get(w.label) ?? 0) <= 1) return w;
+        const segs = (w.path || "").split("/").filter(Boolean);
+        return { ...w, label: segs.slice(-2).join("/") || w.label };
+      })
+      .sort((a, b) => b.lastAt - a.lastAt || a.label.localeCompare(b.label));
   }, [rows]);
 
-  const shown = useMemo(() => (cwd ? rows.filter((r) => r.cwd === cwd) : rows), [rows, cwd]);
+  /** 搜索 + 空间筛选后的行（时间倒序，与客户端列表一致）。 */
+  const shown = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return rows
+      .filter((r) => {
+        if (ws && (r.workspaceKey ?? "") !== ws) return false;
+        if (!q) return true;
+        return [r.title, r.workspace, r.workspacePath, r.id, r.model].some((v) =>
+          (v ?? "").toLowerCase().includes(q),
+        );
+      })
+      .slice()
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }, [rows, ws, query]);
+
+  /** 按空间分组（顺序跟着 `wsOptions`：最近活动的在前）。 */
+  const wsGroups = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; items: SessionRow[] }
+    >();
+    for (const r of shown) {
+      const key = r.workspaceKey ?? "";
+      const g = map.get(key);
+      if (g) g.items.push(r);
+      else
+        map.set(key, {
+          key,
+          label: r.workspace || "（未归属）",
+          path: r.workspacePath || "",
+          items: [r],
+        });
+    }
+    const order = new Map(wsOptions.map((w, i) => [w.key, i]));
+    return [...map.values()].sort(
+      (a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+    );
+  }, [shown, wsOptions]);
+
+  /** 表格要渲染的「块」：分组视图按空间分块；平铺视图合成一块。 */
+  const renderGroups = byWorkspace
+    ? wsGroups
+    : [{ key: "__flat__", label: "", path: "", items: shown }];
 
   const allChecked = shown.length > 0 && shown.every((r) => selected.has(r.id));
   const someChecked = shown.some((r) => selected.has(r.id));
   useEffect(() => {
     if (allRef.current) allRef.current.indeterminate = someChecked && !allChecked;
   }, [someChecked, allChecked]);
-  // 换版本 / 换「含归档」/ 换工作目录 ⇒ 勾选清空：留着会删到屏幕上看不见的行。
+  // 换版本 / 换「含归档」/ 换空间 / 改搜索 ⇒ 勾选清空：留着会删到屏幕上看不见的行。
   useEffect(() => {
     setSelected(new Set());
-  }, [region, includeArchived, cwd]);
+  }, [region, includeArchived, ws, query]);
 
   const toggleAll = () => {
     setSelected((prev) => {
@@ -353,20 +447,66 @@ export default function QoderSessionsPage() {
                 <option value="cn">国内版</option>
                 <option value="global">国际版</option>
               </select>
+              {/* 搜索：只搜元数据（正文要逐条读 SQLite，不放在这里） */}
+              <div className="relative">
+                <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜索标题 / 空间 / 会话 id"
+                  className="h-8 w-[220px] pl-7 pr-7 text-xs"
+                />
+                {query ? (
+                  <button
+                    type="button"
+                    title="清除搜索"
+                    className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                    onClick={() => setQuery("")}
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                ) : null}
+              </div>
               <select
-                value={cwd}
-                onChange={(e) => setCwd(e.target.value)}
+                value={ws}
+                onChange={(e) => setWs(e.target.value)}
                 className="h-8 max-w-[220px] rounded-lg border bg-background px-2 text-xs outline-none focus:border-primary"
-                title="按工作目录筛选"
+                title="按工作空间筛选"
               >
-                <option value="">全部工作目录</option>
-                {cwds.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
+                <option value="">全部工作空间（{wsOptions.length}）</option>
+                {wsOptions.map((w) => (
+                  <option key={w.key} value={w.key}>
+                    {w.label} · {w.count}
                   </option>
                 ))}
               </select>
-              <Badge variant="outline">{shown.length} 个会话</Badge>
+              <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+                <button
+                  type="button"
+                  className={cn(
+                    "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                    byWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                  )}
+                  onClick={() => setByWorkspace(true)}
+                >
+                  <Layers className="size-3" />
+                  按空间
+                </button>
+                <button
+                  type="button"
+                  className={cn(
+                    "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                    !byWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                  )}
+                  onClick={() => setByWorkspace(false)}
+                >
+                  <LayoutList className="size-3" />
+                  平铺
+                </button>
+              </div>
+              <Badge variant="outline">
+                {shown.length === rows.length ? `${rows.length} 个会话` : `${shown.length} / ${rows.length} 个会话`}
+              </Badge>
             </div>
           </div>
         </CardHeader>
@@ -393,14 +533,59 @@ export default function QoderSessionsPage() {
                 </tr>
               </thead>
               <tbody>
-                {shown.length === 0 ? (
+                {rows.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="px-3 py-10 text-center text-xs text-muted-foreground">
                       {busy ? "读取中…" : "这个版本没有会话记录。"}
                     </td>
                   </tr>
+                ) : shown.length === 0 ? (
+                  /* ⚠️「筛选后为空」与「本来就没有会话」必须长得不一样：前者给清除入口。 */
+                  <tr>
+                    <td colSpan={5} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                      <div className="space-y-2">
+                        <div>
+                          没有匹配的会话 —— 筛选后 0 条，该版本共 {rows.length} 条。
+                        </div>
+                        <button
+                          type="button"
+                          className="rounded-md border px-2 py-1 hover:bg-accent"
+                          onClick={() => {
+                            setQuery("");
+                            setWs("");
+                          }}
+                        >
+                          清除搜索与筛选
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
                 ) : (
-                  shown.map((r) => (
+                  renderGroups.map((g) => (
+                    <Fragment key={g.key}>
+                      {/* 分组表头（只有「按空间」视图才画）。点一下 = 只看这个空间。 */}
+                      {byWorkspace ? (
+                        <tr className="bg-muted/50">
+                          <td colSpan={5} className="px-2 py-1.5">
+                            <button
+                              type="button"
+                              className="flex w-full items-center gap-2 text-left"
+                              title="只看这个工作空间"
+                              onClick={() => setWs(g.key)}
+                            >
+                              <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                              <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                              <Badge variant="secondary" className="shrink-0">
+                                {g.items.length}
+                              </Badge>
+                              <span className="truncate text-xs text-muted-foreground" title={g.path}>
+                                {g.path}
+                              </span>
+                            </button>
+                          </td>
+                        </tr>
+                      ) : null}
+                      {g.items.map((r) => (
                     <tr
                       key={r.id}
                       className={cn(
@@ -430,8 +615,17 @@ export default function QoderSessionsPage() {
                             <span className="text-[11px] text-muted-foreground">{r.source}</span>
                           )}
                         </div>
-                        <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
-                          {r.cwd || "—"}
+                        <div className="mt-0.5 flex items-center gap-1.5">
+                          {/* 平铺视图看不出行属于哪个空间，补一个徽标；分组视图表头已经写明了 */}
+                          {!byWorkspace ? (
+                            <span className="inline-flex shrink-0 items-center gap-1 rounded border px-1 py-0.5 text-[11px] text-muted-foreground">
+                              <FolderOpen className="size-3" />
+                              {r.workspace || "（未归属）"}
+                            </span>
+                          ) : null}
+                          <span className="truncate font-mono text-[11px] text-muted-foreground">
+                            {r.cwd || "—"}
+                          </span>
                         </div>
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap text-xs text-muted-foreground">
@@ -468,6 +662,8 @@ export default function QoderSessionsPage() {
                         </div>
                       </td>
                     </tr>
+                      ))}
+                    </Fragment>
                   ))
                 )}
               </tbody>

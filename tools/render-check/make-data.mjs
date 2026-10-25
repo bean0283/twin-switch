@@ -821,8 +821,8 @@ const data = {
 
   // 更新状态：给一份「已是最新」，免得更新入口卡在检查中。
   updateState: {
-    currentVersion: "0.4.2",
-    latestVersion: "0.4.2",
+    currentVersion: "0.4.3",
+    latestVersion: "0.4.3",
     hasUpdate: false,
     checking: false,
     downloading: false,

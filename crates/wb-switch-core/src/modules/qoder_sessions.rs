@@ -74,10 +74,17 @@ pub fn list(region: QoderRegion, include_archived: bool) -> Result<Vec<Value>, S
             let archived: i64 = r.get(6).unwrap_or(0);
             let extra: Option<String> = r.get(9).ok();
             let (source, imported_from) = parse_extra(extra.as_deref());
+            let cwd = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+            // 归属空间与另两页同一套判定（`modules::workspace`）：Qoder 的会话只有 cwd，
+            // 没有空间名字段，所以展示名用目录名。
+            let (wkey, wname) = crate::modules::workspace::workspace_of(&cwd);
             Ok(serde_json::json!({
                 "id": r.get::<_, String>(0)?,
                 "title": r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                "cwd": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "cwd": cwd,
+                "workspace": wname,
+                "workspaceKey": wkey,
+                "workspacePath": cwd.replace('\\', "/"),
                 "model": r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 "createdAt": r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 "updatedAt": r.get::<_, Option<i64>>(5)?.unwrap_or(0),

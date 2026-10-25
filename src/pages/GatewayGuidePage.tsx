@@ -369,6 +369,18 @@ export default function GatewayGuidePage() {
             <span className="font-medium text-foreground">响应很慢 / 超时</span>
             ：热门免费模型可能在上游排队（如 <code className="font-mono">DeepSeek-Flash</code>），
             换 <code className="font-mono">Qwen3.8-Max</code> / <code className="font-mono">GLM-5.3</code> 之类。
+            <span className="block pt-1">
+              想确认「慢在哪一步」看 <code className="font-mono">~/.twin-switch/gateway-metrics.jsonl</code>
+              ：<code className="font-mono">ttft_ms</code> 是首字延迟（远小于{" "}
+              <code className="font-mono">total_ms</code> 说明流式生效了）、
+              <code className="font-mono">queued</code> 是撞上排队、
+              <code className="font-mono">failovers</code> 是换了几个号（&gt;0 会把总时长放大）。
+            </span>
+          </p>
+          <p>
+            <span className="font-medium text-foreground">流式出问题时的一键退路</span>
+            ：启动前设 <code className="font-mono">TWIN_TS_NO_STREAM=1</code> 退回「聚合后一次性返回」，
+            设 <code className="font-mono">TWIN_TS_NO_AFFINITY=1</code> 让会话 ID 每次新建（不复用）。
           </p>
           <p>
             <span className="font-medium text-foreground">模型名报「未知作用域」</span>

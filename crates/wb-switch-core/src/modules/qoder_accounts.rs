@@ -65,6 +65,9 @@ pub struct QoderAccount {
     /// 上次成功查到额度的时刻（毫秒）—— 卡片上的「x 分钟前更新」就是它。
     #[serde(default)]
     pub credits_updated_at: Option<i64>,
+    /// 额度明细（每个积分包一行）。空 = 还没查过 / 上游没给分块数据。
+    #[serde(default)]
+    pub credit_parts: Vec<CreditPart>,
     /// **服务端登录时签发的设备令牌**（抓包里 `cosy-machinetoken`，86 字符）。
     ///
     /// ⚠️ 活动下发（`/me/campaigns`）绑定这个身份：用派生值查，部分账号（新号等）
@@ -82,6 +85,25 @@ pub struct QoderAccount {
     /// 原样保留的产品侧字段，不做二次解释。
     #[serde(default)]
     pub meta: Value,
+}
+
+/// 一个「积分包」（Qoder 侧就是上游 `userQuota` / `addOnQuota` 两块）。
+///
+/// 为什么要单独存：Qoder 的额度接口天生分成两块（用户额度 + 加购额度），
+/// 但界面要跟 Trae / WorkBuddy 一样**按包展示**（每包总量 / 已用 / 剩余）。
+/// 只存一个 `credits` 合计的话，「这 800 分由哪两块组成」就再也看不见了。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct CreditPart {
+    /// 展示名（`用户额度` / `加购额度`）—— 由解析方给定，不猜上游字段名。
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub total: f64,
+    #[serde(default)]
+    pub used: f64,
+    /// 剩余；缺失按 `total - used` 兜底之前请保持 0 语义（调用方负责）。
+    #[serde(default)]
+    pub remaining: f64,
 }
 
 fn default_source() -> String {
@@ -104,6 +126,7 @@ impl QoderAccount {
             credits: None,
             credits_expire_at: None,
             credits_updated_at: None,
+            credit_parts: Vec::new(),
             cosy_machine_token: None,
             cosy_machine_type: None,
             created_at: now_ms(),

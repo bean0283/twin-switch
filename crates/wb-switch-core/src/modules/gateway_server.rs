@@ -21,7 +21,9 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::modules::gateway_keys::{self, GATEWAY_PORT};
+use crate::modules::gateway_metrics::Trace;
 use crate::modules::gateway_pool;
+use crate::modules::gateway_stream::{Delta, Emitter, Kind, StreamReader};
 
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
@@ -82,7 +84,8 @@ pub async fn selftest(key: Option<String>, model: Option<String>) -> Value {
 
     // ② 真实模型清单（`/v1/models` 不需要 Key）
     let mut models: Vec<String> = Vec::new();
-    let mut models_detail = String::new();
+    // 每一条分支都会赋值，所以不需要初始值（`String::new()` 那个初值从来没被读过）。
+    let models_detail;
     let mut models_ok = false;
     if running {
         match client.get(format!("{base}/v1/models")).send().await {
@@ -320,6 +323,16 @@ pub async fn serve(port: u16) -> Result<(), String> {
     result
 }
 
+/// 请求体上限（字节）。
+///
+/// ⚠️⚠️ axum 默认 **2 MiB**，超过就直接回 413，且**连 handler 都进不来** —— 客户端里
+/// 只看到一行裸文本 `Failed to buffer the request body: length limit exceeded`。
+/// 实测踩到：WorkBuddy 让模型分析一份 DXF 转成的 PDF（13551 条路径 / 112 个文本实体），
+/// 那一轮的 body 远超 2 MiB，于是「分析这个文档」整条走不通，而网关日志里连请求都没有。
+/// 对话类 body 天然会长（历史消息 + 工具结果 + 文件内容），本机只绑 127.0.0.1，
+/// 放宽到 64 MiB 即可；真正的瘦身交给 `gateway_stream::prepare()`（发上游前折叠）。
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 fn build_router() -> Router {
     // 两组路径都挂（带 /v1 前缀与不带）：不同客户端对 base_url 的拼接习惯不同
     // —— 有的拼 `{base}/models`，有的拼 `{base}/v1/models`，只挂一组就 404。
@@ -334,7 +347,10 @@ fn build_router() -> Router {
         // 用户填 `…/v1`、`…/v1/chat/completions`、甚至 `…` 都能通。
         .route("/v1", post(chat))
         .route("/", post(chat));
-    api.layer(axum::middleware::from_fn(cors))
+    api
+        // 见 [`MAX_BODY_BYTES`]：默认 2 MiB 会把「带大文件的分析请求」直接 413 掉。
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(cors))
 }
 
 /// CORS：WorkBuddy / Trae 客户端的「测试连接」是**渲染进程（Chromium）发的 fetch**，
@@ -569,21 +585,28 @@ async fn chat(
 
     // ⑤ 上游透传 + **同一个请求内的换号重试**。
     //
-    // 客户端要流式时，我们**仍然向上游要完整结果**，再把结果包装成一段 SSE 发回去。
-    // 理由：两家上游的流格式各不相同（Trae 是私有事件流、WorkBuddy 是 OpenAI SSE），
-    // 逐字转发需要两套解析；先把「能不能用」保证住，逐字流式留作后续优化。
+    // 客户端要流式时**真的按流式走**（2026-10-24 之前是「向上游要完整结果，再一次性
+    // 包成一段 SSE」）。改的理由很直接：整段生成 10 分钟的任务，客户端前 10 分钟
+    // 一个字都看不到 ⇒ 它会判定卡住并重试 ⇒ 重试再排一次队，越等越久。
+    // 现在三家各有一套解析（Trae 私有事件流 / Qoder 信封 SSE / WB 原生 OpenAI SSE
+    // 直接透传），见 `gateway_stream`。
     //
-    // ⚠️⚠️ 换号重试是 2026-10-24 用户实测后补的：上游会临时拒绝某个账号，最典型的是
-    // Trae 的 `HTTP 429 / code 6804「使用量已超出频率限制」`，以及某个号的额度当天耗尽。
-    // 以前这种情况把 429 原样抛回客户端（用户在 Trae 里看到「请求模型供应商失败」，
-    // 得自己再点一次），而池子里明明还有别的号 —— 现在同一个请求里按紧迫度顺序往下换，
-    // **只有全部试完才报错**。
+    // ⚠️ 换号只能在**首字之前**做：一旦开始往客户端发字节，这轮就只能在这条流上报错。
     let want_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // 降级开关：`TWIN_TS_NO_STREAM=1` 时退回「上游聚合完再一次性包成 SSE」的老路径。
+    // 真流式万一在某家上游上踩到边角（半截流比整段失败更难收拾），这是最快的止损手段。
+    let stream_ok = want_stream && std::env::var("TWIN_TS_NO_STREAM").as_deref() != Ok("1");
     let mut upstream_req = req.clone();
-    if want_stream {
-        if let Some(obj) = upstream_req.as_object_mut() {
-            obj.insert("stream".into(), json!(false));
-        }
+    let mut trace = Trace::new(&model, want_stream);
+    // 前缀稳定 + 历史折叠：确定性规则，同样的历史每轮折出同样的字节，
+    // 这样上游的前缀缓存才有机会命中（见 `gateway_stream::prepare`）。
+    if let Some(obj) = upstream_req.as_object_mut() {
+        let prep = crate::modules::gateway_stream::prepare(obj);
+        trace.msgs = prep.msgs;
+        trace.tools = prep.tools;
+        trace.chars = prep.chars;
+        trace.tools_chars = prep.tools_chars;
+        trace.folded = prep.folded;
     }
 
     // 候选顺序：pool 的紧迫度顺序（没在冷却的在前），并把 preview 选中的挪到队首，
@@ -610,17 +633,35 @@ async fn chat(
     let mut tried = 0usize;
     for cand in cands.iter().take(MAX_FAILOVER) {
         tried += 1;
-        match forward(cand, &bare, &upstream_req).await {
-            Ok(resp) => {
+        let mut t = trace.clone();
+        t.hit(&cand.scope, &cand.key);
+        t.failovers = tried - 1;
+        match forward(cand, &bare, &upstream_req, stream_ok, t).await {
+            Ok(Upstream::Json(resp)) => {
                 REQUESTS.fetch_add(1, Ordering::Relaxed);
                 gateway_keys::touch(&key.id);
                 // 成功了就把这个号之前记的冷却撤掉，别让一次偶发失败按它 60 秒。
                 gateway_pool::clear_cooldown(&cand.key, Some(&bare));
+                let mut done = trace.clone();
+                done.hit(&cand.scope, &cand.key);
+                done.failovers = tried - 1;
+                if let Some(u) = resp.get("usage") {
+                    done.usage(u);
+                }
+                done.finish(true, 200, "");
+                // `stream_ok` 为假但客户端要流式 ⇒ 走老的「聚合后包装」路径。
                 return if want_stream {
                     sse_from_completion(&resp)
                 } else {
                     Json(resp).into_response()
                 };
+            }
+            Ok(Upstream::Sse(resp)) => {
+                REQUESTS.fetch_add(1, Ordering::Relaxed);
+                gateway_keys::touch(&key.id);
+                gateway_pool::clear_cooldown(&cand.key, Some(&bare));
+                // 指标在流结束时由 `gateway_stream::respond` 落盘（那时才知道 ttft 与用量）。
+                return resp;
             }
             Err((code, msg)) => {
                 // 上游报错 → 反馈给池子（冷却/标记），下一个请求也不会再撞同一个。
@@ -631,8 +672,12 @@ async fn chat(
                     let left = (until - gateway_pool::now_ms_pub()).max(0) / 1000;
                     let _ = gateway_pool::mark_last_error(&cand.key, &msg, kind, left);
                 }
+                if gateway_pool::is_queued_hint(&msg) {
+                    trace.note_queued();
+                }
                 let failover = should_failover(code.as_u16(), &msg);
                 log_failover(&model, &cand.key, code.as_u16(), &msg, failover);
+                trace.note_failover();
                 last_err = Some((code, msg));
                 if !failover {
                     break;
@@ -645,6 +690,7 @@ async fn chat(
         StatusCode::BAD_GATEWAY,
         "上游没有任何响应".to_string(),
     ));
+    trace.finish(false, code.as_u16(), &msg);
     api_err(
         code,
         "upstream_error",
@@ -865,6 +911,13 @@ fn builtin_spec(scope: &str) -> Option<UpstreamSpec> {
     }
 }
 
+/// 转发结果：要么是完整结果（客户端没要流式），要么是一条已经可以往下发字节的流。
+enum Upstream {
+    Json(Value),
+    /// 已经可以往客户端写的流式响应（`gateway_stream` 里已经组好头和 body）。
+    Sse(axum::response::Response),
+}
+
 /// 读配置并转发。
 ///
 /// 优先用 `~/.twin-switch/upstreams.json` 里登记的；没登记时回落到 [`builtin_spec`]，
@@ -873,7 +926,9 @@ async fn forward(
     cand: &gateway_pool::PoolEntry,
     model: &str,
     req: &Value,
-) -> Result<Value, (StatusCode, String)> {
+    want_stream: bool,
+    trace: Trace,
+) -> Result<Upstream, (StatusCode, String)> {
     let scope = cand.scope.as_str();
     // ⚠️⚠️ **公开名 → 这一家的代号**，必须在这里做、且每家各算一次。
     //
@@ -891,12 +946,20 @@ async fn forward(
 
     // Trae 走私有协议（设备 jwt + llm_utils_chat 专用请求体），不进通用透传。
     if scope.starts_with("trae") && spec.is_none() {
-        return trae_forward(model, req).await;
+        return if want_stream {
+            trae_stream(model, req, trace).await
+        } else {
+            trae_forward(model, req).await.map(Upstream::Json)
+        };
     }
 
     // Qoder 走 COSY 签名的私有协议（**信封 SSE**）——2026-10-22 真机跑通。
     if scope.starts_with("qoder") && spec.is_none() {
-        return qoder_forward(scope, model, req).await;
+        return if want_stream {
+            qoder_stream(scope, model, req, trace).await
+        } else {
+            qoder_forward(scope, model, req).await.map(Upstream::Json)
+        };
     }
 
     let Some(spec) = spec else {
@@ -936,8 +999,25 @@ async fn forward(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+    // ⚠️⚠️ 超时口径必须分两档，原来一律 300 秒整段超时是错的：
+    //
+    // * **非流式**（`want_stream == false`）：整段 300 秒，超了就是真挂了。
+    // * **流式**：整段可能很长（WorkBuddy 的 agent 任务实测有 10 分钟以上的），
+    //   300 秒会在 5 分钟处**把正在写的流掐断** —— 客户端只看到回答突然没了，
+    //   而指标里是一条「成功但很短」的记录，极难查。所以流式改成：
+    //   整段给 30 分钟（够任何正常任务），真正的保护交给**每块空闲 120 秒**
+    //   （reqwest 的 `read_timeout` 是按单次读计时的）。
+    //   `gateway_stream` 里还有一层自己的空闲判据（首字前 90s / 出字后 8s），
+    //   两层不冲突：外层是「上游彻底不动了」，内层是「上游还连着但不再吐字」。
+    let mut builder = reqwest::Client::builder();
+    builder = if want_stream {
+        builder
+            .timeout(std::time::Duration::from_secs(1800))
+            .read_timeout(std::time::Duration::from_secs(120))
+    } else {
+        builder.timeout(std::time::Duration::from_secs(300))
+    };
+    let client = builder
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构造 HTTP 客户端失败：{e}")))?;
     let resp = client
@@ -956,9 +1036,9 @@ async fn forward(
         })?;
 
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
         let hint = match status.as_u16() {
             401 | 403 => "（上游鉴权失败：token 可能已过期，需重新登录该账号）",
             429 => "（上游限流 / 当日额度用完）",
@@ -977,15 +1057,49 @@ async fn forward(
         ));
     }
 
-    if spec.force_stream {
-        return aggregate_sse(&text, model);
+    // WorkBuddy 这类 OpenAI 兼容上游：本来就是标准 SSE ⇒ 直接透传字节。
+    // 重新解析再拼一遍只会把 `tool_calls` / `finish_reason` 的细节拼丢。
+    //
+    // ⚠️ 先看 content-type：自建上游有时直接回一整段 JSON（不支持流式），
+    // 把 JSON 当 SSE 透出去，客户端会一直等 `data:` 行 —— 那是最难查的一种「卡住」。
+    if want_stream {
+        let sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("event-stream"))
+            .unwrap_or(false);
+        if sse {
+            return Ok(Upstream::Sse(crate::modules::gateway_stream::passthrough(
+                resp, trace,
+            )));
+        }
+        let text = resp.text().await.unwrap_or_default();
+        return serde_json::from_str::<Value>(&text)
+            .map(Upstream::Json)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "上游既不是 SSE 也不是 JSON（{e}）：{}",
+                        text.chars().take(200).collect::<String>()
+                    ),
+                )
+            });
     }
-    serde_json::from_str::<Value>(&text).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("上游返回的不是 JSON（{e}）：{}", text.chars().take(200).collect::<String>()),
-        )
-    })
+
+    let text = resp.text().await.unwrap_or_default();
+    if spec.force_stream {
+        return aggregate_sse(&text, model).map(Upstream::Json);
+    }
+    serde_json::from_str::<Value>(&text)
+        .map(Upstream::Json)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("上游返回的不是 JSON（{e}）：{}", text.chars().take(200).collect::<String>()),
+            )
+        })
 }
 
 /// 把上游的业务错误码翻成人能懂的句子（原文一并带上，便于排查）。
@@ -1139,29 +1253,41 @@ pub(crate) fn absorb_tool_call(accs: &mut Vec<ToolCallAcc>, raw: &Value) {
 /// 累积表 → OpenAI `message.tool_calls`。
 ///
 /// 没有 `name` 的条目直接丢掉：那是上游的脏数据，编一个名字只会让客户端调用出错的工具。
+///
+/// ⚠️ 还要保证三件事，否则客户端只能**串行**执行、甚至只执行最后一个（L2-2）：
+///
+/// 1. `index` 连续且唯一（上游有时候给重复 index，甚至不给）；
+/// 2. `id` 唯一（缺 id 或 id 撞了都重编，撞 id 会让客户端把两次调用当成同一次的重试）；
+/// 3. 完全相同的重复调用（同名 + 同参 + 同/空 id）只留一条 —— 那是分片重复到达的残留。
 pub(crate) fn finalize_tool_calls(accs: &[ToolCallAcc]) -> Vec<Value> {
-    accs.iter()
-        .enumerate()
-        .filter(|(_, a)| !a.name.is_empty())
-        .map(|(i, a)| {
-            let args = if a.arguments.trim().is_empty() {
-                "{}".to_string()
-            } else {
-                a.arguments.clone()
-            };
-            let id = if a.id.is_empty() {
-                format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..24])
-            } else {
-                a.id.clone()
-            };
-            json!({
-                "index": a.index.unwrap_or(i as u64),
-                "id": id,
-                "type": "function",
-                "function": { "name": a.name, "arguments": args }
-            })
-        })
-        .collect()
+    let mut out: Vec<Value> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for a in accs.iter().filter(|a| !a.name.is_empty()) {
+        let args = if a.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            a.arguments.clone()
+        };
+        let key = (a.name.clone(), args.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let mut id = a.id.clone();
+        if id.is_empty() || ids.iter().any(|x| x == &id) {
+            id = format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+        }
+        ids.push(id.clone());
+        let index = out.len() as u64;
+        out.push(json!({
+            "index": index,
+            "id": id,
+            "type": "function",
+            "function": { "name": a.name, "arguments": args }
+        }));
+    }
+    out
 }
 
 /// 有工具调用时 `finish_reason` 必须是 `tool_calls` —— 很多客户端只认这个值才去解析
@@ -1484,6 +1610,117 @@ async fn qoder_forward(
     Ok(lift_qoder_tool_calls(out, has_tools))
 }
 
+/// `QUEUED|<秒>|<文案>` → `(秒, 文案)`。标记不一定在开头（外面可能包了 `上游报错：`）。
+fn queue_parts(e: &str) -> Option<(u64, String)> {
+    let rest = e.split_once("QUEUED|")?.1;
+    let mut it = rest.splitn(2, '|');
+    let wait = it.next().unwrap_or("30").trim().parse().unwrap_or(30);
+    Some((wait, it.next().unwrap_or("上游排队中").to_string()))
+}
+
+/// Qoder 真流式：选号 → 打开流 → **首字探测** → 交出响应体。
+///
+/// 排队（10605）在这里按官方语义处理：`sleep(retryAfterSeconds)` 再来一次，
+/// 直到预算用完才回 429 原文。换号是无效的 —— 队列是模型级的。
+async fn qoder_stream(
+    scope: &str,
+    model: &str,
+    req: &Value,
+    mut trace: Trace,
+) -> Result<Upstream, (StatusCode, String)> {
+    use crate::modules::qoder_realm::QoderRegion;
+
+    let region = if scope.ends_with("global") {
+        QoderRegion::Global
+    } else {
+        QoderRegion::Cn
+    };
+    let accounts = crate::modules::qoder_accounts::list(region)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读 Qoder 账号失败：{e}")))?;
+    let acc = accounts.iter().find(|a| a.is_usable()).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "{} 没有可用的 Qoder 账号（先在账号页导入/登录）",
+                region.display_name()
+            ),
+        )
+    })?;
+
+    let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
+    let tools = req.get("tools").cloned().unwrap_or(Value::Null);
+    let shown = crate::modules::gateway_models::display_of(scope, model);
+
+    let budget = qoder_queue_budget();
+    let started = std::time::Instant::now();
+    loop {
+        let resp = crate::modules::qoder_tools::chat_open(
+            region,
+            acc,
+            model,
+            &shown,
+            &messages,
+            Some(&tools),
+        )
+        .await
+        .map_err(|e| {
+            if let Some((_, msg)) = queue_parts(&e) {
+                trace.note_queued();
+                (StatusCode::TOO_MANY_REQUESTS, format!("Qoder 上游排队中：{msg}"))
+            } else {
+                (StatusCode::BAD_GATEWAY, format!("Qoder 上游：{e}"))
+            }
+        })?;
+
+        let mut reader = StreamReader::new(resp, Kind::Qoder);
+        match reader.next_batch().await {
+            Ok(Some(first)) => {
+                return Ok(Upstream::Sse(crate::modules::gateway_stream::respond(
+                    Emitter::new(model),
+                    reader,
+                    first,
+                    trace,
+                )))
+            }
+            Ok(None) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Qoder 返回了流，但既没有正文也没有工具调用".to_string(),
+                ));
+            }
+            Err(e) => {
+                if let Some((wait, msg)) = queue_parts(&e) {
+                    let spent = started.elapsed().as_secs();
+                    let nap = wait.clamp(1, 45);
+                    if spent + nap <= budget {
+                        // 上游说的 retryAfterSeconds 要**照等**：官方客户端就是这么等的。
+                        tokio::time::sleep(std::time::Duration::from_secs(nap)).await;
+                        continue;
+                    }
+                    trace.note_queued();
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "Qoder 上游排队中：{msg}（已等 {spent} 秒仍没排到 —— 换号没用，\
+                             队列是模型级的；可换冷门模型试试）"
+                        ),
+                    ));
+                }
+                return Err((StatusCode::BAD_GATEWAY, e));
+            }
+        }
+    }
+}
+
+/// 流式路径的排队预算（与 `qoder_tools::queue_budget_secs` 同一口径）。
+fn qoder_queue_budget() -> u64 {
+    std::env::var("TWIN_TS_QUEUE_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(240)
+}
+
 // ---------------------------------------------------------------------------
 // Qoder：正文里的 `<function_calls>` → OpenAI `tool_calls`
 //
@@ -1690,15 +1927,21 @@ fn lift_qoder_tool_calls(mut v: Value, allow_tools: bool) -> Value {
     v
 }
 
-async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, String)> {
-    let cred = trae_cred(None).ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "找不到可用的 Trae 登录态（storage.json 里没有解不开的授权条目）".to_string(),
-        )
-    })?;
-
+/// Trae 上游请求体（含 proto 归一化 + 会话 ID）。
+///
+/// ⚠️ 会话 ID 用**指纹派生**，不再每轮 `Uuid::new_v4()`：每轮换新 ID，上游就没法把
+/// 这几次请求认成同一个会话，前缀缓存 100% 失效。多轮 agent 里这是最大的隐性成本
+/// （报告 §3.2：45k tokens/轮 × 60 轮 ≈ 2.7M 输入，绝大多数是同一段前缀被反复 prefill）。
+/// 指纹只含「对话开始时就不变」的东西，见 [`crate::modules::gateway_stream::session_seed`]。
+fn trae_body(model: &str, req: &Value, cred: &TraeCred) -> (Value, String) {
     let (config_name, model_name) = trae_model_config(model);
+    let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
+    let seed = crate::modules::gateway_stream::session_seed(
+        &model_name,
+        &cred.uid,
+        &messages,
+        req.get("tools"),
+    );
     let mut body = req.clone();
     if let Some(obj) = body.as_object_mut() {
         // 上游要求 `messages[].content` 是数组（字符串形态会回 4001），
@@ -1712,15 +1955,24 @@ async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, St
         normalize_trae_tool_choice(obj);
         obj.insert("config_name".into(), json!(config_name));
         obj.insert("model_name".into(), json!(model_name));
-        // 上游只支持流式；本地聚合。
+        // 上游只支持流式。
         obj.insert("stream".into(), json!(true));
         obj.insert("function".into(), json!(TRAE_FUNCTION));
         obj.insert("user_id".into(), json!(cred.uid));
         obj.insert("device_id".into(), json!(cred.device_id));
         obj.insert("machine_id".into(), json!(cred.machine_id));
-        obj.insert("conversation_id".into(), json!(uuid::Uuid::new_v4().to_string()));
-        obj.insert("session_id".into(), json!(uuid::Uuid::new_v4().to_string()));
-        obj.insert("project_id".into(), json!(uuid::Uuid::new_v4().to_string()));
+        obj.insert(
+            "conversation_id".into(),
+            json!(crate::modules::gateway_stream::session_id(&seed, "trae-conv")),
+        );
+        obj.insert(
+            "session_id".into(),
+            json!(crate::modules::gateway_stream::session_id(&seed, "trae-sess")),
+        );
+        obj.insert(
+            "project_id".into(),
+            json!(crate::modules::gateway_stream::session_id(&seed, "trae-proj")),
+        );
         obj.insert("workspace_id".into(), json!("e04cdd"));
         obj.insert("prompt_max_tokens".into(), json!(168_000));
         obj.insert("mode".into(), json!("FunctionCall"));
@@ -1729,10 +1981,29 @@ async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, St
         obj.insert("app_id".into(), json!(TRAE_APP_ID));
         obj.insert("package_type".into(), json!("stable_cn"));
     }
+    (body, format!("{TRAE_AGENT_HOST}{TRAE_LLM_CHAT_PATH}"))
+}
 
-    let url = format!("{TRAE_AGENT_HOST}{TRAE_LLM_CHAT_PATH}");
+/// 发一次 Trae 请求，**不看状态码**（调用方自己判，才说得清错在哪）。
+///
+/// `timeout_s` 分两档：聚合路径 180 s（整段生成完才算完），流式路径给 900 s
+/// —— 流式下首字之外还有整段生成，用 180 s 卡整段会把「模型在慢慢写」误判成
+/// 「上游挂了」，然后换号重来，等于把已经花掉的算力全丢掉（报告 §3.3）。
+async fn trae_post(
+    model: &str,
+    req: &Value,
+    timeout_s: u64,
+) -> Result<reqwest::Response, (StatusCode, String)> {
+    let cred = trae_cred(None).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "找不到可用的 Trae 登录态（storage.json 里没有解不开的授权条目）".to_string(),
+        )
+    })?;
+    let (body, url) = trae_body(model, req, &cred);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(timeout_s))
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构造客户端失败：{e}")))?;
     let resp = client
@@ -1763,7 +2034,11 @@ async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, St
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("请求 Trae 失败：{e}")))?;
+    Ok(resp)
+}
 
+async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, String)> {
+    let resp = trae_post(model, req, 180).await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1776,8 +2051,68 @@ async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, St
             ),
         ));
     }
-
     aggregate_trae_sse(&text, model)
+}
+
+/// Trae 真流式。
+///
+/// **首字探测**在这里做：先把第一批增量读到手里，再交出响应体。这样「上游 200 但
+/// 立刻报错 / 空流」仍然能走换号重试（一旦开始往客户端发字节就没法换了）。
+async fn trae_stream(
+    model: &str,
+    req: &Value,
+    trace: Trace,
+) -> Result<Upstream, (StatusCode, String)> {
+    let resp = trae_post(model, req, 900).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Trae 上游返回 HTTP {}：{}",
+                status.as_u16(),
+                text.chars().take(400).collect::<String>()
+            ),
+        ));
+    }
+    let mut reader = StreamReader::new(resp, Kind::Trae);
+    let first = match reader.next_batch().await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Trae 返回了事件流，但没有正文也没有工具调用".to_string(),
+            ));
+        }
+        Err(e) => {
+            return Err((StatusCode::BAD_GATEWAY, e));
+        }
+    };
+    // ⚠️ 「只有思考内容」也算有效首包：模型可能先想 30 秒再出正文。
+    // 这里判太严会把正常请求当成失败、换号重来（等于白烧掉一次生成）。
+    let useful = first
+        .iter()
+        .any(|d| has_payload(d) || matches!(d, Delta::Reasoning(_)));
+    if !useful {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Trae 只回了结束事件，没有正文也没有工具调用".to_string(),
+        ));
+    }
+    Ok(Upstream::Sse(crate::modules::gateway_stream::respond(
+        Emitter::new(model),
+        reader,
+        first,
+        trace,
+    )))
+}
+
+/// 这一包增量里有没有「真内容」（正文或工具调用）。
+///
+/// 只有思考内容不算 —— 但也不当失败（思考说明上游在干活，继续等正文）。
+fn has_payload(d: &Delta) -> bool {
+    matches!(d, Delta::Content(_) | Delta::ToolCall(_))
 }
 
 /// `messages[].content` 字符串 → `[{ "type": "text", "text": … }]`。
