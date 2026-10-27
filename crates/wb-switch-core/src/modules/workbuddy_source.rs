@@ -187,25 +187,30 @@ fn normalize_ids(line: &str, ids: &[String]) -> String {
 /// `路径 + 长度 + 修改时间 + id 集`：文件被编辑/替换/重写、或组成员变了 ⇒ 键变 ⇒
 /// 自动重算。**不设过期时间**——过期时间只会让「刚改完的会话」读到旧摘要，
 /// 反而制造出「显示与内容不一致」这种最难查的问题。
-fn content_id_cached(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
-    use std::hash::{Hash, Hasher};
-    use std::sync::{Mutex, OnceLock};
+/// 摘要缓存的容量上限（估算值；超了就整体清空重来）。
+const MAX_CACHED_BYTES: usize = 256 << 20;
 
-    const MAX_CACHED_BYTES: usize = 256 << 20;
+struct DigestCache {
+    map: std::collections::HashMap<String, ContentId>,
+    bytes: usize,
+}
 
-    struct Cache {
-        map: std::collections::HashMap<String, ContentId>,
-        bytes: usize,
-    }
-
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| {
-        Mutex::new(Cache {
+fn digest_cache() -> &'static std::sync::Mutex<DigestCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DigestCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(DigestCache {
             map: std::collections::HashMap::new(),
             bytes: 0,
         })
-    });
+    })
+}
 
+/// 缓存键：`路径|长度|mtime|id集哈希`。
+///
+/// 任一项变了就 miss —— 文件被改写/替换、或组成员变了，都必须重算。
+/// id 集用「排序后哈希」入键：组内顺序不影响归一化结果，避免仅仅换个顺序就 miss。
+fn cache_key(path: &std::path::Path, ids: &[String]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -213,29 +218,38 @@ fn content_id_cached(path: &std::path::Path, ids: &[String]) -> Option<ContentId
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // id 集用「排序后哈希」入键：组内顺序不影响归一化结果，避免仅仅换个顺序就 miss。
     let mut ids_sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
     ids_sorted.sort_unstable();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ids_sorted.hash(&mut h);
-    let key = format!(
+    Some(format!(
         "{}|{}|{}|{:x}",
         path.to_string_lossy(),
         meta.len(),
         mtime,
         h.finish()
-    );
+    ))
+}
 
-    if let Ok(guard) = cache.lock() {
-        if let Some(hit) = guard.map.get(&key) {
-            return Some(hit.clone());
-        }
+/// **只查不算**：缓存里有就返回，没有就 `None`（绝不读盘）。
+///
+/// 用来回答「这一组能不能直接下结论」：摘要都在、且文件键没变 ⇒ 逐行比对的结论
+/// 是现成的，没有理由再读一遍，更没有理由把它退回「未比对」。
+fn peek_content_id(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
+    let key = cache_key(path, ids)?;
+    digest_cache().lock().ok()?.map.get(&key).cloned()
+}
+
+fn content_id_cached(path: &std::path::Path, ids: &[String]) -> Option<ContentId> {
+
+    let key = cache_key(path, ids)?;
+    if let Some(hit) = digest_cache().lock().ok().and_then(|g| g.map.get(&key).cloned()) {
+        return Some(hit);
     }
-
     let id = content_id(path, ids)?;
     // 估算：每条行摘要约 48 字节 + 结构体开销
     let cost = id.line_digests.len() * 48 + id.total.len() + 64;
-    if let Ok(mut guard) = cache.lock() {
+    if let Ok(mut guard) = digest_cache().lock() {
         if guard.bytes + cost > MAX_CACHED_BYTES {
             guard.map.clear();
             guard.bytes = 0;
@@ -387,6 +401,271 @@ fn decide_group(ids: &[Option<ContentId>], updated_at: &[i64]) -> (usize, Vec<St
     (newest_pos, notes)
 }
 
+// ---------------------------------------------------------------------------
+// 同步后的回读校验 / 「已校验一致」记录
+// ---------------------------------------------------------------------------
+
+/// 一份文件的内容摘要（`digest` 为 16 位十六进制，与 `WbSession::content_digest` 同口径）。
+pub struct VerifyReport {
+    /// 全部一致（且至少有一份）。
+    pub all_same: bool,
+    /// 行数（以第一份为准）。
+    pub lines: usize,
+    /// 摘要前 16 位。
+    pub digest: String,
+    /// 与第一份不一致的下标（空 = 全部一致）。
+    pub mismatched: Vec<usize>,
+    pub elapsed_ms: u64,
+}
+
+/// 逐个**读回**算出摘要，判断这些文件内容是否一致。
+///
+/// ⚠️ 这一步是真读盘，不是拿「我刚写过」当结论。用户反复觉得「同步没生效」，
+/// 正是因为界面只会说「无法确认」——读一遍换一个确定的答案，值得。
+/// 读完摘要会留在缓存里，紧接着刷新界面时不必再读一遍。
+pub fn verify_same_content(paths: &[PathBuf], ids: &[String]) -> VerifyReport {
+    let t0 = std::time::Instant::now();
+    let mut base: Option<(usize, String)> = None;
+    let mut mismatched: Vec<usize> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        match content_id_cached(p, ids) {
+            Some(cid) => match &base {
+                None => base = Some((cid.lines, cid.total.clone())),
+                Some((lines, total)) => {
+                    if *lines != cid.lines || *total != cid.total {
+                        mismatched.push(i);
+                    }
+                }
+            },
+            // 读不出来也算不一致：绝不能把「读失败」当成「一样」。
+            None => mismatched.push(i),
+        }
+    }
+    let (lines, digest) = base.unwrap_or((0, String::new()));
+    VerifyReport {
+        all_same: mismatched.is_empty() && !paths.is_empty() && !digest.is_empty(),
+        lines,
+        digest: digest.chars().take(16).collect(),
+        mismatched,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+    }
+}
+
+/// 一条记录：某个会话正文最后一次**被回读校验**时的文件指纹与内容摘要。
+///
+/// 为什么需要它：超过 [`DUP_MAX_BYTES`] 的组默认不比对，界面上只能写「无法确认」。
+/// 但用户刚点过同步、我们也真的读回来校验过 —— 这个结论不该因为「刷新了一下列表」
+/// 或者「重启了工具」就丢掉，否则用户只会看到同一句话反复出现，以为同步没生效。
+///
+/// 判据严格：`长度 + mtime` 必须与记录逐项相同。文件被改过（哪怕只追加一条）
+/// mtime 就变 ⇒ 记录失效 ⇒ 老老实实退回「未比对」。**绝不拿旧结论冒充当前状态。**
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VerifiedEntry {
+    len: u64,
+    mtime: u128,
+    lines: usize,
+    digest: String,
+    at: i64,
+}
+
+fn verified_store_path() -> PathBuf {
+    store_dir().join("workbuddy").join("verified-bodies.json")
+}
+
+fn file_stamp(path: &Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
+}
+
+fn load_verified_at(path: &Path) -> std::collections::HashMap<String, VerifiedEntry> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_verified_at(path: &Path, map: &std::collections::HashMap<String, VerifiedEntry>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 只留最近 200 条：这是「免重复读」的备忘，不是账本。
+    let mut items: Vec<(&String, &VerifiedEntry)> = map.iter().collect();
+    if items.len() > 200 {
+        items.sort_by_key(|(_, e)| std::cmp::Reverse(e.at));
+        items.truncate(200);
+    }
+    let trimmed: std::collections::HashMap<&String, &VerifiedEntry> = items.into_iter().collect();
+    if let Ok(text) = serde_json::to_string_pretty(&trimmed) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// 同步后回读校验通过 ⇒ 把「会话 id → 文件指纹 + 摘要」登记下来。
+pub fn mark_verified(pairs: &[(String, PathBuf)], lines: usize, digest: &str) -> Result<(), String> {
+    mark_verified_at(&verified_store_path(), pairs, lines, digest)
+}
+
+fn mark_verified_at(
+    path: &Path,
+    pairs: &[(String, PathBuf)],
+    lines: usize,
+    digest: &str,
+) -> Result<(), String> {
+    if digest.is_empty() {
+        return Err("摘要为空，不能登记「已校验」".to_string());
+    }
+    let mut map = load_verified_at(path);
+    let at = chrono::Local::now().timestamp_millis();
+    for (id, p) in pairs {
+        let Some((len, mtime)) = file_stamp(p) else {
+            continue;
+        };
+        map.insert(
+            id.clone(),
+            VerifiedEntry {
+                len,
+                mtime,
+                lines,
+                digest: digest.to_string(),
+                at,
+            },
+        );
+    }
+    save_verified_at(path, &map);
+    Ok(())
+}
+
+/// 这些副本是不是「上次同步时回读校验过、之后谁都没动过」的同一份内容？
+///
+/// 任一份没有记录、或文件指纹变了，就返回 `None`（= 老实说不知道）。
+pub fn verified_after_sync(pairs: &[(String, PathBuf)]) -> Option<(usize, String)> {
+    verified_after_sync_at(&verified_store_path(), pairs)
+}
+
+fn verified_after_sync_at(path: &Path, pairs: &[(String, PathBuf)]) -> Option<(usize, String)> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let map = load_verified_at(path);
+    let mut lines = 0usize;
+    let mut digest = String::new();
+    for (id, p) in pairs {
+        let e = map.get(id)?;
+        let (len, mtime) = file_stamp(p)?;
+        if e.len != len || e.mtime != mtime {
+            return None;
+        }
+        if digest.is_empty() {
+            lines = e.lines;
+            digest = e.digest.clone();
+        } else if e.digest != digest {
+            return None;
+        }
+    }
+    if digest.is_empty() {
+        None
+    } else {
+        Some((lines, digest))
+    }
+}
+
+/// 内容既然已经一致，「谁最新」就只能按更新时间定，其余一律 `equal`。
+///
+/// 抽成纯函数是为了能单测：这条判据一旦歪掉，界面就会重新长出
+/// 「明明一致却说有副本落后」那种自相矛盾的结论。
+fn synced_relations(updated_at: &[i64]) -> (usize, Vec<&'static str>) {
+    let mut newest = 0usize;
+    for pos in 1..updated_at.len() {
+        if updated_at[pos] > updated_at[newest] {
+            newest = pos;
+        }
+    }
+    let rels = (0..updated_at.len())
+        .map(|pos| if pos == newest { "latest" } else { "equal" })
+        .collect();
+    (newest, rels)
+}
+
+/// 一组的客观事实（判据的输入；全是「已算好的布尔值」，不含 IO）。
+#[derive(Debug, Clone, Copy)]
+struct GroupFacts {
+    members: usize,
+    all_body: bool,
+    all_fit: bool,
+    all_cached: bool,
+    recorded: bool,
+}
+
+/// 这一组该怎么下结论。
+#[derive(Debug, PartialEq, Eq)]
+enum Decide {
+    /// 用户点了「强制比对」：不管上限，真读。
+    Forced,
+    /// 体积/成员数都在上限内：逐行比对（常规路径）。
+    Compare,
+    /// 体积超限，但摘要已在缓存（强制比对过 / 同步回读校验算过）⇒ 直接用。
+    ReuseCache,
+    /// 有落盘的「同步后回读校验一致」记录，且文件指纹没变 ⇒ 直接用。
+    ReuseRecord,
+    /// 只能说不知道（成员太多 / 缺正文 / 体积超限且什么都没算过）。
+    Unknown,
+}
+
+/// 纯判据：**顺序即优先级**，别随意调换。
+///
+/// - `Forced` 永远最优先（用户明确要求真读，缓存再新也要重算）；
+/// - 成员数超上限时直接放弃（读 9 份 200 MB 不是「耐心」问题）；
+/// - 「体积合规」「摘要已缓存」「有校验记录」三者任一成立就能给结论。
+///
+/// 抽出来是因为这里一旦写歪，界面就会重新出现「明明一致却写未比对」
+/// 或更糟的「没比对却说一致」——后者是绝对不能有的。
+fn decide_mode(force: bool, f: &GroupFacts) -> Decide {
+    if force {
+        return Decide::Forced;
+    }
+    if f.members > DUP_MAX_MEMBERS || !f.all_body {
+        return Decide::Unknown;
+    }
+    if f.all_fit {
+        return Decide::Compare;
+    }
+    if f.all_cached {
+        return Decide::ReuseCache;
+    }
+    if f.recorded {
+        return Decide::ReuseRecord;
+    }
+    Decide::Unknown
+}
+
+/// 用「已同步并回读校验一致」的记录直接给整组下结论（不读一个字节）。
+fn apply_synced_group(list: &mut [WbSession], idx: &[usize], key: &str, lines: usize, digest: &str) {
+    let stamps: Vec<i64> = idx.iter().map(|&i| list[i].updated_at).collect();
+    let (newest, rels) = synced_relations(&stamps);
+    let label: String = key.chars().take(16).collect();
+    for (pos, &i) in idx.iter().enumerate() {
+        list[i].dup_group = label.clone();
+        list[i].body_lines = lines;
+        list[i].content_digest = digest.to_string();
+        list[i].is_newest = pos == newest;
+        list[i].dup_relation = rels[pos].to_string();
+        list[i].dup_note = if pos == newest {
+            format!("共 {} 份重复标题副本", idx.len())
+        } else {
+            "已与来源同步，回读校验一致（文件未再改动）".to_string()
+        };
+    }
+}
+
 /// 给列表补上「同标题副本」信息：哪一份最新、其余各差多少。
 ///
 /// 读盘（逐行摘要）只对**同标题分组**内的成员做，且限制成员数与单文件体积，
@@ -424,11 +703,49 @@ fn annotate_duplicates_opt(list: &mut [WbSession], force: bool) {
         // ⚠️ 归一化要用**整组**的 id：正文可能引用组内其它副本的 id（实测有过），
         // 只换自己那个会让「刚同步完的副本」互相比对不上，误报「有分歧」。
         let group_ids: Vec<String> = idx.iter().map(|&i| list[i].id.clone()).collect();
-        let detailed = force
-            || (idx.len() <= DUP_MAX_MEMBERS
-                && idx
+        // ---- 这一组到底能不能下结论 -------------------------------------------
+        // 事实先算出来（贵的两项只在「体积超限」时才去碰，常见路径零额外 IO）。
+        let all_body = idx.iter().all(|&i| list[i].has_body);
+        let all_fit = all_body && idx.iter().all(|&i| list[i].body_bytes <= DUP_MAX_BYTES);
+        let mut all_cached = false;
+        let mut recorded: Option<(usize, String)> = None;
+        if !force && all_body && !all_fit && idx.len() <= DUP_MAX_MEMBERS {
+            // ① 摘要是否都已在缓存里（强制比对 / 同步回读校验留下的）——只查不读盘。
+            all_cached = idx.iter().all(|&i| {
+                find_jsonl(&list[i].id)
+                    .map(|p| peek_content_id(&p, &group_ids).is_some())
+                    .unwrap_or(false)
+            });
+            // ② 有没有「同步后回读校验一致」的记录，且每份文件的长度/mtime 与记录逐项相同。
+            if !all_cached {
+                let pairs: Vec<(String, PathBuf)> = idx
                     .iter()
-                    .all(|&i| list[i].has_body && list[i].body_bytes <= DUP_MAX_BYTES));
+                    .filter_map(|&i| {
+                        find_jsonl(&list[i].id).map(|p| (list[i].id.clone(), p))
+                    })
+                    .collect();
+                if pairs.len() == idx.len() {
+                    recorded = verified_after_sync(&pairs);
+                }
+            }
+        }
+        let mode = decide_mode(
+            force,
+            &GroupFacts {
+                members: idx.len(),
+                all_body,
+                all_fit,
+                all_cached,
+                recorded: recorded.is_some(),
+            },
+        );
+        if mode == Decide::ReuseRecord {
+            if let Some((lines, digest)) = recorded {
+                apply_synced_group(list, &idx, &key, lines, &digest);
+                continue;
+            }
+        }
+        let detailed = matches!(mode, Decide::Forced | Decide::Compare | Decide::ReuseCache);
         for &i in &idx {
             if !list[i].has_body {
                 ids.push(None);
@@ -1343,5 +1660,144 @@ mod tests {
         let cb_old = content_id(&b, &["bbbb".to_string()]).unwrap();
         assert_ne!(ca_old.total, cb_old.total);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回读校验：一样就必须说一样，差一行就必须说不一样（读不出来也算不一样）。
+    #[test]
+    fn verify_same_content_detects_real_difference() {
+        let dir = std::env::temp_dir().join(format!("wbsrc-v-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.jsonl");
+        let b = dir.join("b.jsonl");
+        let ids = vec!["aaaa".to_string(), "bbbb".to_string()];
+        std::fs::write(&a, "{\"n\":1}\n{\"n\":2}\n").unwrap();
+        std::fs::write(&b, "{\"n\":1}\n{\"n\":2}\n").unwrap();
+        let r = verify_same_content(&[a.clone(), b.clone()], &ids);
+        assert!(r.all_same, "内容相同必须判一致");
+        assert_eq!(r.lines, 2, "行数要如实报，界面要用它显示");
+        assert!(r.mismatched.is_empty());
+        assert_eq!(r.digest.len(), 16, "摘要取前 16 位，与 content_digest 同口径");
+
+        // 多一行 ⇒ 必须判不一致，且下标指向第二份
+        std::fs::write(&b, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
+        let r = verify_same_content(&[a, b.clone()], &ids);
+        assert!(!r.all_same);
+        assert_eq!(r.mismatched, vec![1usize]);
+
+        // 文件不存在也算不一致 —— 绝不能把「读失败」当成「一样」
+        let missing = dir.join("nope.jsonl");
+        let r = verify_same_content(&[b, missing], &ids);
+        assert!(!r.all_same);
+        assert_eq!(r.mismatched, vec![1usize]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「已同步并校验一致」的记录：刷新能复用，文件一动必须失效。
+    #[test]
+    fn verified_record_survives_refresh_but_dies_on_change() {
+        let dir = std::env::temp_dir().join(format!("wbsrc-r-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.jsonl");
+        let b = dir.join("b.jsonl");
+        let store = dir.join("verified.json");
+        std::fs::write(&a, "{\"n\":1}\n").unwrap();
+        std::fs::write(&b, "{\"n\":1}\n").unwrap();
+        let pairs = vec![
+            ("aaaa".to_string(), a.clone()),
+            ("bbbb".to_string(), b.clone()),
+        ];
+
+        assert!(
+            verified_after_sync_at(&store, &pairs).is_none(),
+            "没登记过就只能是「不知道」，不许猜"
+        );
+
+        mark_verified_at(&store, &pairs, 1, "0123456789abcdef").unwrap();
+        let hit = verified_after_sync_at(&store, &pairs).expect("登记后应能复用结论");
+        assert_eq!(hit, (1usize, "0123456789abcdef".to_string()));
+        assert_eq!(
+            load_verified_at(&store).len(),
+            2,
+            "必须落盘；只放内存的话重启就退回「未比对」"
+        );
+
+        // 文件被改（长度也变）⇒ 记录失效
+        std::fs::write(&b, "{\"n\":1}\n{\"n\":2}\n").unwrap();
+        assert!(
+            verified_after_sync_at(&store, &pairs).is_none(),
+            "文件变了就不能再拿旧结论冒充当前状态"
+        );
+
+        // 只登记了一份 ⇒ 不够下结论
+        let store2 = dir.join("verified2.json");
+        mark_verified_at(&store2, &pairs[..1], 1, "0123456789abcdef").unwrap();
+        assert!(verified_after_sync_at(&store2, &pairs).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已校验一致时的关系：最新那份 `latest`，其余 `equal`；不能冒出 `behind`。
+    #[test]
+    fn synced_group_never_reports_behind() {
+        let (newest, rels) = synced_relations(&[100, 300, 200]);
+        assert_eq!(newest, 1);
+        assert_eq!(rels, vec!["equal", "latest", "equal"]);
+        assert!(!rels.contains(&"behind"), "内容一致就不许说「有副本落后」");
+
+        // 并列时取靠前那个，避免每次刷新「最新」跳来跳去
+        let (newest, rels) = synced_relations(&[500, 500]);
+        assert_eq!(newest, 0);
+        assert_eq!(rels, vec!["latest", "equal"]);
+    }
+
+    /// 判据优先级：强制 > 成员超限 > 体积合规 > 摘要缓存 > 校验记录 > 不知道。
+    ///
+    /// 这条顺序一旦写反，要么「明明一致却写未比对」（用户看到的那个 bug），
+    /// 要么「没比对却说一致」（更糟）。两头都必须锁住。
+    #[test]
+    fn decide_mode_priority_is_stable() {
+        let facts = |members: usize, all_body: bool, all_fit: bool, all_cached: bool, recorded: bool| {
+            GroupFacts {
+                members,
+                all_body,
+                all_fit,
+                all_cached,
+                recorded,
+            }
+        };
+        // 强制比对永远有效：成员超限、什么都没算过也照样真读
+        assert_eq!(
+            decide_mode(true, &facts(20, true, false, false, false)),
+            Decide::Forced
+        );
+        // 成员超上限 ⇒ 不知道（缓存/记录都不该越过这条线）
+        assert_eq!(
+            decide_mode(false, &facts(9, true, false, true, true)),
+            Decide::Unknown
+        );
+        // 缺正文 ⇒ 不知道
+        assert_eq!(
+            decide_mode(false, &facts(3, false, false, true, true)),
+            Decide::Unknown
+        );
+        // 体积合规 ⇒ 常规逐行比对（优先于复用）
+        assert_eq!(
+            decide_mode(false, &facts(3, true, true, true, true)),
+            Decide::Compare
+        );
+        // 超限但摘要已在缓存 ⇒ 直接复用（「强制比对后刷新又变未比对」的修复点）
+        assert_eq!(
+            decide_mode(false, &facts(4, true, false, true, false)),
+            Decide::ReuseCache
+        );
+        // 超限、无缓存、但有同步回读校验记录 ⇒ 复用记录
+        assert_eq!(
+            decide_mode(false, &facts(4, true, false, false, true)),
+            Decide::ReuseRecord
+        );
+        // 什么都没有 ⇒ 老实说不知道，绝不猜「一致」
+        assert_eq!(
+            decide_mode(false, &facts(4, true, false, false, false)),
+            Decide::Unknown
+        );
     }
 }

@@ -261,6 +261,10 @@ export function WorkbuddySessionGroups() {
       const r = await api.workbuddySessionGroupDetailForced(key);
       if (!r.ok) throw new Error(r.error || "强制比对失败");
       setDetail(r as unknown as GroupDetail);
+      // ⚠️ 必须同时刷新外层列表：详情里已经是「一致」，卡片上却还挂着「未比对」，
+      // 这种自相矛盾比不比对更让人怀疑工具坏了。
+      // 摘要进了缓存 ⇒ 重拉列表不会再读一遍盘（`peek_content_id`）。
+      await load(true);
       toast.success("比对完成", {
         description:
           (r as unknown as GroupDetail).statusText
@@ -272,7 +276,7 @@ export function WorkbuddySessionGroups() {
     } finally {
       setForcing(false);
     }
-  }, []);
+  }, [load]);
 
   const items = useMemo(() => {
     const all = data?.items ?? [];
@@ -342,15 +346,28 @@ export function WorkbuddySessionGroups() {
         true,
       );
       if (!r.ok) throw new Error(r.error || "同步失败");
-      toast.success(
-        `已用「${member.accountName}」的副本统一 ${r.syncedCount ?? 0} 个账号`,
-        {
-          description: clientNote(
-            r,
-            r.backupDir ? `原内容已备份：${r.backupDir}` : "原内容已备份，可人工恢复",
-          ),
-        },
-      );
+      const backupNote = r.backupDir
+        ? `原内容已备份：${r.backupDir}`
+        : "原内容已备份，可人工恢复";
+      // 校验结论必须出现在提示里。上一版只有「同步成功」，而弹窗里仍写着
+      // 「无法确认这些副本是否一致」，看起来就像同步没生效 —— 用户就是这么反馈的。
+      const verifyNote =
+        r.verified === undefined
+          ? ""
+          : r.verified
+            ? `已回读校验一致（${r.verifiedLines ?? 0} 条 / ${((r.verifyMs ?? 0) / 1000).toFixed(1)}s）`
+            : `回读校验发现 ${r.verifyMismatch?.length ?? 0} 份与来源不一致，请人工核对`;
+      if (r.verified === false) {
+        // 内容真写下去了（ok=true），但校验没过 —— 不能说「成功」，也不能说「失败」。
+        toast.error("已写入，但回读校验没通过", {
+          description: [verifyNote, backupNote].join(" · "),
+        });
+      } else {
+        toast.success(
+          `已用「${member.accountName}」的副本统一 ${r.syncedCount ?? 0} 个账号`,
+          { description: [verifyNote, clientNote(r, backupNote)].filter(Boolean).join(" · ") },
+        );
+      }
       await load(true);
       // 同步会把同标题簇升级成正式关联组，key 从 `dup:` 换成 `link:`；
       // 用后端回传的新 key 重开，否则拿到的是刚失效的旧 key。
