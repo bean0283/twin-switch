@@ -824,6 +824,40 @@ fn unify_locked(group_key: &str, source_session_id: &str) -> Result<Value, Strin
         ));
     }
 
+    // ---- 回读校验：把「写进去了」变成「写进去的确实一致」 ---------------------
+    //
+    // 用户反馈原话：「强制对比，然后以此为准同步后，还是出现这个问题」——
+    // 同步明明成功了，界面却还是「无法确认这些副本是否一致」。根因是同步完界面走的
+    // 是**非强制**路径，体积超限就只会说「不知道」，于是看起来像没修好。
+    //
+    // 这里真把每一份读回来算摘要（不是拿「我刚写过」当结论），一致就把结论登记下来：
+    // 之后的刷新、甚至重启工具，都不再退回「未比对」。
+    let group_ids: Vec<String> = g
+        .members
+        .iter()
+        .map(|m| m.cid().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let mut verify_paths: Vec<std::path::PathBuf> = vec![src_path.clone()];
+    let mut verify_ids: Vec<String> = vec![source_session_id.to_string()];
+    let mut pairs: Vec<(String, std::path::PathBuf)> =
+        vec![(source_session_id.to_string(), src_path.clone())];
+    for (cid, dest, _saved) in &written {
+        verify_paths.push(dest.clone());
+        verify_ids.push(cid.clone());
+        pairs.push((cid.clone(), dest.clone()));
+    }
+    let report = workbuddy_source::verify_same_content(&verify_paths, &group_ids);
+    if report.all_same {
+        // 校验不过就**不登记**：界面上能看到的永远只能是「真的核对过」的结论。
+        let _ = workbuddy_source::mark_verified(&pairs, report.lines, &report.digest);
+    }
+    let verify_mismatch: Vec<String> = report
+        .mismatched
+        .iter()
+        .map(|&i| verify_ids.get(i).cloned().unwrap_or_default())
+        .collect();
+
     // 库行时间跟着走，否则客户端列表里的「更新时间」还停在旧值。
     let now = chrono::Local::now().timestamp_millis();
     let conn = rusqlite::Connection::open(workbuddy_sessions::db_path())
@@ -869,7 +903,16 @@ fn unify_locked(group_key: &str, source_session_id: &str) -> Result<Value, Strin
         "syncedCount": details.len(),
         "backupDir": backup_dir.to_string_lossy(),
         "dbBackup": db_backup.to_string_lossy(),
-        "note": "已用选中副本覆盖其它账号副本；原内容已备份，可人工恢复",
+        // 回读校验结论：`verified = false` 时正文已写入但内容对不上，界面必须照实说。
+        "verified": report.all_same,
+        "verifiedLines": report.lines,
+        "verifyMs": report.elapsed_ms,
+        "verifyMismatch": verify_mismatch,
+        "note": if report.all_same {
+            "已用选中副本覆盖其它账号副本，并回读校验一致；原内容已备份，可人工恢复"
+        } else {
+            "已写入，但回读校验发现有不一致的副本，请人工核对；原内容已备份，可人工恢复"
+        },
     }))
 }
 

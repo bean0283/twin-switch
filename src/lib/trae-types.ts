@@ -1837,6 +1837,19 @@ export interface WbGroupUnifyReport {
   clientRestarted?: boolean;
   /** 自动重启失败的原因（有值就说明客户端还是关着的，得让用户手动开）。 */
   restartError?: string;
+  /**
+   * 写入后是否**回读校验**过并确认各副本内容一致（后端真读盘算摘要，不是「我刚写过」）。
+   *
+   * 体积超限的组默认不比对，界面只能写「无法确认」；同步是唯一能让工具知道
+   * 「现在它们确实一样」的动作，所以这个结论必须带到界面上，不能只说「同步成功」。
+   */
+  verified?: boolean;
+  /** 校验得到的行数。 */
+  verifiedLines?: number;
+  /** 校验耗时（毫秒；大组要读几百 MB）。 */
+  verifyMs?: number;
+  /** 校验发现与来源不一致的会话 id（空 = 全部一致）。 */
+  verifyMismatch?: string[];
   note?: string;
   error?: string;
 }
