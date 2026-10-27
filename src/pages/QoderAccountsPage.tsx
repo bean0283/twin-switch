@@ -17,6 +17,7 @@ import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
+import { AccountTokenDialog } from "@/components/account-token-dialog";
 import { CheckinButton } from "@/components/checkin-button";
 import {
   CreditBlock as CreditBlockView,
@@ -28,6 +29,7 @@ import { Button } from "@/components/ui/button";
 import {
   qoderAccountsExport,
   qoderAccountsList,
+  qoderAccountRefresh,
   qoderAccountsRefreshAll,
   qoderAccountRemove,
   qoderAccountRename,
@@ -39,7 +41,6 @@ import {
   qoderLoginPoll,
   qoderLoginStart,
   qoderRegions,
-  qoderTokenRefresh,
   traeRevealPath,
   qoderAccountSetCosy,
 } from "@/lib/api";
@@ -94,12 +95,6 @@ function accountName(a: QoderAccount): string {
   return `uid …${a.uid.slice(-6)}`;
 }
 
-/** 只留前 6 / 后 4，中间打码 —— 截图发出去也不会泄露。 */
-function mask(v: string | null): string {
-  if (!v) return "—";
-  if (v.length <= 12) return "•".repeat(v.length);
-  return `${v.slice(0, 6)}…${v.slice(-4)}`;
-}
 
 const money = (v: number | null) =>
   v == null
@@ -196,9 +191,8 @@ export default function QoderAccountsPage() {
   const [loginState, setLoginState] = useState<"idle" | "pending" | "ok" | "error">("idle");
   const [loginError, setLoginError] = useState<string | null>(null);
 
+  /** 打开令牌弹窗的账号（弹窗本身是共用的 `AccountTokenDialog`）。 */
   const [dialog, setDialog] = useState<QoderAccount | null>(null);
-  const [showSecret, setShowSecret] = useState(false);
-  const [refreshingToken, setRefreshingToken] = useState(false);
 
   const fileRef = useRef<HTMLInputElement | null>(null);
   /** 已自动查过额度的区域（每个区域只自动查一次，避免 reload 后自我循环）。 */
@@ -206,6 +200,8 @@ export default function QoderAccountsPage() {
 
   /** 展开「全部积分包」的账号（与 Trae / WorkBuddy 同一个弹窗）。 */
   const [expand, setExpand] = useState<QoderAccount | null>(null);
+  /** 正在单独刷新的账号 id（该卡片积分块里的按钮转圈）。 */
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     setBusy(true);
@@ -398,22 +394,6 @@ export default function QoderAccountsPage() {
     }
   }
 
-  /** 刷新 token 有效期（用 refresh_token 换新 token）。 */
-  async function doRefreshToken(a: QoderAccount) {
-    setRefreshingToken(true);
-    setError(null);
-    try {
-      const updated = (await qoderTokenRefresh(a.region, a.id)) as QoderAccount;
-      setDialog(updated);
-      toast.success("令牌已刷新");
-      await reload();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRefreshingToken(false);
-    }
-  }
-
   async function removeOne(a: QoderAccount) {
     if (!confirm(`把 ${a.name || a.uid} 移到回收站？之后可以恢复。`)) return;
     setBusy(true);
@@ -424,6 +404,32 @@ export default function QoderAccountsPage() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * 只刷新**一个**账号的额度（卡片积分块里的小刷新按钮）。
+   *
+   * 与 `refreshAll` 分开：整批会把整个区域的账号串行查一遍（每个账号一次接口，
+   * 还要防频控）；点一个号就只该等那一个号。成功后**原地替换**该条，
+   * 不整批重拉 —— 其它账号的数字和时间戳不会被无关地改动。
+   */
+  async function refreshOne(a: QoderAccount) {
+    if (refreshingId) return; // 连点保护
+    setRefreshingId(a.id);
+    setError(null);
+    try {
+      const up = (await qoderAccountRefresh(a.region, a.id)) as QoderAccount;
+      if (!up || up.id !== a.id) {
+        toast.error("这个账号的额度没刷到", { description: "接口没有返回该账号的最新额度" });
+        return;
+      }
+      setRows((prev) => prev.map((r) => (r.id === up.id ? { ...r, ...up } : r)));
+    } catch (e) {
+      // 失败保留旧数字，但必须说出来 —— 静默不动会让用户以为刷新没生效。
+      toast.error("额度查询失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRefreshingId(null);
     }
   }
 
@@ -716,11 +722,14 @@ export default function QoderAccountsPage() {
                 name={accountName(a)}
                 identity={`uid ${a.uid}`}
                 identityMono
-                identityTitle={a.uid}
-                onAvatarClick={() => {
-                  setDialog(a);
-                  setShowSecret(false);
-                }}
+                identityTitle={
+                  // 「上次使用」原来单独占卡片底部一行（Qoder 独有）—— 那正是与另两家的
+                  // 布局差异。并进悬停提示后信息不丢，卡片主体只剩积分块，三页结构一致。
+                  a.last_used_at
+                    ? `${a.uid}\n上次使用 ${fmtTime(a.last_used_at)}`
+                    : a.uid
+                }
+                onAvatarClick={() => setDialog(a)}
                 avatarLabel={`查看 ${a.name || a.uid} 的令牌`}
                 chips={
                   <>
@@ -753,119 +762,59 @@ export default function QoderAccountsPage() {
                 }
               >
                 {/* 与 Trae / WorkBuddy 同一个积分块：大数字 + 包数 + 每包剩余/到期 + 「全部积分包」 */}
-                <CreditBlockView item={qoderToView(a)} onExpand={() => setExpand(a)} />
-
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  上次使用 {fmtTime(a.last_used_at)}
-                </p>
+                <CreditBlockView
+                  item={qoderToView(a)}
+                  onExpand={() => setExpand(a)}
+                  onRefresh={() => void refreshOne(a)}
+                  refreshing={refreshingId === a.id}
+                  refreshHint="重新查询这个账号的额度"
+                />
               </AccountCard>
             );
           })}
         </div>
       )}
 
-      {dialog && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-          onClick={() => setDialog(null)}
-        >
-          <div
-            className="w-full max-w-lg rounded-2xl border bg-card p-5 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h2 className="text-sm font-semibold">令牌与有效期</h2>
-                <p className="mt-0.5 text-xs text-muted-foreground">{dialog.name || dialog.uid}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setDialog(null)}
-                className="rounded-lg border px-2.5 py-1 text-xs hover:bg-accent"
-              >
-                关闭
-              </button>
-            </div>
-
-            <div className="mt-3 space-y-2 text-[11px]">
-              <div>
-                <div className="text-muted-foreground">Access token</div>
-                <code className="mt-0.5 block break-all rounded-lg border bg-muted/30 px-2 py-1.5 font-mono">
-                  {showSecret ? dialog.access_token || "—" : mask(dialog.access_token)}
-                </code>
-              </div>
-              <div>
-                <div className="text-muted-foreground">Refresh token</div>
-                <code className="mt-0.5 block break-all rounded-lg border bg-muted/30 px-2 py-1.5 font-mono">
-                  {showSecret ? dialog.refresh_token || "—" : mask(dialog.refresh_token)}
-                </code>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">令牌来源</span>
-                <span className="font-mono">{dialog.source}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">令牌到期</span>
-                <span>{fmtTime(dialog.expires_at)}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">上次刷新</span>
-                <span>{fmtTime(dialog.credits_updated_at)}</span>
-              </div>
-            </div>
-
-            <div className="mt-4 flex flex-wrap items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => setShowSecret((v) => !v)}>
-                {showSecret ? "隐藏明文" : "显示明文"}
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => void doRefreshToken(dialog)}
-                disabled={refreshingToken}
-                className="gap-1.5"
-              >
-                {refreshingToken ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="size-4" />
-                )}
-                刷新有效期
-              </Button>
-              {dialog.access_token && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => void navigator.clipboard.writeText(dialog.access_token ?? "")}
-                >
-                  复制 access token
-                </Button>
-              )}
-              <Button
-                size="sm"
-                variant="ghost"
-                title="抓包请求头里复制 cosy-machinetoken / cosy-machinetype 各一份；活动下发绑定这个身份"
-                onClick={async () => {
-                  const tk = window.prompt("粘贴 cosy-machinetoken（抓包请求头里整段复制）");
-                  if (!tk?.trim()) return;
-                  const ty = window.prompt("粘贴 cosy-machinetype（18 位）");
-                  if (!ty?.trim()) return;
-                  try {
-                    await qoderAccountSetCosy(dialog.region, dialog.id, tk.trim(), ty.trim());
-                    toast.success("Cosy 设备身份已保存", {
-                      description: "之后签到 / 查活动会用它",
-                    });
-                    await reload();
-                  } catch (e) {
-                    setError(String(e));
-                  }
-                }}
-              >
-                设置 Cosy 设备令牌…
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 令牌弹窗：**与 Trae / WorkBuddy 同一个组件**（原来这里是手写的 fixed 遮罩，
+          遮罩、按钮、打码、续期门槛全都是第二套实现 —— 三页各一套就是这次要消灭的）。
+          Qoder 独有的「设置 Cosy 设备令牌」通过 `extraFooter` 插槽挂在「关闭」左边，
+          不额外造一个弹窗。 */}
+      <AccountTokenDialog
+        open={dialog !== null}
+        onOpenChange={(v) => {
+          if (!v) setDialog(null);
+        }}
+        provider="qoder"
+        targetKey={dialog?.region ?? null}
+        accountId={dialog?.id ?? null}
+        accountName={dialog ? dialog.name || dialog.uid : null}
+        extraFooter={
+          dialog ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              title="抓包请求头里复制 cosy-machinetoken / cosy-machinetype 各一份；活动下发绑定这个身份"
+              onClick={async () => {
+                const tk = window.prompt("粘贴 cosy-machinetoken（抓包请求头里整段复制）");
+                if (!tk?.trim()) return;
+                const ty = window.prompt("粘贴 cosy-machinetype（18 位）");
+                if (!ty?.trim()) return;
+                try {
+                  await qoderAccountSetCosy(dialog.region, dialog.id, tk.trim(), ty.trim());
+                  toast.success("Cosy 设备身份已保存", {
+                    description: "之后签到 / 查活动会用它",
+                  });
+                  await reload();
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+            >
+              设置 Cosy 设备令牌…
+            </Button>
+          ) : null
+        }
+      />
 
       {/* 全部积分包（与 Trae / WorkBuddy 同一个弹窗） */}
       <CreditsDialogView

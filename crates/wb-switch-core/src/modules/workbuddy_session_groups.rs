@@ -226,7 +226,19 @@ fn project_label(cwd: &str) -> String {
 
 /// 装配全部会话组。**列表与详情共用**，避免两处算出不同的成员集合。
 fn collect() -> Result<(Vec<Group>, Vec<(String, String)>), String> {
-    let all = workbuddy_source::list_sessions()?;
+    collect_opt(false)
+}
+
+/// [`collect`] 的带开关版本。
+///
+/// `force = true` ⇒ 会话列表走 [`workbuddy_source::list_sessions_forced`]，
+/// **忽略体积/成员数上限真的逐行比对**（用户手动点了「强制比对」才走这条）。
+fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), String> {
+    let all = if force {
+        workbuddy_source::list_sessions_forced()?
+    } else {
+        workbuddy_source::list_sessions()?
+    };
     let accounts = usable_accounts();
     let store = workbuddy_sessions::load_links()?;
 
@@ -464,7 +476,19 @@ pub fn list() -> Result<Value, String> {
 
 /// 单个关联组的成员明细（与 [`list`] 同源，保证数字一致）。
 pub fn detail(group_key: &str) -> Result<Value, String> {
-    let (groups, accounts) = collect()?;
+    detail_opt(group_key, false)
+}
+
+/// [`detail`] 的**强制比对**版本：忽略体积上限，逐行读完再判「一致 / 不一致」。
+///
+/// ⚠️ 慢是预期：一份 227 MB 的正文要读几秒，几个副本就是十几秒。
+/// 所以只在用户**手动点「强制比对」**时调用（默认路径绝不走这里）。
+pub fn detail_forced(group_key: &str) -> Result<Value, String> {
+    detail_opt(group_key, true)
+}
+
+fn detail_opt(group_key: &str, force: bool) -> Result<Value, String> {
+    let (groups, accounts) = collect_opt(force)?;
     let g = find_group(&groups, group_key)?;
     let mut payload = group_payload(g, &accounts);
     if let Some(obj) = payload.as_object_mut() {
@@ -539,7 +563,7 @@ fn require_closed() -> Result<(), String> {
 /// 所以不能去掉；正确做法是**用户在确认框里同意后，由本工具主动退出它再写**。
 ///
 /// `close_client = false` 时行为不变（拒绝 + 说明原因），供没有界面的调用方使用。
-fn ensure_closed(close_client: bool) -> Result<bool, String> {
+pub(crate) fn ensure_closed(close_client: bool) -> Result<bool, String> {
     if !workbuddy_switch::is_running() {
         return Ok(false);
     }
@@ -899,6 +923,131 @@ pub fn link_session(
     })
 }
 
+/// [`unlink_members`] 的存储层：就地把要移除的成员从关联记录里拿掉。
+///
+/// 返回「组是否被整体删除」。**单独拆出来是为了能单测** —— 真正的入口要先扫会话库
+/// （本机 DB + 账号库），单测里造不出那些条件；而这段「按 uid 删成员 / 剩几个就解散 /
+/// 聚类组要补记录」的判据恰恰是最容易写错的部分。
+fn apply_unlink_store(
+    store: &mut workbuddy_sessions::LinkStore,
+    group_id: Option<&str>,
+    removed: &[String],
+    keep: &[(String, String)],
+    now: i64,
+) -> Result<bool, String> {
+    let mut group_deleted = false;
+    match group_id {
+        // ① 正式关联组：直接删成员。
+        Some(id) => {
+            let Some(idx) = store.groups.iter().position(|x| x.id == id) else {
+                return Err("关联记录刚被改动过，请刷新后重试".to_string());
+            };
+            store.groups[idx]
+                .members
+                .retain(|m| !removed.iter().any(|u| *u == m.uid));
+            // 只剩 0/1 个成员时「组」不成立：留着会让那份副本永远被算作「已关联」，
+            // 以后再也无法和别的副本聚到一起。
+            if store.groups[idx].members.len() <= 1 {
+                store.groups.remove(idx);
+                group_deleted = true;
+            }
+        }
+        // ② 同标题聚类组（本来没有记录）：给留下的人补一条，才能表达「已经拆开」。
+        None => {
+            if keep.len() >= 2 {
+                store.version = workbuddy_sessions::LINK_STORE_VERSION;
+                store.groups.push(workbuddy_sessions::LinkGroup {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    created_at: now,
+                    members: keep
+                        .iter()
+                        .map(|(uid, sid)| workbuddy_sessions::LinkMember {
+                            uid: uid.clone(),
+                            session_id: sid.clone(),
+                            linked_at: now,
+                        })
+                        .collect(),
+                });
+            }
+            // keep < 2：没有可登记的组合，什么都不写（单份副本本来就不成组）。
+        }
+    }
+    Ok(group_deleted)
+}
+
+/// 取消关联：把指定账号从这个「同一段对话」的关联里移除。
+///
+/// ## 只删记录，不动会话
+///
+/// 这里**不写会话库、不碰正文文件**，只改 `workbuddy-session-links.json`。
+/// 所以也**不需要关客户端**（其它写入接口要先退出，是因为它们要改 sqlite / jsonl）。
+/// 用户点了「取消关联」之后，那个账号的会话仍然在它自己名下，只是不再被当成同一段对话。
+///
+/// ## 两种组的处理不一样
+///
+/// * **正式关联组**（`link:<id>`）：直接从记录里删成员；删到只剩 0/1 个时把整组删掉
+///   —— 只留一个成员的话「组」不成立，留着会让那份副本永远被当成「已关联」，
+///   以后再也无法和别的副本聚到一起。
+/// * **同标题聚类组**（`dup:<标题>`）：本来就没有记录，要表达「把他们拆开」只能
+///   **给留下的人补一条正式记录**。否则下次列表又按标题把它们聚回去，用户会看到
+///   「点了取消关联，它还在」。
+pub fn unlink_members(group_key: &str, uids: &[String]) -> Result<Value, String> {
+    // 定位组（key 可能是 link:<id> / dup:<标题> / 备用别名 —— 都交给 find_group）。
+    let (groups, _accounts) = collect()?;
+    let g = find_group(&groups, group_key)?;
+    let group_id = g.group_id.clone();
+    let title = g.title();
+    let members: Vec<(String, String)> = g
+        .members
+        .iter()
+        .map(|m| (m.uid.clone(), m.cid().to_string()))
+        .collect();
+
+    // 归一化要移除的账号：去重、忽略空串。**一个都没给 = 取消全部**
+    // （界面「取消全部关联」会把成员 uid 全传过来，走的是同一条路，不搞两个分支）。
+    let mut want: Vec<String> = Vec::new();
+    for u in uids {
+        let u = u.trim();
+        if !u.is_empty() && !want.iter().any(|x| x == u) {
+            want.push(u.to_string());
+        }
+    }
+    let remove_all = want.is_empty();
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut keep: Vec<(String, String)> = Vec::new();
+    for (uid, sid) in members.iter() {
+        if remove_all || want.iter().any(|w| w == uid) {
+            removed.push(uid.clone());
+        } else {
+            keep.push((uid.clone(), sid.clone()));
+        }
+    }
+    if removed.is_empty() {
+        return Err("这些账号本来就不在这个关联组里（请刷新后重试）".to_string());
+    }
+
+    let mut store = workbuddy_sessions::load_links()?;
+    let group_deleted = apply_unlink_store(
+        &mut store,
+        group_id.as_deref(),
+        &removed,
+        &keep,
+        crate::modules::config::now_ms(),
+    )?;
+    workbuddy_sessions::save_links(&store)?;
+
+    Ok(json!({
+        "ok": true,
+        "title": title,
+        "removed": removed,
+        "removedCount": removed.len(),
+        "remaining": keep.len(),
+        "groupDeleted": group_deleted,
+        "note": "只删了关联记录，会话数据一个字节都没动",
+    }))
+}
+
 /// 把客户端重新拉起来。
 ///
 /// ⚠️ **我们关的就得我们开回来**：2026-10-24 用户反馈「同步会话后 WorkBuddy 不会自动
@@ -906,7 +1055,7 @@ pub fn link_session(
 /// 拉起，不等窗口就绪 —— 界面不该为此卡住。
 ///
 /// 返回 `(是否已启动, 失败原因)`。没关过就不启动（不能因为一次同步就凭空多开一个客户端）。
-fn restart_client(stopped: bool) -> (bool, Option<String>) {
+pub(crate) fn restart_client(stopped: bool) -> (bool, Option<String>) {
     if !stopped {
         return (false, None);
     }

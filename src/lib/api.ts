@@ -3,6 +3,8 @@ import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
   BackupRetention,
   CheckinResult,
+  DiagLogSettings,
+  DiagLogStatus,
   SettingsSnapshot,
   TraeAccountOverview,
   TraeAccountToken,
@@ -14,6 +16,8 @@ import type {
   TraeBrowserInfo,
   TraeCleanupReport,
   TraeCleanupScan,
+  TraeCreditEntry,
+  AccountTokenInfo,
   TraeCreditsResult,
   TraeDecryptReport,
   TraeDecryptedStatus,
@@ -33,6 +37,7 @@ import type {
   TraeOAuthSessionStatus,
   TraeOAuthStartResult,
   TraeProfileRefreshResult,
+  TraeScanDecryptTimings,
   TraeScanResult,
   TraeSessionDetail,
   TraeSessionInfo,
@@ -64,6 +69,7 @@ import type {
   WbSessionCopyPreview,
   WbGroupCandidatesReport,
   WbGroupUnifyReport,
+  WbSessionCopyMultiReport,
   WbSessionCopyReport,
   WbSessionGroup,
   WbSessionGroupsReport,
@@ -238,6 +244,10 @@ export function traeScanAndDecrypt(
 ): Promise<{
   scan: TraeScanResult;
   report: TraeDecryptReport;
+  /** 本次是否复用了已有快照（true = 没有重新整库解密）。 */
+  reused: boolean;
+  /** 分段耗时：扫描 / 解密 / 总耗时。 */
+  timings: TraeScanDecryptTimings;
   decryptedDb: string;
   progress: string[];
 }> {
@@ -920,8 +930,34 @@ export function settingsSet(patch: {
   syncWorkbuddyAutomations?: boolean;
   /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */
   autoLinkWorkbuddySessions?: boolean;
+  /** 诊断日志设置（**整块覆盖**：给全量，不是增量）。 */
+  log?: DiagLogSettings;
 }): Promise<SettingsSnapshot> {
   return call("settings_set", { patch });
+}
+
+// ---------------------------------------------------------------------------
+// 诊断日志（默认关闭）
+// ---------------------------------------------------------------------------
+
+/** 日志现状：开关、目录、占用、每天的文件数与大小。 */
+export function diagLogStatus(): Promise<DiagLogStatus> {
+  return call("diag_log_status");
+}
+
+/** 最近的若干行日志（设置页「看一眼」，默认 200 行）。 */
+export function diagLogTail(limit = 200): Promise<{ ok: boolean; lines: string[]; error?: string }> {
+  return call("diag_log_tail", { limit });
+}
+
+/** 立即清空日志（**直接删，不进回收站**）。 */
+export function diagLogClear(): Promise<{ ok: boolean; freedBytes?: number; error?: string }> {
+  return call("diag_log_clear");
+}
+
+/** 打开日志目录（不存在时后端会先建出来）。 */
+export function diagLogOpen(): Promise<{ ok: boolean; dir?: string; error?: string }> {
+  return call("diag_log_open");
 }
 
 /**
@@ -1001,6 +1037,19 @@ export function traeCreditsQuery(
   force = false,
 ): Promise<TraeCreditsResult> {
   return call("trae_credits_query", { clientKey: clientKey ?? null, force });
+}
+
+/**
+ * 只刷新**一个** Trae 账号的积分（账号卡上的小刷新按钮）。
+ *
+ * 与 `traeCreditsQuery` 的区别：那个整批刷新所有账号并写整份磁盘缓存；
+ * 这个只打该账号一次接口，返回形状与整批结果里的单条一致。
+ */
+export function traeCreditsOne(
+  clientKey: string | null | undefined,
+  id: string,
+): Promise<TraeCreditEntry> {
+  return call("trae_credits_one", { clientKey: clientKey ?? null, id });
 }
 
 /**
@@ -1190,6 +1239,27 @@ export function workbuddySessionCopy(
   return call("workbuddy_session_copy", { sourceUid, targetUid, ids });
 }
 
+/**
+ * **多目标**复制：一次把选中的会话复制给多个账号。
+ *
+ * 与 `workbuddySessionCopy` 的区别：那个一次只能一个目标，要复制给 3 个号就得点 3 遍
+ * （每遍各备份一次整库）。这个逐目标执行、**每个目标独立成败**，结果按目标逐条返回。
+ */
+export function workbuddySessionCopyMulti(
+  sourceUid: string,
+  targetUids: string[],
+  ids: string[],
+  closeClient = false,
+): Promise<WbSessionCopyMultiReport> {
+  return call("workbuddy_session_copy_multi", {
+    sourceUid,
+    targetUids,
+    ids,
+    // true = 客户端在跑就由本工具退出它，复制完再开回来（需用户先确认）
+    closeClient,
+  });
+}
+
 export function workbuddySessionLinksPreview(
   sourceUid: string,
   targetUid: string,
@@ -1229,6 +1299,48 @@ export function workbuddySessionGroups(): Promise<WbSessionGroupsReport> {
 /** 关联会话：单个组的成员明细（与列表同源）。 */
 export function workbuddySessionGroupDetail(groupKey: string): Promise<WbSessionGroupsReport & WbSessionGroup> {
   return call("workbuddy_session_group_detail", { groupKey });
+}
+
+/**
+ * 关联会话：**强制比对**一个组。
+ *
+ * 默认详情在「体积超限 / 成员过多」时不做逐行比对（只回「无法确认」），
+ * 因为一份 227 MB 的正文读一次要几秒。这个接口是用户**手动确认**后才走的慢路径：
+ * 真的读完整正文，因此可能要十几秒 —— 调用方必须显示「正在分析」。
+ */
+export function workbuddySessionGroupDetailForced(
+  groupKey: string,
+): Promise<WbSessionGroupsReport & WbSessionGroup> {
+  return call("workbuddy_session_group_detail_forced", { groupKey });
+}
+
+/** 取消关联的结果（`workbuddy_session_unlink_members`）。 */
+export interface WbSessionUnlinkReport {
+  ok: boolean;
+  title: string;
+  /** 被移除的账号 uid。 */
+  removed: string[];
+  removedCount: number;
+  /** 组里还剩几个账号（0 = 整组解散）。 */
+  remaining: number;
+  /** 组记录被整体删掉了（成员不足 2 个）。 */
+  groupDeleted: boolean;
+  note: string;
+}
+
+/**
+ * 关联会话：**取消关联**（把指定账号从「同一段对话」里移除）。
+ *
+ * ⚠️ 只删关联记录，**不动任何会话数据** —— 会话仍然在各自账号名下，
+ * 所以这个动作不需要关客户端、也不会备份会话库。
+ *
+ * `uids` 传全部成员 = 取消全部关联。
+ */
+export function workbuddySessionUnlinkMembers(
+  groupKey: string,
+  uids: string[],
+): Promise<WbSessionUnlinkReport> {
+  return call("workbuddy_session_unlink_members", { groupKey, uids });
 }
 
 /** 关联会话：还没纳入关联组的会话（供「新增关联会话」选择）。 */
@@ -1672,6 +1784,22 @@ export async function qoderCheckinAll(region: string): Promise<{
 // Qoder token 刷新 / 改名 / 设为默认
 export async function qoderTokenRefresh(region: string, id: string): Promise<unknown> {
   return invoke("qoder_token_refresh", { region, id });
+}
+
+/**
+ * Qoder 账号 token 弹窗的数据：与 Trae / WorkBuddy **同一个形状**（`AccountTokenInfo`）。
+ * 三个产品的令牌弹窗是同一个组件，按 `provider` 分流取值。
+ */
+export function qoderAccountToken(region: string, id: string): Promise<AccountTokenInfo> {
+  return invoke("qoder_account_token", { region, id });
+}
+
+/**
+ * Qoder 账号 token 续期，返回与 Trae / WorkBuddy 同一形状的刷新结果
+ * （共用弹窗只认 `{ refreshed, remainingDays, message, tokenExp… }`）。
+ */
+export function qoderAccountTokenRefresh(region: string, id: string): Promise<TraeAccountTokenRefresh> {
+  return invoke("qoder_account_token_refresh", { region, id });
 }
 
 export async function qoderAccountRename(

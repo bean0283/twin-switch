@@ -105,6 +105,8 @@ function WorkbuddyAccountCard({
   onDelete,
   onAvatarClick,
   onExpand,
+  onRefreshCredits,
+  creditsRefreshing,
 }: {
   acc: WorkbuddyAccount;
   credit: WbCreditItem | null;
@@ -114,6 +116,9 @@ function WorkbuddyAccountCard({
   onSwitch: () => void;
   onRename: () => void;
   onDelete: () => void;
+  /** 只刷新这个账号的积分（积分块里的小刷新按钮）。 */
+  onRefreshCredits: () => void;
+  creditsRefreshing: boolean;
   /** 点头像 = 看这个账号的 token（可复制 / 续期）。 */
   onAvatarClick: () => void;
   onExpand: () => void;
@@ -156,7 +161,14 @@ function WorkbuddyAccountCard({
         </>
       }
     >
-      <CreditBlock item={credit} error={creditError} loading={creditsLoading} onExpand={onExpand} />
+      <CreditBlock
+        item={credit}
+        error={creditError}
+        loading={creditsLoading}
+        onExpand={onExpand}
+        onRefresh={acc.hasToken ? onRefreshCredits : undefined}
+        refreshing={creditsRefreshing}
+      />
     </AccountCard>
   );
 }
@@ -771,6 +783,8 @@ export default function WorkbuddySwitchPage() {
                   const it = creditByUid.get(key);
                   if (it) credits.setExpand(it);
                 }}
+                onRefreshCredits={() => void credits.refreshOne(acc.id)}
+                creditsRefreshing={credits.refreshingId === acc.id}
               />
             );
           })}

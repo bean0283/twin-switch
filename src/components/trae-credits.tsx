@@ -65,16 +65,29 @@ export function TraeCreditBlock({
   entry,
   loading,
   onExpand,
+  onRefresh,
+  refreshing,
 }: {
   entry: TraeCreditEntry | null;
   loading?: boolean;
   onExpand: () => void;
+  /** 只刷新这个账号；不传就不画按钮。 */
+  onRefresh?: () => void;
+  refreshing?: boolean;
 }) {
   return (
     <CreditBlockView
       item={entry ? traeEntryToView(entry) : null}
       loading={loading}
       onExpand={onExpand}
+      onRefresh={onRefresh}
+      refreshing={refreshing}
+      refreshDisabled={entry ? !entry.queryable : false}
+      refreshHint={
+        entry && !entry.queryable
+          ? "该账号是切换载体，没有网页凭证，无法查询积分"
+          : "重新查询这个账号的积分"
+      }
     />
   );
 }
@@ -101,6 +114,15 @@ export interface TraeCreditsState {
   error: string | null;
   busy: boolean;
   refresh: () => Promise<void>;
+  /**
+   * 只刷新一个账号（卡片上的小刷新按钮）。
+   *
+   * 成功后把**这一条**替换进 `result.accounts` 并重算 `summary` —— 不整批重拉，
+   * 所以点了哪个号就只等那一个号的接口。失败只提示，不动其它账号的数字。
+   */
+  refreshOne: (id: string) => Promise<void>;
+  /** 正在单独刷新的账号 id（该卡片的按钮转圈）。 */
+  refreshingId: string | null;
   expand: TraeCreditEntry | null;
   setExpand: (v: TraeCreditEntry | null) => void;
 }
@@ -115,6 +137,8 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
   const [result, setResult] = useState<TraeCreditsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 正在单独刷新的账号（同一时刻只允许一个，避免连点打一串接口）。 */
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [expand, setExpand] = useState<TraeCreditEntry | null>(null);
 
   useEffect(() => {
@@ -153,7 +177,56 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
     }
   }, [clientKey]);
 
-  return { result, error, busy, refresh, expand, setExpand };
+  /**
+   * 单账号刷新。
+   *
+   * ⚠️ 与 `refresh`（整批）**不是同一条链路**：整批会写整份磁盘缓存并重拉所有账号；
+   * 这里只打这一个号，然后把结果**原地替换**进现有 result。这样：
+   * ① 只等一个请求；② 其它账号的数字与时间戳不会被无关地改动。
+   */
+  const refreshOne = useCallback(
+    async (id: string) => {
+      if (refreshingId) return; // 已有一个在刷（连点保护）
+      setRefreshingId(id);
+      try {
+        const one = (await api.traeCreditsOne(clientKey, id)) as TraeCreditEntry;
+        if (one && one.ok === false && one.error) {
+          // 失败：保留旧数字，只把原因说出来（不能悄悄不动，用户会以为刷新没生效）
+          toast.error("这个账号的积分没刷到", { description: one.error });
+          return;
+        }
+        setResult((prev) => {
+          if (!prev) return prev;
+          const accounts = prev.accounts.map((x) => (x.id === id ? one : x));
+          const succeeded = accounts.filter((x) => x.ok).length;
+          const totalRemaining = accounts.reduce(
+            (n, x) => n + (x.ok ? Number(x.remaining ?? 0) : 0),
+            0,
+          );
+          return {
+            ...prev,
+            accounts,
+            // 与后端 `summarize()` 同口径：只统计成功的账号。
+            summary: {
+              queried: accounts.length,
+              succeeded,
+              failed: accounts.length - succeeded,
+              totalRemaining,
+            },
+            updatedAt: Date.now(),
+            cached: false,
+          };
+        });
+      } catch (e) {
+        toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+      } finally {
+        setRefreshingId(null);
+      }
+    },
+    [clientKey, refreshingId],
+  );
+
+  return { result, error, busy, refresh, refreshOne, refreshingId, expand, setExpand };
 }
 
 /** 顶部工具条（与 WorkBuddy 侧同一套）。 */

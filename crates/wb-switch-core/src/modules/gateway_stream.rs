@@ -201,6 +201,54 @@ pub fn session_id(seed: &str, salt: &str) -> String {
 ///
 /// 组成：上游模型名 + 账号 uid + system 提示词 + 工具名（排序后）+ 第一条 user 消息。
 /// ⚠️ 绝不能把「最后一条 user」或任何时间戳放进来 —— 那样每轮指纹都变，等于没做亲和。
+/// 这段对话的**身份**（不含账号）：模型 + 首条 user。
+///
+/// 用途 = 会话粘性（同一段对话固定同一个账号）。**故意不含 uid**：
+/// 它回答的是「这是哪一段对话」，而不是「这是谁在跑」。
+///
+/// ⚠️ 不能直接用 [`session_seed`]：那个把 uid 也拼进去了（上游会话 ID 需要），
+/// 拿它当粘性键会导致「换号后键也变了」⇒ 永远粘不住。
+pub fn conversation_key(model: &str, req: &Value) -> String {
+    let arr = req
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let first_user = arr
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|m| match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        })
+        .unwrap_or_default();
+    let system = arr
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        .map(|m| match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        })
+        .unwrap_or_default();
+    // 首条 user 截 2000 字、system 截 4000 字：与 `session_seed` 同口径，
+    // 保证「同一段对话」在这两处判定一致。
+    let mut seed = String::with_capacity(256);
+    seed.push_str(model);
+    seed.push('\u{1}');
+    seed.push_str(&system.chars().take(4000).collect::<String>());
+    seed.push('\u{1}');
+    seed.push_str(&first_user.chars().take(2000).collect::<String>());
+    // 取摘要做键：长对话首条 user 可能有几千字，直接当 HashMap 键太重。
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 pub fn session_seed(model: &str, uid: &str, msgs: &Value, tools: Option<&Value>) -> String {
     let arr = msgs.as_array().cloned().unwrap_or_default();
     let text_of = |m: &Value| -> String {

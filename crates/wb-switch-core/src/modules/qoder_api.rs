@@ -351,7 +351,19 @@ pub async fn refresh_account(account: &QoderAccount) -> Result<QoderAccount, Str
             })?;
             fetch_quota(&renewed).await?
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // 诊断日志：Qoder 的「刷新额度失败 / 401」终结在这里。
+            crate::modules::diag_log::error(
+                "qoder_quota",
+                format!(
+                    "刷新额度失败 region={} id={} uid={} | {e}",
+                    account.region.as_str(),
+                    account.id,
+                    account.uid
+                ),
+            );
+            return Err(e);
+        }
     };
     let plan = fetch_plan(account).await.ok();
     let plan_name = plan

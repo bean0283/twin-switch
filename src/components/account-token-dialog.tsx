@@ -43,7 +43,14 @@ import type { AccountTokenInfo, TraeAccountToken, WbAccountToken } from "@/lib/t
  * ⚠️ 两个产品的差别只在「数据从哪来 / 怎么刷」，因此在 `loadInfo` / `refreshOnce` 两处
  *    按 `provider` 分流，**其余展示逻辑只有一份**（新加产品只需在这里加一支）。
  */
-export type TokenProvider = "trae" | "workbuddy";
+/**
+ * 三个产品的令牌弹窗是**同一个组件**，只按这里分流取值。
+ *
+ * ⚠️ Qoder 的 access_token 是 `dt-…` 不透明串（**不是 JWT**），到期时间只能读账号库里的
+ * `expires_at`；Trae / WorkBuddy 是 JWT，到期时间从 token 的 `exp` 解。
+ * 这个差别只在后端取值层，展示层完全共用。
+ */
+export type TokenProvider = "trae" | "workbuddy" | "qoder";
 
 /**
  * 官方当前**签发**的 access token 有效期（天）。**本工具指定不了这个值。**
@@ -68,6 +75,10 @@ export type TokenProvider = "trae" | "workbuddy";
 export const ISSUED_VALIDITY_DAYS: Record<TokenProvider, number> = {
   trae: 14,
   workbuddy: 28,
+  // Qoder = 30 天：账号库里 `expires_at - created_at` 实测 30.035 / 29.999 天
+  // （cn 弦思十安 2026-10-20→2026-11-19、global bean0283 同期），是整 30 天。
+  // ⚠️ 同样只用于文案举例，判定一律看账号库里的 `expires_at`。
+  qoder: 30,
 };
 
 /** 刷新结果的**归一化**形状（两个产品的响应共用这几个字段）。 */
@@ -97,15 +108,27 @@ export function AccountTokenDialog({
   targetKey,
   accountId,
   accountName,
+  extraFooter,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   provider: TokenProvider;
-  /** Trae 用：客户端 key（`trae-cn` / `solo-cn`…）；WorkBuddy 传 `null`。 */
+  /**
+   * Trae 用：客户端 key（`trae-cn` / `solo-cn`…）；
+   * Qoder 用：区域（`cn` / `global`）；
+   * WorkBuddy 传 `null`（它不分客户端）。
+   */
   targetKey: string | null;
   accountId: string | null;
   /** 只在标题上给人看，不参与取值。 */
   accountName?: string | null;
+  /**
+   * 产品独有的附加操作（渲染在「关闭」左边）。
+   *
+   * 目前只有 Qoder 用：它需要一个「设置 Cosy 设备令牌」的入口（签到/活动下发要这个身份）。
+   * 做成插槽而不是给 Qoder 再写一个弹窗 —— 那正是这次要消灭的自定义布局。
+   */
+  extraFooter?: React.ReactNode;
 }) {
   const [info, setInfo] = useState<AccountTokenInfo | null>(null);
   const [loading, setLoading] = useState(false);
@@ -130,14 +153,18 @@ export function AccountTokenDialog({
 
   const load = useCallback(async () => {
     if (!accountId) return;
-    if (provider === "trae" && !targetKey) return;
+    if ((provider === "trae" || provider === "qoder") && !targetKey) return;
     setLoading(true);
     setError(null);
     try {
       setInfo(
         provider === "trae"
           ? normalizeTrae(await api.traeAccountToken(targetKey!, accountId))
-          : normalizeWorkbuddy(await api.workbuddyAccountToken(accountId)),
+          : provider === "qoder"
+            // Qoder 后端返回的**就是** `AccountTokenInfo`（`qoder_accounts::token_info` 按
+            // 这个形状拼的）⇒ 不需要归一化，直接就是弹窗要的形状。
+            ? await api.qoderAccountToken(targetKey!, accountId)
+            : normalizeVaultAccount(await api.workbuddyAccountToken(accountId)),
       );
     } catch (cause) {
       setInfo(null);
@@ -149,7 +176,7 @@ export function AccountTokenDialog({
 
   // 每次打开都重新读一遍：token 会被客户端自己改，界面不能拿上次的旧值糊弄人。
   useEffect(() => {
-    if (open && accountId && (provider !== "trae" || targetKey)) {
+    if (open && accountId && (provider === "workbuddy" || targetKey)) {
       setReveal(false);
       setCopied(false);
       setRevealRt(false);
@@ -205,14 +232,16 @@ export function AccountTokenDialog({
   /** `force = false` 时后端可能回「本次不刷新」→ 我们据此弹强制刷新确认窗。 */
   async function doRefresh(force: boolean) {
     if (!accountId) return;
-    if (provider === "trae" && !targetKey) return;
+    if ((provider === "trae" || provider === "qoder") && !targetKey) return;
     setRefreshing(true);
     setRefreshError(null);
     try {
       const res: TokenRefreshOutcome =
         provider === "trae"
           ? await api.traeAccountTokenRefresh(targetKey!, accountId, force)
-          : await api.workbuddyAccountTokenRefresh(accountId, force);
+          : provider === "qoder"
+            ? await api.qoderAccountTokenRefresh(targetKey!, accountId)
+            : await api.workbuddyAccountTokenRefresh(accountId, force);
       if (!res.refreshed) {
         setForceAsk({
           remainingDays: res.remainingDays,
@@ -244,7 +273,8 @@ export function AccountTokenDialog({
   const exp = info?.tokenExp ?? null;
   const token = info?.token ?? "";
   const masked = maskToken(token);
-  const what = provider === "trae" ? "Trae" : "WorkBuddy";
+  const what =
+    provider === "trae" ? "Trae" : provider === "qoder" ? "Qoder" : "WorkBuddy";
   /** 官方签发的有效期天数 —— **按产品分流**，只用于文案举例（判定一律看 token 的 `exp`）。 */
   const issuedDays = ISSUED_VALIDITY_DAYS[provider];
 
@@ -447,6 +477,7 @@ export function AccountTokenDialog({
           ) : null}
 
           <DialogFooter>
+            {extraFooter}
             <Button variant="outline" onClick={() => onOpenChange(false)}>
               <X className="size-4" />
               关闭
@@ -511,8 +542,14 @@ function normalizeTrae(t: TraeAccountToken): AccountTokenInfo {
   };
 }
 
-/** WorkBuddy 响应 → 归一化形状。 */
-function normalizeWorkbuddy(t: WbAccountToken): AccountTokenInfo {
+/**
+ * 「账号库型」响应 → 归一化形状。**WorkBuddy 与 Qoder 共用**（两者后端已返回同一形状）。
+ *
+ * 差别只在 `sourceLabel` 的措辞上：WorkBuddy 说「加密信封 / 明文」，Qoder 说登录来源。
+ * 靠 `t.source` 的取值区分：WorkBuddy 只有 `plain` / `envelope`，Qoder 是
+ * `oauth` / `pat` / `desktop-app` / `cli`。
+ */
+function normalizeVaultAccount(t: WbAccountToken): AccountTokenInfo {
   const label =
     t.source === "plain"
       ? "本工具账号库（workbuddy-accounts.json，明文凭据）"

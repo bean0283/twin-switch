@@ -16,6 +16,7 @@
 //! 2. **删除是软的**：先进回收站，随时可恢复；这也和 0.3.x 里 Trae / WorkBuddy 的做法一致。
 //! 3. **写盘必须原子**：先写同目录 `.tmp` 再 `rename`，中途崩不会留半截 JSON。
 
+use serde_json::json;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,53 @@ pub struct QoderAccount {
     /// 原样保留的产品侧字段，不做二次解释。
     #[serde(default)]
     pub meta: Value,
+}
+
+/// 令牌弹窗要的形状：**与 Trae / WorkBuddy 完全一致**（`AccountTokenInfo`）。
+///
+/// 为什么在这里做而不是让前端各写一份：三个产品的令牌弹窗是同一个组件
+/// （`components/account-token-dialog.tsx`），只按 `provider` 分流取值。
+/// 字段名一旦不一致，弹窗就得为每家写一套 —— 那正是要消灭的自定义布局。
+///
+/// 判据都来自账号库真实字段：
+/// * `token` = `access_token`（Qoder 是 `dt-…` 形态的不透明串，**不是 JWT**，
+///   所以到期时间不能从 token 里解，只能读库里的 `expires_at`）；
+/// * `canRefresh` = 有 `refresh_token`（`drt-` / `jrt-` 两种，见 `qoder_api::refresh_token`）；
+/// * `sourceLabel` 说清凭据形态，别让人以为「有 token 就一定能用」。
+pub fn token_info(account: &QoderAccount) -> Value {
+    let at = account.access_token.as_deref().unwrap_or("").trim().to_string();
+    let rt = account.refresh_token.as_deref().unwrap_or("").trim().to_string();
+    let exp = account.expires_at.filter(|v| *v > 0);
+    let has_at = !at.is_empty();
+    let has_rt = !rt.is_empty();
+    let source = match account.source.as_str() {
+        "oauth" => "浏览器登录（OAuth）",
+        "pat" => "个人访问令牌（PAT）",
+        "desktop-app" => "桌面端导入",
+        "cli" => "CLI 导入",
+        other => other,
+    };
+    json!({
+        "ok": true,
+        "id": account.id,
+        "uid": account.uid,
+        "name": if account.name.trim().is_empty() { account.uid.clone() } else { account.name.clone() },
+        "token": at,
+        // 导出 refresh token：只在**有**的时候给（没有就是 null，不给空串冒充）。
+        "refreshToken": if has_rt { json!(rt) } else { Value::Null },
+        "tokenExp": exp.map(Value::from).unwrap_or(Value::Null),
+        // Qoder 的 refresh_token 没有独立的到期字段 ⇒ null（不编）。
+        "refreshExpiredAt": Value::Null,
+        "sourceLabel": source,
+        "blockedReason": if has_at {
+            Value::Null
+        } else {
+            json!("该账号没有采集到 access_token，任何接口都会 401。用「浏览器登录」或重新导入一次。")
+        },
+        "canRefresh": has_rt,
+        "thresholdDays": crate::modules::workbuddy_credits::TOKEN_REFRESH_THRESHOLD_DAYS,
+        "remainingDays": exp.map(crate::modules::config::days_left_ms).unwrap_or(-1),
+    })
 }
 
 /// 一个「积分包」（Qoder 侧就是上游 `userQuota` / `addOnQuota` 两块）。
@@ -366,6 +414,45 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 令牌形状必须与 Trae / WorkBuddy 一致（共用弹窗只认这一种）。
+    #[test]
+    fn token_info_matches_shared_shape() {
+        // 用 JSON 造账号（字段多，逐个写会漏；serde 缺省值由 `#[serde(default)]` 兜住）
+        let a: QoderAccount = serde_json::from_value(json!({
+            "id": "acc1", "uid": "u1", "name": "测试号", "region": "cn",
+            "source": "oauth", "access_token": "dt-abc", "refresh_token": "drt-xyz",
+            "expires_at": crate::modules::config::now_ms() + 5 * 86_400_000,
+            "created_at": 0
+        }))
+        .expect("构造账号");
+        let v = token_info(&a);
+        // 共用弹窗读取的字段一个都不能少
+        for k in [
+            "token", "refreshToken", "tokenExp", "refreshExpiredAt", "sourceLabel",
+            "blockedReason", "canRefresh", "thresholdDays", "remainingDays",
+        ] {
+            assert!(v.get(k).is_some(), "缺少字段 {k}：{v}");
+        }
+        assert_eq!(v["token"], json!("dt-abc"));
+        assert_eq!(v["canRefresh"], json!(true));
+        assert_eq!(v["blockedReason"], serde_json::Value::Null);
+        // 剩余天数按天四舍五入：5 天
+        assert_eq!(v["remainingDays"], json!(5));
+    }
+
+    /// 没有 refresh_token ⇒ 不能续期；没有 access_token ⇒ 必须给出可读原因（不是空串）。
+    #[test]
+    fn token_info_reports_missing_pieces() {
+        let a: QoderAccount = serde_json::from_value(json!({
+            "id": "acc2", "uid": "u2", "region": "cn", "created_at": 0
+        }))
+        .expect("构造账号");
+        let v = token_info(&a);
+        assert_eq!(v["canRefresh"], json!(false));
+        assert!(v["blockedReason"].as_str().unwrap_or("").contains("access_token"));
+        assert_eq!(v["refreshToken"], serde_json::Value::Null);
+    }
     use super::*;
 
     #[test]

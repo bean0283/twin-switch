@@ -5,7 +5,9 @@ import {
   Check,
   ChevronDown,
   FolderGit2,
+  Link2Off,
   Loader2,
+  ScanSearch,
   Plus,
   RefreshCw,
   ScrollText,
@@ -155,6 +157,8 @@ export function WorkbuddySessionGroups() {
 
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<GroupDetail | null>(null);
+  /** 正在强制比对（慢路径：要读完整正文，必须让用户看到在跑）。 */
+  const [forcing, setForcing] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -175,6 +179,11 @@ export function WorkbuddySessionGroups() {
     group: GroupDetail;
     member: WbGroupMember;
   } | null>(null);
+
+  /** 「取消关联」弹窗：勾选要拆出去的账号（支持取消部分或全部）。 */
+  const [unlinkOpen, setUnlinkOpen] = useState(false);
+  const [unlinkSel, setUnlinkSel] = useState<Set<string>>(new Set());
+  const [unlinkBusy, setUnlinkBusy] = useState(false);
 
   const load = useCallback(async (force = false) => {
     if (!force && CACHE && Date.now() - CACHE.at < CACHE_TTL) {
@@ -235,6 +244,36 @@ export function WorkbuddySessionGroups() {
     }
   }, [load]);
 
+  /**
+   * 强制比对：忽略体积上限，真的逐行读完再判「一致 / 不一致」。
+   *
+   * ⚠️ 必须先让用户确认：一份 227 MB 的正文要读几秒，几个副本十几秒，
+   * 默认不跑就是怕把「打开列表」拖死。用户点了确定 = 他愿意等。
+   */
+  const forceCompare = useCallback(async (key: string) => {
+    const ok = window.confirm(
+      "强制比对会逐行读取完整正文（单份可达数百 MB），可能需要十几秒到一分钟。\n\n" +
+        "只有体积超限 / 成员过多时才会走到这里；默认是不比对的。\n\n继续吗？",
+    );
+    if (!ok) return;
+    setForcing(true);
+    try {
+      const r = await api.workbuddySessionGroupDetailForced(key);
+      if (!r.ok) throw new Error(r.error || "强制比对失败");
+      setDetail(r as unknown as GroupDetail);
+      toast.success("比对完成", {
+        description:
+          (r as unknown as GroupDetail).statusText
+            ? `结论：${(r as unknown as GroupDetail).statusText}`
+            : "已逐行读完，状态见上方",
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setForcing(false);
+    }
+  }, []);
+
   const items = useMemo(() => {
     const all = data?.items ?? [];
     switch (filter) {
@@ -251,6 +290,44 @@ export function WorkbuddySessionGroups() {
   }, [data, filter]);
 
   const clientRunning = data?.clientRunning ?? false;
+
+  /**
+   * 取消关联：把选中的账号从这个组里拆出去。
+   *
+   * ⚠️ **只删关联记录，不动会话数据** —— 所以不需要关客户端、也不备份会话库，
+   * 点完立刻生效。但组的 key 会变（成员少了，甚至整组解散），因此这里**主动关掉详情**
+   * 再重拉列表：留着旧 key 用户点一下就会看到「这个关联组已不存在」。
+   */
+  const doUnlink = async (group: GroupDetail, uids: string[]) => {
+    if (uids.length === 0) return;
+    setUnlinkBusy(true);
+    setBusy(`unlink:${group.key}`);
+    try {
+      const r = await api.workbuddySessionUnlinkMembers(group.key, uids);
+      if (!r.ok) throw new Error("取消关联失败");
+      toast.success(
+        r.remaining === 0
+          ? `已取消全部关联（${r.removedCount} 个账号）`
+          : `已取消 ${r.removedCount} 个账号的关联`,
+        {
+          description:
+            r.remaining === 0
+              ? "这个组已解散；会话数据一个字节都没动"
+              : `组里还剩 ${r.remaining} 个账号；会话数据未改动`,
+        },
+      );
+      setUnlinkOpen(false);
+      setUnlinkSel(new Set());
+      setOpenKey(null);
+      setDetail(null);
+      await load(true);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnlinkBusy(false);
+      setBusy(null);
+    }
+  };
 
   const doUnify = async () => {
     if (!confirmUnify) return;
@@ -590,6 +667,25 @@ export function WorkbuddySessionGroups() {
                           ? "选择要保留的一份；确认后会把它的内容统一到其它可验证的账号。"
                           : "这些副本的标题被改过或体积超限，本工具没有做逐行比对 —— 不能当成一致。"}
                       </div>
+                      {/* 只有「无法确认」才给这个入口：它慢，不该出现在别的状态里。 */}
+                      {detail.status === "unknown" && (
+                        <div className="mt-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={forcing}
+                            onClick={() => void forceCompare(detail.key)}
+                            title="逐行读完完整正文再判定（体积大时会慢）"
+                          >
+                            {forcing ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <ScanSearch className="size-3.5" />
+                            )}
+                            {forcing ? "正在逐行比对…" : "强制比对"}
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : detail.status === "missing" ? (
@@ -655,6 +751,9 @@ export function WorkbuddySessionGroups() {
                                   setConfirmUnify({ group: detail, member: m })
                                 }
                                 onView={() => void openViewer(m)}
+                                onUnlink={() =>
+                                  void doUnlink(detail, [m.uid])
+                                }
                               />
                               <span className="pointer-events-none absolute -right-4 top-1/2 hidden h-px w-3.5 bg-emerald-500/30 sm:block" />
                             </div>
@@ -687,6 +786,9 @@ export function WorkbuddySessionGroups() {
                                   setConfirmUnify({ group: detail, member: m })
                                 }
                                 onView={() => void openViewer(m)}
+                                onUnlink={() =>
+                                  void doUnlink(detail, [m.uid])
+                                }
                               />
                             </div>
                           ))}
@@ -730,6 +832,20 @@ export function WorkbuddySessionGroups() {
                     <Plus className="size-3" />
                     关联新账号
                   </button>
+                  <button
+                    type="button"
+                    disabled={(detail?.members.length ?? 0) === 0}
+                    title="把部分或全部账号从这个关联组里拆出去（只删关联记录，不动会话数据）"
+                    onClick={() => {
+                      // 默认一个都不选：这里只做「拆」，不预设要拆谁。
+                      setUnlinkSel(new Set());
+                      setUnlinkOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-full border border-dashed px-3 py-1.5 text-[11px] font-medium text-muted-foreground transition hover:border-solid hover:border-destructive/40 hover:bg-destructive/5 hover:text-destructive disabled:opacity-40"
+                  >
+                    <Link2Off className="size-3" />
+                    取消关联…
+                  </button>
                   <span className="ml-auto text-[11px] text-muted-foreground">
                     在上方选择一个副本作为标准，会覆盖其它账号
                   </span>
@@ -742,6 +858,118 @@ export function WorkbuddySessionGroups() {
               </div>
             </>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* ── 取消关联（勾账号，可全选） ─────────────────────────
+          「取消关联」只删本工具的关联记录：不做任何写库、不复制、不覆盖，
+          所以不需要关客户端，也不备份会话库。 */}
+      <Dialog
+        open={unlinkOpen}
+        onOpenChange={(v) => {
+          if (!v) {
+            setUnlinkOpen(false);
+            setUnlinkSel(new Set());
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>取消哪些账号的关联？</DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-1.5 text-[13px] leading-relaxed text-muted-foreground">
+                <p>
+                  取消后这些账号的会话仍然在各自名下，只是不再被当成「同一段对话」。
+                  <strong className="text-foreground">只删关联记录，不动会话数据。</strong>
+                </p>
+                <p className="text-xs">
+                  组里只剩 1 个账号时会整组解散 —— 只剩一份副本就没必要再当组。
+                </p>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex items-center justify-between px-0.5">
+            <span className="text-[11px] text-muted-foreground">
+              已选 {unlinkSel.size} / {detail?.members.length ?? 0}
+            </span>
+            <button
+              type="button"
+              className="text-[11px] font-medium text-emerald-700 underline-offset-2 hover:underline dark:text-emerald-300"
+              onClick={() => {
+                const all = detail?.members ?? [];
+                setUnlinkSel(
+                  unlinkSel.size === all.length
+                    ? new Set()
+                    : new Set(all.map((m) => m.uid)),
+                );
+              }}
+            >
+              {unlinkSel.size === (detail?.members.length ?? 0) && unlinkSel.size > 0
+                ? "全不选"
+                : "全选（= 取消全部关联）"}
+            </button>
+          </div>
+
+          <div className="max-h-[46vh] space-y-1 overflow-auto">
+            {(detail?.members ?? []).map((m) => {
+              const checked = unlinkSel.has(m.uid);
+              return (
+                <label
+                  key={m.uid + m.sessionId}
+                  className={cn(
+                    "flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 text-sm transition hover:bg-muted/50",
+                    checked && "border-destructive/30 bg-destructive/[0.04]",
+                  )}
+                >
+                  <input
+                    type="checkbox"
+                    className="size-4 shrink-0"
+                    checked={checked}
+                    onChange={() =>
+                      setUnlinkSel((prev) => {
+                        const n = new Set(prev);
+                        if (n.has(m.uid)) n.delete(m.uid);
+                        else n.add(m.uid);
+                        return n;
+                      })
+                    }
+                  />
+                  <span className="min-w-0 flex-1 truncate">{m.accountName}</span>
+                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                    {RELATION[m.relation] || "—"}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setUnlinkOpen(false);
+                setUnlinkSel(new Set());
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={unlinkBusy || unlinkSel.size === 0}
+              onClick={() => {
+                if (!detail) return;
+                void doUnlink(detail, [...unlinkSel]);
+              }}
+            >
+              {unlinkBusy ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Link2Off className="size-4" />
+              )}
+              取消这 {unlinkSel.size} 个账号的关联
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -959,15 +1187,19 @@ function MemberCard({
   busy,
   onUnify,
   onView,
+  onUnlink,
 }: {
   m: WbGroupMember;
   groupKey: string;
   busy: string | null;
   onUnify: () => void;
   onView: () => void;
+  /** 把这个账号从组里拆出去（只删关联记录）。 */
+  onUnlink: () => void;
 }) {
   const canSync = m.contentState === "ready";
   const isBusy = busy === `unify:${groupKey}`;
+  const isUnlinking = busy === `unlink:${groupKey}`;
   return (
     <div className="rounded-xl border bg-card p-2.5 transition hover:border-emerald-500/30">
       <div className="flex items-start justify-between gap-2">
@@ -1017,6 +1249,19 @@ function MemberCard({
           className="inline-flex items-center gap-0.5 rounded-full px-2 py-1 text-[11px] font-medium text-emerald-700 transition hover:bg-emerald-500/10 disabled:opacity-40 dark:text-emerald-300"
         >
           查看内容 <ChevronDown className="size-3" />
+        </button>
+        <button
+          type="button"
+          disabled={isUnlinking}
+          title="取消关联：把这个账号从「同一段对话」里拆出去（只删关联记录，会话数据不动）"
+          onClick={onUnlink}
+          className="ml-auto inline-flex items-center rounded-full p-1 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+        >
+          {isUnlinking ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Link2Off className="size-3.5" />
+          )}
         </button>
       </div>
     </div>

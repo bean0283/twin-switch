@@ -326,6 +326,29 @@ pub fn now_ms() -> i64 {
 /// ⚠️ 必须**四舍五入**而不是直接截断：调用方拿到 `now` 之后哪怕只过 1 毫秒，
 ///    `(now + 13 天 - now') / 1 天` 截断就成了 12 天 —— 判据会随机差一天。
 ///    加半天再用 `div_euclid` 取整 ⇒ `days_left_ms(now + n 天) == n` 恒成立。
+/// 毫秒 → 本地时间文案（`YYYY-MM-DD HH:MM`）。
+///
+/// 只用于提示语，**不参与任何判定**；判定一律用毫秒数比大小。
+pub fn fmt_ms_local(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| format!("{ms} ms"))
+}
+
+/// 毫秒 → 本地日期目录名 `YYYY-MM-DD`（诊断日志按天分文件夹用）。
+pub fn fmt_day_local(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+/// 毫秒 → 本地时间（带毫秒）`YYYY-MM-DD HH:MM:SS.mmm`（诊断日志行首）。
+pub fn fmt_ms_with_millis(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
 pub fn days_left_ms(exp_ms: i64) -> i64 {
     if exp_ms <= 0 {
         return -1;

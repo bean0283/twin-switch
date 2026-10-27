@@ -64,6 +64,13 @@ export interface CreditsState {
   error: string | null;
   busy: boolean;
   refresh: () => Promise<void>;
+  /**
+   * 只刷新一个账号（卡片上的小刷新按钮）。
+   * 成功后就地替换这一条并重算 summary；失败保留旧数字并提示原因。
+   */
+  refreshOne: (id: string) => Promise<void>;
+  /** 正在单独刷新的账号 id。 */
+  refreshingId: string | null;
   expand: WbCreditItem | null;
   setExpand: (v: WbCreditItem | null) => void;
 }
@@ -79,6 +86,8 @@ export function useWorkbuddyCredits(): CreditsState {
   const [result, setResult] = useState<WbCreditsResult | null>(null);
   const [meta, setMeta] = useState<{ count: number; queryable: number } | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 正在单独刷新的账号（同一时刻只允许一个，避免连点打一串接口）。 */
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expand, setExpand] = useState<WbCreditItem | null>(null);
 
@@ -121,7 +130,58 @@ export function useWorkbuddyCredits(): CreditsState {
     }
   }, []);
 
-  return { meta, result, error, busy, refresh, expand, setExpand };
+  /**
+   * 单账号刷新（后端 `workbuddy_credits_one`：不走缓存、不写缓存）。
+   *
+   * ⚠️ 与整批 `refresh` 分开：整批会重查所有账号，点一个号不该让其它号也重新联网。
+   */
+  const refreshOne = useCallback(async (id: string) => {
+    if (refreshingId) return;
+    setRefreshingId(id);
+    try {
+      const one = await api.workbuddyCreditsOne(id);
+      if (!one || one.ok === false) {
+        toast.error("这个账号的积分没刷到", {
+          description:
+            (one as { error?: string } | null)?.error ?? "接口没有返回这个账号的积分",
+        });
+        return;
+      }
+      setResult((prev) => {
+        if (!prev) return prev;
+        const accounts = prev.accounts.map((x) =>
+          x.account.id === id ? one : x,
+        );
+        const succeeded = accounts.filter((x) => x.ok).length;
+        // 与后端 `summarize` 同口径：只累加成功的账号，字段是条目自己的 `totalRemaining`
+        // （不是 `summary.remaining` —— `WbCreditItem` 没有这个字段）。
+        const totalRemaining = accounts.reduce(
+          (n, x) => n + (x.ok ? Number(x.totalRemaining ?? 0) : 0),
+          0,
+        );
+        return {
+          ...prev,
+          accounts,
+          errors: (prev.errors ?? []).filter((e) => e.id !== id),
+          summary: {
+            ...prev.summary,
+            queried: accounts.length,
+            succeeded,
+            failed: accounts.length - succeeded,
+            totalRemaining,
+          },
+          updatedAt: Date.now(),
+          cached: false,
+        };
+      });
+    } catch (e) {
+      toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRefreshingId(null);
+    }
+  }, [refreshingId]);
+
+  return { meta, result, error, busy, refresh, refreshOne, refreshingId, expand, setExpand };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +226,17 @@ export function CreditBlock({
   error,
   loading,
   onExpand,
+  onRefresh,
+  refreshing,
 }: {
   item: WbCreditItem | null;
   /** 该账号的查询失败原因（来自 result.errors）。 */
   error?: string | null;
   loading?: boolean;
   onExpand: () => void;
+  /** 只刷新这个账号；不传就不画按钮。 */
+  onRefresh?: () => void;
+  refreshing?: boolean;
 }) {
   const view = useMemo<CreditView | null>(() => {
     if (error) {
@@ -180,7 +245,16 @@ export function CreditBlock({
     return item ? wbItemToView(item) : null;
   }, [item, error]);
 
-  return <CreditBlockView item={view} loading={loading} onExpand={onExpand} />;
+  return (
+    <CreditBlockView
+      item={view}
+      loading={loading}
+      onExpand={onExpand}
+      onRefresh={onRefresh}
+      refreshing={refreshing}
+      refreshHint="重新查询这个账号的积分"
+    />
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -344,8 +344,17 @@ export default function TraeRecordsPage() {
         const res = await api.traeScanAndDecrypt(clientKey);
         setDecryptProgress(res.progress ?? []);
         const ok = res.report.hmac_ok;
+        // ⚠️ 报**总耗时**，不是只报解密那一段：以前体感近 20s、提示 4.4s，
+        // 因为扫描（占大头）根本没算进去。
+        const t = res.timings;
+        const totalS = ((t?.totalMs ?? res.report.elapsed_ms) / 1000).toFixed(1);
+        const detail = t
+          ? `扫描 ${(t.scanMs / 1000).toFixed(1)}s + ${
+              res.reused ? "复用快照" : `解密 ${(t.decryptMs / 1000).toFixed(1)}s`
+            }`
+          : `${res.report.pages} 页`;
         toast.success(ok ? "解密成功" : "密钥校验未通过", {
-          description: `${res.report.pages} 页 · ${res.report.tables.length} 张表 · ${(res.report.elapsed_ms / 1000).toFixed(1)}s`,
+          description: `${res.report.pages} 页 · ${res.report.tables.length} 张表 · 总耗时 ${totalS}s（${detail}）`,
         });
         await refresh(clientKey);
       } catch (cause) {

@@ -6,12 +6,15 @@ import {
   AppWindow,
   ArrowRight,
   DatabaseBackup,
+  FolderOpen,
   HardDrive,
   Loader2,
   RefreshCw,
   RotateCcw,
   Save,
+  ScrollText,
   ShieldAlert,
+  Trash2,
   Wand2,
 } from "lucide-react";
 
@@ -38,6 +41,8 @@ import {
 import { selectableClients } from "@/lib/trae-client-list";
 import type {
   BackupRetention,
+  DiagLogSettings,
+  DiagLogStatus,
   SettingsSnapshot,
   TraeInstalledClient,
 } from "@/lib/trae-types";
@@ -68,6 +73,13 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<BackupRetention | null>(null);
   /** 写库前备份开关的草稿。`null` = 还没载入 / 载入失败。 */
   const [beforeWrite, setBeforeWrite] = useState<boolean | null>(null);
+  /** 诊断日志设置的草稿。`null` = 还没载入 / 载入失败。 */
+  const [logDraft, setLogDraft] = useState<DiagLogSettings | null>(null);
+  /** 日志目录现状（占用 / 每天的文件数），打开本页与操作后刷新。 */
+  const [logStatus, setLogStatus] = useState<DiagLogStatus | null>(null);
+  /** 最近若干行日志（点「查看最近的日志」才拉）。 */
+  const [logLines, setLogLines] = useState<string[] | null>(null);
+  const [logBusy, setLogBusy] = useState(false);
   /**
    * 客户端主程序路径的草稿：`clientKey → 绝对路径`。
    * `null` = 还没载入 / 载入失败；空串 = 「这个客户端走自动探测」。
@@ -103,6 +115,17 @@ export default function SettingsPage() {
     }
   }, []);
 
+  /** 刷新日志现状（占用 / 每天的文件数）。失败不清空旧值 —— 免得看起来像"日志没了"。 */
+  const refreshLogStatus = useCallback(async () => {
+    try {
+      const st = await api.diagLogStatus();
+      if (st.ok) setLogStatus(st);
+      else setLogStatus({ ok: false, error: st.error ?? "读取日志状态失败" });
+    } catch (e) {
+      setLogStatus({ ok: false, error: api.asError(e) });
+    }
+  }, []);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -116,7 +139,9 @@ export default function SettingsPage() {
       setQoderDraft({ ...(s.qoderExe ?? {}) });
       setSyncAuto(s.syncWorkbuddyAutomations ?? true);
       setAutoLinkSessions(s.autoLinkWorkbuddySessions ?? false);
+      setLogDraft(s.log ?? null);
       void loadClients(false);
+      void refreshLogStatus();
     } catch (cause) {
       // ⚠️ 撤掉表单与默认值：失败时给用户看「30 天 / 3 份 / 4 GB」，
       //    他会以为设置被重置了 —— 实际只是文件坏了。
@@ -127,6 +152,8 @@ export default function SettingsPage() {
       setQoderDraft({});
       setSyncAuto(null);
       setAutoLinkSessions(null);
+      setLogDraft(null);
+      setLogStatus(null);
       setError(api.asError(cause));
     } finally {
       setLoading(false);
@@ -151,6 +178,8 @@ export default function SettingsPage() {
         qoderExe: qoderDraft,
         syncWorkbuddyAutomations: syncAuto ?? true,
         autoLinkWorkbuddySessions: autoLinkSessions ?? false,
+        // 日志整块覆盖（后端会 sanitized 夹区间，回读值再刷表单）。
+        ...(logDraft ? { log: logDraft } : {}),
       });
       setSnap(next);
       // 用**后端回读的实际值**刷表单：手输了离谱的数会被后端夹到合理区间，
@@ -162,6 +191,8 @@ export default function SettingsPage() {
       setQoderDraft({ ...(next.qoderExe ?? {}) });
       setSyncAuto(next.syncWorkbuddyAutomations ?? true);
       setAutoLinkSessions(next.autoLinkWorkbuddySessions ?? false);
+      setLogDraft(next.log ?? null);
+      void refreshLogStatus();
       // 路径改了 ⇒ 让探测结果跟着刷新（否则下面那几行还挂着「未找到」）。
       void loadClients(true);
       toast.success("设置已保存", {
@@ -191,7 +222,8 @@ export default function SettingsPage() {
       draft.maxTotalMb !== snap.backupRetention.maxTotalMb ||
       beforeWrite !== snap.backupBeforeWrite ||
       (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true) ||
-      (autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false));
+      (autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false) ||
+      (!!logDraft && JSON.stringify(logDraft) !== JSON.stringify(snap.log)));
 
   /** 取某个客户端「正在运行的」主程序路径并填进草稿。 */
   async function pickRunning(key: string) {
@@ -863,6 +895,276 @@ export default function SettingsPage() {
             </div>
             </CardContent>
           </Card>
+
+          {/* ── 诊断日志（默认关） ─────────────────────────────────────────
+              加这个的直接原因：有用户报「账号刷新失败 / 401」而开发侧复现不了 ——
+              只能让出问题那台机器自己留证据。默认必须关。 */}
+          <Card data-settings-loaded="1">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <ScrollText className="size-4" />
+                诊断日志
+              </CardTitle>
+              <CardDescription>
+                开启后会记录<strong className="text-foreground">出错</strong>时的现场
+                （请求失败、400 / 401 / 500 等），用于排查「账号刷新失败」这类只在别人机器上
+                出现的问题。<strong className="text-foreground">默认关闭。</strong>
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid min-w-0 gap-4">
+              {logDraft ? (
+                <>
+                  <div
+                    className={
+                      logDraft.enabled
+                        ? "grid gap-2 rounded-lg border bg-muted/30 px-3 py-3"
+                        : "grid gap-2 rounded-lg border border-dashed px-3 py-3"
+                    }
+                  >
+                    <label className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 size-4 shrink-0 accent-[var(--primary)]"
+                        checked={logDraft.enabled}
+                        onChange={(e) => setLogDraft({ ...logDraft, enabled: e.target.checked })}
+                        data-field="logEnabled"
+                        title="开 / 关诊断日志"
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium">
+                          记录诊断日志（现在：{logDraft.enabled ? "已开启" : "已关闭"})
+                        </span>
+                        <span className="mt-0.5 block text-xs text-muted-foreground">
+                          改完记得点下面的<strong className="text-foreground">保存设置</strong>。
+                          关着的时候不会往磁盘写任何一个字。
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="grid gap-1 text-xs">
+                      <span className="text-muted-foreground">记录级别</span>
+                      <select
+                        className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+                        value={logDraft.level}
+                        disabled={!logDraft.enabled}
+                        onChange={(e) =>
+                          setLogDraft({
+                            ...logDraft,
+                            level: e.target.value === "info" ? "info" : "error",
+                          })
+                        }
+                        data-field="logLevel"
+                      >
+                        <option value="error">仅错误（推荐，默认）</option>
+                        <option value="info">全部（量大，仅短期排查用）</option>
+                      </select>
+                    </label>
+
+                    <label className="grid gap-1 text-xs">
+                      <span className="text-muted-foreground">单个文件上限（MB，写满分段）</span>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={512}
+                        value={logDraft.maxMb}
+                        disabled={!logDraft.enabled}
+                        onChange={(e) =>
+                          setLogDraft({ ...logDraft, maxMb: clampInt(e.target.value, 0, 512) })
+                        }
+                        data-field="logMaxMb"
+                      />
+                    </label>
+
+                    <label className="grid gap-1 text-xs">
+                      <span className="text-muted-foreground">最多保留天数（超过自动删除）</span>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={365}
+                        value={logDraft.maxDays}
+                        disabled={!logDraft.enabled}
+                        onChange={(e) =>
+                          setLogDraft({ ...logDraft, maxDays: clampInt(e.target.value, 0, 365) })
+                        }
+                        data-field="logMaxDays"
+                      />
+                    </label>
+
+                    <label className="grid gap-1 text-xs">
+                      <span className="text-muted-foreground">每天最多留几份（超过删最旧）</span>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={200}
+                        value={logDraft.maxFiles}
+                        disabled={!logDraft.enabled}
+                        onChange={(e) =>
+                          setLogDraft({ ...logDraft, maxFiles: clampInt(e.target.value, 0, 200) })
+                        }
+                        data-field="logMaxFiles"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="rounded-lg border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+                    <div>
+                      <strong className="text-foreground">存放位置：</strong>
+                      <span className="break-all">{snap.logDir}</span>
+                      <span className="ml-1">（按日期分文件夹，同日写满就分段）</span>
+                    </div>
+                    <div className="mt-1">
+                      <strong className="text-foreground">超限怎么删：</strong>
+                      早于 {logDraft.maxDays} 天的<strong className="text-foreground">整个文件夹</strong>删除；
+                      每天超过 {logDraft.maxFiles} 份的<strong className="text-foreground">旧文件</strong>删除；
+                      单文件超过 {logDraft.maxMb} MB 自动分段。
+                      <strong className="text-foreground">全部直接删除，不进回收站。</strong>
+                    </div>
+                    <div className="mt-1">
+                      <strong className="text-foreground">不含凭据：</strong>
+                      token / jwt 这类长串在落盘前会被打码，日志可以直接发给别人看。
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={logBusy}
+                      onClick={async () => {
+                        setLogBusy(true);
+                        try {
+                          await api.diagLogOpen();
+                          await refreshLogStatus();
+                          toast.success("已在文件管理器中打开日志目录");
+                        } catch (e) {
+                          toast.error("打开失败", { description: api.asError(e) });
+                        } finally {
+                          setLogBusy(false);
+                        }
+                      }}
+                    >
+                      <FolderOpen className="size-4" />
+                      打开文件夹
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={logBusy}
+                      onClick={async () => {
+                        setLogBusy(true);
+                        try {
+                          const r = await api.diagLogTail(200);
+                          setLogLines(r.lines ?? []);
+                          await refreshLogStatus();
+                          if ((r.lines ?? []).length === 0) {
+                            toast.info("还没有日志", {
+                              description: "日志功能关着，或者开启后还没出过错。",
+                            });
+                          }
+                        } catch (e) {
+                          toast.error("读取失败", { description: api.asError(e) });
+                        } finally {
+                          setLogBusy(false);
+                        }
+                      }}
+                    >
+                      {logBusy ? <Loader2 className="size-4 animate-spin" /> : <ScrollText className="size-4" />}
+                      查看最近的日志
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={logBusy}
+                      onClick={async () => {
+                        if (!window.confirm("立即清空所有日志？\n\n直接删除，不进回收站。")) return;
+                        setLogBusy(true);
+                        try {
+                          const r = await api.diagLogClear();
+                          if (!r.ok) throw new Error(r.error || "清理失败");
+                          setLogLines(null);
+                          await refreshLogStatus();
+                          toast.success("日志已清空", {
+                            description: `释放 ${fmtBytes(r.freedBytes ?? 0)}`,
+                          });
+                        } catch (e) {
+                          toast.error("清理失败", { description: api.asError(e) });
+                        } finally {
+                          setLogBusy(false);
+                        }
+                      }}
+                    >
+                      <Trash2 className="size-4" />
+                      立即清空
+                    </Button>
+                  </div>
+
+                  {/* 现状：占用 / 每天文件数。数据来自后端，与清理判据同源。 */}
+                  <div className="rounded-lg border px-3 py-2 text-xs">
+                    {logStatus === null ? (
+                      <span className="text-muted-foreground">正在统计日志占用…</span>
+                    ) : logStatus.ok === false ? (
+                      <span className="text-destructive">
+                        读取日志状态失败：{logStatus.error ?? "未知原因"}
+                      </span>
+                    ) : (
+                      <>
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                          <span>
+                            合计 <strong className="tabular-nums">{fmtBytes(logStatus.totalBytes ?? 0)}</strong>
+                          </span>
+                          <span className="text-muted-foreground">
+                            {logStatus.totalFiles ?? 0} 个文件 · {logStatus.days?.length ?? 0} 天
+                          </span>
+                        </div>
+                        {(logStatus.days?.length ?? 0) > 0 ? (
+                          <div className="mt-1.5 flex flex-wrap gap-1.5">
+                            {logStatus.days!.slice(0, 8).map((d) => (
+                              <span
+                                key={d.day}
+                                className="rounded-md border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground"
+                              >
+                                {d.day} · {fmtBytes(d.bytes)} · {d.files} 份
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="mt-1 text-muted-foreground">
+                            还没有任何日志文件。
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  {logLines !== null ? (
+                    <div className="grid gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-medium">
+                          最近 {logLines.length} 行
+                        </span>
+                        <button
+                          type="button"
+                          className="text-xs text-muted-foreground underline"
+                          onClick={() => setLogLines(null)}
+                        >
+                          收起
+                        </button>
+                      </div>
+                      <pre className="max-h-64 overflow-auto rounded-lg border bg-muted/40 p-2 text-[11px] leading-relaxed break-all whitespace-pre-wrap">
+                        {logLines.length === 0 ? "（空）" : logLines.join("\n")}
+                      </pre>
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  设置还没载入成功，暂时无法编辑日志选项。
+                </p>
+              )}
+            </CardContent>
+          </Card>
         </>
       ) : null}
 
@@ -905,6 +1207,15 @@ function cnPolicyBox(enabled: boolean): string {
 }
 
 /** 去掉空项：空串 = 「恢复自动探测」，不写进设置文件。 */
+/** 字节数 → 人话（日志占用展示用）。 */
+function fmtBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 function cleanExeDraft(m: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(m)) {

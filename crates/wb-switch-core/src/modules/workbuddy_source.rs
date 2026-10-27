@@ -392,6 +392,18 @@ fn decide_group(ids: &[Option<ContentId>], updated_at: &[i64]) -> (usize, Vec<St
 /// 读盘（逐行摘要）只对**同标题分组**内的成员做，且限制成员数与单文件体积，
 /// 避免在大仓库上一次性读上百个 10 MB 级正文。
 fn annotate_duplicates(list: &mut [WbSession]) {
+    annotate_duplicates_opt(list, false)
+}
+
+/// [`annotate_duplicates`] 的带开关版本。
+///
+/// `force = true` 时**忽略体积上限与成员数上限**，真的逐行读完整正文做比对。
+///
+/// 为什么要这个开关：体积超限时默认不比对（一份 227 MB 的正文读一次要好几秒，
+/// 20 个副本一次列表就 1 GB / 35 秒 —— 不能让「打开列表」被它拖死）。
+/// 但用户明确要求「支持手动确定后执行判定分析」：他自己决定等，就真的要比。
+/// 所以这里是**用户显式触发**才走的慢路径，默认路径的性能不受影响。
+fn annotate_duplicates_opt(list: &mut [WbSession], force: bool) {
     use std::collections::BTreeMap;
 
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -412,10 +424,11 @@ fn annotate_duplicates(list: &mut [WbSession]) {
         // ⚠️ 归一化要用**整组**的 id：正文可能引用组内其它副本的 id（实测有过），
         // 只换自己那个会让「刚同步完的副本」互相比对不上，误报「有分歧」。
         let group_ids: Vec<String> = idx.iter().map(|&i| list[i].id.clone()).collect();
-        let detailed = idx.len() <= DUP_MAX_MEMBERS
-            && idx
-                .iter()
-                .all(|&i| list[i].has_body && list[i].body_bytes <= DUP_MAX_BYTES);
+        let detailed = force
+            || (idx.len() <= DUP_MAX_MEMBERS
+                && idx
+                    .iter()
+                    .all(|&i| list[i].has_body && list[i].body_bytes <= DUP_MAX_BYTES));
         for &i in &idx {
             if !list[i].has_body {
                 ids.push(None);
@@ -450,7 +463,7 @@ fn annotate_duplicates(list: &mut [WbSession]) {
                 )
             } else {
                 format!(
-                    "有副本体积超过 {} MB，未做逐行比对",
+                    "有副本体积超过 {} MB，未做逐行比对（可点「强制比对」逐行分析）",
                     DUP_MAX_BYTES >> 20
                 )
             };
@@ -702,6 +715,16 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
     // 同标题副本的新旧判定（多账号时同一段对话会有多份，必须能分清谁是最新）。
     // 不重排列表：重复副本的时间本来就接近，天然相邻，全局「最近优先」的顺序更顺手。
     annotate_duplicates(&mut out);
+    Ok(out)
+}
+
+/// [`list_sessions`] 的**强制比对**版本：忽略体积/成员数上限，逐行读完整正文。
+///
+/// 只给「用户手动点了强制比对」用（见 `annotate_duplicates_opt` 的注释）。
+/// 慢是预期行为：一份 227 MB 的正文要读几秒，界面必须自己显示「正在分析」。
+pub fn list_sessions_forced() -> Result<Vec<WbSession>, String> {
+    let mut out = list_sessions()?;
+    annotate_duplicates_opt(&mut out, true);
     Ok(out)
 }
 
