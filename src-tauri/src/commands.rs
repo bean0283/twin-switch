@@ -3466,14 +3466,54 @@ pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
     if enabled {
         let port = gateway_keys::GATEWAY_PORT;
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = gateway_server::serve(port).await {
+            // `restart` 而不是 `serve`：刚关过的话旧实例还在退出，`serve` 会因幂等直接返回，
+            // 结果「开关是开的、端口没人听」。
+            if let Err(e) = gateway_server::restart(port).await {
                 eprintln!("[gateway] {e}");
             }
         });
+        gateway_wait_listening(gateway_keys::GATEWAY_PORT, 4000).await;
     } else {
         gateway_server::request_stop();
     }
     Ok(json!({ "enabled": enabled, "status": gateway_server::status() }))
+}
+
+/// 局域网开关：开了才绑 `0.0.0.0`（局域网其它设备能连），默认只绑回环。
+///
+/// ⚠️ 改绑定地址必须**重绑端口**，所以这里会重启网关 —— 正在生成的对话会断。
+#[tauri::command]
+pub async fn gateway_set_lan(lan: bool) -> Result<Value, String> {
+    gateway_server::set_lan(lan)?;
+    // 总开关关着的时候不需要重绑（根本没监听），改配置就够了，下次启动生效。
+    let enabled = gateway_server::enabled();
+    if enabled {
+        let port = gateway_keys::GATEWAY_PORT;
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = gateway_server::restart(port).await {
+                eprintln!("[gateway] {e}");
+            }
+        });
+        gateway_wait_listening(gateway_keys::GATEWAY_PORT, 5000).await;
+    }
+    Ok(json!({ "lan": lan, "enabled": enabled, "status": gateway_server::status() }))
+}
+
+/// 等端口真有应答（`127.0.0.1:<port>` 能连上）。返回是否连上 —— 超时不算成功。
+///
+/// 为什么不用 `status().running`：`running` 读的是本进程标记，重启窗口里它可能先亮后灭；
+/// 「能连上」才是客户端能用的唯一事实。
+async fn gateway_wait_listening(port: u16, budget_ms: u64) -> bool {
+    let step = 50u64;
+    let mut waited = 0u64;
+    while waited < budget_ms {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+        waited += step;
+    }
+    false
 }
 
 

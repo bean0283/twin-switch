@@ -1,4 +1,4 @@
-//! 积分共享 · 本机网关（`127.0.0.1:57892`）。
+//! 积分共享 · 本机网关（默认 `127.0.0.1:57892`，可选局域网 `0.0.0.0:57892`）。
 //!
 //! 对外只暴露 OpenAI 兼容的三个端点：
 //!
@@ -6,13 +6,16 @@
 //! - `GET  /v1/models` —— 模型清单（来自 `~/.twin-switch/models.json`）
 //! - `POST /v1/chat/completions` —— 选号后透传给对应产品的上游
 //!
-//! 三条纪律：
+//! 四条纪律：
 //!
-//! 1. **只绑 127.0.0.1**。网关能代替你花掉账号额度，绑 0.0.0.0 等于借给整个局域网。
+//! 1. **默认只绑 127.0.0.1**。网关能代替你花掉账号额度，绑 0.0.0.0 等于借给整个局域网
+//!    —— 所以开成 `0.0.0.0` 必须是用户**显式勾选**（`lan` 开关），且非回环来源
+//!    一律强制 Key（`/healthz` 除外，它会把账号细节收敛掉）。
 //! 2. **没配上游就 501，不假装成功**；鉴权失败单独说，不和网络错误混在一起。
 //! 3. **一次失败不许把数字说成成功**：请求数只统计真正打通上游的次数。
+//! 4. **「没绑定」与「绑定失败」不许长得一样**：绑定失败的原因要能从 /healthz 与界面读到。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -28,16 +31,80 @@ use crate::modules::gateway_stream::{Delta, Emitter, Kind, StreamReader};
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 static STARTED_AT: AtomicI64 = AtomicI64::new(0);
+/// **实际生效**的绑定模式（不是配置值）：只有 `serve` 真绑上 `0.0.0.0` 才为 true。
+static LAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次绑定失败的原因。空 = 没失败过。
+///
+/// ⚠️ 存在的理由：`serve` 失败只 `eprintln!` 的话，界面会显示「未启动」，
+/// 和用户主动关掉开关长得一模一样 —— 必须能区分「关了」与「起不来」。
+fn last_error_slot() -> &'static std::sync::Mutex<Option<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_last_error(msg: Option<String>) {
+    if let Ok(mut g) = last_error_slot().lock() {
+        *g = msg;
+    }
+}
+
+pub fn last_error() -> Option<String> {
+    last_error_slot().lock().ok().and_then(|g| g.clone())
+}
+
+/// 本机对外的局域网 IPv4（没有就 `None`，**不编造**）。
+///
+/// 用 `UDP connect` 让系统按路由表挑出口网卡 —— UDP 不握手、不发包，纯粹查路由。
+/// 多个目标是为了没有默认路由时也能拿到（纯局域网环境）。全部失败就老实返回 `None`。
+pub fn lan_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    for target in ["8.8.8.8:80", "223.5.5.5:80", "192.168.1.1:9"] {
+        if sock.connect(target).is_err() {
+            continue;
+        }
+        let Ok(addr) = sock.local_addr() else { continue };
+        let ip = addr.ip();
+        // 回环 / 未指定 都不算「局域网地址」
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
+        }
+        return Some(ip.to_string());
+    }
+    None
+}
+
+/// 对外地址：`http://<host>:<port>/v1`。
+fn base_url(host: &str) -> String {
+    format!("http://{host}:{GATEWAY_PORT}/v1")
+}
 
 pub fn status() -> Value {
     let started = STARTED_AT.load(Ordering::Relaxed);
+    let lan = LAN_ACTIVE.load(Ordering::Relaxed);
+    let local = base_url("127.0.0.1");
+    // 只有真绑了 0.0.0.0 才给局域网地址；探测不到就 null + 原因，绝不拿 127.0.0.1 冒充。
+    let lan_ip = if lan { lan_ip() } else { None };
+    let lan_addr = lan_ip.as_deref().map(base_url);
     json!({
         "running": started > 0,
         "port": GATEWAY_PORT,
         "started_at": if started > 0 { Some(started) } else { None },
         "requests": REQUESTS.load(Ordering::Relaxed),
         "rejected": REJECTED.load(Ordering::Relaxed),
-        "addr": format!("http://127.0.0.1:{GATEWAY_PORT}/v1"),
+        "lan": lan,
+        // 配置里的意图值（网关没在跑时 `lan` 恒为 false，但用户的勾选已经落了盘）；
+        // 界面靠这两个值区分「没开」与「开了但没起来」。
+        "lanPref": lan_enabled(),
+        "addr": lan_addr.clone().unwrap_or_else(|| local.clone()),
+        "localAddr": local,
+        "lanAddr": lan_addr,
+        "lanAddrError": if lan && lan_ip.is_none() {
+            Some("没有识别到局域网 IPv4 地址（网卡没连上？）".to_string())
+        } else {
+            None
+        },
+        "bindError": last_error(),
     })
 }
 
@@ -250,21 +317,59 @@ pub async fn selftest(key: Option<String>, model: Option<String>) -> Value {
 /// 关掉之后：网关不再监听端口、控制台也不提供对话能力 —— 用户明确要求
 /// 「不启动的状态下网关等都可以关闭」，所以这是**真的停服务**，不是只藏入口。
 pub fn enabled() -> bool {
+    read_flag("enabled").unwrap_or(true) // 老用户默认开（升级前后行为一致）
+}
+
+/// 局域网开关（`gateway.json` 的 `lan`）。**默认关**：绑 `0.0.0.0` 等于把额度借给整个局域网，
+/// 必须是用户显式勾选，不许因为历史配置缺失就默认放开。
+pub fn lan_enabled() -> bool {
+    read_flag("lan").unwrap_or(false)
+}
+
+fn read_flag(key: &str) -> Option<bool> {
     let path = crate::modules::config::store_dir().join("gateway.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(true) // 老用户默认开（升级前后行为一致）
+        .and_then(|v| v.get(key).and_then(Value::as_bool))
 }
 
-pub fn set_enabled(on: bool) -> Result<(), String> {
+/// 写一个开关值 —— **合并写**，不是覆盖写。
+///
+/// ⚠️⚠️ 曾经的写法是 `json!({ "enabled": on })` 整份覆盖：加上 `lan` 之后，
+/// 用户点一下总开关就会把 `lan` 抹掉（反之亦然），表现为「设置自己变回去了」。
+fn write_flag(key: &str, value: bool) -> Result<(), String> {
     let dir = crate::modules::config::store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
     let path = dir.join("gateway.json");
-    let body = serde_json::json!({ "enabled": on });
+    let body = merge_flag(read_body(&path), key, value);
     std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap_or_default())
         .map_err(|e| format!("写 {} 失败：{e}", path.display()))
+}
+
+fn read_body(path: &std::path::Path) -> Value {
+    // 读不到 / 不是 JSON 对象时从空对象起步（把坏文件当空处理，不抛）
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// 合并写一个布尔开关：**其余字段原样保留**（这是 `set_enabled` 曾经丢掉 `lan` 的原因）。
+fn merge_flag(mut body: Value, key: &str, value: bool) -> Value {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(key.to_string(), json!(value));
+    }
+    body
+}
+
+pub fn set_enabled(on: bool) -> Result<(), String> {
+    write_flag("enabled", on)
+}
+
+pub fn set_lan(on: bool) -> Result<(), String> {
+    write_flag("lan", on)
 }
 
 /// 停止信号（`serve` 收到后优雅退出）。
@@ -283,15 +388,67 @@ pub fn request_stop() {
     }
 }
 
+/// 等旧实例真的退出（最多 `timeout_ms`）。返回是否已经停了。
+///
+/// ⚠️ 不做这个等待就直接 `serve` 会「看起来重启了其实没有」：`serve` 开头
+/// `STARTED_AT > 0` 就返回 `Ok`，随后旧实例优雅退出、端口释放 —— 结果没人监听。
+async fn wait_stopped(timeout_ms: u64) -> bool {
+    let step = 50u64;
+    let mut waited = 0u64;
+    while STARTED_AT.load(Ordering::Relaxed) > 0 {
+        if waited >= timeout_ms {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+        waited += step;
+    }
+    true
+}
+
+/// 换绑定模式 / 改端口后**真的重启**：停旧 → 等端口释放 → 起新。必须在一个 tokio 运行时里调用。
+///
+/// 这是 `serve` 的推荐入口（`serve` 保留幂等语义，给启动时用）。
+pub async fn restart(port: u16) -> Result<(), String> {
+    request_stop();
+    if !wait_stopped(3000).await {
+        let msg = "旧网关实例 3 秒内没退出（可能有正在进行的对话），本次没重新监听；再点一次开关即可";
+        set_last_error(Some(msg.to_string()));
+        return Err(msg.to_string());
+    }
+    serve(port).await
+}
+
+/// 绑定地址：**局域网开关关着就只绑回环**（默认），开着才绑全网卡。
+///
+/// 单独抽成函数是为了能被单测钉住 —— 这条判据错了，等于把额度借给整个局域网。
+pub fn bind_ip(lan: bool) -> [u8; 4] {
+    if lan {
+        [0, 0, 0, 0]
+    } else {
+        [127, 0, 0, 1]
+    }
+}
+
 pub async fn serve(port: u16) -> Result<(), String> {
     if STARTED_AT.load(Ordering::Relaxed) > 0 {
         return Ok(());
     }
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("端口 {port} 绑定失败：{e}（可能被占用）"))?;
-
+    // 绑定地址由 `lan` 开关决定：默认只听回环。
+    let lan = lan_enabled();
+    let addr: std::net::SocketAddr = (bind_ip(lan), port).into();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let msg = format!(
+                "端口 {port} 绑定到 {} 失败：{e}（可能被占用，或被安全软件拦下）",
+                addr.ip()
+            );
+            set_last_error(Some(msg.clone()));
+            return Err(msg);
+        }
+    };
+    set_last_error(None);
+    LAN_ACTIVE.store(lan, Ordering::Relaxed);
     STARTED_AT.store(crate::modules::qoder_accounts::now_ms(), Ordering::Relaxed);
 
     // 后台刷一次额度：池子按「谁先过期用谁」排序，靠的就是这份数据。
@@ -309,14 +466,19 @@ pub async fn serve(port: u16) -> Result<(), String> {
     if let Ok(mut guard) = shutdown_tx().lock() {
         *guard = Some(tx);
     }
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // 关掉开关时收到 `true` → 优雅退出并释放端口。
-            let _ = rx.changed().await;
-        })
-        .await
-        .map_err(|e| format!("网关退出：{e}"));
+    let result = axum::serve(
+        listener,
+        // 必须带 connect info：`lan_guard` 靠它判断「这个请求是不是从本机来的」。
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        // 关掉开关时收到 `true` → 优雅退出并释放端口。
+        let _ = rx.changed().await;
+    })
+    .await
+    .map_err(|e| format!("网关退出：{e}"));
     STARTED_AT.store(0, Ordering::Relaxed);
+    LAN_ACTIVE.store(false, Ordering::Relaxed);
     if let Ok(mut guard) = shutdown_tx().lock() {
         *guard = None;
     }
@@ -350,7 +512,57 @@ fn build_router() -> Router {
     api
         // 见 [`MAX_BODY_BYTES`]：默认 2 MiB 会把「带大文件的分析请求」直接 413 掉。
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        // ⚠️ 顺序：后加的 layer 在外层。`cors` 必须最外（预检要被它直接答掉，
+        //    否则 `lan_guard` 会先要 Key，浏览器连预检都过不去）。
+        .layer(axum::middleware::from_fn(lan_guard))
         .layer(axum::middleware::from_fn(cors))
+}
+
+/// 局域网模式的门禁：**非回环来源一律要有效 Key**。
+///
+/// 绑 `0.0.0.0` 之后，局域网里任何人都能敲到这个端口；网关能代花额度，
+/// 所以这里不是「建议带 Key」而是硬拦。`/healthz` 例外（给用户/脚本探活），
+/// 但它自己的 handler 会把账号细节收敛掉。
+///
+/// 回环来源完全不受影响 —— 本机行为与之前一字不差。
+async fn lan_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !LAN_ACTIVE.load(Ordering::Relaxed) {
+        return next.run(req).await;
+    }
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    let from_loopback = peer.map(|a| a.ip().is_loopback()).unwrap_or(false);
+    if from_loopback || req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+    let Some(token) = bearer(req.headers()) else {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            format!(
+                "局域网访问需要 Key：请求头带 Authorization: Bearer sk-ts-…（来源 {}）",
+                peer.map(|a| a.to_string()).unwrap_or_else(|| "未知".into())
+            ),
+        );
+    };
+    match gateway_keys::verify(&token) {
+        Ok(Some(_)) => next.run(req).await,
+        Ok(None) => {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            api_err(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "网关 Key 无效或已吊销",
+            )
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e),
+    }
 }
 
 /// CORS：WorkBuddy / Trae 客户端的「测试连接」是**渲染进程（Chromium）发的 fetch**，
@@ -401,8 +613,24 @@ async fn cors(
     res
 }
 
-async fn healthz() -> impl IntoResponse {
+async fn healthz(
+    // ⚠️ 有它才能区分来源：`serve` 必须配 `into_make_service_with_connect_info`，
+    //    否则这个 extractor 直接 500。
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
     let mut body = status();
+    // 局域网来源（非回环）只回「在跑没跑 + 端口 + 计数」：
+    // 账号显示名 / 剩余额度是本机信息，不该随 healthz 泄给整个局域网。
+    if !peer.ip().is_loopback() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("remote".into(), json!(peer.ip().to_string()));
+            obj.insert(
+                "note".into(),
+                json!("局域网来源：账号池细节已省略；对话请带 Authorization: Bearer sk-ts-…"),
+            );
+        }
+        return Json(body);
+    }
     let pool = gateway_pool::snapshot();
     if let Some(obj) = body.as_object_mut() {
         obj.insert("pool_total".into(), json!(pool.len()));
@@ -2771,9 +2999,105 @@ mod tests {
 
     #[test]
     fn status_reports_not_running_before_start() {
+        // 与 `lan_guard_lets_loopback_through` 互斥：那个用例会临时把 LAN_ACTIVE 置 true。
+        let _g = lan_test_lock();
         let s = status();
         assert_eq!(s["running"], false);
         assert_eq!(s["port"], GATEWAY_PORT);
+        // 没绑 0.0.0.0 时不许冒充「局域网地址」在跑
+        assert_eq!(s["lan"], false);
+        assert_eq!(s["addr"], base_url("127.0.0.1"));
+        assert!(s["lanAddr"].is_null());
+    }
+
+    // ---------------------------------------------------------------- 局域网共享
+
+    /// 默认只绑回环：这条判据错了 = 把整个局域网放进来花额度。
+    #[test]
+    fn default_bind_is_loopback_only() {
+        assert_eq!(bind_ip(false), [127, 0, 0, 1]);
+        assert_eq!(bind_ip(true), [0, 0, 0, 0]);
+        // `lan` 缺省必须是关（`lan_enabled()` 的 `unwrap_or(false)`）——
+        // 这条不在这里断真实配置，避免测试依赖本机 `gateway.json`。
+    }
+
+    /// 两个开关是**合并写**：写 `lan` 不许把 `enabled` 抹掉，反之亦然。
+    ///
+    /// 曾经的写法是整份覆盖，加上 `lan` 之后点一次总开关就会把局域网设置清掉。
+    #[test]
+    fn flag_write_merges_instead_of_overwriting() {
+        let body = merge_flag(json!({ "enabled": true }), "lan", true);
+        assert_eq!(body, json!({ "enabled": true, "lan": true }));
+        // 反向：开总开关不许丢 lan
+        let body = merge_flag(body, "enabled", false);
+        assert_eq!(body, json!({ "enabled": false, "lan": true }));
+        // 坏文件（不是对象）当空处理，不 panic
+        let body = merge_flag(json!("oops"), "lan", true);
+        assert_eq!(body, json!("oops"), "非对象原样返回，不硬塞字段");
+    }
+
+    /// 局域网地址必须是 `http://<ip>:<port>/v1`，端口跟着常量走（别在两处各写一个数）。
+    #[test]
+    fn lan_url_keeps_single_port_source() {
+        let u = base_url("192.168.6.226");
+        assert_eq!(u, format!("http://192.168.6.226:{GATEWAY_PORT}/v1"));
+        assert!(u.ends_with(&format!(":{GATEWAY_PORT}/v1")));
+    }
+
+    /// 探测到的地址绝不可能是回环/未指定（否则「局域网地址」会指回本机，等于骗人）。
+    #[test]
+    fn lan_probe_never_reports_loopback() {
+        if let Some(ip) = lan_ip() {
+            let parsed: std::net::IpAddr = ip.parse().expect("探测结果必须是合法 IP");
+            assert!(!parsed.is_loopback(), "不许把 127.0.0.1 当局域网地址：{ip}");
+            assert!(!parsed.is_unspecified(), "不许把 0.0.0.0 当局域网地址：{ip}");
+        }
+    }
+
+    /// 会改全局 `LAN_ACTIVE` 的测试必须串行（否则并行跑 `status()` 的用例会看到中间态）。
+    fn lan_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 局域网模式下**本机来源必须放行**：这条一旦坏了，本机所有客户端都会被 401 打死。
+    ///
+    /// 用真实监听 + 真实请求验证（纯函数测不到 `ConnectInfo` 到底有没有进 extensions ——
+    /// 那正是这里最容易踩的坑：忘了 `into_make_service_with_connect_info` 就永远拿不到来源）。
+    #[tokio::test]
+    async fn lan_guard_lets_loopback_through() {
+        let _g = lan_test_lock();
+        let app = Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(lan_guard));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("临时端口应能绑定");
+        let port = listener.local_addr().expect("取端口").port();
+        LAN_ACTIVE.store(true, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        // `no_proxy()`：本机环境变量里常挂着沙箱代理，走代理就测不到自己了。
+        let c = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("建客户端");
+        let r = c
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .expect("本机请求应发出");
+        let code = r.status().as_u16();
+        LAN_ACTIVE.store(false, Ordering::Relaxed);
+        assert_eq!(code, 200, "回环来源被门禁拦了 —— connect info 没进 extensions");
     }
 
     #[test]

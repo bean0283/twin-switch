@@ -1951,6 +1951,18 @@ export async function gatewaySetEnabled(enabled: boolean): Promise<{ enabled: bo
 }
 
 
+/**
+ * 局域网共享开关。开了才绑 `0.0.0.0`（同网段其它设备能连），默认只绑回环。
+ *
+ * ⚠️ 改绑定地址会**重启网关**，正在生成的对话会断（返回值里带最新 `status`）。
+ */
+export async function gatewaySetLan(
+  lan: boolean,
+): Promise<{ lan: boolean; enabled: boolean; status: unknown }> {
+  return invoke("gateway_set_lan", { lan });
+}
+
+
 /** 改 Qoder 会话里一条消息的正文。 */
 export async function qoderSessionUpdateMessage(
   region: string,
