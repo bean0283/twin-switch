@@ -1201,6 +1201,15 @@ async fn query_account(account: &CreditAccount) -> Value {
             }),
         );
     }
+    // 诊断日志：WorkBuddy 的「刷新失败 / 401」就终结在这里。
+    // 记下 uid + 401 与否 + 是否试过续期，够判断是「凭据失效」还是「接口/网络问题」。
+    crate::modules::diag_log::error(
+        "wb_credits",
+        format!(
+            "刷新失败 uid={} id={} 401={} 试过续期={} 有refresh={} | {}",
+            account.uid, account.id, still_unauthorized, refresh_attempted, !no_refresh, error
+        ),
+    );
     json!({
         "ok": false,
         "account": account.public_info(),

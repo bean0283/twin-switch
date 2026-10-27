@@ -180,15 +180,33 @@ pub fn decrypt_database(
                         .write(true)
                         .open(out_path)
                         .map_err(|e| e.to_string())?;
-                    let mut buf = vec![0u8; PAGE_SZ];
-                    for pgno in start..=end {
-                        let off = (pgno - 1) * PAGE_SZ as u64;
-                        fin.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-                        fin.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                        let dec = decrypt_page(&enc_key, &buf, pgno);
-                        fout.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-                        fout.write_all(&dec).map_err(|e| e.to_string())?;
-                        done.fetch_add(1, Ordering::Relaxed);
+                    // ⚠️ 按**块**顺序读写，不要「一页一次 seek+read / seek+write」：
+                    // 整库 24 万页那样就是 48 万次系统调用，实测比按块慢一倍以上。
+                    // 每个线程处理的是连续区间，所以可以整段顺序 I/O；
+                    // 块大小 1MB（256 页）兼顾 syscall 次数与内存占用（每线程约 2MB 缓冲）。
+                    const BLK_PAGES: usize = 256;
+                    let mut inbuf = vec![0u8; BLK_PAGES * PAGE_SZ];
+                    let mut outbuf = vec![0u8; BLK_PAGES * PAGE_SZ];
+                    let start_off = (start - 1) * PAGE_SZ as u64;
+                    fin.seek(SeekFrom::Start(start_off)).map_err(|e| e.to_string())?;
+                    fout.seek(SeekFrom::Start(start_off)).map_err(|e| e.to_string())?;
+
+                    let mut pgno = start;
+                    while pgno <= end {
+                        let n = ((end - pgno + 1) as usize).min(BLK_PAGES);
+                        let bytes = n * PAGE_SZ;
+                        fin.read_exact(&mut inbuf[..bytes]).map_err(|e| e.to_string())?;
+                        for k in 0..n {
+                            let dec = decrypt_page(
+                                &enc_key,
+                                &inbuf[k * PAGE_SZ..(k + 1) * PAGE_SZ],
+                                pgno + k as u64,
+                            );
+                            outbuf[k * PAGE_SZ..(k + 1) * PAGE_SZ].copy_from_slice(&dec);
+                        }
+                        fout.write_all(&outbuf[..bytes]).map_err(|e| e.to_string())?;
+                        done.fetch_add(n as u64, Ordering::Relaxed);
+                        pgno += n as u64;
                     }
                     Ok(())
                 };

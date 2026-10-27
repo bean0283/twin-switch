@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
+  ChevronDown,
   Copy,
   Eye,
   FileDown,
@@ -50,6 +51,7 @@ import type {
   WbLinkGroup,
   WbLinksPreview,
   WbSessionCopyPreview,
+  WbSessionCopyMultiReport,
   WbSessionCopyReport,
   WbSessionDeleteReport,
   WbSessionDetail,
@@ -140,11 +142,33 @@ export default function WorkbuddyRecordsPage() {
 
   // 复制与关联
   const [srcUid, setSrcUid] = useState("");
-  const [dstUid, setDstUid] = useState("");
+  // ⚠️ 目标账号是**多选**（用户要求）：一次把选中的会话复制给多个账号。
+  // 原来只有一个 `dstUid`，要复制给 3 个号就得点 3 遍、每遍各备份一次整库。
+  const [dstUids, setDstUids] = useState<Set<string>>(new Set());
+  const [dstPickerOpen, setDstPickerOpen] = useState(false);
   const [copySel, setCopySel] = useState<Set<string>>(new Set());
+  // 复制页自己的搜索 / 空间筛选 / 分组（与会话记录页同一套交互，但状态独立：
+  // 在记录页筛过的条件不该影响复制页的选择范围）。
+  const [copyQuery, setCopyQuery] = useState("");
+  const [copyWs, setCopyWs] = useState("");
+  const [copyByWorkspace, setCopyByWorkspace] = useState(true);
   const [preview, setPreview] = useState<WbSessionCopyPreview | null>(null);
   const [links, setLinks] = useState<WbLinksPreview | null>(null);
-  const [copyReport, setCopyReport] = useState<WbSessionCopyReport | null>(null);
+  /**
+   * 旧的单目标复制结果 —— 现在只在「上次复制结果」卡里展示历史（不再写入）。
+   * 多目标走 `copyReportMulti`；保留这个是为了不删掉历史展示。
+   */
+  const [copyReport] = useState<WbSessionCopyReport | null>(null);
+  /** 多目标复制的结果（每目标一条；旧的单目标 `copyReport` 只用于历史展示）。 */
+  const [copyReportMulti, setCopyReportMulti] = useState<WbSessionCopyMultiReport | null>(null);
+  /**
+   * 复制前的确认弹窗。
+   *
+   * 用户在截图里提的要求：点复制先弹提示框，确定后**自动退出 WorkBuddy → 复制 →
+   * 自动重新打开**。以前客户端开着就直接拒绝写入（「已阻止写入」），
+   * 用户只能自己去关、复制完再自己开。
+   */
+  const [confirmCopy, setConfirmCopy] = useState(false);
   const [edgeDbs, setEdgeDbs] = useState<{ name: string; path: string; size: number }[]>([]);
 
   // 全账号互通（一键 + 切号自动跑）。`autoLink === null` = 设置还没读到/读失败，
@@ -154,6 +178,13 @@ export default function WorkbuddyRecordsPage() {
   const [linkPreview, setLinkPreview] = useState<WbSessionLinkAllReport | null>(null);
   const [confirmLink, setConfirmLink] = useState(false);
   const [autoLink, setAutoLink] = useState<boolean | null>(null);
+  /**
+   * 「跨账号关联」卡片是否展开。**默认收起**（2026-10-26 用户要求）。
+   *
+   * 这块是低频操作（一键互通 / 关联组表），却常驻半屏，把上面的会话复制挤得只剩
+   * 三行、选会话要一直滚。收起后把腾出的高度直接给会话列表（见列表容器的 `max-h`）。
+   */
+  const [linkOpen, setLinkOpen] = useState(false);
 
   /**
    * 读会话列表。
@@ -176,7 +207,11 @@ export default function WorkbuddyRecordsPage() {
       setStaleNote(null);
       setUid((prev) => prev || list[0]?.uid || "");
       setSrcUid((prev) => prev || list[0]?.uid || "");
-      setDstUid((prev) => prev || list[1]?.uid || list[0]?.uid || "");
+      setDstUids((prev) => {
+        if (prev.size > 0) return prev;
+        const first = list[1]?.uid ?? list[0]?.uid;
+        return first ? new Set([first]) : prev;
+      });
       const ed = await api.workbuddySessionEdgeSyncDbs();
       setEdgeDbs(ed.items || []);
       // 预览与主流程并行、失败也不影响列表（但绝不显示旧/假数字：失败就清空）。
@@ -310,17 +345,26 @@ export default function WorkbuddyRecordsPage() {
     });
   }, [filtered]);
 
+  /** 目标账号列表（多选状态 → 数组，保持账号库顺序）。 */
+  const dstList = useMemo(
+    () => accounts.filter((a) => dstUids.has(a.uid) && a.uid !== srcUid).map((a) => a.uid),
+    [accounts, dstUids, srcUid],
+  );
+
   const loadLinks = useCallback(async () => {
-    if (!srcUid || !dstUid || srcUid === dstUid) {
+    // 关联预览的口径是「源 vs 某个目标」，多选时取第一个目标即可 ——
+    // 它只是给用户看「这个号和源差多少」，真正写库由复制按钮按全部目标执行。
+    const first = dstList[0];
+    if (!srcUid || !first) {
       setLinks(null);
       return;
     }
     try {
-      setLinks(await api.workbuddySessionLinksPreview(srcUid, dstUid));
+      setLinks(await api.workbuddySessionLinksPreview(srcUid, first));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
     }
-  }, [srcUid, dstUid]);
+  }, [srcUid, dstList]);
 
   useEffect(() => {
     void loadLinks();
@@ -333,16 +377,17 @@ export default function WorkbuddyRecordsPage() {
   );
 
   const refreshPreview = useCallback(async () => {
-    if (!srcUid || !dstUid || srcUid === dstUid || copySel.size === 0) {
+    const first = dstList[0];
+    if (!srcUid || !first || copySel.size === 0) {
       setPreview(null);
       return;
     }
     try {
-      setPreview(await api.workbuddySessionCopyPreview(srcUid, dstUid, [...copySel]));
+      setPreview(await api.workbuddySessionCopyPreview(srcUid, first, [...copySel]));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
     }
-  }, [srcUid, dstUid, copySel]);
+  }, [srcUid, dstList, copySel]);
 
   useEffect(() => {
     void refreshPreview();
@@ -419,13 +464,49 @@ export default function WorkbuddyRecordsPage() {
     }
   };
 
-  const runCopy = async () => {
-    if (!srcUid || !dstUid || copySel.size === 0) return;
+  /** 点「复制到目标账号」→ 先弹确认框（不直接写库）。 */
+  const runCopy = () => {
+    if (!srcUid || dstList.length === 0 || copySel.size === 0) return;
+    setConfirmCopy(true);
+  };
+
+  /**
+   * 确认后真正执行复制。
+   *
+   * `closeClient = true`：客户端在跑就由本工具退出它 —— 复制完**自动重新打开**。
+   * 这是用户在确认框里点「确定」换来的授权，不再需要他自己去关再自己开。
+   */
+  const doCopy = async () => {
+    setConfirmCopy(false);
+    if (!srcUid || dstList.length === 0 || copySel.size === 0) return;
     setBusy("copy");
     try {
-      const r = await api.workbuddySessionCopy(srcUid, dstUid, [...copySel]);
-      setCopyReport(r);
-      toast.success(`已复制 ${r.count} 个会话`, { description: "源账号数据未做任何改动" });
+      const r = await api.workbuddySessionCopyMulti(srcUid, dstList, [...copySel], true);
+      setCopyReportMulti(r);
+      // ⚠️ 每个目标独立成败，不能一句话说成「全部成功」。
+      const failed = r.targets.filter((t) => !t.ok);
+      // 客户端是我们关的，就必须说清「开回来了没有」—— 失败也得照实说。
+      const relaunchNote = r.clientStopped
+        ? r.clientRelaunched
+          ? "已重新打开 WorkBuddy"
+          : `WorkBuddy 没能自动打开：${r.restartError ?? "原因未知"}`
+        : "";
+      if (failed.length === 0) {
+        toast.success(
+          `已复制 ${r.count} 个会话到 ${r.okCount} 个账号`,
+          {
+            description:
+              ["源账号数据未做任何改动", relaunchNote].filter(Boolean).join(" · "),
+          },
+        );
+      } else if (r.okCount > 0) {
+        toast.warning(
+          `${r.okCount}/${r.targetCount} 个账号复制成功`,
+          { description: `${failed.length} 个失败：${failed.map((f) => f.targetUid.slice(0, 8)).join("、")}` },
+        );
+      } else {
+        toast.error("复制全部失败", { description: failed[0]?.error ?? "未知原因" });
+      }
       setCopySel(new Set());
       await load(true);
       await loadLinks();
@@ -527,6 +608,85 @@ export default function WorkbuddyRecordsPage() {
     for (const it of preview?.items ?? []) m.set(it.id, it);
     return m;
   }, [preview]);
+  /** 复制页用（名字带 ById 的旧变量保留给原逻辑，新代码统一用这个）。 */
+  const previewById = previewByid;
+
+  // ---------------------------------------------------------------------------
+  // 复制页：搜索 / 空间分组（与会话记录页同一套口径）
+  // ---------------------------------------------------------------------------
+
+  /** 源账号涉及的工作空间（最近活动的在前；同名空间补一级目录区分）。 */
+  const copyWsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; last: number }
+    >();
+    for (const s of srcSessions) {
+      const key = s.workspaceKey ?? "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.last = Math.max(cur.last, s.updatedAt || 0);
+      } else {
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspacePath || "",
+          count: 1,
+          last: s.updatedAt || 0,
+        });
+      }
+    }
+    const list = [...map.values()];
+    const dup = new Map<string, number>();
+    for (const w of list) dup.set(w.label, (dup.get(w.label) ?? 0) + 1);
+    return list
+      .map((w) => {
+        if ((dup.get(w.label) ?? 0) <= 1) return w;
+        const segs = (w.path || "").split("/").filter(Boolean);
+        return { ...w, label: segs.slice(-2).join("/") || w.label };
+      })
+      .sort((a, b) => b.last - a.last || a.label.localeCompare(b.label));
+  }, [srcSessions]);
+
+  /** 搜索 + 空间筛选后的源会话（勾选只作用于这些行）。 */
+  const copyVisible = useMemo(() => {
+    const q = copyQuery.trim().toLowerCase();
+    return srcSessions.filter((s) => {
+      if (copyWs && (s.workspaceKey ?? "") !== copyWs) return false;
+      if (!q) return true;
+      return [s.title, s.workspace, s.workspacePath, s.id].some((v) =>
+        (v ?? "").toLowerCase().includes(q),
+      );
+    });
+  }, [srcSessions, copyWs, copyQuery]);
+
+  /** 按空间分组（顺序跟着 `copyWsOptions`）。 */
+  const copyRenderGroups = useMemo(() => {
+    if (!copyByWorkspace) {
+      return [{ key: "__flat__", label: "", path: "", items: copyVisible }];
+    }
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; items: typeof copyVisible }
+    >();
+    for (const s of copyVisible) {
+      const key = s.workspaceKey ?? "";
+      const g = map.get(key);
+      if (g) g.items.push(s);
+      else
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspacePath || "",
+          items: [s],
+        });
+    }
+    const order = new Map(copyWsOptions.map((w, i) => [w.key, i]));
+    return [...map.values()].sort(
+      (a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+    );
+  }, [copyByWorkspace, copyVisible, copyWsOptions]);
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-4 px-4 py-6">
@@ -913,7 +1073,9 @@ export default function WorkbuddyRecordsPage() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              <div className="flex flex-wrap items-center gap-3">
+              {/* 源账号 + 目标账号（**多选**）+ 搜索 + 空间筛选 + 视图切换
+                  —— 与会话记录页同一套交互与同一套空间口径。 */}
+              <div className="flex flex-wrap items-center gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-muted-foreground">源账号</span>
                   <select
@@ -922,6 +1084,12 @@ export default function WorkbuddyRecordsPage() {
                     onChange={(e) => {
                       setSrcUid(e.target.value);
                       setCopySel(new Set());
+                      // 源账号变了，目标里若含它自己要去掉（后端会拒绝，别让用户白点）
+                      setDstUids((prev) => {
+                        const n = new Set(prev);
+                        n.delete(e.target.value);
+                        return n;
+                      });
                     }}
                   >
                     {accounts.map((a) => (
@@ -931,105 +1099,294 @@ export default function WorkbuddyRecordsPage() {
                     ))}
                   </select>
                 </div>
+
                 <span className="text-muted-foreground">→</span>
+
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-muted-foreground">目标账号</span>
-                  <select
-                    className="h-9 min-w-[200px] rounded-md border border-input bg-background px-3 text-sm"
-                    value={dstUid}
-                    onChange={(e) => setDstUid(e.target.value)}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 min-w-[200px] justify-between font-normal"
+                    onClick={() => setDstPickerOpen(true)}
+                    disabled={!srcUid}
                   >
-                    {accounts.map((a) => (
-                      <option key={a.uid} value={a.uid}>
-                        {accountLabel(a, a.uid)} · {a.count}
-                      </option>
-                    ))}
-                  </select>
+                    <span className="truncate">
+                      {dstList.length === 0
+                        ? "选择目标账号（可多选）"
+                        : `已选 ${dstList.length} 个账号`}
+                    </span>
+                    <ChevronDown className="size-3.5 shrink-0 opacity-60" />
+                  </Button>
+                </div>
+
+                <div className="relative">
+                  <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={copyQuery}
+                    onChange={(e) => setCopyQuery(e.target.value)}
+                    placeholder="搜索标题 / 工作空间 / 会话 id"
+                    className="h-9 w-[230px] pl-7 pr-7 text-sm"
+                  />
+                  {copyQuery ? (
+                    <button
+                      type="button"
+                      title="清除搜索"
+                      className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                      onClick={() => setCopyQuery("")}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+
+                <select
+                  value={copyWs}
+                  onChange={(e) => setCopyWs(e.target.value)}
+                  className="h-9 max-w-[220px] rounded-md border border-input bg-background px-2 text-sm"
+                  title="按工作空间筛选"
+                >
+                  <option value="">全部工作空间（{copyWsOptions.length}）</option>
+                  {copyWsOptions.map((w) => (
+                    <option key={w.key} value={w.key}>
+                      {w.label} · {w.count}
+                    </option>
+                  ))}
+                </select>
+
+                <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                      copyByWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setCopyByWorkspace(true)}
+                  >
+                    <Layers className="size-3" />
+                    按空间
+                  </button>
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                      !copyByWorkspace ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                    )}
+                    onClick={() => setCopyByWorkspace(false)}
+                  >
+                    <LayoutList className="size-3" />
+                    平铺
+                  </button>
                 </div>
               </div>
 
-              {srcUid && dstUid && srcUid === dstUid && (
+              {srcUid && dstList.includes(srcUid) && (
                 <Alert>
                   <AlertTriangle className="size-4" />
-                  <AlertTitle>源账号与目标账号相同</AlertTitle>
-                  <AlertDescription>请选择一个不同的目标账号。</AlertDescription>
+                  <AlertTitle>源账号出现在目标里</AlertTitle>
+                  <AlertDescription>已自动跳过源账号本身。</AlertDescription>
                 </Alert>
               )}
 
               {preview?.blocked && (
-                <Alert variant="destructive">
+                <Alert variant={preview.appRunning ? "default" : "destructive"}>
                   <AlertTriangle className="size-4" />
-                  <AlertTitle>已阻止写入</AlertTitle>
-                  <AlertDescription>{preview.reason}</AlertDescription>
+                  <AlertTitle>
+                    {preview.appRunning ? "需要先退出 WorkBuddy" : "已阻止写入"}
+                  </AlertTitle>
+                  <AlertDescription>
+                    {preview.reason}
+                    {preview.appRunning ? (
+                      <span className="mt-1 block">
+                        点下面的「复制到目标账号」会先弹确认框，确定后
+                        <b className="font-medium">自动退出 WorkBuddy → 复制 → 自动重新打开</b>
+                        ，你不需要自己关。
+                      </span>
+                    ) : null}
+                  </AlertDescription>
                 </Alert>
               )}
 
-              <div className="max-h-80 overflow-auto rounded-md border">
+              <div
+                className={cn(
+                  "overflow-auto rounded-md border",
+                  // 原来固定 320px（max-h-80）：一屏只能看到三行，勾会话要一直滚。
+                  // 下面「跨账号关联」收起时（默认）把腾出的高度给它，展开时回到原状。
+                  // 用 vh 而不是写死像素：窗口大小不同也不会有半屏空白或溢出。
+                  linkOpen ? "max-h-80" : "max-h-[max(20rem,calc(100vh-24rem))]",
+                )}
+              >
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 border-b bg-muted/40 text-xs text-muted-foreground">
                     <tr>
-                      <th className="w-10 px-3 py-2" />
+                      <th className="w-10 px-3 py-2">
+                        <input
+                          type="checkbox"
+                          className="size-4 align-middle"
+                          title="全选当前可见的会话"
+                          checked={
+                            copyVisible.length > 0 &&
+                            copyVisible.every((x) => copySel.has(x.id) || !x.hasBody)
+                          }
+                          onChange={(e) => {
+                            setCopySel((prev) => {
+                              const n = new Set(prev);
+                              for (const x of copyVisible) {
+                                if (!x.hasBody) continue;
+                                if (e.target.checked) n.add(x.id);
+                                else n.delete(x.id);
+                              }
+                              return n;
+                            });
+                          }}
+                        />
+                      </th>
                       <th className="px-3 py-2 text-left font-medium">会话</th>
+                      <th className="px-3 py-2 text-left font-medium">工作空间</th>
                       <th className="w-32 px-3 py-2 text-left font-medium">复制状态</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {srcSessions.map((s) => {
-                      const p = previewByid.get(s.id);
-                      const disabled = !s.hasBody || (p ? !p.available : false);
-                      return (
-                        <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
-                          <td className="px-3 py-2">
-                            <input
-                              type="checkbox"
-                              className="size-4"
-                              disabled={disabled}
-                              checked={copySel.has(s.id)}
-                              onChange={() => toggle(s.id, setCopySel, copySel)}
-                            />
-                          </td>
-                          <td className="max-w-[420px] px-3 py-2">
-                            <div className="truncate font-medium">{s.title}</div>
-                            <div className="truncate text-xs text-muted-foreground">
-                              {timeLabel(s.updatedAt)} · {humanSize(s.bodyBytes)}
-                            </div>
-                          </td>
-                          <td className="px-3 py-2 text-xs">
-                            {p?.alreadyLinked ? (
-                              <Badge variant="secondary">已有副本</Badge>
-                            ) : p && !p.available ? (
-                              <span className="text-destructive">{p.reason}</span>
-                            ) : !s.hasBody ? (
-                              <span className="text-muted-foreground">无正文</span>
-                            ) : (
-                              <span className="text-muted-foreground">可复制</span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {copyRenderGroups.map((g) => (
+                      <Fragment key={g.key}>
+                        {copyByWorkspace ? (
+                          <tr className="bg-muted/50">
+                            <td colSpan={4} className="px-3 py-1.5">
+                              <button
+                                type="button"
+                                className="flex w-full items-center gap-2 text-left"
+                                title="只看这个工作空间"
+                                onClick={() => setCopyWs(g.key)}
+                              >
+                                <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                                <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                                <Badge variant="secondary" className="shrink-0">
+                                  {g.items.length}
+                                </Badge>
+                                <span className="truncate text-xs text-muted-foreground" title={g.path}>
+                                  {g.path}
+                                </span>
+                              </button>
+                            </td>
+                          </tr>
+                        ) : null}
+                        {g.items.map((s) => {
+                          const p = previewById.get(s.id);
+                          const disabled = !s.hasBody || (p ? !p.available : false);
+                          return (
+                            <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
+                              <td className="px-3 py-2">
+                                <input
+                                  type="checkbox"
+                                  className="size-4"
+                                  disabled={disabled}
+                                  checked={copySel.has(s.id)}
+                                  onChange={() => toggle(s.id, setCopySel, copySel)}
+                                />
+                              </td>
+                              <td className="max-w-[380px] px-3 py-2">
+                                <div className="truncate font-medium">{s.title}</div>
+                                <div className="truncate text-xs text-muted-foreground">
+                                  {timeLabel(s.updatedAt)} · {humanSize(s.bodyBytes)}
+                                </div>
+                              </td>
+                              <td className="max-w-[240px] px-3 py-2">
+                                <div className="truncate text-xs text-muted-foreground" title={s.workspacePath}>
+                                  {s.workspace || "（未归属）"}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-xs">
+                                {disabled && !s.hasBody ? (
+                                  <span className="text-muted-foreground">无正文</span>
+                                ) : p && !p.available ? (
+                                  <span className="text-destructive">{p.reason}</span>
+                                ) : (
+                                  <span className="text-muted-foreground">可复制</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </Fragment>
+                    ))}
+                    {copyRenderGroups.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                          {srcSessions.length === 0
+                            ? "这个账号没有会话。"
+                            : `没有匹配的会话 —— 筛选后 0 条，该账号共 ${srcSessions.length} 条。`}
+                        </td>
+                      </tr>
+                    ) : null}
                   </tbody>
                 </table>
               </div>
 
-              <div className="flex items-center justify-between rounded-md border bg-muted/40 px-3 py-2 text-sm">
-                <span>已选 {copySel.size} 个会话</span>
-                <Button
-                  size="sm"
-                  disabled={
-                    busy === "copy" ||
-                    copySel.size === 0 ||
-                    srcUid === dstUid ||
-                    !!preview?.blocked
-                  }
-                  onClick={() => void runCopy()}
-                >
-                  {busy === "copy" ? <Loader2 className="size-4 animate-spin" /> : <Copy className="size-4" />}
-                  复制到目标账号
-                </Button>
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+                <span>
+                  已选 {copySel.size} 个会话
+                  {dstList.length > 0 ? ` → ${dstList.length} 个目标账号` : ""}
+                </span>
+                <div className="flex items-center gap-2">
+                  {copySel.size > 0 && (
+                    <Button size="sm" variant="ghost" onClick={() => setCopySel(new Set())}>
+                      清空选择
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    disabled={
+                      busy === "copy" ||
+                      copySel.size === 0 ||
+                      dstList.length === 0 ||
+                      // 「目标账号正被客户端使用」不再禁用：确认后会由本工具退出它。
+                      // 其余阻止原因（源=目标、会话不可用…）仍禁用。
+                      (!!preview?.blocked && !preview?.appRunning)
+                    }
+                    onClick={() => void runCopy()}
+                  >
+                    {busy === "copy" ? <Loader2 className="size-4 animate-spin" /> : <Copy className="size-4" />}
+                    复制到目标账号
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
+
+          {copyReportMulti && (
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">上次复制结果（按目标账号）</CardTitle>
+                <CardDescription>
+                  {copyReportMulti.okCount}/{copyReportMulti.targetCount} 个账号成功，
+                  合计复制 {copyReportMulti.count} 个会话
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-1.5 text-xs">
+                {copyReportMulti.targets.map((t) => (
+                  <div
+                    key={t.targetUid}
+                    className={cn(
+                      "flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5",
+                      t.ok ? "border-primary/25 bg-primary/5" : "border-destructive/30 bg-destructive/5",
+                    )}
+                  >
+                    <span className="font-mono">{t.targetUid.slice(0, 10)}…</span>
+                    {t.ok ? (
+                      <>
+                        <Badge variant="secondary">复制 {t.count ?? 0} 个</Badge>
+                        {t.skipped && t.skipped.length > 0 && (
+                          <span className="text-muted-foreground">跳过 {t.skipped.length} 个</span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-destructive">{t.error ?? "未知原因"}</span>
+                    )}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
 
           {copyReport && (
             <Card>
@@ -1054,11 +1411,38 @@ export default function WorkbuddyRecordsPage() {
 
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-base">跨账号关联</CardTitle>
-              <CardDescription>
-                复制过的会话会自动登记成一个关联组，这里可以看到各账号副本的当前状态。
-              </CardDescription>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 space-y-1.5">
+                  <CardTitle className="text-base">跨账号关联</CardTitle>
+                  <CardDescription>
+                    复制过的会话会自动登记成一个关联组，这里可以看到各账号副本的当前状态。
+                    {linkOpen
+                      ? null
+                      : "（默认收起：一键互通与关联组列表点右侧「展开」查看）"}
+                  </CardDescription>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {!linkOpen && (links?.groups.length ?? 0) > 0 ? (
+                    <span className="rounded-full border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
+                      {links?.groups.length} 组
+                    </span>
+                  ) : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-expanded={linkOpen}
+                    title={linkOpen ? "收起跨账号关联" : "展开跨账号关联"}
+                    onClick={() => setLinkOpen((v) => !v)}
+                  >
+                    <ChevronDown
+                      className={cn("size-4 transition-transform", linkOpen && "rotate-180")}
+                    />
+                    {linkOpen ? "收起" : "展开"}
+                  </Button>
+                </div>
+              </div>
             </CardHeader>
+            {linkOpen ? (
             <CardContent className="space-y-3">
               {/* ── 全账号互通 ───────────────────────────────────────────
                   关联组 = 「同一段对话在各账号上的副本」。要把本机所有会话都做成关联，
@@ -1243,6 +1627,7 @@ export default function WorkbuddyRecordsPage() {
                 </p>
               )}
             </CardContent>
+            ) : null}
           </Card>
 
           {edgeDbs.length > 0 && (
@@ -1273,6 +1658,97 @@ export default function WorkbuddyRecordsPage() {
       </Tabs>
 
       {/* 详情（会话正文很长，默认放大并可拖拽调节） */}
+      {/* 目标账号**多选**弹窗：勾多个号，确定后开始执行复制任务。 */}
+      <Dialog open={dstPickerOpen} onOpenChange={setDstPickerOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>选择目标账号（可多选）</DialogTitle>
+            <DialogDescription>
+              勾选要复制到的账号，确定后开始执行。源账号不能作为目标，会自动排除。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[50vh] space-y-1 overflow-auto">
+            {accounts
+              .filter((a) => a.uid !== srcUid)
+              .map((a) => {
+                const checked = dstUids.has(a.uid);
+                return (
+                  <label
+                    key={a.uid}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm hover:bg-muted/50",
+                      checked && "border-primary/30 bg-primary/5",
+                    )}
+                  >
+                    <input
+                      type="checkbox"
+                      className="size-4"
+                      checked={checked}
+                      onChange={() =>
+                        setDstUids((prev) => {
+                          const n = new Set(prev);
+                          if (n.has(a.uid)) n.delete(a.uid);
+                          else n.add(a.uid);
+                          return n;
+                        })
+                      }
+                    />
+                    <span className="min-w-0 flex-1 truncate">{accountLabel(a, a.uid)}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{a.count} 个会话</span>
+                  </label>
+                );
+              })}
+            {accounts.filter((a) => a.uid !== srcUid).length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">
+                没有其它账号可选（先在「账号管理」里添加账号）。
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" size="sm" onClick={() => setDstUids(new Set())}>
+              清空
+            </Button>
+            <Button size="sm" onClick={() => setDstPickerOpen(false)}>
+              确定（已选 {dstList.length} 个）
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 复制确认：确认后才动会话库；客户端在跑就自动退出 + 复制完自动开回来 */}
+      <Dialog open={confirmCopy} onOpenChange={setConfirmCopy}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>开始复制？</DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-2 text-[13px] leading-relaxed text-muted-foreground">
+                <p>
+                  将把 <b className="text-foreground">{copySel.size}</b> 个会话从源账号复制到{" "}
+                  <b className="text-foreground">{dstList.length}</b> 个目标账号。
+                  源账号的数据不做任何改动；目标账号已存在的同 id 副本会跳过。
+                </p>
+                {preview?.appRunning ? (
+                  <p className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    WorkBuddy 正在运行，且目标账号就是当前登录的号。写会话库前必须先退出它：
+                    点「确定」后本工具会
+                    <b>自动关闭 WorkBuddy → 复制 → 自动重新打开</b>，你不用自己关。
+                  </p>
+                ) : null}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmCopy(false)}>
+              取消
+            </Button>
+            <Button onClick={() => void doCopy()}>
+              <Copy className="size-4" />
+              确定并开始
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={!!detail} onOpenChange={(o) => !o && setDetail(null)}>
         <ResizableDialogContent storageKey="wb-session-detail">
           <DialogHeader>

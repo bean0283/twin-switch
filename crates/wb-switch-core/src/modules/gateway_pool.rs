@@ -16,7 +16,9 @@
 //! 1. **额度未知 ≠ 为 0**：查不到就留 `None`，不许填 0（填 0 等于把一个能用的号永久排除）。
 //! 2. **没有凭据的账号不进池**：否则选号会选到一个发不出请求的空壳。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -72,6 +74,75 @@ impl PoolEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 会话粘性：同一段对话固定用同一个账号
+// ---------------------------------------------------------------------------
+
+/// 会话 → 账号 key 的绑定表（进程内）。
+///
+/// **为什么必须有这张表**：Trae 的上游会话 ID 由 `session_seed(model, uid, …)` 派生，
+/// **uid 参与指纹**。所以同一段对话中途换号 ⇒ 上游认为「这是另一个会话」⇒ 前缀缓存全失效，
+/// 而且用户会看到「会话像断了一样」（上下文还在，但上游那边的连续性是断的）。
+///
+/// 用户的原始要求就是这个：「如果是担心同一个会话，切换模型会出现会话中断，
+/// 应当在新会话的时候就要切换」。于是规则定为：
+/// * **一段对话第一次请求** → 按积分最早过期选号（省钱、先用快过期的）；
+/// * **同一段对话后续请求** → 锁定第一次选中的那个账号，不换（除非它不可用/冷却）。
+///
+/// 会话指纹用 [`crate::modules::gateway_stream::session_seed`] 的**前两段**（模型 + 首条 user），
+/// 不含 uid —— 正好就是「这段对话是谁」。
+fn sticky_path() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join("gateway-sticky.json")
+}
+
+/// 进程内绑定表（读盘一次、写时落盘，重启后仍能接上同一段对话）。
+fn sticky_map() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let loaded = std::fs::read_to_string(sticky_path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<HashMap<String, String>>(&t).ok())
+            .unwrap_or_default();
+        Mutex::new(loaded)
+    })
+}
+
+/// 绑定表上限：只留最近这么多段对话，避免无限增长（LRU 用「最近写入」近似）。
+const STICKY_MAX: usize = 512;
+
+/// 查这段对话绑定的账号 key。
+pub fn sticky_lookup(conv: &str) -> Option<String> {
+    sticky_map().lock().ok()?.get(conv).cloned()
+}
+
+/// 记下这段对话用的账号（覆盖写：换号后以最新的为准）。
+pub fn sticky_bind(conv: &str, key: &str) {
+    if conv.is_empty() || key.is_empty() {
+        return;
+    }
+    let Ok(mut m) = sticky_map().lock() else { return };
+    // 近似 LRU：超限时按插入顺序丢最早的一批（HashMap 无顺序，这里直接截断到上限的 3/4）。
+    if m.len() >= STICKY_MAX && !m.contains_key(conv) {
+        let keep: Vec<(String, String)> = m.iter().skip(m.len() / 4).map(|(k, v)| (k.clone(), v.clone())).collect();
+        m.clear();
+        m.extend(keep);
+    }
+    m.insert(conv.to_string(), key.to_string());
+    if let Ok(text) = serde_json::to_string(&*m) {
+        let _ = std::fs::write(sticky_path(), text);
+    }
+}
+
+/// 忘掉这段对话的绑定（那个账号不可用时调用，下次重新按紧迫度选）。
+pub fn sticky_forget(conv: &str) {
+    let Ok(mut m) = sticky_map().lock() else { return };
+    if m.remove(conv).is_some() {
+        if let Ok(text) = serde_json::to_string(&*m) {
+            let _ = std::fs::write(sticky_path(), text);
+        }
+    }
+}
+
 /// 全部账号（已排序：最紧迫在前）。
 pub fn snapshot() -> Vec<PoolEntry> {
     let mut out = Vec::new();
@@ -95,11 +166,21 @@ pub fn snapshot() -> Vec<PoolEntry> {
     };
 
     out.sort_by(|a, b| {
-        // 可用的排前面 → 默认账号 → 越紧迫越靠前。
+        // ⚠️⚠️ **紧迫度优先于「默认账号」**（2026-10-26 用户实测纠正）。
+        //
+        // 原来的顺序是「可用的 → 默认账号 → 紧迫度」，于是「设为默认」的号永远排在
+        // 所有快过期的号前面 —— 用户看到的现象正是「积分没有按最早过期的消耗，
+        // 反而一直消耗当前登录的那个号」（Qoder 切号时会 `set_default`）。
+        // 积分的意义就是**先用会过期的**，让默认账号压过它等于把这条规则废掉。
+        // 现在：可用的在前 → 越紧迫越靠前 → 只有到期时间完全相同时才让默认账号占先。
         b.usable
             .cmp(&a.usable)
+            .then_with(|| {
+                a.urgency()
+                    .partial_cmp(&b.urgency())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| is_default(b).cmp(&is_default(a)))
-            .then_with(|| a.urgency().partial_cmp(&b.urgency()).unwrap_or(std::cmp::Ordering::Equal))
     });
     with_cooldowns(out, None)
 }
@@ -115,8 +196,6 @@ pub fn usable() -> Vec<PoolEntry> {
 // 上游报错后把**冷却**写回内存表，下次选号跳过 —— 否则同一个请求失败后，
 // 下一个请求还会选同一个账号再撞一次。
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// 冷却表落盘位置。
 fn cooldowns_path() -> std::path::PathBuf {
@@ -383,6 +462,17 @@ fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'stati
         return Some((now + 60 * 60_000, "balance_exhausted"));
     }
 
+    // ★ WorkBuddy `11128 Illegal API invocation from an unapproved channel`：
+    // 上游按**频道/账号**校验，换一份同样的请求体、换一个号就正常（2026-10-26 真机探针
+    // 7 种请求形状全部 200，只有这条错误凭空出现）。所以它是**账号级**判据：
+    // 记 10 分钟整号冷却（`auth_dead` 会锁整个号），期间直接跳过它、自动换号。
+    //
+    // 为什么不记更长（比如 30 分钟，与 401 一致）：万一是「请求形状」引起的，
+    // 一次长锁会把本来好好的号封半小时；10 分钟足够躲过一轮，也不会长期误伤。
+    if hint.contains("11128") || hint.contains("unapproved channel") {
+        return Some((now + 10 * 60_000, "auth_dead"));
+    }
+
     match http_status {
         0 => Some((now + 60_000, "transient")),
         401 | 403 => Some((now + 30 * 60_000, "auth_dead")),
@@ -641,125 +731,243 @@ fn workbuddy_entries() -> Vec<PoolEntry> {
 
 // ---------------------------------------------------------------- Trae
 
-fn trae_entries() -> Vec<PoolEntry> {
-    let vault = store_dir().join("trae").join("vault");
-    let Ok(clients) = std::fs::read_dir(&vault) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let now = qoder_accounts::now_ms();
+/// 一个 Trae 账号**真正能被网关使用**的凭据（唯一出口）。
+///
+/// ⚠️⚠️ 这张结构存在的理由，是 2026-10-26 的一次真实事故：
+/// 积分池判断「这个号能不能用」看的是 `oauth.json` 里有没有 `privateKeyPEM`，
+/// 而真正发请求要的是 `User/globalStorage/storage.json` 里能解开的 `iCubeAuthInfo`
+/// —— **两个判据不同源**。于是池子把「有私钥但没有登录态」的号当成可用、按紧迫度选中，
+/// 发出去却 502「找不到账号 xxx 的可用登录态」，连换 3 个号全失败。
+///
+/// 更隐蔽的一层：**uid 解析也有两套**。池子用「meta → profile → 解 JWT → 目录名」四段回退，
+/// 而旧的 `trae_cred` 只认 meta/oauth.id；`solo-cn/oauth_717036` 的 meta 里没有
+/// `verified_uid`，池子能解出 842681600717036，发送端却解不出 ⇒ 按 uid 找不到。
+///
+/// 所以现在只留**一个**函数：uid + jwt + 设备标识一起给，池子和发送端都只认它。
+pub struct TraeLogin {
+    pub uid: String,
+    pub jwt: String,
+    pub device_id: String,
+    pub machine_id: String,
+    /// 账号目录（取 profile.json 算额度/到期用）。
+    pub dir: std::path::PathBuf,
+}
 
-    for client in clients.flatten() {
-        let name = client.file_name().to_string_lossy().to_string();
-        let scope = match name.as_str() {
-            "trae-cn" | "solo-cn" => "trae-cn",
-            "trae-intl" | "solo-intl" => "trae-global",
-            _ => continue,
-        };
-        let Ok(dirs) = std::fs::read_dir(client.path()) else {
+/// 扫 vault 下所有 Trae 账号目录（`trae-cn` / `solo-cn`）。
+fn trae_vault_dirs() -> Vec<std::path::PathBuf> {
+    let vault = store_dir().join("trae").join("vault");
+    let mut dirs = Vec::new();
+    // ⚠️ 2026-10-26 用户决定：**弃用 solo-cn**，网关只认 trae-cn。
+    // 老机器上可能还留着 solo-cn 目录，但它的账号与 trae-cn 是同一批（uid 相同），
+    // 两边都扫只会让同一个号出现两次、并让「按 uid 取凭据」取到缺 meta 的那一份。
+    for client in ["trae-cn"] {
+        let Ok(rd) = std::fs::read_dir(vault.join(client)) else {
             continue;
         };
-        for dir in dirs.flatten() {
-            if !dir.path().is_dir() {
-                continue;
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
             }
-            let profile = read_json(&dir.path().join("profile.json"));
-            let oauth = read_json(&dir.path().join("oauth.json"));
-            let meta = read_json(&dir.path().join("meta.json"));
-
-            // uid 解析顺序（越靠前越可信）：
-            //   ① meta.verified_uid  ② profile.user_id
-            //   ③ 从 storage.json 解出的 JWT 里取（SOLO 与 Trae 目录常有一边缺 meta，
-            //      缺了就会退化成目录名 ⇒ 同一个号被算两次，池子里重复出现）
-            //   ④ 目录名兜底
-            let uid = meta
-                .as_ref()
-                .and_then(|v| v.get("verified_uid"))
-                .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)))
-                .or_else(|| {
-                    profile
-                        .as_ref()
-                        .and_then(|v| v.get("user_id"))
-                        .and_then(|v| v.as_i64().map(|n| n.to_string()))
-                })
-                .or_else(|| uid_from_storage(&dir.path()))
-                .unwrap_or_else(|| dir.file_name().to_string_lossy().to_string());
-
-            let label = profile
-                .as_ref()
-                .and_then(|v| v.get("screen_name"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("Trae {uid}"));
-
-            let remaining = profile
-                .as_ref()
-                .and_then(|v| v.get("credits"))
-                .and_then(Value::as_f64)
-                .map(|v| (v * 100.0).round() / 100.0);
-
-            // ⚠️ 只算**有余额**的包：`credit_packs` 里混着大量已经用完的空包（remaining=0），
-            // 它们的 `expire_at` 常常就在几小时后 —— 取最小值会把「已用完的包明天过期」
-            // 显示成「这个账号的积分 10 小时后到期」（用户实测对不上）。
-            let expires_at = profile
-                .as_ref()
-                .and_then(|v| v.get("credit_packs"))
-                .and_then(Value::as_array)
-                .and_then(|packs| {
-                    packs
-                        .iter()
-                        .filter(|p| {
-                            p.get("remaining").and_then(Value::as_f64).unwrap_or(0.0) > 0.0
-                        })
-                        .filter_map(|p| p.get("expire_at").and_then(Value::as_i64))
-                        .min()
-                })
-                .or_else(|| {
-                    oauth
-                        .as_ref()
-                        .and_then(|v| v.get("expiredAt"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.timestamp_millis())
-                });
-
-            // Trae 的凭据是设备私钥（oauth.json 里的 privateKeyPEM），
-            // 不是 bearer token —— 有文件就当有凭据，真发请求由上游适配器负责。
-            let has_cred = oauth
-                .as_ref()
-                .and_then(|v| v.get("privateKeyPEM"))
-                .and_then(Value::as_str)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            let expired = expires_at.map(|t| t <= now).unwrap_or(false);
-
-            out.push(PoolEntry {
-                key: format!("trae:{uid}"),
-                product: "trae".into(),
-                scope: scope.into(),
-                label,
-                remaining,
-                expires_at,
-                usable: has_cred && !expired,
-                cooldown_until: None,
-                limited_models: Vec::new(),
-                reason: if !has_cred {
-                    Some("缺少设备凭据".into())
-                } else if expired {
-                    Some("积分已过期".into())
-                } else {
-                    None
-                },
-            });
         }
     }
-    // SOLO 与 Trae 是同一批号，按 uid 去重（保留剩余更高的一条）。
-    out.sort_by(|a, b| b.remaining.partial_cmp(&a.remaining).unwrap_or(std::cmp::Ordering::Equal));
+    dirs
+}
+
+/// 解析某个账号目录的 uid（四段回退，顺序不能乱）。
+///
+/// ⚠️ 这个顺序就是池子原来那套：`meta.verified_uid` → `profile.user_id` →
+/// 从 `storage.json` 的 JWT 里取 → 目录名兜底。**发送端必须用同一个结果**，
+/// 否则「池子按 uid 选中的号」在发送端找不到（2026-10-26 的事故）。
+fn trae_dir_uid(dir: &std::path::Path) -> String {
+    let meta = read_json(&dir.join("meta.json"));
+    let profile = read_json(&dir.join("profile.json"));
+    let oauth = read_json(&dir.join("oauth.json"));
+    meta.as_ref()
+        .and_then(|v| v.get("verified_uid"))
+        .and_then(|v| {
+            v.as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| v.as_str().map(str::to_string))
+        })
+        .or_else(|| {
+            // ⚠️ `user_id` 在真实 profile.json 里有**两种类型**：数字（`925158341882023`）
+            // 和字符串（同一份文件被不同版本写成 `"925158341882023"`）。
+            // 原来只认 `as_i64`，字符串就会被跳过、一路掉到目录名兜底
+            // （实测 `oauth_882023` 因此变成 `trae:oauth_882023`，与账号页的 uid 对不上）。
+            profile
+                .as_ref()
+                .and_then(|v| v.get("user_id"))
+                .and_then(|v| {
+                    v.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(str::to_string))
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            oauth
+                .as_ref()
+                .and_then(|v| v.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| uid_from_storage(dir))
+        .unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+}
+
+/// 一个账号目录能否产出可用凭据 ⇒ `Some(TraeLogin)`。
+///
+/// `None` 的三种原因（都算「不可用」，但界面要把原因说清）：
+/// 没有 `storage.json` / 里面没有 `iCubeAuthInfo://icube.cloudide` / 解得开但 token 空。
+pub fn trae_vault_login(dir: &std::path::Path) -> Option<TraeLogin> {
+    let oauth = read_json(&dir.join("oauth.json"));
+    let storage = read_json(&dir.join("User").join("globalStorage").join("storage.json"))?;
+    let enc = storage
+        .get("iCubeAuthInfo://icube.cloudide")
+        .and_then(Value::as_str)?;
+    let auth = crate::modules::trae_km::decrypt_km_json(enc)?;
+    let token = auth.get("token").and_then(Value::as_str)?;
+    let jwt = crate::modules::trae_km::strip_cloud_prefix(token).to_string();
+    if jwt.is_empty() {
+        return None;
+    }
+    Some(TraeLogin {
+        uid: trae_dir_uid(dir),
+        jwt,
+        // ⚠️ 真实 `oauth.json` 里 `deviceId` 是**字符串**（`"2081789759006043"`）。
+        // 原来只认 `as_i64` ⇒ 一直取到空串 ⇒ `x-device-id` 头是空的。
+        // 上游对这个头有要求（缺了会回 9004 一类），空着发出去等于白撞。
+        device_id: oauth
+            .as_ref()
+            .and_then(|v| v.get("deviceId"))
+            .and_then(|v| {
+                v.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| v.as_str().map(str::to_string))
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        machine_id: oauth
+            .as_ref()
+            .and_then(|v| v.get("machineId"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        dir: dir.to_path_buf(),
+    })
+}
+
+/// 全部**可用**的 Trae 登录态（按 uid 去重，先出现的优先）。
+pub fn trae_logins() -> Vec<TraeLogin> {
+    let mut out: Vec<TraeLogin> = Vec::new();
+    for dir in trae_vault_dirs() {
+        let Some(login) = trae_vault_login(&dir) else {
+            continue;
+        };
+        if out.iter().any(|x| x.uid == login.uid) {
+            continue;
+        }
+        out.push(login);
+    }
+    out
+}
+
+fn trae_entries() -> Vec<PoolEntry> {
+    let now = qoder_accounts::now_ms();
+    let mut out: Vec<PoolEntry> = Vec::new();
+
+    // ⚠️ 目录枚举与凭据判定都走 `trae_vault_dirs` / `trae_vault_login`
+    // （solo-cn 已弃用，见 `trae_vault_dirs` 的注释）。
+    //
+    // 2026-10-26 事故复盘：这里原来自己再枚举一遍 vault、自己 match 客户端名、
+    // 自己判断「有没有凭据」，与发送端各有一套 ⇒ 池子选中了发不出去的号，
+    // 网关连换 3 个号全 502。**枚举、uid、凭据三者现在都只有一个出口。**
+    for dir in trae_vault_dirs() {
+        let profile = read_json(&dir.join("profile.json"));
+        let oauth = read_json(&dir.join("oauth.json"));
+
+        let uid = trae_dir_uid(&dir);
+
+        let label = profile
+            .as_ref()
+            .and_then(|v| v.get("screen_name"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Trae {uid}"));
+
+        let remaining = profile
+            .as_ref()
+            .and_then(|v| v.get("credits"))
+            .and_then(Value::as_f64)
+            .map(|v| (v * 100.0).round() / 100.0);
+
+        // ⚠️ 只算**有余额**的包：`credit_packs` 里混着大量已经用完的空包（remaining=0），
+        // 它们的 `expire_at` 常常就在几小时后 —— 取最小值会把「已用完的包明天过期」
+        // 显示成「这个账号的积分 10 小时后到期」（用户实测对不上）。
+        let expires_at = profile
+            .as_ref()
+            .and_then(|v| v.get("credit_packs"))
+            .and_then(Value::as_array)
+            .and_then(|packs| {
+                packs
+                    .iter()
+                    .filter(|p| p.get("remaining").and_then(Value::as_f64).unwrap_or(0.0) > 0.0)
+                    .filter_map(|p| p.get("expire_at").and_then(Value::as_i64))
+                    .min()
+            })
+            .or_else(|| {
+                oauth
+                    .as_ref()
+                    .and_then(|v| v.get("expiredAt"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.timestamp_millis())
+            });
+
+        // ⚠️⚠️ 「可用」必须等于「**真能发出去**」。
+        // 旧判据是「oauth.json 里有 privateKeyPEM」—— 那只是**签名私钥**，
+        // 真正发请求要的是 storage.json 里能解开的 jwt。实测 `oauth_717036`
+        // 有私钥却解不出登录态 ⇒ 池子把它当可用、按紧迫度选中、发出去 502。
+        let has_cred = trae_vault_login(&dir).is_some();
+        let expired = expires_at.map(|t| t <= now).unwrap_or(false);
+
+        out.push(PoolEntry {
+            key: format!("trae:{uid}"),
+            product: "trae".into(),
+            scope: "trae-cn".into(),
+            label,
+            remaining,
+            expires_at,
+            usable: has_cred && !expired,
+            reason: if !has_cred {
+                Some("缺少可用登录态（storage.json 里没有能解开的授权）".into())
+            } else if expired {
+                Some("积分已过期".into())
+            } else {
+                None
+            },
+            cooldown_until: None,
+            limited_models: Vec::new(),
+        });
+    }
+    // 同一个 uid 可能出现在多个目录（历史遗留的 solo-cn 副本）：按 uid 去重，
+    // 保留剩余更高的一条。
+    out.sort_by(|a, b| {
+        b.remaining
+            .partial_cmp(&a.remaining)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut seen = std::collections::BTreeSet::new();
     out.retain(|e| seen.insert(e.key.clone()));
     out
 }
+
 
 /// 从 `storage.json` 的登录态里解出 JWT，再取 uid。
 ///
@@ -1024,6 +1232,126 @@ pub fn qoder_scope(region: QoderRegion) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 回归（2026-10-26 事故）：**有私钥但解不出登录态**的号，积分池必须判为不可用。
+    ///
+    /// 事故现象：池子按紧迫度选中了 `oauth_717036`（它有 `privateKeyPEM`），
+    /// 真正发请求时需要 `storage.json` 里的 jwt，那份解不出来 ⇒ 502
+    /// 「找不到账号 842681600717036 的可用 Trae 登录态」，连换 3 个号全失败。
+    #[test]
+    fn trae_login_requires_decryptable_storage_auth() {
+        let dir = std::env::temp_dir().join(format!("trae-login-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("User").join("globalStorage")).expect("建目录");
+        // 只有签名私钥，没有可解开的授权条目 —— 正是出事的那种号
+        std::fs::write(
+            dir.join("oauth.json"),
+            r#"{"privateKeyPEM":"-----BEGIN PRIVATE KEY-----","deviceId":6200000000000001}"#,
+        )
+        .expect("写 oauth");
+        std::fs::write(
+            dir.join("User").join("globalStorage").join("storage.json"),
+            r#"{"other":"x"}"#,
+        )
+        .expect("写 storage");
+        assert!(
+            trae_vault_login(&dir).is_none(),
+            "解不出 jwt 就不许判为可用，否则又会选中一个发不出去的号"
+        );
+
+        // 补上能解开的授权条目才可用 —— 但本测试不构造真实密文，
+        // 因此只断言「没有条目 ⇒ None」这条硬判据（剩下的由真机验证覆盖）。
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归：uid 解析必须与池子/发送端**同一套回退顺序**（meta → profile → oauth.id → 目录名）。
+    #[test]
+    fn trae_dir_uid_falls_back_in_one_order() {
+        let dir = std::env::temp_dir().join(format!("trae-uid-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+
+        // 什么都没有 ⇒ 目录名兜底
+        assert_eq!(trae_dir_uid(&dir), name);
+
+        // 只有 oauth.id ⇒ 用 oauth.id
+        std::fs::write(dir.join("oauth.json"), r#"{"id":"888800001111"}"#).unwrap();
+        assert_eq!(trae_dir_uid(&dir), "888800001111");
+
+        // profile.user_id 优先于 oauth.id
+        std::fs::write(dir.join("profile.json"), r#"{"user_id":222233334444}"#).unwrap();
+        assert_eq!(trae_dir_uid(&dir), "222233334444", "数字 uid 会被转成字符串");
+
+        // meta.verified_uid 最优先（这才是权威值）
+        std::fs::write(dir.join("meta.json"), r#"{"verified_uid":842681600717036}"#).unwrap();
+        assert_eq!(trae_dir_uid(&dir), "842681600717036");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 排序：**最早过期的必须排最前**，不能被「默认账号」压过去。
+    ///
+    /// 这正是 2026-10-26 用户实测的问题：明明有个号积分 11-01 就过期，
+    /// 消耗却一直落在当前登录（默认）的那个号上。
+    #[test]
+    fn soonest_expiry_beats_default_account() {
+        let mk = |key: &str, exp: Option<i64>| PoolEntry {
+            key: key.to_string(),
+            product: "trae".to_string(),
+            scope: "trae-cn".to_string(),
+            label: key.to_string(),
+            remaining: Some(100.0),
+            expires_at: exp,
+            usable: true,
+            reason: None,
+            cooldown_until: None,
+            limited_models: Vec::new(),
+        };
+        let mut list = vec![
+            // 默认账号：到期最晚
+            mk("trae:default", Some(1_800_000_000_000)),
+            mk("trae:soon", Some(1_790_000_000_000)),
+            mk("trae:none", None),
+        ];
+        // 与 `snapshot()` 里的比较器同序（这里不依赖磁盘，只验排序规则本身）
+        let is_default = |k: &str| k == "trae:default";
+        list.sort_by(|a, b| {
+            b.usable
+                .cmp(&a.usable)
+                .then_with(|| {
+                    a.urgency()
+                        .partial_cmp(&b.urgency())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| is_default(&b.key).cmp(&is_default(&a.key)))
+        });
+        assert_eq!(list[0].key, "trae:soon", "最早过期的必须排第一");
+        assert_eq!(list[1].key, "trae:default", "默认账号只能排在它后面");
+        assert_eq!(list[2].key, "trae:none", "没有到期时间的排最后");
+    }
+
+    /// 会话粘性：同一段对话查得到、换号后能覆盖；清掉之后查不到。
+    #[test]
+    fn sticky_binds_and_forgets() {
+        let conv = "test-conv-sticky-001";
+        sticky_forget(conv);
+        assert_eq!(sticky_lookup(conv), None);
+        sticky_bind(conv, "trae:aaa");
+        assert_eq!(sticky_lookup(conv), Some("trae:aaa".to_string()));
+        // 换号 ⇒ 覆盖（以最新为准，不是"保留第一个"）
+        sticky_bind(conv, "trae:bbb");
+        assert_eq!(sticky_lookup(conv), Some("trae:bbb".to_string()));
+        sticky_forget(conv);
+        assert_eq!(sticky_lookup(conv), None);
+    }
+
+    /// 空键不许写进表（否则会把无关对话粘到同一个号上）。
+    #[test]
+    fn sticky_ignores_empty() {
+        sticky_bind("", "trae:aaa");
+        assert_eq!(sticky_lookup(""), None);
+        sticky_bind("x", "");
+        assert_eq!(sticky_lookup("x"), None);
+    }
     use super::*;
 
     /// 上游文案里的「将在 2026-10-24 22:04:42 UTC+8 重置」要能抠出来 ——
@@ -1085,7 +1413,19 @@ mod tests {
 
     #[test]
     fn real_upstream_429_parks_the_account_until_its_reset_time() {
-        let now = chrono::Local::now().timestamp_millis();
+        // ⚠️ `now` 必须**固定在文案里的重置时刻之前**（这里取 2026-10-24 12:00 UTC+8）。
+        //
+        // 原来用的是 `Local::now()` —— 那是个时间炸弹：断言「冷却必须超过 60 秒」
+        // 在 2026-10-25 11:12 之后必然失败（重置时刻已经过去），而那时它跟真的
+        // 回归长得一模一样。2026-10-26 起这条一直在报错、掩盖真失败，就是它。
+        // 判据本身（钉在上游给的重置时刻）与被测代码无关，所以固定 now 完全够用。
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 10, 24)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+            - 8 * 3_600_000;
         let (until, kind) = classify(429, REAL_WB_429, now).expect("额度耗尽必定要冷却");
         assert_eq!(kind, "balance_exhausted", "不该退化成 60 秒的 rate_limited");
         // ⚠️ 期望值按文案里的 **UTC+8** 算，不看本机时区 —— 换台机器（UTC+0 / UTC-5）
@@ -1175,6 +1515,15 @@ mod tests {
         assert!(classify(403, "code 10605 isQueued", now).is_none());
         // 客户端参数错 → 不冷却
         assert!(classify(400, "bad request", now).is_none());
+        // WorkBuddy 频道校验（11128）→ 账号级 10 分钟（不是 400 那种「不冷却」）
+        let (until, kind) = classify(
+            400,
+            r#"{"code":"11128","msg":"Illegal API invocation from an unapproved channel"}"#,
+            now,
+        )
+        .expect("11128 必须冷却这个号，否则下一个请求还会撞它");
+        assert_eq!(kind, "auth_dead");
+        assert!((until - now - 10 * 60_000).abs() < 2_000);
         // 402 → 停到下一个重置窗口（必定 > 现在 + 1 小时）
         let (until, kind) = classify(402, "", now).unwrap();
         assert_eq!(kind, "balance_exhausted");

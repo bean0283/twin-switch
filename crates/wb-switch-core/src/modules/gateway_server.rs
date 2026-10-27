@@ -475,7 +475,15 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 fn api_err(code: StatusCode, kind: &str, msg: impl Into<String>) -> axum::response::Response {
-    (code, Json(json!({ "error": { "type": kind, "message": msg.into() } }))).into_response()
+    let msg = msg.into();
+    // **所有对外错误都从这里出去**，所以诊断日志只挂这一处就覆盖了全部
+    // 4xx/5xx 返回（用户报的 400 / 401 / 500 都在内）。
+    // ⚠️ 只记「状态码 + 类型 + 正文」，不记请求体（正文里可能有对话内容）。
+    crate::modules::diag_log::error(
+        "gateway",
+        format!("HTTP {} {} | {}", code.as_u16(), kind, msg),
+    );
+    (code, Json(json!({ "error": { "type": kind, "message": msg } }))).into_response()
 }
 
 /// 把**最近一次** `/v1/chat/completions` 的请求体落盘（覆盖式，只留一次）。
@@ -562,18 +570,43 @@ async fn chat(
         );
     }
 
-    // ④ 选号（最紧迫优先）
+    // ④ 选号：**同一段对话锁定同一账号，新对话才按「积分最早过期」挑**。
+    //
+    // 为什么不是每次都按紧迫度挑：Trae 的上游会话 ID 由 `session_seed(model, uid, …)`
+    // 派生（uid 参与指纹），中途换号 ⇒ 上游当成新会话 ⇒ 前缀缓存全失效、观感上「会话断了」。
+    // 所以规则是：**对话第一次请求**按最早过期选（先用快过期的，省钱）；
+    // **后续请求**沿用同一个号，只有它不可用/冷却时才重新挑。
+    //
+    // 会话指纹 = 模型 + 首条 user（不含 uid），见 `gateway_stream::session_seed`。
+    // 用原始请求体算指纹（`upstream_req` 是后面才克隆并改写的，那时已经不含原始形态）。
+    let conv = crate::modules::gateway_stream::conversation_key(&bare, &req);
+    let sticky_key = gateway_pool::sticky_lookup(&conv);
+
     let sel = match gateway_pool::preview(&model) {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
-    let Some(picked) = sel.picked.clone() else {
-        return api_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_account",
-            sel.reason.unwrap_or_else(|| "没有可用账号".into()),
-        );
+    // 粘住的号仍然可用（在池子里、且没冷却）才继续用它；否则回落到紧迫度最高的那个。
+    let sticky_alive = sticky_key.as_ref().and_then(|k| {
+        gateway_pool::usable()
+            .into_iter()
+            .find(|e| &e.key == k && e.cooldown_until.unwrap_or(0) <= crate::modules::config::now_ms())
+    });
+    let picked = match sticky_alive {
+        Some(e) => e,
+        None => match sel.picked.clone() {
+            Some(p) => p,
+            None => {
+                return api_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_account",
+                    sel.reason.unwrap_or_else(|| "没有可用账号".into()),
+                )
+            }
+        },
     };
+    // 记下这段对话用的是哪个号（下次接着用它）。换号时这里会被覆盖。
+    gateway_pool::sticky_bind(&conv, &picked.key);
     if !key.allows(&picked.scope) {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return api_err(
@@ -675,6 +708,13 @@ async fn chat(
                 if gateway_pool::is_queued_hint(&msg) {
                     trace.note_queued();
                 }
+                // ⚠️ 把「最后试过的那个号」记回外层 trace。
+                //
+                // 原来只在 `t`（每轮 clone）上 hit，失败时落盘的 trace 里 scope/account
+                // 是**空的** —— 2026-10-26 排 11128 时翻指标，失败行全是空账号，根本
+                // 不知道是哪个号被拒（成功行反而有）。失败比成功更需要这个信息。
+                trace.hit(&cand.scope, &cand.key);
+                trace.failovers = tried - 1;
                 let failover = should_failover(code.as_u16(), &msg);
                 log_failover(&model, &cand.key, code.as_u16(), &msg, failover);
                 trace.note_failover();
@@ -767,13 +807,106 @@ fn should_failover(status: u16, msg: &str) -> bool {
     if matches!(status, 0 | 401 | 402 | 403 | 429 | 500..=599) {
         return true;
     }
-    m.contains("6804")
+    // WorkBuddy `11128 Illegal API invocation from an unapproved channel`：
+    // 上游是按**账号/频道**判的（同一份 body 换其它账号就正常，见 2026-10-26 真机探针），
+    // 所以它对「这个号」是死判据 ⇒ 必须换号，而不是直接把 400 丢给用户。
+    m.contains("11128")
+        || m.contains("unapproved channel")
+        || m.contains("6804")
         || m.contains("quota exceeded")
         || m.contains("rate limit")
         || msg.contains("频率限制")
         || msg.contains("使用量已超出")
         || msg.contains("额度不足")
         || msg.contains("余额不足")
+}
+
+/// 上游回了「看不懂原因」的错误时，把这次发出去的请求体原样落盘（最多 3 份、≤4 MB）。
+///
+/// ⚠️ 为什么需要：2026-10-26 的 `11128` 用 15 种合成请求都复现不出来（无 system /
+/// 33 工具 / 12 万字符 / 顶层 system 字段 / 图片 / 多轮，全部 200），只有用户真机上
+/// 那份**真实内容**会被拒。靠猜形状是死路，只能把出事的那份请求原样留下来比对。
+///
+/// 隐私：文件里有对话正文，只写在本机 `<store>/diag/`，最多 3 份，路径会显示在错误信息里，
+/// 用户可以随时手删；不含任何凭据（Token 在 header 里，不进 body）。
+fn dump_rejected_body(body: &Value) -> Option<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// 每个进程最多留几份：够比对一次就行，别把磁盘塞满。
+    const KEEP: usize = 3;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= KEEP {
+        return None;
+    }
+    let dir = crate::modules::config::store_dir().join("diag");
+    std::fs::create_dir_all(&dir).ok()?;
+    let text = serde_json::to_vec_pretty(body).ok()?;
+    if text.len() > MAX_BYTES {
+        return None;
+    }
+    let path = dir.join(format!(
+        "rejected-{}-{}.json",
+        crate::modules::config::now_ms(),
+        COUNT.load(Ordering::Relaxed)
+    ));
+    std::fs::write(&path, text).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
+/// 把首条消息的 `developer` 角色还原成 `system`（OpenAI 的后继别名还原）。
+///
+/// 返回「是否改过」。单独抽出来是为了能单测 —— 它决定 11128 的第一道闸门过不过，
+/// 而这段逻辑本身不依赖任何 IO。
+fn normalize_first_role(body: &mut Value) -> bool {
+    let Some(first) = body
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|a| a.first_mut())
+    else {
+        return false;
+    };
+    if first.get("role").and_then(|r| r.as_str()) == Some("developer") {
+        first["role"] = json!("system");
+        return true;
+    }
+    false
+}
+
+/// 请求体形状摘要：**只说结构，不带任何正文**。
+///
+/// 用途只有一个：上游报错时让人一眼看出「是不是这个请求太大 / 工具太多 / 工具结果太多」。
+/// 2026-10-26 的 `11128` 事故里，网关指标显示失败请求都是 ~98 万字符，而界面只显示了
+/// 上游那句 "unapproved channel" —— 两边对不上，排障只能靠翻 jsonl。
+fn req_shape(req: &Value) -> String {
+    let msgs = req.get("messages").and_then(Value::as_array);
+    let count = msgs.map(|a| a.len()).unwrap_or(0);
+    let count_role = |role: &str| {
+        msgs.map(|a| {
+            a.iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some(role))
+                .count()
+        })
+        .unwrap_or(0)
+    };
+    let tools = req
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let chars = serde_json::to_string(req)
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let images = serde_json::to_string(req)
+        .map(|s| s.matches("image_url").count())
+        .unwrap_or(0);
+    format!(
+        "{chars} 字符 / {count} 条消息（工具结果 {} 条、assistant {} 条、system {} 条、developer {} 条）/ {tools} 个工具 / {images} 张图 / model={}",
+        count_role("tool"),
+        count_role("assistant"),
+        count_role("system"),
+        count_role("developer"),
+        req.get("model").and_then(Value::as_str).unwrap_or("?")
+    )
 }
 
 /// 把一条完整结果包装成 OpenAI 流式事件。
@@ -945,20 +1078,46 @@ async fn forward(
         .or_else(|| builtin_spec(scope));
 
     // Trae 走私有协议（设备 jwt + llm_utils_chat 专用请求体），不进通用透传。
+    //
+    // ⚠️⚠️ **必须把选中的账号传下去**。原来这里是 `trae_cred(None)` —— 那个 `None`
+    // 意思是「随便找一份能解开的登录态」，而它按目录顺序取，实际永远是**当前登录**的号。
+    // 于是网关对 Trae **根本不会换号**：池子按积分到期紧迫度选出了 A，请求却用 B 的
+    // token 发出去（用户实测：明明 B 的积分快过期了，消耗的还是 A）。
+    // 现在按池子条目的 key（`trae:{uid}`）取对应账号的设备 jwt。
+    let trae_uid = if scope.starts_with("trae") {
+        cand.key.split_once(':').map(|(_, v)| v.trim().to_string())
+    } else {
+        None
+    };
     if scope.starts_with("trae") && spec.is_none() {
         return if want_stream {
-            trae_stream(model, req, trace).await
+            trae_stream(model, req, trace, trae_uid.clone()).await
         } else {
-            trae_forward(model, req).await.map(Upstream::Json)
+            trae_forward(model, req, trae_uid).await.map(Upstream::Json)
         };
     }
 
     // Qoder 走 COSY 签名的私有协议（**信封 SSE**）——2026-10-22 真机跑通。
     if scope.starts_with("qoder") && spec.is_none() {
-        return if want_stream {
-            qoder_stream(scope, model, req, trace).await
+        // ⚠️⚠️ **必须把池子选中的账号传下去**。`qoder_stream` 原来是
+        // `accounts.iter().find(|a| a.is_usable())` —— 永远第一个可用号，
+        // 于是池子按紧迫度轮换、日志写「已按积分池顺序换了 2 个账号」，
+        // 实际每个候选都在用**同一个号**发请求，失败当然一模一样
+        // （2026-10-26 用户实测：GLM-5.3-Flash 连续两轮 400）。
+        let qoder_id = if scope.starts_with("qoder") {
+            cand.key
+                .split_once(':')
+                .map(|(_, v)| v.trim().to_string())
+                .filter(|v| !v.is_empty())
         } else {
-            qoder_forward(scope, model, req).await.map(Upstream::Json)
+            None
+        };
+        return if want_stream {
+            qoder_stream(scope, model, req, trace, qoder_id).await
+        } else {
+            qoder_forward(scope, model, req, qoder_id)
+                .await
+                .map(Upstream::Json)
         };
     }
 
@@ -999,6 +1158,40 @@ async fn forward(
         }
     }
 
+    // ⚠️ 首条 `developer` 角色归一化为 `system`。
+    //
+    // OpenAI 在 2024-12 把 system 角色更名为 developer（developer 是 system 的后继别名，
+    // 语义完全相同），新一些的客户端（如 DeepSeek Harness）就按新规范发 `developer`。
+    // 但上游的**渠道校验**只认字面量 `role: "system"`，发 developer 会被判成
+    // 「非官方客户端」→ 400 / code 11128 / Illegal API invocation from an unapproved channel。
+    //
+    // 实测（同一网关、同一账号、同一模型，**仅改角色**，2026-10-27）：
+    //   首条 developer → HTTP 400 / 11128
+    //   首条 system    → HTTP 200
+    //
+    // 归一化不改变任何内容，只是把别名还原成上游接受的那个名字。
+    // 只处理**首条**：后续消息里的 developer 极少见，且不应影响已生效的首轮系统指令。
+    if normalize_first_role(&mut body) {
+        // 记一笔：这条请求原本首条是 developer（dsh 这类新客户端），已还原成 system。
+        // 出现频率能反映「哪个客户端在用新角色名」，也是上游改判据时的一手线索。
+        crate::modules::diag_log::info("gateway", "首条 developer 角色已归一化为 system");
+    }
+
+    // ⚠️⚠️ WorkBuddy / CodeBuddy 的对话网关还会对 **system prompt** 做关键词风控：
+    // 开头出现 `You are an AI agent powered by DeepSeek Harness` 直接回
+    // `400 11128 Illegal API invocation from an unapproved channel`（文案骗人，
+    // 跟渠道无关；2026-10-26 真机 A/B 已证实，见 `gateway_prompt` 模块头注释）。
+    // DeepSeek Harness 每轮都注入这句 ⇒ 不打这个补丁，走 WB 的每一轮必被拦。
+    if cand.product == "workbuddy" || scope.starts_with("wb") {
+        let hits = crate::modules::gateway_prompt::neutralize_system(&mut body);
+        if hits > 0 {
+            crate::modules::diag_log::info(
+                "gateway",
+                format!("workbuddy：system 命中关键词风控，已中和 {hits} 处（零宽空格，语义不变）"),
+            );
+        }
+    }
+
     // ⚠️⚠️ 超时口径必须分两档，原来一律 300 秒整段超时是错的：
     //
     // * **非流式**（`want_stream == false`）：整段 300 秒，超了就是真挂了。
@@ -1020,11 +1213,26 @@ async fn forward(
     let client = builder
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构造 HTTP 客户端失败：{e}")))?;
-    let resp = client
+    let mut rb = client
         .post(format!("{}{}", spec.base_url, spec.chat_path))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
-        .header("accept", if spec.force_stream { "text/event-stream" } else { "application/json" })
+        .header("accept", if spec.force_stream { "text/event-stream" } else { "application/json" });
+
+    // ⚠️⚠️ WorkBuddy 的对话端点是**按「频道」校验**的：只带 `Authorization` 会被回
+    // `400 {"code":"11128","msg":"Illegal API invocation from an unapproved channel",
+    //  "zh":"请求被拦截，请重新发送","displayTips":"This call failed a channel verification…"}`
+    // （2026-10-26 用户实测）。
+    //
+    // 官方客户端在**每个**请求上都带这两个头（本工具取模型清单那条请求一直带着，
+    // 所以清单能拉、对话却被拦 —— 差别只在这两个头）。对话这条路径以前漏了。
+    if cand.product == "workbuddy" || scope.starts_with("wb") {
+        rb = rb
+            .header("user-agent", crate::modules::gateway_models::WORKBUDDY_UA)
+            .header("x-product", "SaaS");
+    }
+
+    let resp = rb
         .json(&body)
         .send()
         .await
@@ -1047,12 +1255,29 @@ async fn forward(
         // ⚠️ **原样保留上游状态码**。以前一律改成 502，于是 429 被当成 5xx 记「60 秒后再说」，
         // 402 更永远走不到「等到重置窗口」那条分支 —— 冷却判据全被这一个转换废掉了。
         let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        // ⚠️ 带上**请求形状**（不含任何正文）。2026-10-26 排 WorkBuddy `11128` 时，
+        // 光看上游那句话（"unapproved channel"）根本判断不了是模型 / 账号 / 体量的问题，
+        // 只能靠网关自己的指标去反推「失败请求都是 98 万字符」。既然要报错，就把这个
+        // 现成的信息一起报出来 —— 用户复制一句话给我们就够定位。
+        // 频道校验类错误（11128 那一族）用合成请求复现不出来，把真实请求留下来。
+        let dumped = if text.contains("11128") || text.contains("unapproved channel") {
+            dump_rejected_body(&body)
+        } else {
+            None
+        };
+        let where_hint = match &dumped {
+            Some(p) => {
+                format!("\n本次被拒的请求已原样保存：{p}（含对话正文，只在本机，可直接删除）")
+            }
+            None => String::new(),
+        };
         return Err((
             code,
             format!(
-                "上游返回 HTTP {}{hint}：{}",
+                "上游返回 HTTP {}{hint}：{}\n请求形状：{}{where_hint}",
                 status.as_u16(),
-                explain_upstream_error(&text)
+                explain_upstream_error(&text),
+                req_shape(req)
             ),
         ));
     }
@@ -1434,82 +1659,27 @@ struct TraeCred {
 /// token 在 `User/globalStorage/storage.json` 的 `iCubeAuthInfo://icube.cloudide`，
 /// 是 Km 加密串 —— 用 0.3.4 现成的 [`trae_km::decrypt_km_json`] 解开取 `token`。
 fn trae_cred(uid_hint: Option<&str>) -> Option<TraeCred> {
-    let vault = crate::modules::config::store_dir().join("trae").join("vault");
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    for client in ["trae-cn", "solo-cn"] {
-        let Ok(rd) = std::fs::read_dir(vault.join(client)) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                dirs.push(e.path());
-            }
-        }
-    }
-
-    for dir in dirs {
-        let meta = read_json_at(&dir.join("meta.json"));
-        let oauth = read_json_at(&dir.join("oauth.json"));
-        let uid = meta
-            .as_ref()
-            .and_then(|v| v.get("verified_uid"))
-            .and_then(|v| v.as_i64().map(|n| n.to_string()))
-            .or_else(|| {
-                oauth
-                    .as_ref()
-                    .and_then(|v| v.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        if let Some(hint) = uid_hint {
-            if uid != hint {
-                continue;
-            }
-        }
-
-        let Some(storage) = read_json_at(&dir.join("User").join("globalStorage").join("storage.json"))
-        else {
-            continue;
-        };
-        let Some(enc) = storage
-            .get("iCubeAuthInfo://icube.cloudide")
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(auth) = crate::modules::trae_km::decrypt_km_json(enc) else {
-            continue;
-        };
-        let Some(token) = auth.get("token").and_then(Value::as_str) else {
-            continue;
-        };
-        let jwt = crate::modules::trae_km::strip_cloud_prefix(token).to_string();
-        if jwt.is_empty() {
-            continue;
-        }
-
-        let device_id = oauth
-            .as_ref()
-            .and_then(|v| v.get("deviceId"))
-            .and_then(|v| v.as_i64().map(|n| n.to_string()))
-            .unwrap_or_default();
-        let machine_id = oauth
-            .as_ref()
-            .and_then(|v| v.get("machineId"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        return Some(TraeCred { uid, jwt, device_id, machine_id });
-    }
-    None
+    // ⚠️⚠️ 凭据解析**只有这一个出口**：`gateway_pool::trae_logins()`。
+    //
+    // 2026-10-26 事故：这里原来自己扫 vault、自己解析 uid，与积分池各有一套 ——
+    // 池子用四段回退能解出 842681600717036，这里只认 meta/oauth.id 解不出，
+    // 于是「按 uid 找不到账号」，换 3 个号全 502。现在 uid 与 jwt 来自同一个函数，
+    // 池子选中的 key 必然能在这里取到。
+    //
+    // `uid_hint` 为 None 时取第一个可用的（老行为的兜底路径，仍保留）。
+    let logins = gateway_pool::trae_logins();
+    let hit = match uid_hint {
+        Some(hint) => logins.into_iter().find(|l| l.uid == hint),
+        None => logins.into_iter().next(),
+    }?;
+    Some(TraeCred {
+        uid: hit.uid,
+        jwt: hit.jwt,
+        device_id: hit.device_id,
+        machine_id: hit.machine_id,
+    })
 }
 
-fn read_json_at(path: &std::path::Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
 
 /// 模型名 → (config_name, model_name)。与参考实现的 [`model_config`] 同形。
 fn trae_model_config(model: &str) -> (String, String) {
@@ -1548,6 +1718,7 @@ async fn qoder_forward(
     scope: &str,
     model: &str,
     req: &Value,
+    acc_id: Option<String>,
 ) -> Result<Value, (StatusCode, String)> {
     use crate::modules::qoder_realm::QoderRegion;
 
@@ -1558,15 +1729,7 @@ async fn qoder_forward(
     };
     let accounts = crate::modules::qoder_accounts::list(region)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读 Qoder 账号失败：{e}")))?;
-    let acc = accounts
-        .iter()
-        .find(|a| a.is_usable())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("{} 没有可用的 Qoder 账号（先在账号页导入/登录）", region.display_name()),
-            )
-        })?;
+    let acc = pick_qoder_account(&accounts, acc_id.as_deref(), region)?;
 
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
     // 客户端给的工具定义原样下发（Qoder 模板 `model_config.format = openai`，
@@ -1622,11 +1785,44 @@ fn queue_parts(e: &str) -> Option<(u64, String)> {
 ///
 /// 排队（10605）在这里按官方语义处理：`sleep(retryAfterSeconds)` 再来一次，
 /// 直到预算用完才回 429 原文。换号是无效的 —— 队列是模型级的。
+/// 从本区域账号里挑出**积分池选中的那一个**。
+///
+/// ⚠️ 为什么不「找不到就退回第一个可用号」：那正是 2026-10-26 的 bug ——
+/// 池子轮换到 A、发送端却永远用 B，两轮报错一模一样，日志还写「换了 2 个账号」。
+/// 指名的号取不到时必须**说清是哪个号**，否则永远查不出「换号是假的」。
+fn pick_qoder_account<'a>(
+    accounts: &'a [crate::modules::qoder_accounts::QoderAccount],
+    acc_id: Option<&str>,
+    region: crate::modules::qoder_realm::QoderRegion,
+) -> Result<&'a crate::modules::qoder_accounts::QoderAccount, (StatusCode, String)> {
+    if let Some(id) = acc_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return accounts.iter().find(|a| a.id == id).ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{} 里找不到账号 {id}（积分池选中的账号可能已被删除，刷新一下账号页）",
+                    region.display_name()
+                ),
+            )
+        });
+    }
+    accounts.iter().find(|a| a.is_usable()).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "{} 没有可用的 Qoder 账号（先在账号页导入/登录）",
+                region.display_name()
+            ),
+        )
+    })
+}
+
 async fn qoder_stream(
     scope: &str,
     model: &str,
     req: &Value,
     mut trace: Trace,
+    acc_id: Option<String>,
 ) -> Result<Upstream, (StatusCode, String)> {
     use crate::modules::qoder_realm::QoderRegion;
 
@@ -1637,15 +1833,7 @@ async fn qoder_stream(
     };
     let accounts = crate::modules::qoder_accounts::list(region)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读 Qoder 账号失败：{e}")))?;
-    let acc = accounts.iter().find(|a| a.is_usable()).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "{} 没有可用的 Qoder 账号（先在账号页导入/登录）",
-                region.display_name()
-            ),
-        )
-    })?;
+    let acc = pick_qoder_account(&accounts, acc_id.as_deref(), region)?;
 
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
     let tools = req.get("tools").cloned().unwrap_or(Value::Null);
@@ -1993,11 +2181,20 @@ async fn trae_post(
     model: &str,
     req: &Value,
     timeout_s: u64,
+    uid: Option<&str>,
 ) -> Result<reqwest::Response, (StatusCode, String)> {
-    let cred = trae_cred(None).ok_or_else(|| {
+    let cred = trae_cred(uid).ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
-            "找不到可用的 Trae 登录态（storage.json 里没有解不开的授权条目）".to_string(),
+            match uid {
+                // 指名要的账号取不到 ⇒ 必须说清是哪个号，否则用户只会看到「找不到登录态」
+                // 却不知道是池子里选中的那个号缺凭据（该号可能没导入到本工具账号库）。
+                Some(u) => format!(
+                    "找不到账号 {u} 的可用 Trae 登录态（该号可能只有切换载体、没有网页凭证；                     到「账号管理 → Trae 账号」导入一次本机登录态）"
+                ),
+                None => "找不到可用的 Trae 登录态（storage.json 里没有解不开的授权条目）"
+                    .to_string(),
+            },
         )
     })?;
     let (body, url) = trae_body(model, req, &cred);
@@ -2037,8 +2234,12 @@ async fn trae_post(
     Ok(resp)
 }
 
-async fn trae_forward(model: &str, req: &Value) -> Result<Value, (StatusCode, String)> {
-    let resp = trae_post(model, req, 180).await?;
+async fn trae_forward(
+    model: &str,
+    req: &Value,
+    uid: Option<String>,
+) -> Result<Value, (StatusCode, String)> {
+    let resp = trae_post(model, req, 180, uid.as_deref()).await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -2062,8 +2263,9 @@ async fn trae_stream(
     model: &str,
     req: &Value,
     trace: Trace,
+    uid: Option<String>,
 ) -> Result<Upstream, (StatusCode, String)> {
-    let resp = trae_post(model, req, 900).await?;
+    let resp = trae_post(model, req, 900, uid.as_deref()).await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -2483,6 +2685,47 @@ fn token_of(scope: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 首条 `developer` 必须还原成 `system`：上游渠道校验只认字面量 system，
+    /// 发 developer 就是 400 / 11128（2026-10-27 真机 A/B 证实）。
+    #[test]
+    fn first_developer_role_is_normalized() {
+        let mut body = json!({
+            "messages": [
+                { "role": "developer", "content": "You are a helpful assistant." },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        assert!(normalize_first_role(&mut body));
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        // 后续消息不动（只还原首条）
+        assert_eq!(body["messages"][1]["role"], json!("user"));
+        // 内容一个字都不许改
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!("You are a helpful assistant.")
+        );
+    }
+
+    /// 已经是 system 的不能被改坏；developer 出现在非首条也不动。
+    #[test]
+    fn role_normalization_is_surgical() {
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "a" },
+                { "role": "developer", "content": "b" }
+            ]
+        });
+        assert!(!normalize_first_role(&mut body));
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        assert_eq!(body["messages"][1]["role"], json!("developer"));
+
+        // 没有 messages 也不能 panic
+        let mut empty = json!({});
+        assert!(!normalize_first_role(&mut empty));
+        let mut not_array = json!({ "messages": "x" });
+        assert!(!normalize_first_role(&mut not_array));
+    }
+
     /// 该换号的：限流 / 额度耗尽 / 凭据死 / 5xx / 传输失败。
     #[test]
     fn failover_on_account_level_errors() {
@@ -2493,6 +2736,13 @@ mod tests {
         assert!(should_failover(402, "balance"));
         assert!(should_failover(503, "gateway"));
         assert!(should_failover(0, "error sending request"));
+        // WorkBuddy 频道校验（11128）：真机探针证明同一份 body 换号/换尺寸都正常，
+        // 它对「这个号」是死判据 ⇒ 必须换号，不能把 400 原样丢给用户
+        // （2026-10-26 用户实测：只回一句 unapproved channel，一次都没换号）。
+        assert!(should_failover(
+            400,
+            r#"{"code":"11128","msg":"Illegal API invocation from an unapproved channel"}"#
+        ));
     }
 
     /// 不该换号的：参数错（换了也一样错）、模型不存在、以及**排队**。

@@ -901,6 +901,104 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
     }))
 }
 
+/// **多目标**复制：一次把源账号的若干会话复制到多个目标账号。
+///
+/// 为什么不让前端循环调 `copy_sessions`：
+/// * 每个目标各备份一次整库、各开关一次写连接 —— N 个目标就 N 次，明显慢；
+/// * 任一个目标失败时，前端拿不到「哪些成了、哪些没成」的统一结论，只能拼字符串。
+///
+/// 这里逐个目标跑同一套 `copy_sessions`（它内部已有校验 / 备份 / 回滚），
+/// 但**每个目标独立成败**：一个目标失败不中断其余，结果按目标逐条汇总。
+/// 所以 `ok` 是「有没有目标成功」，不是「全部成功」—— 界面必须分别显示。
+pub fn copy_sessions_multi(
+    source_uid: &str,
+    target_uids: &[String],
+    ids: &[String],
+    close_client: bool,
+) -> Result<Value, String> {
+    if source_uid.trim().is_empty() {
+        return Err("缺少源账号 uid".to_string());
+    }
+    if target_uids.is_empty() {
+        return Err("没有选择任何目标账号".to_string());
+    }
+    if ids.is_empty() {
+        return Err("没有选择任何会话".to_string());
+    }
+    // 去重并剔除源账号自己（源=目标复制没有意义，且 copy_sessions 会直接报错）。
+    let mut seen: Vec<String> = Vec::new();
+    for u in target_uids {
+        let u = u.trim();
+        if u.is_empty() || u == source_uid || seen.iter().any(|x| x == u) {
+            continue;
+        }
+        seen.push(u.to_string());
+    }
+    if seen.is_empty() {
+        return Err("目标账号里没有可复制的（不能等于源账号）".to_string());
+    }
+
+    // ⚠️ 客户端占用门禁：目标账号正被客户端使用时 `copy_sessions` 会直接拒绝
+    // （`TARGET_IN_USE`）。用户在确认框里点过「确定」= 同意我们关它，
+    // 所以这里先退出客户端、复制完**再由我们自己开回来**（谁关的谁负责开）。
+    // 没关过就不启动 —— 不能因为一次复制就凭空多开一个客户端。
+    let stopped = crate::modules::workbuddy_session_groups::ensure_closed(close_client)?;
+
+    let outcome = copy_multi_run(source_uid, &seen, ids);
+
+    let (relaunched, restart_err) = crate::modules::workbuddy_session_groups::restart_client(stopped);
+    let mut out = outcome?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("clientStopped".into(), json!(stopped));
+        obj.insert("clientRelaunched".into(), json!(relaunched));
+        if let Some(e) = restart_err {
+            obj.insert("restartError".into(), json!(e));
+        }
+    }
+    Ok(out)
+}
+
+/// [`copy_sessions_multi`] 的纯复制部分（不含客户端开关）。
+///
+/// 单独拆出来是为了让「关客户端 → 复制 → 开回来」这段收尾**无论成败都执行**：
+/// 早期版本把重启写在成功分支里，中途报错就把客户端关在外面没人管。
+fn copy_multi_run(source_uid: &str, seen: &[String], ids: &[String]) -> Result<Value, String> {
+    let mut results: Vec<Value> = Vec::new();
+    let mut ok_count = 0usize;
+    let mut total_copied = 0usize;
+    for uid in seen {
+        match copy_sessions(source_uid, uid, ids) {
+            Ok(v) => {
+                ok_count += 1;
+                total_copied += v.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+                results.push(json!({
+                    "targetUid": uid,
+                    "ok": true,
+                    "count": v.get("count").cloned().unwrap_or(json!(0)),
+                    "copied": v.get("copied").cloned().unwrap_or(json!([])),
+                    "skipped": v.get("skipped").cloned().unwrap_or(json!([])),
+                    "backup": v.get("backup").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            Err(e) => results.push(json!({
+                "targetUid": uid,
+                "ok": false,
+                "error": e,
+            })),
+        }
+    }
+    Ok(json!({
+        "ok": ok_count > 0,
+        // ⚠️ 三个数字必须同源：okCount 是成功的目标数，count 是成功的那些目标里
+        //    复制成功的会话条数合计 —— 界面不能自己再算一遍，否则会出现两个数对不上。
+        "okCount": ok_count,
+        "targetCount": seen.len(),
+        "count": total_copied,
+        "sourceUid": source_uid,
+        "targets": results,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // 三、跨账号关联
 // ---------------------------------------------------------------------------

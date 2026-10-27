@@ -334,6 +334,15 @@ pub async fn trae_credits_query(client_key: Option<String>, force: Option<bool>)
     Ok(trae_credits::query(client_key, force.unwrap_or(false)).await)
 }
 
+/// 只刷新**一个** Trae 账号的积分（账号卡上的小刷新按钮）。
+///
+/// 与 [`trae_credits_query`] 的区别：那个是整批刷新并写整份磁盘缓存，点一个账号会把
+/// 全部账号都打一遍接口；这个只打该账号一次，返回的形状与整批结果里的单条一致。
+#[tauri::command]
+pub async fn trae_credits_one(client_key: Option<String>, id: String) -> Result<Value, String> {
+    Ok(trae_credits::query_one(client_key, &id).await)
+}
+
 /// 一键签到（Trae / WorkBuddy 全部账号）。
 ///
 /// - `scope`：`"trae"` / `"workbuddy"` / `"all"`（默认）；
@@ -548,7 +557,9 @@ pub async fn trae_scan_and_decrypt(client_key: String) -> Result<Value, String> 
         return Err(format!("未找到数据库：{}", db.display()));
     }
     tauri::async_runtime::spawn_blocking(move || {
+        let all = std::time::Instant::now();
         let progress: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let t_scan = std::time::Instant::now();
         let scan = trae_memory_scan::scan_for_key(&client_key, &db, Some(&|m| {
             progress.lock().unwrap().push(m.to_string());
         }))
@@ -561,8 +572,14 @@ pub async fn trae_scan_and_decrypt(client_key: String) -> Result<Value, String> 
         }
         let key = scan.key.clone().unwrap_or_default();
         trae_memory_scan::save_key(&client_key, &key).map_err(|e| format!("保存密钥失败：{e}"))?;
-        // 丢弃元信息 → 强制重新解密一次，拿到与实时库一致的最新快照
-        trae_export::drop_snapshot_meta(&client_key);
+        let scan_ms = t_scan.elapsed().as_millis() as u64;
+        // ⚠️ 这里**不再无条件** `drop_snapshot_meta`。
+        //
+        // 以前每次点击都强制重解 900MB（快照明明还是最新的）。现在交给签名判断：
+        // 签名（salt / 页数 / change counter / schema cookie / mtime）与实时库一致就直接复用；
+        // 而「WAL 里更新的那几帧」由读取路径 `reader_plain_path` 在读取时合并，
+        // **不会看到旧数据**。密钥换过 / 库被 checkpoint 改写 ⇒ 签名不同 ⇒ 自动整库重解。
+        let t_dec = std::time::Instant::now();
         let out = trae_export::ensure_decrypted(&client_key, Some(&|m| {
             progress.lock().unwrap().push(m.to_string());
         }))
@@ -570,9 +587,18 @@ pub async fn trae_scan_and_decrypt(client_key: String) -> Result<Value, String> 
             let p = progress.lock().unwrap().join("\n");
             format!("{e}\n{p}")
         })?;
+        let decrypt_ms = t_dec.elapsed().as_millis() as u64;
+        let reused = out.reused;
         let wal = std::path::PathBuf::from(format!("{}-wal", db.display()));
         Ok(json!({
             "scan": scan,
+            "reused": reused,
+            // 分段耗时：界面上报「总耗时」，不然只报解密一段（体感 20s、提示 4.4s）
+            "timings": {
+                "scanMs": scan_ms,
+                "decryptMs": if reused { 0 } else { decrypt_ms },
+                "totalMs": all.elapsed().as_millis() as u64,
+            },
             "report": {
                 "out_path": out.path,
                 "pages": out.pages,
@@ -1041,6 +1067,8 @@ pub struct SettingsPatch {
     pub sync_workbuddy_automations: Option<bool>,
     /// 切号时是否把 WorkBuddy 的会话自动同步给所有账号（`None` = 不改）。
     pub auto_link_workbuddy_sessions: Option<bool>,
+    /// **诊断日志**设置（`None` = 不改）。整块覆盖：开关 / 级别 / 保留天数 / 份数 / 单文件上限。
+    pub log: Option<wb_switch_core::modules::diag_log::DiagLogConfig>,
 }
 
 /// 设置快照的**唯一出口** —— `settings_get` 与 `settings_set` 都返回它的形状。
@@ -1072,6 +1100,15 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         "traeExe": s.trae_exe,
         "workbuddyExe": s.workbuddy_exe,
         "qoderExe": s.qoder_exe,
+        // 诊断日志设置（默认关）。
+        "log": {
+            "enabled": s.log.enabled,
+            "level": s.log.level,
+            "maxDays": s.log.max_days,
+            "maxFiles": s.log.max_files,
+            "maxMb": s.log.max_mb,
+        },
+        "logDir": wb_switch_core::modules::diag_log::log_root().to_string_lossy(),
         // 自动探测到的 WorkBuddy 主程序（界面在「没手动指定」时显示这一条）。
         // 与真正启动时用的是**同一个出口**，不会出现「显示 A、启动 B」。
         "workbuddyDetected": workbuddy_switch::resolve_exe()
@@ -1111,6 +1148,9 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         let mut next = settings::load();
         if let Some(r) = patch.backup_retention {
             next.backup_retention = r;
+        }
+        if let Some(l) = patch.log.clone() {
+            next.log = l.sanitized();
         }
         if let Some(b) = patch.backup_before_write {
             next.backup_before_write = b;
@@ -2041,6 +2081,27 @@ pub async fn workbuddy_session_copy(
     .map_err(|e| format!("复制任务失败: {e}"))?
 }
 
+/// WorkBuddy：**多目标**复制（一次复制给多个账号）。
+///
+/// 每个目标独立成败：一个目标失败不中断其余，结果按目标逐条返回
+/// （`okCount` 是成功的目标数，`count` 是这些目标里复制成功的会话合计）。
+#[tauri::command]
+pub async fn workbuddy_session_copy_multi(
+    source_uid: String,
+    target_uids: Vec<String>,
+    ids: Vec<String>,
+    close_client: Option<bool>,
+) -> Result<Value, String> {
+    // `close_client = true`：客户端在跑就由本工具退出它，复制完再开回来。
+    // 用户在界面的确认框里点过「确定」才传 true（默认 false = 老行为，拒绝写入）。
+    let close = close_client.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        workbuddy_sessions::copy_sessions_multi(&source_uid, &target_uids, &ids, close)
+    })
+    .await
+    .map_err(|e| format!("复制任务失败: {e}"))?
+}
+
 /// WorkBuddy：一键把本机所有会话互通到所有账号（补齐缺失副本 + 登记关联组）。
 ///
 /// ⚠️ 这是**重操作**：实测本机一次可能复制几十个副本、几个 GB。界面必须先给预览数字
@@ -2118,6 +2179,37 @@ pub async fn workbuddy_session_group_detail(group_key: String) -> Value {
     })
     .await
     .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：**强制比对**一个关联组（忽略体积/成员数上限，逐行读完再判定）。
+///
+/// 默认路径（`workbuddy_session_group_detail`）在「体积超限 / 成员过多」时**不做比对**，
+/// 只回「无法确认」。用户明确要求「支持手动确定后执行判定分析」——
+/// 这个命令就是那条慢路径：会真的读完整正文，因此**要几秒到几十秒**。
+#[tauri::command]
+pub async fn workbuddy_session_group_detail_forced(group_key: String) -> Value {
+    off_main(move || {
+        wb_switch_core::modules::workbuddy_session_groups::detail_forced(&group_key)
+            .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：**取消关联**（把指定账号从「同一段对话」里移除）。
+///
+/// ⚠️ 只删关联记录，**不动任何会话数据**：不写 sqlite、不碰 jsonl、不备份会话库。
+/// 所以这里也不需要关客户端 —— 用户点一下立刻生效，不用等 WorkBuddy 重启。
+#[tauri::command]
+pub async fn workbuddy_session_unlink_members(
+    group_key: String,
+    uids: Vec<String>,
+) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::workbuddy_session_groups::unlink_members(&group_key, &uids)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e))
 }
 
 /// WorkBuddy：还没纳入关联组的会话（供「新增关联会话」选择，只读）。
@@ -2475,6 +2567,54 @@ pub async fn workbuddy_credits_query(force: Option<bool>) -> Value {
 #[tauri::command]
 pub async fn workbuddy_credits_one(account_id: String) -> Value {
     workbuddy_credits::query_one(&account_id).await
+}
+
+// ---------------------------------------------------------------------------
+// 诊断日志（默认关闭；见 `modules::diag_log`）
+// ---------------------------------------------------------------------------
+
+/// 日志现状：开关、级别、目录、占用、每天的文件数与大小（设置页直接展示）。
+#[tauri::command]
+pub async fn diag_log_status() -> Value {
+    // 会扫 logs 目录（几十个文件以内），按项目硬规则离开主线程。
+    off_main(wb_switch_core::modules::diag_log::status)
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// 最近的若干行日志（给设置页「看一眼」，不用去开文件夹）。
+#[tauri::command]
+pub async fn diag_log_tail(limit: Option<usize>) -> Value {
+    let n = limit.unwrap_or(200).min(2000);
+    off_main(move || {
+        json!({ "ok": true, "lines": wb_switch_core::modules::diag_log::tail(n) })
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "lines": [], "error": e }))
+}
+
+/// 立即清空全部日志（**直接删，不进回收站** —— 这是本工具自己的诊断文件）。
+#[tauri::command]
+pub async fn diag_log_clear() -> Value {
+    off_main(|| match wb_switch_core::modules::diag_log::clear() {
+        Ok(bytes) => json!({ "ok": true, "freedBytes": bytes }),
+        Err(e) => json!({ "ok": false, "error": format!("清理失败：{e}") }),
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// 在文件管理器里打开日志目录。
+///
+/// ⚠️ 目录不存在时**先建出来**再打开 —— 否则「打开了但什么都没有」会让人以为
+/// 「日志功能没生效」，而其实是「还没写过日志」。
+#[tauri::command]
+pub fn diag_log_open() -> Value {
+    let dir = wb_switch_core::modules::diag_log::log_root();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return json!({ "ok": false, "error": format!("创建日志目录失败：{e}") });
+    }
+    json!({ "ok": true, "dir": dir.to_string_lossy() })
 }
 
 // ---------------------------------------------------------------------------
@@ -2981,6 +3121,61 @@ pub async fn qoder_checkin_all(region: String) -> Result<Value, String> {
         "messages": messages,
         "failures": failures,
     }))
+}
+
+/// Qoder 账号 token 弹窗的数据：与 Trae / WorkBuddy **同一个形状**（只读、不联网）。
+///
+/// 三个产品的令牌弹窗是同一个组件，按 `provider` 分流取值 —— 形状一致才能共用。
+#[tauri::command]
+pub async fn qoder_account_token(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let acc = qoder_accounts::list(r)?
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("找不到账号 {id}"))?;
+    Ok(qoder_accounts::token_info(&acc))
+}
+
+/// Qoder 账号 token 续期，返回**与 Trae / WorkBuddy 同一形状**的刷新结果。
+///
+/// 共用弹窗（`account-token-dialog.tsx`）只认 `{ refreshed, reason?, remainingDays,
+/// thresholdDays?, message, tokenExp, tokenExpBefore }`；而 `qoder_token_refresh` 返回的是
+/// 整个账号对象。所以这里做一次适配 —— 形状统一放在后端，前端就不用为 Qoder 分叉。
+///
+/// Qoder 没有「剩余多久才允许续」的阈值语义（有 refresh_token 就能换），
+/// 因此 `force` 参数在这里只是**接受但不改变行为**，`thresholdDays` 如实给 0。
+#[tauri::command]
+pub async fn qoder_account_token_refresh(region: String, id: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    let acc = qoder_accounts::list(r)?
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("找不到账号 {id}"))?;
+    let before = acc.expires_at.filter(|v| *v > 0);
+    let updated = qoder_api::refresh_token(&acc).await?;
+    let after = updated.expires_at.filter(|v| *v > 0);
+    let remaining = after.map(qoder_days_left).unwrap_or(-1);
+    Ok(json!({
+        "refreshed": true,
+        "remainingDays": remaining,
+        "thresholdDays": 0,
+        "message": match (before, after) {
+            (Some(b), Some(a2)) => format!(
+                "新的到期时间：{}（原来 {}）",
+                wb_switch_core::modules::config::fmt_ms_local(a2),
+                wb_switch_core::modules::config::fmt_ms_local(b)
+            ),
+            (_, Some(a2)) => format!("新的到期时间：{}", wb_switch_core::modules::config::fmt_ms_local(a2)),
+            _ => "令牌已续期（上游没返回到期时间）".to_string(),
+        },
+        "tokenExp": after.map(Value::from).unwrap_or(Value::Null),
+        "tokenExpBefore": before.map(Value::from).unwrap_or(Value::Null),
+    }))
+}
+
+/// 毫秒 → 「还剩几天」（与 `config::days_left_ms` 同口径：四舍五入到天）。
+fn qoder_days_left(exp_ms: i64) -> i64 {
+    wb_switch_core::modules::config::days_left_ms(exp_ms)
 }
 
 /// 刷新该账号的访问令牌（用 refresh_token 换新的，并写回账号库）。

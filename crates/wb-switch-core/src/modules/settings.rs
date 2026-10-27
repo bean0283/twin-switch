@@ -354,11 +354,19 @@ pub struct Settings {
     /// 从下一次开始才是真正的增量复制。
     #[serde(default)]
     pub wb_link_since: i64,
+    /// **诊断日志**（2026-10-26 新增）。**默认关闭**。
+    ///
+    /// 加这个是因为有用户报「账号刷新失败 / 401」而开发侧复现不了 —— 只能让
+    /// 出问题那台机器自己留证据。默认关：把运行细节写进磁盘必须由用户亲手打开。
+    /// 形状与清理策略见 [`crate::modules::diag_log`]。
+    #[serde(default)]
+    pub log: crate::modules::diag_log::DiagLogConfig,
 }
 
 impl Settings {
     pub fn sanitized(mut self) -> Self {
         self.backup_retention = self.backup_retention.sanitized();
+        self.log = self.log.sanitized();
         // 去掉空白项与空值：空串留在磁盘上等于「设了一个空路径」，
         // 会让界面显示「已手动指定」而实际什么都没指定。
         self.trae_exe = self

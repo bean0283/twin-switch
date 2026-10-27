@@ -270,7 +270,20 @@ export interface TraeScanResult {
   scanned_mb: number;
   elapsed_ms: number;
   pid: number | null;
+  /** 客户端版本（3.4.9 起改为多进程布局；读不到就是 null）。 */
+  client_version: string | null;
+  /** 这次实际生效的密钥存放布局。 */
+  layout: "legacy" | "multi";
   message: string;
+}
+
+/** 扫描 + 解密的分段耗时（后端 `trae_scan_and_decrypt` 的 `timings`）。 */
+export interface TraeScanDecryptTimings {
+  scanMs: number;
+  /** 复用了快照时为 0。 */
+  decryptMs: number;
+  /** 用户真正等待的时长（扫描 + 解密）。 */
+  totalMs: number;
 }
 
 export interface TraeDecryptedStatus {
@@ -1641,6 +1654,37 @@ export interface WbSessionCopyReport {
   note: string;
 }
 
+/**
+ * 多目标复制的结果（`workbuddy_session_copy_multi`）。
+ *
+ * ⚠️ `ok` 是「**有没有**目标成功」，不是「全部成功」：每个目标独立成败，
+ * 界面必须按 `targets[]` 逐条显示，不能用一句「已复制」盖过去。
+ */
+export interface WbSessionCopyMultiReport {
+  ok: boolean;
+  /** 成功的目标账号数。 */
+  okCount: number;
+  /** 去重、剔除源账号之后的目标总数。 */
+  targetCount: number;
+  /** 成功的那些目标里，复制成功的会话条数合计（与 `okCount` 同源，界面别自己再算）。 */
+  count: number;
+  sourceUid: string;
+  targets: Array<{
+    targetUid: string;
+    ok: boolean;
+    count?: number;
+    backup?: string | null;
+    error?: string;
+    skipped?: Array<{ id: string; title: string; reason: string }>;
+  }>;
+  /** 本次是否由本工具退出了 WorkBuddy（用户确认过才会）。 */
+  clientStopped?: boolean;
+  /** 是否已自动重新打开。 */
+  clientRelaunched?: boolean;
+  /** 重新打开失败时的原因（不静默）。 */
+  restartError?: string;
+}
+
 export interface WbSessionLinkAllReport {
   ok: boolean;
   /** 复制后所在关联组的 key（`link:<组id>`），供界面换掉手上的旧 key。 */
@@ -2274,6 +2318,37 @@ export interface BackupRetention {
   maxTotalMb: number;
 }
 
+/** 诊断日志设置。字段名与 `settings.json` / 后端结构**完全一致**（camelCase）。 */
+export interface DiagLogSettings {
+  /** 总开关。默认 `false`。 */
+  enabled: boolean;
+  /** `error` = 只记失败（默认）；`info` = 连正常流程一起记（量大，只建议短期开）。 */
+  level: "error" | "info";
+  /** 保留天数：早于今天-N 天的日期文件夹整个删掉。`0` = 不按天删。 */
+  maxDays: number;
+  /** 每个日期文件夹最多留几份文件（超出删最旧的）。`0` = 不按份数删。 */
+  maxFiles: number;
+  /** 单个文件上限（MB），写满轮转。`0` = 不轮转。 */
+  maxMb: number;
+}
+
+/** 日志现状（`diag_log_status`）：占用与每天的文件数，设置页直接展示。 */
+export interface DiagLogStatus {
+  ok: boolean;
+  enabled?: boolean;
+  level?: string;
+  maxDays?: number;
+  maxFiles?: number;
+  maxMb?: number;
+  /** 日志根目录绝对路径。 */
+  dir?: string;
+  totalBytes?: number;
+  totalFiles?: number;
+  /** 每天的目录（按日期倒序）。 */
+  days?: Array<{ day: string; bytes: number; files: number }>;
+  error?: string;
+}
+
 /** 设置快照（`settings_get` / `settings_set` 的返回，两者**同形**）。 */
 export interface SettingsSnapshot {
   ok: boolean;
@@ -2306,6 +2381,15 @@ export interface SettingsSnapshot {
    * 新装与老用户升级都是关 —— 这是写库操作，必须本人亲手打开。
    */
   autoLinkWorkbuddySessions: boolean;
+  /**
+   * **诊断日志**设置（2026-10-26 新增，**默认关闭**）。
+   *
+   * 用途：有用户报「账号刷新失败 / 401」而开发侧复现不了 —— 只能让出问题那台机器
+   * 自己留证据。默认关：把运行细节写进磁盘必须由用户亲手打开。
+   */
+  log: DiagLogSettings;
+  /** 日志根目录（`<store>/logs`），界面「打开文件夹」用。 */
+  logDir: string;
   /** `settings.json` 的绝对路径（读坏时用户能自己去看）。 */
   path: string;
   /**

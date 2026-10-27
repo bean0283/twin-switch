@@ -220,6 +220,72 @@ pub fn cached(client_key: Option<String>) -> Value {
     from_profiles(client_key.as_deref())
 }
 
+/// 只查**一个账号**的积分（卡片上那个小刷新按钮）。
+///
+/// 为什么不复用 [`query`]：
+/// * `query` 是「整批刷新 + 写整份磁盘缓存」，点一个账号会把全部账号都打一遍接口，
+///   多账号时明显变慢，也会白白多耗额度；
+/// * 这里只读一个账号的 `oauth.json` → 打一次接口 → 写回它自己的 `profile.json`，
+///   返回**这一个账号的条目**（形状与 `query` 的 `accounts[i]` 完全一致，前端不用分叉）。
+///
+/// 磁盘里那份整批缓存要**作废**：它的数字已经被这次刷新改掉了，继续用它会让「刷新后
+/// 立刻重进页面又看到旧值」。作废方式是最朴素的 —— 删掉缓存文件，下次 `query(false)`
+/// 自然重新拉一遍（也就一次）。
+pub async fn query_one(client_key: Option<String>, id: &str) -> Value {
+    let targets = collect_targets(client_key.as_deref());
+    let Some((client, aid, has_oauth)) = targets
+        .into_iter()
+        .find(|(_, aid, _)| aid == id)
+    else {
+        return json!({ "ok": false, "error": format!("账号库里没有这个账号：{id}") });
+    };
+    if !has_oauth {
+        return json!({
+            "ok": false,
+            "id": id,
+            "queryable": false,
+            "error": "该账号是切换载体，没有网页凭证，无法查询积分",
+        });
+    }
+    let path = trae_vault::account_dir(&client, &aid).join("oauth.json");
+    let Some(oauth) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return json!({ "ok": false, "id": id, "queryable": false, "error": "读不到该账号的网页凭证（oauth.json）" });
+    };
+
+    // 与整批刷新走同一个刷新函数 ⇒ 落盘口径完全一致，不会出现两套数字。
+    // `refresh_profile` 返回 `None` = 没拿到可用 token（不是「成功」）；失败时它保留旧 profile。
+    let ok = trae_profile::refresh_profile(&client, &aid, &oauth).await.is_some();
+
+    // 以落盘后的 profile.json 为准现拼（失败时是旧值，所以要把失败原因写清楚）。
+    let profile = trae_vault::read_profile(&client, &aid);
+    let mut item = entry(&client, &aid, has_oauth, profile.as_ref());
+    if let Some(o) = item.as_object_mut() {
+        if !ok {
+            o.insert(
+                "ok".into(),
+                json!(false),
+                );
+            o.insert(
+                "error".into(),
+                json!("刷新失败：网页凭证已失效或接口没返回（显示的是上次查到的值）"),
+            );
+            // 诊断日志：这是用户报「刷新失败 / 401」时唯一能拿到的现场。
+            // 带上 client 与 uid —— 没有这两个，事后只能看到「有人失败了」。
+            crate::modules::diag_log::error(
+                "trae_credits",
+                format!("单账号刷新失败 client={client} uid={aid}（网页凭证失效或接口无返回）"),
+            );
+        }
+    }
+
+    // 整批缓存已过期（里面还是刷新前的数字）—— 删掉，别让下次进页面读到旧值。
+    config::clear_cache_json(CACHE_NAME);
+    item
+}
+
 /// 查询积分。
 ///
 /// - `force = false`：5 分钟内的磁盘缓存直接返回（`cached: true`）；
@@ -256,7 +322,14 @@ pub async fn query(client_key: Option<String>, force: bool) -> Value {
             continue;
         };
         // 单个账号失败不影响其它账号：refresh_profile 失败时保留旧 profile.json。
-        let _ = trae_profile::refresh_profile(&client, &id, &oauth).await;
+        // ⚠️ 原来这里是 `let _ =` —— 刷新失败的原因被彻底吞掉，用户报「刷新失败」时
+        // 开发侧没有任何线索。现在失败至少进诊断日志（默认关，只有用户开启才落盘）。
+        if trae_profile::refresh_profile(&client, &id, &oauth).await.is_none() {
+            crate::modules::diag_log::error(
+                "trae_credits",
+                format!("批量刷新失败 client={client} uid={id}（该账号返回空，保留旧数据）"),
+            );
+        }
     }
 
     // 汇总与条目一律从落盘后的 profile.json 现拼 —— 以文件为准，
@@ -301,6 +374,17 @@ mod tests {
         assert!(v["accounts"].is_array());
         assert_eq!(v["cached"], json!(true));
         assert!(v["summary"]["queried"].is_number());
+    }
+
+    /// 单账号刷新：账号不在库里时必须是**明确的失败**，不能返回一个空条目冒充成功。
+    #[tokio::test]
+    async fn query_one_rejects_unknown_account() {
+        let v = query_one(Some("no-such-client".to_string()), "no-such-account").await;
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("没有这个账号"),
+            "错误要写明原因，实际: {v}"
+        );
     }
 
     #[test]

@@ -230,10 +230,28 @@ export function CreditBlock({
   item,
   loading,
   onExpand,
+  onRefresh,
+  refreshing,
+  refreshDisabled,
+  refreshHint,
 }: {
   item: CreditView | null;
   loading?: boolean;
   onExpand: () => void;
+  /**
+   * 只刷新**这一个账号**的积分。
+   *
+   * 放在「更新时间」右边：那个位置本来就是回答「这数字多新」，而刷新正是让它可以变新的
+   * 唯一动作 —— 放在别处（比如卡片右上角那排图标）会和「切换 / 改名 / 删除」混在一起，
+   * 用户会以为它也是改账号的操作。传了才画按钮，没传就不占位（布局不变）。
+   */
+  onRefresh?: () => void;
+  /** 该账号正在查（按钮转圈 + 禁用）。 */
+  refreshing?: boolean;
+  /** 不可刷新的原因（如「没有网页凭证」）—— 传了按钮置灰并作为 title 说明。 */
+  refreshDisabled?: boolean;
+  /** 按钮的悬停说明，默认「重新查询这个账号的积分」。 */
+  refreshHint?: string;
 }) {
   const active = useMemo(() => activeOf(item), [item]);
   const shown = active.slice(0, 2);
@@ -286,6 +304,30 @@ export function CreditBlock({
           <Clock3 className="size-3.5 shrink-0" />
           <span className="whitespace-nowrap tabular-nums">{fmtUpdated(item.updatedAt)} 更新</span>
         </span>
+        {/* 单账号刷新：紧挨「更新时间」，因为它的作用就是让这行时间变新。
+            用图标而不是文字按钮，是为了在 3 列卡片里也不挤压「N 个积分包」那行。 */}
+        {onRefresh ? (
+          <button
+            type="button"
+            title={refreshDisabled ? (refreshHint ?? "这个账号无法查询积分") : (refreshHint ?? "重新查询这个账号的积分")}
+            aria-label={refreshHint ?? "重新查询这个账号的积分"}
+            aria-busy={refreshing || undefined}
+            disabled={refreshDisabled || refreshing}
+            onClick={(e) => {
+              // 卡片整体可能可点（进详情），别让刷新顺带触发它。
+              e.stopPropagation();
+              onRefresh();
+            }}
+            className={cn(
+              "-mr-1 inline-flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors",
+              "hover:bg-muted hover:text-foreground",
+              "disabled:pointer-events-none disabled:opacity-40",
+              refreshing && "pointer-events-none",
+            )}
+          >
+            <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+          </button>
+        ) : null}
       </div>
 
       {/* 近期到期 + 查看全部 */}

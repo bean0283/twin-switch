@@ -19,7 +19,7 @@
   const handlers = {
     // ⚠️ 每次发版都要跟着改 —— 截图页脚会照实显示桩里的版本，忘了改就会出现
     //    「代码是 vX、截图是 vY」的假证据。
-    "plugin:app|version": () => "0.4.3",
+    "plugin:app|version": () => "0.4.4",
     "plugin:event|listen": () => 1,
     "plugin:event|unlisten": () => null,
     "plugin:event|emit": () => null,

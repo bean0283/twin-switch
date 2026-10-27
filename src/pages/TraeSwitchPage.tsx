@@ -1420,6 +1420,9 @@ export default function TraeSwitchPage() {
                         onExpand={() => {
                           if (credit) credits.setExpand(credit);
                         }}
+                        // 单账号刷新：只有「查得到」的账号才给按钮（切换载体没有网页凭证）
+                        onRefresh={credit ? () => void credits.refreshOne(credit.id) : undefined}
+                        refreshing={credits.refreshingId === credit?.id}
                       />
                     </AccountCard>
                   );
