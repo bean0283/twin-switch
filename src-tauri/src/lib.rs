@@ -135,6 +135,14 @@ pub fn run() {
             if !wb_switch_core::modules::gateway_server::enabled() {
                 eprintln!("[gateway] 积分共享已关闭（设置里可开启），本次不启动网关");
             } else {
+            eprintln!(
+                "[gateway] 绑定 {}",
+                if wb_switch_core::modules::gateway_server::lan_enabled() {
+                    "0.0.0.0（局域网共享已开，非本机来源强制 Key）"
+                } else {
+                    "127.0.0.1（仅本机）"
+                }
+            );
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = wb_switch_core::modules::gateway_server::serve(
                     wb_switch_core::modules::gateway_keys::GATEWAY_PORT,
@@ -197,6 +205,7 @@ pub fn run() {
             commands::gateway_status,
             commands::gateway_guide_selftest,
             commands::gateway_set_enabled,
+            commands::gateway_set_lan,
             commands::gateway_pool,
             commands::gateway_preview,
             commands::gateway_keys_list,

@@ -17,6 +17,7 @@ import {
   gatewayModelsGet,
   gatewayModelLabels,
   gatewaySetEnabled,
+  gatewaySetLan,
   gatewayStatus,
   gatewayUpstreamsGet,
   gatewayUpstreamsSet,
@@ -54,6 +55,17 @@ type Status = {
   requests: number;
   rejected: number;
   addr: string;
+  /** 本机回环地址（始终可用）。 */
+  localAddr?: string;
+  /** 是否真的绑了 `0.0.0.0`（不是配置值，是实际生效值）。 */
+  lan?: boolean;
+  /** 配置里的意图值（网关没在跑时 `lan` 恒 false，但勾选已经落盘）。 */
+  lanPref?: boolean;
+  /** 局域网地址；探测不到时为 null —— 不许拿回环地址冒充。 */
+  lanAddr?: string | null;
+  lanAddrError?: string | null;
+  /** 绑定失败原因（空 = 没失败过）。用来区分「关了」和「起不来」。 */
+  bindError?: string | null;
 };
 
 type Discovered = {
@@ -230,6 +242,9 @@ export default function GatewayPage() {
   const [scanning, setScanning] = useState(false);
   /// 积分共享总开关（关闭会真的停网关）。
   const [gwOn, setGwOn] = useState(true);
+  /// 局域网共享（真的绑 0.0.0.0 才为 true）。切换会重启网关。
+  const [lanOn, setLanOn] = useState(false);
+  const [lanBusy, setLanBusy] = useState(false);
 
   const [upstreamsText, setUpstreamsText] = useState("");
   const [upstreamsOpen, setUpstreamsOpen] = useState(false);
@@ -251,6 +266,10 @@ export default function GatewayPage() {
       const [s, p, k] = await Promise.all([gatewayStatus(), gatewayPool(), gatewayKeysList()]);
       setStatus(s as Status);
       setGwOn(Boolean((s as Status).running));
+      // 网关没在跑时 `lan` 恒为 false，用配置值 `lanPref` 还原用户的勾选
+      setLanOn(
+        (s as Status).running ? Boolean((s as Status).lan) : Boolean((s as Status).lanPref),
+      );
       const rows = Array.isArray(p) ? (p as PoolEntry[]) : [];
       setPool(rows);
       setPoolCollapsed((prev) => (prev.size > 0 ? prev : new Set(rows.map((r) => r.product))));
@@ -261,6 +280,48 @@ export default function GatewayPage() {
       setBusy(false);
     }
   }, []);
+
+  /// 切换局域网共享。改绑定地址 = 重启网关，所以必须把最新状态读回来再说话，
+  /// 不许「勾上了就当成功」—— 绑不上时要报错（`bindError`）。
+  const toggleLan = useCallback(
+    async (on: boolean) => {
+      setLanBusy(true);
+      setError(null);
+      setLanOn(on); // 乐观更新，失败回滚
+      try {
+        const r = await gatewaySetLan(on);
+        const s = r.status as Status;
+        setStatus(s);
+        // 网关没在跑时 `lan` 不会生效（配置已落盘），此时以用户选择为准，别把勾弹回去。
+        setLanOn(s.running ? Boolean(s.lan) : on);
+        if (on && s.running && !s.lan) {
+          toast.error("没能切到局域网模式", {
+            description: s.bindError ?? "网关没有重新监听，先点一次「刷新」看状态",
+          });
+        } else if (on && !s.running) {
+          // 总开关关着时只落配置、不重绑 —— 这不是失败，别报成失败
+          toast.success("已记录局域网设置", {
+            description: "积分共享当前是关闭的，打开总开关后会按局域网模式启动",
+          });
+        } else if (on) {
+          toast.success("已开启局域网共享", {
+            description: s.lanAddr
+              ? `同网段设备填 ${s.lanAddr}`
+              : (s.lanAddrError ?? "未识别到局域网地址，请手动查本机 IP"),
+          });
+        } else {
+          toast.success("已关闭局域网共享", { description: "网关回到只监听 127.0.0.1" });
+        }
+      } catch (err) {
+        setError(String(err));
+        setLanOn(!on);
+      } finally {
+        setLanBusy(false);
+        void reload();
+      }
+    },
+    [reload],
+  );
 
   useEffect(() => {
     void reload();
@@ -465,6 +526,14 @@ export default function GatewayPage() {
     }
   }
 
+  /// 展示用的主机前缀：开了局域网且**真的探测到地址**才用它（方便复制给其它设备），
+  /// 否则用本机回环。绝不把 127.0.0.1 冒充成「局域网地址」。
+  const hostBase = useMemo(() => {
+    const strip = (u: string) => u.replace(/\/v1\/?$/, "");
+    if (status?.lan && status.lanAddr) return strip(status.lanAddr);
+    return strip(status?.localAddr ?? `http://127.0.0.1:${status?.port ?? 57892}/v1`);
+  }, [status]);
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-6">
       <header className="flex items-start justify-between gap-3">
@@ -472,7 +541,7 @@ export default function GatewayPage() {
           <h1 className="text-lg font-semibold">积分共享</h1>
           <p className="mt-1 text-xs text-muted-foreground">
             把 Trae / WorkBuddy / Qoder 的账号额度合成一个池子，按「谁先过期就用谁」供给本机其它 AI
-            工具。数据只在本机。
+            工具。默认只监听本机；打开下面「局域网共享」后同网段设备（NAS、另一台电脑）也能用。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -520,7 +589,11 @@ export default function GatewayPage() {
 
       <Card
         title="网关状态"
-        desc="随应用启动，只绑定 127.0.0.1"
+        desc={
+          status?.lan
+            ? "随应用启动，已开给同网段的设备（非本机来源一律强制 Key）"
+            : "随应用启动，只绑定 127.0.0.1"
+        }
         right={
           <span
             className={cn(
@@ -536,8 +609,8 @@ export default function GatewayPage() {
       >
         <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
           <div>
-            <div className="text-muted-foreground">地址</div>
-            <div className="mt-0.5 font-mono">{status?.addr ?? "—"}</div>
+            <div className="text-muted-foreground">本机地址</div>
+            <div className="mt-0.5 break-all font-mono">{status?.localAddr ?? status?.addr ?? "—"}</div>
           </div>
           <div>
             <div className="text-muted-foreground">端口</div>
@@ -552,9 +625,79 @@ export default function GatewayPage() {
             <div className="mt-0.5 font-mono">{status?.rejected ?? 0}</div>
           </div>
         </div>
+
+        {/* 绑定失败要单独说：否则「未启动」和「用户自己关了」长得一模一样 */}
+        {status?.bindError && (
+          <p className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
+            上次绑定失败：{status.bindError}
+          </p>
+        )}
+
+        <div className="mt-4 rounded-lg border border-border">
+          <label className="flex cursor-pointer items-start gap-2 px-3 py-2.5">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={lanOn}
+              disabled={lanBusy}
+              onChange={(e) => void toggleLan(e.target.checked)}
+            />
+            <span className="min-w-0">
+              <span className="text-xs font-medium">允许局域网内的其它设备使用（NAS、另一台电脑）</span>
+              <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                勾上后网关从 127.0.0.1 改绑 0.0.0.0，同网段设备用自己的 Key 调用。
+                切换会重启网关，正在生成的对话会中断。
+              </span>
+            </span>
+          </label>
+
+          {lanOn && (
+            <div className="space-y-2 border-t border-border px-3 py-2.5">
+              {!gwOn ? (
+                <p className="text-[11px] text-muted-foreground">
+                  积分共享当前是关闭的，设置已保存：打开上面那个总开关后，网关会直接按局域网模式（0.0.0.0）启动。
+                </p>
+              ) : status?.lanAddr ? (
+                <div className="flex items-center gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] text-muted-foreground">局域网地址（给 NAS / 其它设备填）</div>
+                    <div className="mt-0.5 break-all font-mono text-xs">{status.lanAddr}</div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5"
+                    onClick={() => void doCopy(status.lanAddr ?? "", "局域网设备填这个 base_url")}
+                  >
+                    <Copy className="size-3.5" /> 复制
+                  </Button>
+                </div>
+              ) : (
+                <p className="text-[11px] text-amber-600">
+                  {status?.lanAddrError ?? "没有识别到局域网地址（开关可能还没生效，点右上角刷新）"}
+                </p>
+              )}
+              <p className="text-[11px] text-muted-foreground">
+                首次开启时 Windows 可能弹防火墙授权框，<strong>点「允许」</strong>；如果没弹或点了取消，
+                局域网设备会连不上（网关自己看不出来），需要到防火墙里放行入站 TCP {status?.port ?? 57892}。
+                另外本应用要一直开着（关闭窗口到托盘即可），网关随它起停。
+              </p>
+              <p className="text-[11px] text-muted-foreground">
+                上面地址是按默认路由探测的。如果它显示的<strong>不是你以为的那张网卡</strong>（例如是 VPN 的虚拟网卡），
+                在 cmd 里跑 <span className="font-mono">ipconfig</span> 找「以太网/WLAN」的 IPv4 地址，
+                端口不变，直接替换 IP 即可。
+              </p>
+              <p className="text-[11px] text-amber-600">
+                风险提示：同网段任何拿到 Key 的软件都能消耗你的积分。建议按设备分开发 Key，不用了立刻吊销；
+                只在自己的内网开，别把路由器端口转发到公网。
+              </p>
+            </div>
+          )}
+        </div>
+
         <p className="mt-3 text-xs text-muted-foreground">
-          客户端填 <span className="font-mono">http://127.0.0.1:57892/v1</span>，Key 用下面新建的{" "}
-          <span className="font-mono">sk-ts-…</span>。
+          本机客户端填 <span className="font-mono">{status?.localAddr ?? `http://127.0.0.1:${status?.port ?? 57892}/v1`}</span>，
+          Key 用下面新建的 <span className="font-mono">sk-ts-…</span>。
         </p>
       </Card>
 
@@ -567,7 +710,7 @@ export default function GatewayPage() {
             <div className="min-w-0 flex-1">
               <div className="font-medium">WorkBuddy 的「接口地址」要填完整端点</div>
               <div className="truncate font-mono text-[11px] text-muted-foreground">
-                http://127.0.0.1:57892/v1/chat/completions
+                {hostBase}/v1/chat/completions
               </div>
               <div className="text-[11px] text-muted-foreground">
                 它会把填的地址**原样当作对话端点直接 POST**，必须填到 /chat/completions 这一层。
@@ -577,7 +720,7 @@ export default function GatewayPage() {
               variant="outline"
               size="sm"
               className="gap-1.5"
-              onClick={() => void doCopy("http://127.0.0.1:57892/v1/chat/completions", "填进客户端的接口地址")}
+              onClick={() => void doCopy(`${hostBase}/v1/chat/completions`, "填进客户端的接口地址")}
             >
               <Copy className="size-3.5" /> 复制
             </Button>
@@ -586,7 +729,7 @@ export default function GatewayPage() {
             <div className="min-w-0 flex-1">
               <div className="font-medium">其他 OpenAI 兼容客户端（Trae 等）填 Base URL</div>
               <div className="truncate font-mono text-[11px] text-muted-foreground">
-                http://127.0.0.1:57892/v1
+                {hostBase}/v1
               </div>
               <div className="text-[11px] text-muted-foreground">
                 标准 OpenAI 惯例：客户端自己拼 /chat/completions。
@@ -596,13 +739,20 @@ export default function GatewayPage() {
               variant="outline"
               size="sm"
               className="gap-1.5"
-              onClick={() => void doCopy("http://127.0.0.1:57892/v1", "只填到 base_url 的客户端用这个")}
+              onClick={() => void doCopy(`${hostBase}/v1`, "只填到 base_url 的客户端用这个")}
             >
               <Copy className="size-3.5" /> 复制
             </Button>
           </div>
           <p className="text-[11px] text-muted-foreground">
             API Key 在上方创建；模型名在下方「模型」卡片里勾选后点复制，填进客户端。
+            {status?.lan && status.lanAddr && (
+              <>
+                {" "}
+                上面是**局域网地址**（给 NAS / 其它设备）；本机自己用{" "}
+                <span className="font-mono">{status.localAddr}</span> 也行。
+              </>
+            )}
           </p>
         </div>
       </Card>

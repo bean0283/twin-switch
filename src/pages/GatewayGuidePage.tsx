@@ -244,6 +244,14 @@ export default function GatewayGuidePage() {
               标注：WorkBuddy 填 <code className="font-mono">…/v1/chat/completions</code>；
               其它客户端填到 <code className="font-mono">…/v1</code>。填错的典型症状是 404。
             </div>
+            <div className="mt-2 rounded-md border border-dashed border-border bg-muted/30 px-3 py-1.5 text-[11px] text-muted-foreground">
+              在别的设备上用（飞牛 NAS / 另一台电脑）：先到「积分共享」页勾上
+              「允许局域网内的其它设备使用」，再把上面的 <code className="font-mono">127.0.0.1</code>{" "}
+              换成本机局域网 IP（形如{" "}
+              <code className="font-mono">http://192.168.x.x:57892/v1</code>），端口与路径都不变。
+              网关会强制校验 Key，局域网来源不带 Key 一律 401；容器里跑的应用不能用{" "}
+              <code className="font-mono">127.0.0.1</code>。
+            </div>
           </div>
 
           {/* ③ */}
