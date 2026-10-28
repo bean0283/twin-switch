@@ -1598,6 +1598,20 @@ export async function gatewayKeyDelete(id: string): Promise<void> {
   return invoke("gateway_key_delete", { id });
 }
 
+/// 设置 Key 额度（单位 token）。传 null 表示该项不限。
+export async function gatewayKeySetQuota(
+  id: string,
+  maxTotalTokens: number | null,
+  maxDailyTokens: number | null,
+): Promise<unknown> {
+  return invoke("gateway_key_set_quota", { id, maxTotalTokens, maxDailyTokens });
+}
+
+/// 清零这把 Key 的累计/当日用量（不动额度；因额度被自动吊销的会一并放行）。
+export async function gatewayKeyResetUsage(id: string): Promise<unknown> {
+  return invoke("gateway_key_reset_usage", { id });
+}
+
 export async function gatewayModelsGet(): Promise<unknown> {
   return invoke("gateway_models_get");
 }

@@ -21,6 +21,57 @@ pub const GATEWAY_PORT: u16 = 57892;
 /// Key 前缀，便于人眼区分。
 pub const KEY_PREFIX: &str = "sk-ts-";
 
+/// 额度：两个上限互相独立，**任一触发即算超限**；`None` = 该项不限。
+///
+/// 计量单位固定为 token（`prompt_tokens + completion_tokens`）——
+/// 这是上游唯一按次回传的准确数字（见 `gateway_metrics::Trace`）。
+/// 积分没有按次回传，只能估算，所以不做进额度判据。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyQuota {
+    /// 累计 token 上限（这把 Key 一生总计）。
+    #[serde(default)]
+    pub max_total_tokens: Option<i64>,
+    /// 每日 token 上限（本地时区自然日，跨日自动归零）。
+    #[serde(default)]
+    pub max_daily_tokens: Option<i64>,
+}
+
+/// 累计用量。跨日时 `day_tokens` 在**下一次记账**时归零（不需要定时任务）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyUsage {
+    #[serde(default)]
+    pub total_tokens: i64,
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    /// 真正产生了用量的请求数（拿不到用量的失败请求不计）。
+    #[serde(default)]
+    pub requests: i64,
+    /// `day_tokens` 所属日期（`YYYY-MM-DD` 本地时区）。
+    #[serde(default)]
+    pub day: String,
+    #[serde(default)]
+    pub day_tokens: i64,
+    #[serde(default)]
+    pub last_at: Option<i64>,
+}
+
+fn today_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+impl KeyUsage {
+    /// 当日用量（日期不是今天就是 0 —— 不靠定时任务滚动）。
+    pub fn today_tokens(&self) -> i64 {
+        if self.day == today_str() {
+            self.day_tokens
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayKey {
     pub id: String,
@@ -37,6 +88,16 @@ pub struct GatewayKey {
     pub revoked_at: Option<i64>,
     #[serde(default)]
     pub last_used_at: Option<i64>,
+    /// 额度（两个上限，可任一为空 = 不限）。
+    #[serde(default)]
+    pub quota: KeyQuota,
+    /// 累计用量。
+    #[serde(default)]
+    pub usage: KeyUsage,
+    /// 吊销原因：`quota` = 额度用尽自动吊销；`None` = 手工吊销。
+    /// 恢复时要一并清空，否则界面上会一直挂着「因额度吊销」。
+    #[serde(default)]
+    pub revoked_reason: Option<String>,
 }
 
 impl GatewayKey {
@@ -46,6 +107,32 @@ impl GatewayKey {
 
     pub fn allows(&self, scope: &str) -> bool {
         self.is_active() && (self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope))
+    }
+
+    /// 额度是否已用尽。返回 `Some(说明)` 表示该拒绝请求。
+    ///
+    /// 两个上限任一达到即算（`>=`：「到一定值就停」是用户原话，不是「超过才停」）。
+    pub fn quota_block(&self) -> Option<String> {
+        if let Some(t) = self.quota.max_total_tokens {
+            if self.usage.total_tokens >= t {
+                return Some(format!(
+                    "累计 token 已到上限（{} / {}）",
+                    self.usage.total_tokens, t
+                ));
+            }
+        }
+        if let Some(d) = self.quota.max_daily_tokens {
+            let used = self.usage.today_tokens();
+            if used >= d {
+                return Some(format!("今日 token 已到上限（{used} / {d}），明日 0 点自动恢复"));
+            }
+        }
+        None
+    }
+
+    /// 自检用：是否因为额度被自动吊销。
+    pub fn revoked_by_quota(&self) -> bool {
+        self.revoked_reason.as_deref() == Some("quota")
     }
 }
 
@@ -124,7 +211,11 @@ pub fn create(name: &str, scopes: Vec<String>) -> Result<(String, GatewayKey), S
         created_at: crate::modules::qoder_accounts::now_ms(),
         revoked_at: None,
         last_used_at: None,
+        quota: KeyQuota::default(),
+        usage: KeyUsage::default(),
+        revoked_reason: None,
     };
+    let _g = lock();
     let mut file = read()?;
     file.keys.push(rec.clone());
     write(&file)?;
@@ -138,7 +229,29 @@ pub fn verify(plaintext: &str) -> Result<Option<GatewayKey>, String> {
     Ok(file.keys.into_iter().find(|k| k.is_active() && k.hash == h))
 }
 
+/// 按明文找 Key，**不过滤吊销状态**。
+///
+/// 网关用它区分三种情况，好给出不同的报错：
+/// 不存在（401 无效）／被额度自动吊销（401 + 说明怎么恢复）／手工吊销（401 已吊销）。
+/// 只用 `verify` 的话，这三种在客户端看来都是同一句「Key 无效」。
+pub fn find_by_token(plaintext: &str) -> Result<Option<GatewayKey>, String> {
+    let h = hash_of(plaintext.trim());
+    Ok(read()?.keys.into_iter().find(|k| k.hash == h))
+}
+
+/// 进程内串行化「读-改-写」。
+///
+/// ⚠️ 没有这把锁，并发请求（agent 并行调用很常见）会各自读到同一份旧文件、
+/// 各自累加后写回，**后写的把先写的覆盖掉** —— 用量统计会静默偏小，
+/// 额度就永远触发不了。网关只有一个进程，进程内锁足够；
+/// 跨进程并发不在支持范围内（也不该同时跑两个网关）。
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn mutate(id: &str, f: impl FnOnce(&mut GatewayKey)) -> Result<GatewayKey, String> {
+    let _g = lock();
     let mut file = read()?;
     let key = file
         .keys
@@ -156,15 +269,20 @@ pub fn revoke(id: &str) -> Result<GatewayKey, String> {
     mutate(id, |k| {
         if k.revoked_at.is_none() {
             k.revoked_at = Some(now);
+            k.revoked_reason = None; // 手工吊销
         }
     })
 }
 
 pub fn restore(id: &str) -> Result<GatewayKey, String> {
-    mutate(id, |k| k.revoked_at = None)
+    mutate(id, |k| {
+        k.revoked_at = None;
+        k.revoked_reason = None;
+    })
 }
 
 pub fn delete(id: &str) -> Result<(), String> {
+    let _g = lock();
     let mut file = read()?;
     let idx = file
         .keys
@@ -181,6 +299,77 @@ pub fn delete(id: &str) -> Result<(), String> {
 /// 记一次使用（失败不影响请求）。
 pub fn touch(id: &str) {
     let _ = mutate(id, |k| k.last_used_at = Some(crate::modules::qoder_accounts::now_ms()));
+}
+
+// ---------------------------------------------------------------------------
+// 额度与用量
+// ---------------------------------------------------------------------------
+
+/// 设置额度。传 `None` 或 `<= 0` 表示该项**不限**。
+pub fn set_quota(
+    id: &str,
+    max_total_tokens: Option<i64>,
+    max_daily_tokens: Option<i64>,
+) -> Result<GatewayKey, String> {
+    mutate(id, |k| {
+        k.quota.max_total_tokens = max_total_tokens.filter(|v| *v > 0);
+        k.quota.max_daily_tokens = max_daily_tokens.filter(|v| *v > 0);
+    })
+}
+
+/// 清零累计与当日用量（不动额度、不动吊销状态）。
+pub fn reset_usage(id: &str) -> Result<GatewayKey, String> {
+    mutate(id, |k| {
+        k.usage = KeyUsage::default();
+        // 因额度被自动吊销的，清零后自动放行 —— 否则「重置了还是不能用」很费解。
+        if k.revoked_by_quota() {
+            k.revoked_at = None;
+            k.revoked_reason = None;
+        }
+    })
+}
+
+/// 记一次真实用量，并在**跨过上限时自动吊销**。
+///
+/// - 拿不到任何 token 值（失败 / 上游没回 usage）时**不记账**：不让失败请求
+///   去消耗额度，也不把 `requests` 灌水。
+/// - 吊销是软吊销（只置 `revoked_at` + `revoked_reason="quota"`），
+///   提高额度或清零用量后可以在界面上一键恢复。
+pub fn record_usage(id: &str, prompt: Option<i64>, completion: Option<i64>) {
+    if prompt.is_none() && completion.is_none() {
+        return;
+    }
+    let p = prompt.unwrap_or(0).max(0);
+    let c = completion.unwrap_or(0).max(0);
+    let now = crate::modules::qoder_accounts::now_ms();
+    let today = today_str();
+    let _ = mutate(id, |k| {
+        // 跨日先滚动
+        if k.usage.day != today {
+            k.usage.day = today.clone();
+            k.usage.day_tokens = 0;
+        }
+        k.usage.prompt_tokens += p;
+        k.usage.completion_tokens += c;
+        k.usage.total_tokens += p + c;
+        k.usage.day_tokens += p + c;
+        k.usage.requests += 1;
+        k.usage.last_at = Some(now);
+
+        // 达到任一上限 ⇒ 自动吊销（幂等）
+        if k.revoked_at.is_none() {
+            let hit = k.quota.max_total_tokens.map(|t| k.usage.total_tokens >= t).unwrap_or(false)
+                || k
+                    .quota
+                    .max_daily_tokens
+                    .map(|d| k.usage.day_tokens >= d)
+                    .unwrap_or(false);
+            if hit {
+                k.revoked_at = Some(now);
+                k.revoked_reason = Some("quota".into());
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -200,6 +389,7 @@ mod tests {
             id: "1".into(), name: "t".into(), prefix: "p".into(), suffix: "s".into(),
             hash: hash_of("x"), scopes: vec!["trae-cn".into()],
             created_at: 0, revoked_at: None, last_used_at: None,
+            quota: KeyQuota::default(), usage: KeyUsage::default(), revoked_reason: None,
         };
         assert!(k.allows("trae-cn"));
         assert!(!k.allows("trae-cn-x"));
@@ -214,7 +404,71 @@ mod tests {
             id: "1".into(), name: "t".into(), prefix: "p".into(), suffix: "s".into(),
             hash: hash_of("x"), scopes: vec![],
             created_at: 0, revoked_at: None, last_used_at: None,
+            quota: KeyQuota::default(), usage: KeyUsage::default(), revoked_reason: None,
         };
         assert!(k.allows("qoder-cn"));
+    }
+
+    fn mkkey() -> GatewayKey {
+        GatewayKey {
+            id: "1".into(), name: "t".into(), prefix: "p".into(), suffix: "s".into(),
+            hash: hash_of("x"), scopes: vec![],
+            created_at: 0, revoked_at: None, last_used_at: None,
+            quota: KeyQuota::default(), usage: KeyUsage::default(), revoked_reason: None,
+        }
+    }
+
+    #[test]
+    fn 未设额度一律放行() {
+        let mut k = mkkey();
+        k.usage.total_tokens = 10_000_000;
+        assert!(k.quota_block().is_none(), "两个上限都为空 = 不限");
+    }
+
+    #[test]
+    fn 累计上限达到即拦() {
+        let mut k = mkkey();
+        k.quota.max_total_tokens = Some(1000);
+        k.usage.total_tokens = 999;
+        assert!(k.quota_block().is_none(), "差 1 个 token 还没到");
+        k.usage.total_tokens = 1000;
+        assert!(k.quota_block().is_some(), "到上限即拦，不是超过才拦");
+    }
+
+    #[test]
+    fn 每日上限只看当天且跨日自动归零() {
+        let mut k = mkkey();
+        k.quota.max_daily_tokens = Some(500);
+        k.usage.day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        k.usage.day_tokens = 500;
+        k.usage.total_tokens = 500;
+        assert!(k.quota_block().is_some(), "今天到量要拦");
+
+        // 日期换成昨天 ⇒ 当日用量视为 0，不该拦（不需要定时任务滚动）
+        k.usage.day = "2000-01-01".to_string();
+        assert!(k.quota_block().is_none(), "跨日后自动归零");
+        assert_eq!(k.usage.today_tokens(), 0);
+    }
+
+    #[test]
+    fn 两个上限任一触发就拦() {
+        let mut k = mkkey();
+        k.quota.max_total_tokens = Some(10_000);
+        k.quota.max_daily_tokens = Some(500);
+        k.usage.day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        k.usage.total_tokens = 400;
+        k.usage.day_tokens = 500;
+        let msg = k.quota_block().expect("日上限应先触发");
+        assert!(msg.contains("今日"), "应命中每日口径：{msg}");
+    }
+
+    #[test]
+    fn 因额度吊销可被识别() {
+        let mut k = mkkey();
+        k.revoked_at = Some(1);
+        k.revoked_reason = Some("quota".into());
+        assert!(k.revoked_by_quota());
+        k.revoked_reason = None;
+        assert!(!k.revoked_by_quota(), "手工吊销不算额度吊销");
     }
 }

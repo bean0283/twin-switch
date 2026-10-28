@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, Copy, KeyRound, Loader2, RefreshCw, Server, Trash2, XCircle } from "lucide-react";
 
 import { Link } from "react-router-dom";
@@ -8,8 +8,10 @@ import { Button } from "@/components/ui/button";
 import {
   gatewayKeyCreate,
   gatewayKeyDelete,
+  gatewayKeyResetUsage,
   gatewayKeyRestore,
   gatewayKeyRevoke,
+  gatewayKeySetQuota,
   gatewayKeysList,
   gatewayModelsDiscover,
   gatewayPool,
@@ -47,7 +49,33 @@ type KeyRow = {
   suffix: string;
   scopes: string[];
   revoked_at: number | null;
+  last_used_at?: number | null;
+  /** 额度（两个上限，`null`/缺省 = 该项不限）。 */
+  quota?: {
+    max_total_tokens?: number | null;
+    max_daily_tokens?: number | null;
+  };
+  /** 累计用量（token）。 */
+  usage?: {
+    total_tokens?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    requests?: number;
+    day?: string;
+    day_tokens?: number;
+    last_at?: number | null;
+  };
+  /** `quota` = 额度用尽被自动吊销；`null` = 手工吊销。 */
+  revoked_reason?: string | null;
 };
+
+/** token 数量按人眼习惯缩写：1234 → 1.2k，1_234_567 → 1.23M。 */
+function fmtTok(n: number | undefined | null): string {
+  const v = n ?? 0;
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 1 : 2)}M`;
+  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10_000 ? 0 : 1)}k`;
+  return String(v);
+}
 
 type Status = {
   running: boolean;
@@ -222,6 +250,12 @@ export default function GatewayPage() {
   /** 账号池按产品折叠（与清理页的分类块一致）：默认收起，点「展开」看明细。 */
   const [poolCollapsed, setPoolCollapsed] = useState<Set<string>>(new Set());
   const [keys, setKeys] = useState<KeyRow[]>([]);
+  /** 正在编辑额度的那把 Key（null = 没有展开的编辑器）。 */
+  const [quotaEdit, setQuotaEdit] = useState<{
+    id: string;
+    total: string;
+    daily: string;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -930,55 +964,209 @@ export default function GatewayPage() {
                 <tr>
                   <th className="px-3 py-2 text-left font-medium">用途</th>
                   <th className="px-3 py-2 text-left font-medium">Key</th>
+                  <th className="px-3 py-2 text-left font-medium">用量 / 额度（token）</th>
                   <th className="px-3 py-2 text-left font-medium">状态</th>
                   <th className="px-3 py-2 text-right font-medium">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {keys.map((k) => (
-                  <tr key={k.id} className="border-t border-border/60">
-                    <td className="px-3 py-2">{k.name}</td>
-                    <td className="px-3 py-2 font-mono">
-                      {k.prefix}…{k.suffix}
-                    </td>
-                    <td className="px-3 py-2">
-                      {k.revoked_at ? (
-                        <span className="text-muted-foreground">已吊销</span>
-                      ) : (
-                        <span className="text-emerald-600">有效</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      {k.revoked_at ? (
-                        <div className="inline-flex gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => void gatewayKeyRestore(k.id).then(reload)}
-                            className="rounded-md border border-border px-2 py-1 hover:bg-accent"
-                          >
-                            恢复
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void gatewayKeyDelete(k.id).then(reload)}
-                            className="inline-flex items-center gap-1 rounded-md border border-destructive/30 px-2 py-1 text-destructive hover:bg-destructive/5"
-                          >
-                            <Trash2 className="size-3" />
-                            删除
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => void gatewayKeyRevoke(k.id).then(reload)}
-                          className="rounded-md border border-border px-2 py-1 hover:bg-accent"
-                        >
-                          吊销
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {keys.map((k) => {
+                  const used = k.usage?.total_tokens ?? 0;
+                  const today = k.usage?.day_tokens ?? 0;
+                  const maxTotal = k.quota?.max_total_tokens ?? null;
+                  const maxDaily = k.quota?.max_daily_tokens ?? null;
+                  const pct = maxTotal ? Math.min(100, Math.round((used / maxTotal) * 100)) : 0;
+                  const editing = quotaEdit?.id === k.id;
+                  return (
+                    <Fragment key={k.id}>
+                      <tr className="border-t border-border/60">
+                        <td className="px-3 py-2">{k.name}</td>
+                        <td className="px-3 py-2 font-mono">
+                          {k.prefix}…{k.suffix}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono">{fmtTok(used)}</span>
+                            <span className="text-muted-foreground">
+                              / {maxTotal ? fmtTok(maxTotal) : "不限"}
+                            </span>
+                            {maxTotal ? (
+                              <span
+                                className={cn(
+                                  "text-[10px]",
+                                  pct >= 100
+                                    ? "text-destructive"
+                                    : pct >= 80
+                                      ? "text-amber-600"
+                                      : "text-muted-foreground",
+                                )}
+                              >
+                                {pct}%
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            今日 {fmtTok(today)}
+                            {maxDaily ? ` / ${fmtTok(maxDaily)}` : ""} · {k.usage?.requests ?? 0} 次
+                          </div>
+                          {maxTotal ? (
+                            <div className="mt-1 h-1 w-24 overflow-hidden rounded bg-muted">
+                              <div
+                                className={cn(
+                                  "h-full",
+                                  pct >= 100
+                                    ? "bg-destructive"
+                                    : pct >= 80
+                                      ? "bg-amber-500"
+                                      : "bg-emerald-500",
+                                )}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          ) : null}
+                        </td>
+                        <td className="px-3 py-2">
+                          {k.revoked_at ? (
+                            <span className="text-muted-foreground">
+                              {k.revoked_reason === "quota" ? "已吊销（额度用尽）" : "已吊销"}
+                            </span>
+                          ) : (
+                            <span className="text-emerald-600">有效</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <div className="inline-flex flex-wrap justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setQuotaEdit(
+                                  editing
+                                    ? null
+                                    : {
+                                        id: k.id,
+                                        total: maxTotal ? String(maxTotal) : "",
+                                        daily: maxDaily ? String(maxDaily) : "",
+                                      },
+                                )
+                              }
+                              className="rounded-md border border-border px-2 py-1 hover:bg-accent"
+                            >
+                              额度
+                            </button>
+                            {k.revoked_at ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => void gatewayKeyRestore(k.id).then(reload)}
+                                  className="rounded-md border border-border px-2 py-1 hover:bg-accent"
+                                >
+                                  恢复
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void gatewayKeyDelete(k.id).then(reload)}
+                                  className="inline-flex items-center gap-1 rounded-md border border-destructive/30 px-2 py-1 text-destructive hover:bg-destructive/5"
+                                >
+                                  <Trash2 className="size-3" />
+                                  删除
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => void gatewayKeyRevoke(k.id).then(reload)}
+                                className="rounded-md border border-border px-2 py-1 hover:bg-accent"
+                              >
+                                吊销
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                      {editing && quotaEdit ? (
+                        <tr className="border-t border-border/40 bg-muted/20">
+                          <td colSpan={5} className="px-3 py-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <label className="text-[11px]">
+                                总量上限
+                                <input
+                                  value={quotaEdit.total}
+                                  onChange={(e) =>
+                                    setQuotaEdit({ ...quotaEdit, total: e.target.value })
+                                  }
+                                  inputMode="numeric"
+                                  placeholder="不限"
+                                  className="ml-1 w-24 rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px]"
+                                />
+                              </label>
+                              <label className="text-[11px]">
+                                每日上限
+                                <input
+                                  value={quotaEdit.daily}
+                                  onChange={(e) =>
+                                    setQuotaEdit({ ...quotaEdit, daily: e.target.value })
+                                  }
+                                  inputMode="numeric"
+                                  placeholder="不限"
+                                  className="ml-1 w-24 rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px]"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const t = Number(quotaEdit.total.trim() || 0);
+                                  const d = Number(quotaEdit.daily.trim() || 0);
+                                  void gatewayKeySetQuota(
+                                    k.id,
+                                    t > 0 ? Math.floor(t) : null,
+                                    d > 0 ? Math.floor(d) : null,
+                                  )
+                                    .then(() => {
+                                      toast.success("额度已保存");
+                                      setQuotaEdit(null);
+                                      return reload();
+                                    })
+                                    .catch((e) =>
+                                      toast.error("保存额度失败", { description: String(e) }),
+                                    );
+                                }}
+                                className="rounded-md border border-primary/40 bg-primary/10 px-2 py-1 text-[11px] hover:bg-primary/15"
+                              >
+                                保存
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void gatewayKeyResetUsage(k.id)
+                                    .then(() => {
+                                      toast.success("用量已清零");
+                                      return reload();
+                                    })
+                                    .catch((e) =>
+                                      toast.error("清零失败", { description: String(e) }),
+                                    )
+                                }
+                                className="rounded-md border border-border px-2 py-1 text-[11px] hover:bg-accent"
+                              >
+                                用量清零
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setQuotaEdit(null)}
+                                className="rounded-md border border-border px-2 py-1 text-[11px] hover:bg-accent"
+                              >
+                                取消
+                              </button>
+                              <span className="text-[10px] text-muted-foreground">
+                                留空 = 不限；单位 token；到上限会自动吊销这把 Key（提高额度后点「恢复」即可）
+                              </span>
+                            </div>
+                          </td>
+                        </tr>
+                      ) : null}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
