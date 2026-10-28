@@ -2798,6 +2798,22 @@ pub async fn gateway_key_delete(id: String) -> Result<(), String> {
     gateway_keys::delete(&id)
 }
 
+/// 设置 Key 的额度（单位 token）。传 `null` / `0` 表示该项不限。
+#[tauri::command]
+pub async fn gateway_key_set_quota(
+    id: String,
+    max_total_tokens: Option<i64>,
+    max_daily_tokens: Option<i64>,
+) -> Result<Value, String> {
+    gateway_keys::set_quota(&id, max_total_tokens, max_daily_tokens).map(|k| json!(k))
+}
+
+/// 清零这把 Key 的累计/当日用量（不动额度；因额度被自动吊销的会一并放行）。
+#[tauri::command]
+pub async fn gateway_key_reset_usage(id: String) -> Result<Value, String> {
+    gateway_keys::reset_usage(&id).map(|k| json!(k))
+}
+
 /// 模型目录（`models.json`）。空对象表示还没登记。
 #[tauri::command]
 pub async fn gateway_models_get() -> Result<Value, String> {

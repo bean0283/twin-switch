@@ -44,6 +44,11 @@ pub struct Trace {
     pub folded: usize,
     pub failovers: usize,
     pub queued: bool,
+    /// 这次请求用的是哪把网关 Key（用于按 Key 记额度）。
+    ///
+    /// 由 `chat()` 在校验 Key 之后填。换号重试时 clone 出去的每份都带着它 ——
+    /// 但只有最终落盘的那份会 `finish()`，所以用量只记一次，不会因为换号重复计。
+    pub key_id: Option<String>,
     /// 已经写过盘，避免同一份记录落两行。
     ///
     /// ⚠️ 故意**不用** `Arc<AtomicBool>`：换号重试时每次尝试都是 `Clone` 出来的一份，
@@ -70,6 +75,7 @@ impl Trace {
             folded: 0,
             failovers: 0,
             queued: false,
+            key_id: None,
             logged: false,
         }
     }
@@ -115,6 +121,16 @@ impl Trace {
             return;
         }
         self.logged = true;
+        // 按 Key 记额度：**唯一收口**。流式与非流式、成功与失败最后都走这里，
+        // 所以放在 `finish` 里既不会漏记，也不会因为换号重试而重复记。
+        // 拿不到用量时 `record_usage` 自己会跳过（不让失败请求消耗额度）。
+        if let Some(kid) = self.key_id.as_deref() {
+            crate::modules::gateway_keys::record_usage(
+                kid,
+                self.prompt_tokens,
+                self.completion_tokens,
+            );
+        }
         let flat: String = err
             .replace(['\n', '\r', '\t'], " ")
             .chars()
@@ -125,6 +141,7 @@ impl Trace {
             "model": self.model,
             "scope": self.scope,
             "account": self.account,
+            "key_id": self.key_id,
             "stream": self.stream,
             "ok": ok,
             "status": status,

@@ -755,7 +755,7 @@ async fn chat(
             format!("缺少 Authorization 头。客户端里填本机网关 Key（在「积分共享」页新建）"),
         );
     };
-    let key = match gateway_keys::verify(&token) {
+    let key = match gateway_keys::find_by_token(&token) {
         Ok(Some(k)) => k,
         Ok(None) => {
             REJECTED.fetch_add(1, Ordering::Relaxed);
@@ -765,6 +765,38 @@ async fn chat(
             return api_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e);
         }
     };
+
+    // ①-a 吊销状态。**分三种说清楚** —— 只回「Key 无效」会让用户以为是复制错了，
+    // 跑去重建 Key，而真正的原因是额度用尽（模板里最费时间的一类误解）。
+    if !key.is_active() {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        let msg = if key.revoked_by_quota() {
+            format!(
+                "这把 Key「{}」已因额度用尽被自动吊销（累计 {} token）。\
+                 在「积分共享 → Key」里提高额度或点「用量清零」后，再点「恢复」即可继续用。",
+                key.name, key.usage.total_tokens
+            )
+        } else {
+            format!("这把 Key「{}」已被吊销。可在「积分共享 → Key」里恢复。", key.name)
+        };
+        return api_err(StatusCode::UNAUTHORIZED, "authentication_error", msg);
+    }
+
+    // ①-b 额度闸门。额度在**请求进来时**判一次，避免超额继续消耗上游积分。
+    //
+    // 注意这里只拦「额度已到但 Key 还没被吊销」的情况 —— 正常到量时
+    // `record_usage` 已经把它自动吊销了，`verify` 就查不到它。
+    // 这个分支覆盖的是「已恢复但用量没清零 / 额度被调低」这类手工操作后的状态。
+    if let Some(msg) = key.quota_block() {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return api_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota_exceeded",
+            format!(
+                "这把 Key [{msg}]。可在「积分共享 → Key」里提高额度，或把用量清零后重试。"
+            ),
+        );
+    }
 
     let Some(Json(req)) = body else {
         return api_err(StatusCode::BAD_REQUEST, "invalid_request_error", "请求体不是合法 JSON");
@@ -859,6 +891,8 @@ async fn chat(
     let stream_ok = want_stream && std::env::var("TWIN_TS_NO_STREAM").as_deref() != Ok("1");
     let mut upstream_req = req.clone();
     let mut trace = Trace::new(&model, want_stream);
+    // 这次请求记到哪把 Key 头上（额度在 `Trace::finish` 里统一记账）。
+    trace.key_id = Some(key.id.clone());
     // 前缀稳定 + 历史折叠：确定性规则，同样的历史每轮折出同样的字节，
     // 这样上游的前缀缓存才有机会命中（见 `gateway_stream::prepare`）。
     if let Some(obj) = upstream_req.as_object_mut() {
