@@ -504,6 +504,11 @@ fn build_router() -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/models", get(models))
         .route("/chat/completions", post(chat))
+        // 余额查询：dsh-pet 这类桌宠把 `{base_url}/user/balance` 当下游地址拼出来请求
+        // （实测 `GET /v1/user/balance -> 404`，它会在 2 秒内重试十几次）。
+        // 形状对齐 DeepSeek 官方 `/user/balance`，数值按 token 预算估算 —— 见 [`balance`]。
+        .route("/v1/user/balance", get(balance))
+        .route("/user/balance", get(balance))
         // ⚠️ WorkBuddy 的「接口地址」语义是**完整的对话端点**：用户填什么它就 POST 到什么
         // （抓包日志实测 `POST /v1 -> 404`）。所以把可能被当作端点的路径都兜底挂上，
         // 用户填 `…/v1`、`…/v1/chat/completions`、甚至 `…` 都能通。
@@ -655,6 +660,88 @@ async fn healthz(
         obj.insert("pool_head".into(), json!(head));
     }
     Json(body)
+}
+
+/// `GET /v1/user/balance` —— 余额查询（形状对齐 DeepSeek 官方 `/user/balance`）。
+///
+/// 为什么要有：dsh-pet 这类桌宠把「模型 base_url + `/user/balance`」当作余额地址，
+/// 网关没这个路由时它们会一直 404 重试（实测 2 秒内十几次），界面上余额永远空着。
+///
+/// **口径：按 token 预算估算，不去查上游真实积分。**
+/// 上游积分不是按次回传的，硬查要额外请求、各家用不同接口；而 token 是每次请求
+/// 都拿得到的准确数字。所以：
+///     剩余 token = 该 Key 的额度上限 − 已用 token
+///     金额      = 剩余 token / 1e6 × 单价（默认 2.0 元/百万 token，`TWIN_TS_YUAN_PER_MTOK` 可改）
+///
+/// 没设额度的 Key 退回「账号池剩余积分」（真实值），并在 `twin_switch.mode` 里标明口径
+/// —— 两种口径的数不能混在一起还不自知。
+async fn balance(headers: HeaderMap) -> axum::response::Response {
+    // Key 可选：带了按这把 Key 的额度算；没带（或已吊销）就只报池子。
+    let key = bearer(&headers).and_then(|t| gateway_keys::find_by_token(&t).ok().flatten());
+
+    let pool = gateway_pool::snapshot();
+    let pool_remaining: f64 = pool.iter().filter_map(|e| e.remaining).sum();
+    let pool_accounts = pool.len();
+
+    let rate: f64 = std::env::var("TWIN_TS_YUAN_PER_MTOK")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(2.0);
+
+    // 口径开关（默认 pool）：
+    //   pool  —— 直接报账号池真实剩余积分，和「积分共享」页面上看到的数字一致；
+    //   token —— 按 Key 的 token 预算折算金额：剩余 token / 1e6 × 单价。
+    //
+    // ⚠️ 默认给 pool 是因为两套单位量级差很大：10 万 token 预算折成钱只有 ¥0.2，
+    // 而池子里是两万多积分 —— 桌宠上突然显示 ¥0.20 会像坏了。要 token 估算时设
+    // `TWIN_TS_BALANCE_MODE=token` 即可，不用改代码。
+    let want_token = std::env::var("TWIN_TS_BALANCE_MODE")
+        .map(|v| v.trim().eq_ignore_ascii_case("token"))
+        .unwrap_or(false);
+
+    let budget = key.as_ref().and_then(|k| k.quota.max_total_tokens);
+    let used = key.as_ref().map(|k| k.usage.total_tokens);
+
+    let (mode, token_remaining, yuan, available) = if want_token && budget.is_some() {
+        let left = (budget.unwrap_or(0) - used.unwrap_or(0)).max(0);
+        let yuan = left as f64 / 1_000_000.0 * rate;
+        (
+            "token_budget",
+            Some(left),
+            yuan,
+            key.as_ref().map(|k| k.is_active()).unwrap_or(true) && left > 0,
+        )
+    } else {
+        (
+            "pool_remaining",
+            budget.map(|b| (b - used.unwrap_or(0)).max(0)),
+            pool_remaining,
+            pool_remaining > 0.0,
+        )
+    };
+
+    Json(json!({
+        "is_available": available,
+        "balance_infos": [{
+            "currency": "CNY",
+            "total_balance": format!("{yuan:.2}"),
+            "granted_balance": format!("{yuan:.2}"),
+            "topped_up_balance": "0.00",
+        }],
+        // 网关扩展字段（非 DeepSeek 标准，客户端会忽略），用来解释这个数怎么来的
+        "twin_switch": {
+            "mode": mode,
+            "token_remaining": token_remaining,
+            "token_used": used,
+            "token_budget": budget,
+            "yuan_per_mtok": rate,
+            "pool_remaining": pool_remaining,
+            "pool_accounts": pool_accounts,
+            "key_name": key.as_ref().map(|k| k.name.clone()),
+        }
+    }))
+    .into_response()
 }
 
 async fn models() -> impl IntoResponse {
