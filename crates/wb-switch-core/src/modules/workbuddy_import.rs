@@ -60,6 +60,36 @@
 //!    不是每回合一条。
 //! 9. **工作目录不存在时不要声明工作区**（`workspace_folders` 留空），否则客户端反复挂载失败。
 //!
+//! ## 第三批硬约束（3.4.9 新版客户端：导入的会话「打不开」）
+//!
+//! 现象：会话在列表里正常显示，点进去却只有一句
+//! 「**由于网络原因，会话加载失败。请刷新页面。**」，刷新无用；
+//! 客户端 renderer 日志里是 `chat.getMessages → bizCode=995001 / failed to load messages`。
+//!
+//! 10. **`chat_turn.context` 里两个字段必须是「JSON 字符串」，不能是数组/对象**：
+//!     `persist_user_message_context.query`（值形如 `"[{\"type\":\"text\",\"data\":{\"content\":…}}]"`）
+//!     与 `context_usage`（值形如 `"{\"contexts\":[]}"`）。旧实现写成真数组/真对象，
+//!     新版客户端按 `String` 反序列化 → 整个 `get_messages` 失败 → 会话打不开。
+//!     **这是「库是对的、只有类型错」的故障，从数据上看不出问题**，只有逐字段比类型才查得到。
+//! 11. **`plan_item` 别多写当前版本没有的键**：`confirm_info` / `parent_agent_run_ids` /
+//!     `result.error_variant` / `result.is_async` 在当前真实行里已不存在（只有旧版才写 null）。
+//!     与真实行同形，才不会被严格的反序列化拒掉。
+//! 12. **`project` 行必须是 domain v2**：`domain_version = 2` +
+//!     `single_root_workspace_folder`/`workspace_folders` 都填好。新版客户端多处按
+//!     `domain_version = 2` 过滤项目，停在 v1 的行在它眼里等于「项目不存在」。
+//! 13. **不要凭空写 `chat_session.context.vm_mode`**：旧代码在模板缺该键时补一个 `aha_vm`，
+//!     等于把本地会话标成 TraeWork 云工作区会话。
+//! 14. **`history_v2.messages` 必须带 `mode`，`raw_messages[]` 六个键要齐**（2026-10-28 第三处根因）：
+//!     `harness.dll` 里 `HistoryV2Messages` 的字段序列是
+//!     `raw_messages · important_user_message_prompt_section · bottom_line_tool_call_summary ·
+//!      mode · summary · system_reminder_session_initialized · …`，`mode` 是**非 Option 字段**
+//!     （原生行 10/10 写 `"FunctionCall"`）。此前从未写过它，整行解码即失败 ——
+//!     症状与第 10 条一模一样（`995001` + 界面「由于网络原因」），极难分辨。
+//!     `HistoryRawChatMessage` 的 `content`/`extra_info`/`name`/`role`/`tool_call_id`/`tool_calls`
+//!     原生 18/18 全有（可为 null），少键同样失败。
+//!
+//! 旧数据由 `heal_legacy_rows()` 就地修（随每次导入自动跑一遍，幂等）。
+//!
 //! ## 空间占用与「不该做的工作量」（v0.0.6）
 //!
 //! SQLCipher 是**逐页独立加密**（每页自带随机 IV + HMAC、页号参与 HMAC、页长恒 4096），
@@ -248,6 +278,7 @@ fn ensure_project(conn: &Connection, uid: &str, cwd: &str, start: i64) -> Result
         )
         .ok();
     if let Some(pid) = existing {
+        upgrade_project_row(conn, &pid, &path)?;
         return Ok(pid);
     }
     let ts = if start > 0 { start } else { now_secs() };
@@ -260,12 +291,49 @@ fn ensure_project(conn: &Connection, uid: &str, cwd: &str, start: i64) -> Result
     conn.execute(
         "INSERT INTO project \
          (project_id, source, user_id, name, description, absolute_path, biz_project_id, \
-          created_at, updated_at, deleted_at, workspace_status, last_active_at, work_mode) \
-         VALUES (?1, 'native-ide', ?2, ?3, NULL, ?4, ?5, ?6, ?6, NULL, 'virtual', ?6, 'work')",
-        params![pid, uid, name, path, biz, ts],
+          created_at, updated_at, deleted_at, workspace_status, last_active_at, work_mode, \
+          workspace_type, single_root_workspace_folder, workspace_folders, project_kind, domain_version) \
+         VALUES (?1, 'native-ide', ?2, ?3, NULL, ?4, ?5, ?6, ?6, NULL, ?7, ?6, 'work', \
+                 'single_root', ?4, ?8, 'workspace', 2)",
+        params![pid, uid, name, path, biz, ts, workspace_status_of(&path), workspace_folders_of(&path)],
     )
     .map_err(|e| format!("写入 project 失败: {e}"))?;
     Ok(pid)
+}
+
+/// 目录存在 → `single_root`；不存在 → `virtual`（真实库两种取值都有，语义是「能不能挂载」）。
+fn workspace_status_of(path: &str) -> &'static str {
+    if Path::new(path).is_dir() {
+        "single_root"
+    } else {
+        "virtual"
+    }
+}
+
+/// `workspace_folders` 是**数组序列化后的字符串**（真实行形如 `["d:\\htw\\签到"]`）。
+fn workspace_folders_of(path: &str) -> String {
+    json!([path]).to_string()
+}
+
+/// 把旧版本写下的 project 行升级到当前的「project domain v2」形态。
+///
+/// 新版客户端的项目查询普遍带 `domain_version = 2` 过滤，`single_root_workspace_folder`
+/// 也为空的话这个项目在它眼里就是「不存在」，会话虽然还列得出来，打开却会失败。
+/// 只对**单根工作区**做升级（多根项目本来就没有这个字段），已经是 v2 且填好路径的行不动。
+fn upgrade_project_row(conn: &Connection, pid: &str, path: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE project SET domain_version = 2, workspace_type = 'single_root', \
+         single_root_workspace_folder = ?2, workspace_folders = ?3, workspace_status = ?4, \
+         project_kind = 'workspace', work_mode = COALESCE(work_mode, 'work') \
+         WHERE project_id = ?1 \
+           AND ifnull(workspace_type, 'single_root') = 'single_root' \
+           AND (ifnull(domain_version, 0) < 2 \
+                OR single_root_workspace_folder IS NULL \
+                OR TRIM(single_root_workspace_folder) = '')",
+        params![pid, path, workspace_folders_of(path), workspace_status_of(path)],
+    )
+    .map_err(|e| format!("升级 project 行失败: {e}"))?;
+    Ok(())
 }
 
 /// 递归把「可能来自别的会话」的取值清空：数组→`[]`，对象→保持形状递归清空，
@@ -316,6 +384,37 @@ fn shape_template(conn: &Connection, sql: &str) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// 取用户消息 context 形状的 SQL（全库最新一条真实用户消息）。
+const USER_CTX_TPL_SQL: &str = "SELECT user_message_context FROM chat_message \
+     WHERE message_role='user' AND ifnull(user_message_context,'')<>'' \
+     ORDER BY created_at DESC LIMIT 1";
+
+/// 取 `chat_turn.context` 形状的 SQL（全库最新一条真实回合）。
+const TURN_CTX_TPL_SQL: &str = "SELECT context FROM chat_turn \
+     WHERE ifnull(context,'')<>'' AND context<>'{}' \
+     ORDER BY updated_at DESC LIMIT 1";
+
+/// 会话级模板缓存：两个 context 形状各查一次，供该会话的**全部回合**复用。
+///
+/// ⚠️ 以前是每回合各查一次这两个 `SELECT … ORDER BY … LIMIT 1`，而循环正在往
+/// `chat_message` / `chat_turn` 里插行 —— 表越写越大，后面的回合扫描 + 排序的
+/// 数据量也跟着变大，整体是 **O(回合²)**。实测 324 回合 / 17263 工具步骤的会话
+/// （正文 243.8 MB）会慢到数十分钟，且越导越慢。模板在整轮导入期间是稳定的
+/// （取的是库里**已有**的真实行，不是我们刚插的），缓存一次即可。
+struct ShapeTemplates {
+    user_message: Value,
+    turn: Value,
+}
+
+impl ShapeTemplates {
+    fn load(conn: &Connection) -> Self {
+        Self {
+            user_message: shape_template(conn, USER_CTX_TPL_SQL),
+            turn: shape_template(conn, TURN_CTX_TPL_SQL),
+        }
+    }
+}
+
 /// 构造 `chat_session.context`。
 ///
 /// **模板只借字段形状，取值逐项重建**。首版把真实行整段抄下来，于是
@@ -332,7 +431,6 @@ fn build_session_context(conn: &Connection, pid: &str) -> String {
         .as_object()
         .cloned()
         .unwrap_or_default();
-    let vm_mode = tpl.get("vm_mode").cloned().unwrap_or_else(|| json!("aha_vm"));
     let limit = tpl
         .get("server_history_cache_limit")
         .cloned()
@@ -347,27 +445,45 @@ fn build_session_context(conn: &Connection, pid: &str) -> String {
     out.insert("server_history_cache_limit".into(), limit);
     // 本会话尚无任何技能修订缓存
     out.insert("skill_list_revisions".into(), json!({}));
-    out.insert("vm_mode".into(), vm_mode);
+    // ⚠️ 不写 `vm_mode`：它是「TraeWork 云工作区（VM）会话」的标记。本工具的会话是
+    // 本地文件会话，旧代码在模板缺该键时**凭空补一个 `aha_vm`**，等于告诉客户端
+    // 「这个会话跑在 VM 里」，客户端就会去拉 VM 实例（失败时报「正在启动 TraeWork 工作区」）。
+    // 新版真实行的 `chat_session.context` 里根本没有这个键。
+    out.remove("vm_mode");
     Value::Object(out).to_string()
 }
 
+/// 用户提问在 Trae 里的**双重编码**形态：`[{"type":"text","data":{"content":…}}]`
+/// 再整体序列化成一个字符串。
+///
+/// `chat_message.user_message_context.query` 与
+/// `chat_turn.context.persist_user_message_context.query` **都必须是这种字符串**。
+/// 写成真正的数组（本模块 0.4.0～0.4.4 的写法）会让新版客户端按 `String` 反序列化失败，
+/// 整条会话打不开，界面只显示「由于网络原因，会话加载失败。请刷新页面。」——
+/// 而库里数据是好的，只有这一处类型不对，所以从表面完全看不出问题。
+fn query_blob(user_text: &str) -> String {
+    json!([{ "type": "text", "data": { "content": user_text } }]).to_string()
+}
+
+/// 真实行 `history_v2.accumulated_summary` 的默认取值。
+///
+/// ⚠️ 这一列（连同 `summary` / `compress_token_usage` / `micro_compacted` /
+/// `truncated_above` / `micro_compact_strategy`）在真实行里**永远不是 NULL**。
+/// 旧实现没写这几列（即 NULL），新版客户端按非 Option 解码 → 整行读取失败 →
+/// `get_messages` 报 `failed to load messages`，会话打不开。默认值逐字抄自真实行。
+const EMPTY_ACCUMULATED_SUMMARY: &str = r#"{"summary":"","accumulated_summary_used":false}"#;
+
+/// 空上下文用量。真实行同样是**字符串**：`"{\"contexts\":[]}"`，不是对象。
+const EMPTY_CONTEXT_USAGE: &str = r#"{"contexts":[]}"#;
+
 /// 取目标库中最近一条用户消息的 `user_message_context` 作为模板，替换提问内容。
-fn template_user_context(conn: &Connection, user_text: &str) -> String {
-    let mut ctx = conn
-        .query_row(
-            "SELECT user_message_context FROM chat_message \
-             WHERE message_role='user' AND ifnull(user_message_context,'')<>'' \
-             ORDER BY created_at DESC LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !ctx.is_object() {
-        ctx = json!({});
-    }
-    let query_json = json!([{ "type": "text", "data": { "content": user_text } }]).to_string();
+fn template_user_context(tpl: &Value, user_text: &str) -> String {
+    let mut ctx = if tpl.is_object() && !tpl.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        tpl.clone()
+    } else {
+        json!({})
+    };
+    let query_json = query_blob(user_text);
     let obj = ctx.as_object_mut().expect("已保证是对象");
     obj.insert("query".into(), json!(query_json));
     obj.insert("parsed_query".into(), json!([user_text]));
@@ -393,17 +509,12 @@ fn template_user_context(conn: &Connection, user_text: &str) -> String {
 /// 正确做法：**只借字段形状 + `model_info`（唯一随版本漂移且必须照用的部分），其余全部重建**。
 /// 未知的新字段按类型中性化，保持形状不与新版错位。
 fn build_turn_context(
-    conn: &Connection,
+    tpl: &Value,
     workspace: Option<&str>,
     user_text: &str,
     t_start: i64,
     t_end: i64,
 ) -> String {
-    let tpl = shape_template(
-        conn,
-        "SELECT context FROM chat_turn WHERE ifnull(context,'')<>'' AND context<>'{}' \
-         ORDER BY updated_at DESC LIMIT 1",
-    );
     let model_info = tpl
         .pointer("/persist_user_message_context/model_info")
         .cloned()
@@ -441,7 +552,11 @@ fn build_turn_context(
             "command_type": Value::Null,
             "is_ralph_loop": false,
             "turn_type": "default",
-            "query": [{ "type": "text", "data": { "content": user_text } }],
+            // ⚠️ 必须是**字符串**（内容本身是一段 JSON，属于「双重编码」）：
+            // 真实行取值形如 `"[{\"type\":\"text\",\"data\":{\"content\":\"…\"}}]"`。
+            // 写成一真数组会让新版客户端按 String 反序列化失败 → 整条会话打不开
+            // （界面只显示「由于网络原因，会话加载失败」）。
+            "query": query_blob(user_text),
             "is_goal_loop": false,
             "hide_user_query": false,
             "is_background_wakeup": false
@@ -462,7 +577,8 @@ fn build_turn_context(
             None => json!([]),
         },
     );
-    out.insert("context_usage".into(), json!({ "contexts": [] }));
+    // 同理是**字符串**（真实行 `"{\"contexts\":[]}"`），不是对象。
+    out.insert("context_usage".into(), json!(EMPTY_CONTEXT_USAGE));
     out.insert("is_user_canceled".into(), Value::Null);
     out.insert("chat_start_time".into(), json!(t_start.saturating_mul(1000)));
     out.insert("chat_end_time".into(), json!(t_end.saturating_mul(1000)));
@@ -683,23 +799,24 @@ fn build_task_content(
         // 字段必须与 Trae 原生 plan_item 逐一对齐（实测原生库 + 客户端模块
         // `modules/ai-agent/{ai_agent,harness}.dll` 的字段表）：
         //   · tool_call_info 必带 `already_emitted_generating_event`/`already_emitted_run_event`
-        //     （原生取值 false / true）；**缺失时客户端反序列化整条 plan_item 失败，
-        //     于是工具卡片不渲染 —— 表现为「WorkBuddy 里的详细过程在 Trae 看不到」**。
-        //   · result 必带 `error_variant`/`is_async`（原生绝大多数为 null）。
-        //   · plan_item 必带 `confirm_info`/`parent_agent_run_ids`（原生绝大多数为 null）。
+        //     （原生取值 false / true）；缺失时工具卡片不渲染。
         //   · `params` 必须是对象（`parse_params`），写成 JSON 字符串会让卡片取不到参数。
+        //   · `confirm_info` / `parent_agent_run_ids` / `result.error_variant` / `result.is_async`
+        //     在**当前版本**的真实行里根本不存在（只有旧版才写 null），这里也不再写：
+        //     与真实行同形，才不会被严格的反序列化拒掉。
         let tool_call_info = json!({
             "id": hex_id_at(item_ts, 24),
             "name": s.tool,
             "params": params_val,
+            // ⚠️ 字段集合要和**当前版本**真实行逐一对齐：新版真实行的 `result` 里
+            // 只有 status / error_message / data / render / is_truncated / interrupt / images，
+            // 没有 `error_variant` / `is_async`（旧版有）。多写只会增加反序列化风险。
             "result": {
                 "status": status,
                 "error_message": "",
-                "error_variant": Value::Null,
                 "data": data_val,
                 "render": Value::Null,
                 "is_truncated": Value::Null,
-                "is_async": Value::Null,
                 "interrupt": Value::Null,
                 "images": Value::Null
             },
@@ -727,8 +844,6 @@ fn build_task_content(
                     "tool_call_finished_at_ms": s.ts_ms
                 },
                 "tool_call_info": tool_call_info,
-                "confirm_info": Value::Null,
-                "parent_agent_run_ids": Value::Null,
                 "hide": Value::Null
             }
         }));
@@ -771,11 +886,9 @@ fn build_task_content(
                 "result": {
                     "status": "success",
                     "error_message": "",
-                    "error_variant": Value::Null,
                     "data": { "summary": "", "products": Value::Null },
                     "render": Value::Null,
                     "is_truncated": Value::Null,
-                    "is_async": Value::Null,
                     "interrupt": Value::Null,
                     "images": Value::Null
                 },
@@ -783,8 +896,6 @@ fn build_task_content(
                 "already_emitted_generating_event": false,
                 "already_emitted_run_event": true
             },
-            "confirm_info": Value::Null,
-            "parent_agent_run_ids": Value::Null,
             "hide": Value::Null
         }
     }));
@@ -792,12 +903,34 @@ fn build_task_content(
     json!({ "task_id": task_id, "messages": items }).to_string()
 }
 
+/// `history_v2.messages.mode` 的固定值。
+///
+/// ⚠️⚠️ **这是 3.4.9 之后导入会话「打不开」的第三处根因（2026-10-28 查实）**：
+/// `harness.dll` 里 `HistoryV2Messages` 的字段序列是
+/// `raw_messages · important_user_message_prompt_section · bottom_line_tool_call_summary ·
+///  mode · summary · system_reminder_session_initialized · summarized_token_usage · …`，
+/// `mode` 是**非 Option 字段**；原生行 10/10 都写 `"mode":"FunctionCall"`，
+/// 我们此前从未写过它 ⇒ 整行反序列化失败 ⇒ `lite.get_messages` 回 `995001`
+/// ⇒ 前端把它渲染成「由于网络原因，会话加载失败」。
+const HISTORY_MODE: &str = "FunctionCall";
+
 /// 构造 `history_v2.messages` 的 raw_messages 包装。
+///
+/// ⚠️ 两条硬约束（都由原生行反推，18/18 个 raw message 全部具备）：
+/// 1. 顶层必须有 `mode`（见 [`HISTORY_MODE`]）；
+/// 2. `raw_messages[]` 的六个键 `content` / `extra_info` / `name` / `role` /
+///    `tool_call_id` / `tool_calls` 必须齐，缺的写 `null` —— 原生行就是这么写的，
+///    少键会让 `HistoryRawChatMessage` 解码失败。
 fn history_messages(role: &str, text: &str) -> String {
     json!({
+        "mode": HISTORY_MODE,
         "raw_messages": [{
             "role": role,
-            "content": [{ "type": "text", "text": text }]
+            "content": [{ "type": "text", "text": text }],
+            "name": Value::Null,
+            "tool_call_id": Value::Null,
+            "tool_calls": Value::Null,
+            "extra_info": Value::Null
         }]
     })
     .to_string()
@@ -956,6 +1089,202 @@ pub fn purge_malformed_projects(conn: &Connection, on_log: &dyn Fn(&str)) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// 旧数据修复（新版客户端把 context 里的两个字段按字符串解析）
+// ---------------------------------------------------------------------------
+
+/// 修复旧版本写下的、**类型不对**的 context 行。
+///
+/// 0.4.0～0.4.4 写进 `chat_turn.context` 的是「一真数组 / 一真对象」：
+///
+/// ```text
+/// persist_user_message_context.query  = [{"type":"text","data":{"content":…}}]   ← 该是字符串
+/// context_usage                       = {"contexts":[]}                          ← 该是字符串
+/// ```
+///
+/// 新版客户端（3.4.9 起）按 `String` 反序列化这两个字段，类型不符时整条会话加载失败，
+/// 界面只显示「由于网络原因，会话加载失败。请刷新页面。」——**库是对的，只有类型错**，
+/// 所以既不会丢数据也看不出原因。这里就地改成字符串形态（内容不变）。
+///
+/// 同时补上 `history_v2` 里旧实现留成 NULL 的 6 个非空列（真实行永远不是 NULL，
+/// 新版客户端按非 Option 解码，NULL 会让整行读不出来）。
+///
+/// 幂等：已经是字符串 / 已有值的行不动。
+pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Value, String> {
+    let mut turns_fixed = 0usize;
+    let mut projects_fixed = 0usize;
+
+    // 1) chat_turn.context
+    let turns: Vec<(i64, String)> = {
+        let mut st = conn
+            .prepare("SELECT id, context FROM chat_turn WHERE ifnull(context,'') NOT IN ('', '{}')")
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    };
+    for (id, raw) in turns {
+        let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if !v.is_object() {
+            continue;
+        }
+        let mut changed = false;
+        if let Some(pu) = v.get_mut("persist_user_message_context").and_then(Value::as_object_mut) {
+            if let Some(q) = pu.get("query") {
+                if !q.is_string() && !q.is_null() {
+                    pu.insert("query".into(), json!(q.to_string()));
+                    changed = true;
+                }
+            }
+        }
+        if let Some(u) = v.get("context_usage") {
+            if !u.is_string() && !u.is_null() {
+                v["context_usage"] = json!(u.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE chat_turn SET context = ?2 WHERE id = ?1",
+                params![id, v.to_string()],
+            )
+            .map_err(|e| format!("修复 chat_turn.context 失败: {e}"))?;
+            turns_fixed += 1;
+        }
+    }
+
+    // 2) chat_session.context 里旧代码凭空补的 `vm_mode` 不在这里删：
+    //    它对加载无影响（客户端从会话列表接口读 vm_mode，不读这份 context），
+    //    而真·VM 会话可能确实带这个键，批量删会误伤。新导入不再写它即可。
+
+    // 2b) history_v2 里旧实现留成 NULL 的列。真实行这几列**永远不是 NULL**，
+    //     新版客户端按非 Option 解码，一 NULL 整行读不出来 → 会话打不开。
+    let history_fixed = conn
+        .execute(
+            "UPDATE history_v2 SET \
+                summary = ifnull(summary, ''), \
+                accumulated_summary = ifnull(accumulated_summary, ?1), \
+                compress_token_usage = ifnull(compress_token_usage, 0), \
+                micro_compacted = ifnull(micro_compacted, 0), \
+                truncated_above = ifnull(truncated_above, 0), \
+                micro_compact_strategy = ifnull(micro_compact_strategy, '') \
+             WHERE summary IS NULL OR accumulated_summary IS NULL \
+                OR compress_token_usage IS NULL OR micro_compacted IS NULL \
+                OR truncated_above IS NULL OR micro_compact_strategy IS NULL",
+            params![EMPTY_ACCUMULATED_SUMMARY],
+        )
+        .map_err(|e| format!("修复 history_v2 的 NULL 列失败: {e}"))?;
+
+    // 2c) history_v2.messages 的 JSON 形态 —— 「打不开」的第三处根因。
+    //     3.4.9 起 `HistoryV2Messages` 的 `mode` 是非 Option 字段，
+    //     `HistoryRawChatMessage` 的 content/extra_info/name/role/tool_call_id/tool_calls
+    //     六个键也必须齐（缺的写 null）。旧实现两者都没写 ⇒ 整行解码失败。
+    //     先做廉价的字符串预筛，避免把几十万行大 JSON 全解析一遍。
+    //
+    //     ⚠️ 老库/测试库的 history_v2 可能没有 messages 列，缺列时整段跳过（不能当成失败）。
+    let mut history_json_fixed = 0usize;
+    let has_messages = conn
+        .prepare("PRAGMA table_info(history_v2)")
+        .and_then(|mut st| {
+            let it = st.query_map([], |r| r.get::<_, String>(1))?;
+            Ok(it.filter_map(Result::ok).any(|c| c == "messages"))
+        })
+        .unwrap_or(false);
+    let rows: Vec<(i64, String)> = if has_messages {
+        // ⚠️ 必须有 `messages NOT LIKE '%"mode"%'`：全库 history 上万行，
+        // 幂等重跑时让 SQLite 直接把这些行筛掉，比拿回 Rust 再判快一个数量级。
+        let mut st = conn
+            .prepare(
+                "SELECT id, messages FROM history_v2 \
+                 WHERE ifnull(messages,'') LIKE '%raw_messages%' AND messages NOT LIKE '%\"mode\"%'",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    } else {
+        Vec::new()
+    };
+    // 上万行逐条 UPDATE 各自成事务会很慢；SAVEPOINT 可嵌套，外层已有事务也安全。
+    let _ = conn.execute_batch("SAVEPOINT heal_history_messages");
+    for (id, raw) in rows {
+        let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        let mut changed = false;
+        if !obj.contains_key("mode") {
+            obj.insert("mode".into(), json!(HISTORY_MODE));
+            changed = true;
+        }
+        if let Some(msgs) = obj.get_mut("raw_messages").and_then(Value::as_array_mut) {
+            for m in msgs.iter_mut() {
+                let Some(mo) = m.as_object_mut() else {
+                    continue;
+                };
+                for k in ["name", "tool_call_id", "tool_calls", "extra_info"] {
+                    if !mo.contains_key(k) {
+                        mo.insert(k.into(), Value::Null);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE history_v2 SET messages = ?2 WHERE id = ?1",
+                params![id, v.to_string()],
+            )
+            .map_err(|e| format!("修复 history_v2.messages 失败: {e}"))?;
+            history_json_fixed += 1;
+        }
+    }
+    let _ = conn.execute_batch("RELEASE heal_history_messages");
+
+    // 3) project 行升级到 domain v2
+    let projects: Vec<(String, String)> = {
+        let mut st = conn
+            .prepare(
+                "SELECT project_id, absolute_path FROM project \
+                 WHERE ifnull(deleted_at,0)=0 AND ifnull(workspace_type,'single_root')='single_root' \
+                   AND (ifnull(domain_version,0) < 2 \
+                        OR single_root_workspace_folder IS NULL \
+                        OR TRIM(single_root_workspace_folder) = '')",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    };
+    for (pid, path) in &projects {
+        if path.trim().is_empty() {
+            continue;
+        }
+        upgrade_project_row(conn, pid, &normalize_abs_path(path))?;
+        projects_fixed += 1;
+    }
+
+    if turns_fixed + history_fixed + history_json_fixed + projects_fixed > 0 {
+        on_log(&format!(
+            "   已修复旧数据：{turns_fixed} 个回合上下文改成字符串形态 / {history_fixed} 行历史补上非空列 / \
+             {history_json_fixed} 行历史补上 mode 与 raw_messages 缺键 / {projects_fixed} 个项目行升级到 domain v2"
+        ));
+    }
+    Ok(json!({
+        "turns": turns_fixed,
+        "history": history_fixed,
+        "history_json": history_json_fixed,
+        "projects": projects_fixed,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // 单个会话写入
 // ---------------------------------------------------------------------------
 
@@ -1024,6 +1353,9 @@ pub fn write_session(
         stats.skipped_duplicates += 1;
     }
     let pid = ensure_project(conn, dst_uid, &cwd, start)?;
+    // 模板在**清完旧行之后**取一次：此时库里剩的都是真实行，不会把上一轮导入
+    // 自己写的 context 当模板，也不会每回合重扫一遍越来越大的表。
+    let tpl = ShapeTemplates::load(conn);
 
     // 工作区声明：只在本会话真正所属的目录确实存在时才写进 context。
     // 声明一个不存在的目录会让客户端反复尝试挂载 / 预热该工程，是「会话加载异常慢」的来源之一。
@@ -1109,7 +1441,7 @@ pub fn write_session(
         // 2) 用户消息（context 形状取自目标库真实行，只替换提问文本）
         let u_msg = hex_id_at(t_start, 24);
         msg_index += 1;
-        let u_ctx = template_user_context(conn, &turn.user_text);
+        let u_ctx = template_user_context(&tpl.user_message, &turn.user_text);
         conn.execute(
             "INSERT INTO chat_message \
              (session_id, message_id, message_type, message_role, message_index, is_archived, \
@@ -1133,8 +1465,9 @@ pub fn write_session(
             "INSERT INTO history_v2 \
              (history_v2_id, session_id, message_id, messages, token_usage, summary, \
               summarized_above, created_at, updated_at, deleted_at, agent_type, content_source, \
-              agent_run_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, NULL, 0, ?5, ?5, 0, ?6, 'user_input', ?7)",
+              agent_run_id, accumulated_summary, compress_token_usage, micro_compacted, \
+              truncated_above, micro_compact_strategy) \
+             VALUES (?1, ?2, ?3, ?4, 0, '', 0, ?5, ?5, 0, ?6, 'user_input', ?7, ?8, 0, 0, 0, '')",
             params![
                 hex_id_at(t_start, 24),
                 sid,
@@ -1142,7 +1475,8 @@ pub fn write_session(
                 history_messages("user", &turn.user_text),
                 t_start,
                 agent.0,
-                run_id
+                run_id,
+                EMPTY_ACCUMULATED_SUMMARY
             ],
         )
         .map_err(|e| format!("写入用户 history_v2 失败: {e}"))?;
@@ -1189,6 +1523,7 @@ pub fn write_session(
                 s.reasoning.clone()
             };
             let payload = json!({
+                "mode": HISTORY_MODE,
                 "raw_messages": [{
                     "role": "assistant",
                     "content": [{ "type": "text", "text": text, "image_url": Value::Null,
@@ -1200,7 +1535,8 @@ pub fn write_session(
                         "id": s.call_id,
                         "type": "function",
                         "function_call": { "name": s.tool, "arguments": s.params }
-                    }]
+                    }],
+                    "extra_info": Value::Null
                 }]
             })
             .to_string();
@@ -1208,8 +1544,9 @@ pub fn write_session(
                 "INSERT INTO history_v2 \
                  (history_v2_id, session_id, message_id, messages, token_usage, summary, \
                   summarized_above, created_at, updated_at, deleted_at, agent_type, content_source, \
-                  agent_run_id) \
-                 VALUES (?1, ?2, ?3, ?4, 0, NULL, 0, ?5, ?5, 0, ?6, ?7, ?8)",
+                  agent_run_id, accumulated_summary, compress_token_usage, micro_compacted, \
+                  truncated_above, micro_compact_strategy) \
+                 VALUES (?1, ?2, ?3, ?4, 0, '', 0, ?5, ?5, 0, ?6, ?7, ?8, ?9, 0, 0, 0, '')",
                 params![
                     hex_id_at(t_end, 24),
                     sid,
@@ -1218,7 +1555,8 @@ pub fn write_session(
                     t_end,
                     agent.0,
                     s.tool,
-                    run_id
+                    run_id,
+                    EMPTY_ACCUMULATED_SUMMARY
                 ],
             )
             .map_err(|e| format!("写入过程 history_v2 失败: {e}"))?;
@@ -1232,8 +1570,9 @@ pub fn write_session(
                 "INSERT INTO history_v2 \
                  (history_v2_id, session_id, message_id, messages, token_usage, summary, \
                   summarized_above, created_at, updated_at, deleted_at, agent_type, content_source, \
-                  agent_run_id) \
-                 VALUES (?1, ?2, ?3, ?4, 0, NULL, 0, ?5, ?5, 0, ?6, 'llm_default', ?7)",
+                  agent_run_id, accumulated_summary, compress_token_usage, micro_compacted, \
+                  truncated_above, micro_compact_strategy) \
+                 VALUES (?1, ?2, ?3, ?4, 0, '', 0, ?5, ?5, 0, ?6, 'llm_default', ?7, ?8, 0, 0, 0, '')",
                 params![
                     hex_id_at(t_end, 24),
                     sid,
@@ -1241,7 +1580,8 @@ pub fn write_session(
                     history_messages("assistant", &final_text),
                     t_end,
                     agent.0,
-                    run_id
+                    run_id,
+                    EMPTY_ACCUMULATED_SUMMARY
                 ],
             )
             .map_err(|e| format!("写入回答 history_v2 失败: {e}"))?;
@@ -1263,7 +1603,7 @@ pub fn write_session(
                 turn_id,
                 u_msg,
                 a_msg,
-                build_turn_context(conn, workspace.as_deref(), &turn.user_text, t_start, t_end),
+                build_turn_context(&tpl.turn, workspace.as_deref(), &turn.user_text, t_start, t_end),
                 t_start,
                 t_end,
                 agent.0,
@@ -1561,20 +1901,54 @@ pub fn import_sessions(
     if bad_projects > 0 {
         log(&format!("已清理 {bad_projects} 个畸形项目行"));
     }
+    // 4c) 再把旧版本写下的「类型不对」的 context 修好（新版客户端按字符串解析这两处）。
+    //     这样即便这次不重导同一条会话，之前导入过的会话也能重新打开。
+    heal_legacy_rows(&conn, &log)?;
+
+    // 4d) 整批写入放进**一个事务**。
+    //
+    //     SQLite 默认「每条语句 = 一个事务」，每次提交都要一次 fsync。324 回合 /
+    //     17263 个工具步骤会产生近 2 万条 INSERT，等于近 2 万次刷盘 —— 这是「导入慢」
+    //     的另一半原因（另一半是每回合重扫模板表，已由 `ShapeTemplates` 修掉）。
+    //     一个事务只需一次提交。
+    //
+    //     这里的库是**临时工作副本**：失败就整体丢弃、绝不替换线上库，所以顺带关掉
+    //     `synchronous` 也没有任何风险；进程真在这里崩掉，丢的只是这一轮导入。
+    conn.execute_batch("PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;")
+        .map_err(|e| format!("设置写入期 PRAGMA 失败: {e}"))?;
+    // 64 MB 页缓存：这台机器上目标库 639 MB / 156007 页，默认 2 MB 缓存会让索引进出
+    // 反复读同一批页。
+    let _ = conn.execute_batch("PRAGMA cache_size=-65536");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("开启写入事务失败: {e}"))?;
 
     let mut total_turns = 0usize;
     let mut total_steps = 0usize;
     let mut written_sessions = 0usize;
+    let mut write_err: Option<String> = None;
     for (meta, body) in &sources {
         log(&format!("转换会话「{}」…", meta.title));
         // 整批写在**明文副本**上，任一条失败就整体放弃（副本会被丢掉），不会留下半截数据；
         // 报错带上会话名，便于一眼看出是哪条出的问题。
-        let st = write_session(&conn, dst_client_key, dst_uid, meta, body, &log)
-            .map_err(|e| format!("会话「{}」写入失败：{e}", meta.title))?;
-        total_turns += st.turns;
-        total_steps += st.steps;
-        written_sessions += 1;
+        match write_session(&conn, dst_client_key, dst_uid, meta, body, &log) {
+            Ok(st) => {
+                total_turns += st.turns;
+                total_steps += st.steps;
+                written_sessions += 1;
+            }
+            Err(e) => {
+                write_err = Some(format!("会话「{}」写入失败：{e}", meta.title));
+                break;
+            }
+        }
     }
+    if let Some(e) = write_err {
+        // 事务没提交，副本本来就会被丢弃；显式回滚是为了让 `close()` 干净收尾。
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+    conn.execute_batch("COMMIT")
+        .map_err(|e| format!("提交写入事务失败: {e}"))?;
     conn.close().map_err(|(_, e)| format!("关闭明文副本失败: {e}"))?;
     log(&format!(
         "转换完成：{written_sessions} 个会话 / {total_turns} 个回合 / {total_steps} 个工具步骤"
@@ -1830,18 +2204,18 @@ mod tests {
                 "tool_call_info 缺布尔字段 {k}（原生每个工具项都带）"
             );
         }
-        assert!(
-            tci.pointer("/result/error_variant").is_some(),
-            "result 缺 error_variant（原生即使成功也写 null）"
-        );
-        assert!(
-            tci.pointer("/result/is_async").is_some(),
-            "result 缺 is_async（原生即使同步也写 null）"
-        );
-        for k in ["confirm_info", "parent_agent_run_ids", "hide"] {
+        // 新版真实行的 result 里没有 error_variant / is_async，plan_item 里没有
+        // confirm_info / parent_agent_run_ids —— 多写反而可能被严格反序列化拒掉。
+        for k in ["error_variant", "is_async"] {
             assert!(
-                pi.get(k).is_some(),
-                "plan_item 缺字段 {k}（原生每个 plan_item 都带，多数为 null）"
+                tci.pointer(&format!("/result/{k}")).is_none(),
+                "result 不该再写 {k}（当前版本真实行没有这个键）"
+            );
+        }
+        for k in ["confirm_info", "parent_agent_run_ids"] {
+            assert!(
+                pi.get(k).is_none(),
+                "plan_item 不该再写 {k}（当前版本真实行没有这个键；需要确认的卡片才带 confirm_info）"
             );
         }
         assert!(pi.get("hide") == Some(&Value::Null), "hide 应与原生一致为 null");
@@ -2036,10 +2410,16 @@ mod tests {
                         assert!(tci.get(k).is_some(), "{name}: tool_call_info 缺 {k}");
                     }
                     for k in ["error_variant", "is_async"] {
-                        assert!(tci["result"].get(k).is_some(), "{name}: result 缺 {k}");
+                        assert!(
+                            tci["result"].get(k).is_none(),
+                            "{name}: result 不该再写 {k}（当前版本真实行没有）"
+                        );
                     }
-                    for k in ["confirm_info", "parent_agent_run_ids", "hide"] {
-                        assert!(pi.get(k).is_some(), "{name}: plan_item 缺 {k}");
+                    for k in ["confirm_info", "parent_agent_run_ids"] {
+                        assert!(
+                            pi.get(k).is_none(),
+                            "{name}: plan_item 不该再写 {k}（当前版本真实行没有）"
+                        );
                     }
                     // 状态必须是 Trae 认识的那几种，否则卡片卡在「进行中」不渲染结果
                     let st = tci["result"]["status"].as_str().unwrap_or("");
@@ -2111,7 +2491,8 @@ mod tests {
         c.execute("INSERT INTO chat_turn VALUES(1, ?1)", params![tpl])
             .unwrap();
 
-        let out = build_turn_context(&c, Some("d:\\htw\\test"), "nihao", 1791114394, 1791114410);
+        let tpl = ShapeTemplates::load(&c);
+        let out = build_turn_context(&tpl.turn, Some("d:\\htw\\test"), "nihao", 1791114394, 1791114410);
 
         // 1) 提问文本必须换成本次的
         assert!(out.contains("nihao"));
@@ -2127,7 +2508,18 @@ mod tests {
         assert_eq!(v.pointer("/chat_end_time").and_then(Value::as_i64), Some(1791114410000));
         assert_eq!(v.pointer("/persist_user_message_context/parsed_query/0").and_then(Value::as_str), Some("nihao"));
         assert_ne!(v.get("trace_id").and_then(Value::as_str), Some("别人的trace"));
-        assert_eq!(v.pointer("/context_usage/contexts").and_then(Value::as_array).map(Vec::len), Some(0));
+        // 2b) 这两个字段必须是**字符串**（内容本身是 JSON）。写成数组/对象会让新版客户端
+        //     按 String 反序列化失败，整条会话报「由于网络原因，会话加载失败」。
+        let q = v
+            .pointer("/persist_user_message_context/query")
+            .expect("query 必须存在");
+        assert!(q.is_string(), "query 必须是字符串（双重编码），实际是 {q}");
+        assert!(q.as_str().unwrap().contains("nihao"), "字符串里要带本次提问");
+        let usage = v.get("context_usage").expect("context_usage 必须存在");
+        assert!(
+            usage.is_string(),
+            "context_usage 必须是字符串（真实行是 \"{{\\\"contexts\\\":[]}}\"），实际是 {usage}"
+        );
         assert_eq!(v.pointer("/references").and_then(Value::as_array).map(Vec::len), Some(0));
         assert_eq!(
             v.pointer("/render_context/current_file"),
@@ -2148,7 +2540,7 @@ mod tests {
             Some("")
         );
         // 5) 不声明不存在的工作区
-        let out2 = build_turn_context(&c, None, "x", 1, 2);
+        let out2 = build_turn_context(&tpl.turn, None, "x", 1, 2);
         let v2: Value = serde_json::from_str(&out2).unwrap();
         assert_eq!(v2.pointer("/workspace_folders").and_then(Value::as_array).map(Vec::len), Some(0));
     }
@@ -2181,7 +2573,10 @@ mod tests {
             "skill_list_revisions 的键名不能夹带别的会话 id"
         );
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v.get("vm_mode").and_then(Value::as_str), Some("aha_vm"));
+        assert!(
+            v.get("vm_mode").is_none(),
+            "不许凭空写 vm_mode：它会让客户端把本地会话当成 TraeWork VM 会话去拉实例"
+        );
         assert_eq!(
             v.get("last_real_project_id").and_then(Value::as_str),
             Some("6ac0eff953164cb16eb88438")
@@ -2190,6 +2585,109 @@ mod tests {
         assert_eq!(v.get("is_worktree").and_then(Value::as_bool), Some(false));
         assert_eq!(v.pointer("/skill_list_revisions").and_then(Value::as_object).map(serde_json::Map::len), Some(0));
         assert_eq!(v.get("file_read_state_cache"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn heal_rewrites_legacy_context_types_and_project_domain() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE chat_turn(id INTEGER PRIMARY KEY, context TEXT);\
+             CREATE TABLE chat_session(session_id TEXT PRIMARY KEY, context TEXT);\
+             CREATE TABLE history_v2(id INTEGER PRIMARY KEY, summary TEXT, accumulated_summary TEXT,\
+                compress_token_usage INTEGER, micro_compacted INTEGER, truncated_above INTEGER,\
+                micro_compact_strategy TEXT);\
+             CREATE TABLE project(project_id TEXT PRIMARY KEY, absolute_path TEXT, deleted_at INTEGER,\
+                workspace_type TEXT, workspace_status TEXT, single_root_workspace_folder TEXT,\
+                workspace_folders TEXT, project_kind TEXT, work_mode TEXT, domain_version INTEGER);",
+        )
+        .unwrap();
+        // 旧版本写下的形态：query 是数组、context_usage 是对象、会话带 vm_mode、项目停在 v1
+        let legacy_turn = json!({
+            "persist_user_message_context": {
+                "query": [{ "type": "text", "data": { "content": "旧提问" } }],
+                "parsed_query": ["旧提问"]
+            },
+            "context_usage": { "contexts": [] }
+        })
+        .to_string();
+        c.execute("INSERT INTO chat_turn VALUES(1, ?1)", params![legacy_turn])
+            .unwrap();
+        c.execute(
+            "INSERT INTO chat_session VALUES('s1', ?1)",
+            params![json!({ "vm_mode": "aha_vm", "x": 1 }).to_string()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO project VALUES('p1','d:\\htw\\签到',NULL,'single_root','virtual',NULL,'[]','workspace','work',1)",
+            [],
+        )
+        .unwrap();
+        // 旧实现把 history_v2 的 6 个非空列留成 NULL
+        c.execute("INSERT INTO history_v2(id) VALUES(1)", [])
+            .unwrap();
+
+        let n = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(n["turns"], 1);
+        assert_eq!(n["history"], 1);
+        assert_eq!(n["projects"], 1);
+
+        let ctx: String = c
+            .query_row("SELECT context FROM chat_turn WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert!(
+            v.pointer("/persist_user_message_context/query")
+                .map(Value::is_string)
+                .unwrap_or(false),
+            "query 必须被改成字符串，否则新版客户端整条会话打不开"
+        );
+        assert!(v.get("context_usage").map(Value::is_string).unwrap_or(false));
+        assert_eq!(
+            v.pointer("/persist_user_message_context/parsed_query/0")
+                .and_then(Value::as_str),
+            Some("旧提问"),
+            "修复只改类型，不许改内容"
+        );
+
+        let sctx: String = c
+            .query_row("SELECT context FROM chat_session WHERE session_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            sctx.contains("vm_mode"),
+            "会话 context 不在这里改：真·VM 会话可能确实带这个键，批量删会误伤"
+        );
+
+        let (dv, folder, folders): (i64, String, String) = c
+            .query_row(
+                "SELECT domain_version, single_root_workspace_folder, workspace_folders \
+                 FROM project WHERE project_id='p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(dv, 2, "项目行必须升级到 domain v2");
+        assert_eq!(folder, "d:\\htw\\签到");
+        assert_eq!(folders, json!(["d:\\htw\\签到"]).to_string());
+
+        // history_v2 的 NULL 列必须补成真实行的默认值（NULL 会让整行解码失败）
+        let (sum, acc, ctu, mc, ta, mcs): (String, String, i64, i64, i64, String) = c
+            .query_row(
+                "SELECT summary, accumulated_summary, compress_token_usage, micro_compacted, \
+                 truncated_above, micro_compact_strategy FROM history_v2 WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(sum, "");
+        assert_eq!(acc, EMPTY_ACCUMULATED_SUMMARY);
+        assert_eq!((ctu, mc, ta), (0, 0, 0));
+        assert_eq!(mcs, "");
+
+        // 幂等：再跑一次什么都不该改
+        let again = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(again["turns"], 0);
+        assert_eq!(again["history"], 0);
+        assert_eq!(again["projects"], 0);
     }
 
     #[test]
