@@ -215,6 +215,7 @@ pub fn run() {
             commands::gateway_key_delete,
             commands::gateway_key_set_quota,
             commands::gateway_key_reset_usage,
+            commands::gateway_pricing,
             commands::gateway_models_discover,
             commands::gateway_model_labels,
             commands::gateway_models_selected,

@@ -13,6 +13,7 @@ import {
   gatewayKeyRevoke,
   gatewayKeySetQuota,
   gatewayKeysList,
+  gatewayPricing,
   gatewayModelsDiscover,
   gatewayPool,
   gatewayPreview,
@@ -68,6 +69,39 @@ type KeyRow = {
   /** `quota` = 额度用尽被自动吊销；`null` = 手工吊销。 */
   revoked_reason?: string | null;
 };
+
+/** token 数量 × 单价（元/百万）＝ 金额（元）。 */
+function yuanOfTokens(tokens: number, perMtok: number): number {
+  return (tokens / 1_000_000) * perMtok;
+}
+
+/** 金额显示：小额保留 4 位，否则 2 位 —— ¥0.16 和 ¥12.34 都要看得清。 */
+function fmtYuan(v: number): string {
+  return `¥${v.toFixed(v >= 0.01 || v === 0 ? 2 : 4)}`;
+}
+
+/**
+ * 一把 Key 的金额视图。与网关 `/v1/user/balance` **同一套算法**：
+ *   已花费 = 输入token×输入价 + 输出token×输出价
+ *   预算   = 额度token × (已花费/已用)   ← 同一 p/c 比例折算
+ *   剩余   = 预算 − 已花费（不为负）
+ * `perMtok` 是这把 Key 实际混合下来的每百万 token 单价。
+ */
+function keyMoney(
+  k: KeyRow,
+  pricing: { inputPerMtok: number; outputPerMtok: number } | null,
+): { spent: number; budget: number; left: number; perMtok: number } | null {
+  if (!pricing) return null;
+  const budgetTokens = k.quota?.max_total_tokens ?? null;
+  if (budgetTokens == null) return null;
+  const p = k.usage?.prompt_tokens ?? 0;
+  const c = k.usage?.completion_tokens ?? 0;
+  const spent = yuanOfTokens(p, pricing.inputPerMtok) + yuanOfTokens(c, pricing.outputPerMtok);
+  const used = k.usage?.total_tokens ?? 0;
+  const perMtok = used > 0 ? (spent / used) * 1_000_000 : pricing.inputPerMtok;
+  const budget = yuanOfTokens(budgetTokens, perMtok);
+  return { spent, budget, left: Math.max(0, budget - spent), perMtok };
+}
 
 /** token 数量按人眼习惯缩写：1234 → 1.2k，1_234_567 → 1.23M。 */
 function fmtTok(n: number | undefined | null): string {
@@ -250,6 +284,12 @@ export default function GatewayPage() {
   /** 账号池按产品折叠（与清理页的分类块一致）：默认收起，点「展开」看明细。 */
   const [poolCollapsed, setPoolCollapsed] = useState<Set<string>>(new Set());
   const [keys, setKeys] = useState<KeyRow[]>([]);
+  /** 当前 token 单价（把额度换算成金额用；后端 `gateway_pricing` 给）。 */
+  const [pricing, setPricing] = useState<{
+    inputPerMtok: number;
+    outputPerMtok: number;
+    peak: boolean;
+  } | null>(null);
   /** 正在编辑额度的那把 Key（null = 没有展开的编辑器）。 */
   const [quotaEdit, setQuotaEdit] = useState<{
     id: string;
@@ -297,7 +337,13 @@ export default function GatewayPage() {
     setBusy(true);
     setError(null);
     try {
-      const [s, p, k] = await Promise.all([gatewayStatus(), gatewayPool(), gatewayKeysList()]);
+      const [s, p, k, pr] = await Promise.all([
+        gatewayStatus(),
+        gatewayPool(),
+        gatewayKeysList(),
+        gatewayPricing().catch(() => null),
+      ]);
+      setPricing(pr);
       setStatus(s as Status);
       setGwOn(Boolean((s as Status).running));
       // 网关没在跑时 `lan` 恒为 false，用配置值 `lanPref` 还原用户的勾选
@@ -964,7 +1010,7 @@ export default function GatewayPage() {
                 <tr>
                   <th className="px-3 py-2 text-left font-medium">用途</th>
                   <th className="px-3 py-2 text-left font-medium">Key</th>
-                  <th className="px-3 py-2 text-left font-medium">用量 / 额度（token）</th>
+                  <th className="px-3 py-2 text-left font-medium">用量 / 额度（token ≈ 金额）</th>
                   <th className="px-3 py-2 text-left font-medium">状态</th>
                   <th className="px-3 py-2 text-right font-medium">操作</th>
                 </tr>
@@ -977,6 +1023,7 @@ export default function GatewayPage() {
                   const maxDaily = k.quota?.max_daily_tokens ?? null;
                   const pct = maxTotal ? Math.min(100, Math.round((used / maxTotal) * 100)) : 0;
                   const editing = quotaEdit?.id === k.id;
+                  const money = keyMoney(k, pricing);
                   return (
                     <Fragment key={k.id}>
                       <tr className="border-t border-border/60">
@@ -1009,6 +1056,25 @@ export default function GatewayPage() {
                             今日 {fmtTok(today)}
                             {maxDaily ? ` / ${fmtTok(maxDaily)}` : ""} · {k.usage?.requests ?? 0} 次
                           </div>
+                          {money ? (
+                            <div className="text-[10px]">
+                              <span
+                                className={cn(
+                                  "font-mono",
+                                  money.left <= 0 ? "text-destructive" : "text-foreground/80",
+                                )}
+                                title={`已花 ${fmtYuan(money.spent)} / 预算 ${fmtYuan(
+                                  money.budget,
+                                )}（混合单价 ${money.perMtok.toFixed(2)} 元/百万 token）`}
+                              >
+                                ≈ {fmtYuan(money.left)} 剩余
+                              </span>
+                              <span className="text-muted-foreground">
+                                {" "}
+                                · 预算 {fmtYuan(money.budget)}
+                              </span>
+                            </div>
+                          ) : null}
                           {maxTotal ? (
                             <div className="mt-1 h-1 w-24 overflow-hidden rounded bg-muted">
                               <div
@@ -1157,8 +1223,31 @@ export default function GatewayPage() {
                               >
                                 取消
                               </button>
+                              {pricing && quotaEdit.total.trim() ? (
+                                <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-foreground/80">
+                                  换算 ≈{" "}
+                                  {fmtYuan(
+                                    yuanOfTokens(
+                                      Number(quotaEdit.total) || 0,
+                                      pricing.inputPerMtok,
+                                    ),
+                                  )}{" "}
+                                  ~{" "}
+                                  {fmtYuan(
+                                    yuanOfTokens(
+                                      Number(quotaEdit.total) || 0,
+                                      pricing.outputPerMtok,
+                                    ),
+                                  )}
+                                  <span className="text-muted-foreground">
+                                    （{pricing.peak ? "高峰" : "空闲"}价：输入{" "}
+                                    {pricing.inputPerMtok} / 输出 {pricing.outputPerMtok} 元每百万
+                                    token）
+                                  </span>
+                                </span>
+                              ) : null}
                               <span className="text-[10px] text-muted-foreground">
-                                留空 = 不限；单位 token；到上限会自动吊销这把 Key（提高额度后点「恢复」即可）
+                                留空 = 不限；到上限会自动吊销这把 Key（提高额度后点「恢复」即可）
                               </span>
                             </div>
                           </td>
