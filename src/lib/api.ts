@@ -1612,6 +1612,16 @@ export async function gatewayKeyResetUsage(id: string): Promise<unknown> {
   return invoke("gateway_key_reset_usage", { id });
 }
 
+/// 当前生效的 token 单价与峰谷档（把额度换算成金额用）。
+export async function gatewayPricing(): Promise<{
+  currency: string;
+  inputPerMtok: number;
+  outputPerMtok: number;
+  peak: boolean;
+}> {
+  return invoke("gateway_pricing");
+}
+
 export async function gatewayModelsGet(): Promise<unknown> {
   return invoke("gateway_models_get");
 }

@@ -2814,6 +2814,18 @@ pub async fn gateway_key_reset_usage(id: String) -> Result<Value, String> {
     gateway_keys::reset_usage(&id).map(|k| json!(k))
 }
 
+/// 当前生效的 token 单价与峰谷档（界面用它把额度换算成金额）。
+#[tauri::command]
+pub async fn gateway_pricing() -> Result<Value, String> {
+    let (input, output, peak) = gateway_server::pricing_now();
+    Ok(json!({
+        "currency": "CNY",
+        "inputPerMtok": input,
+        "outputPerMtok": output,
+        "peak": peak,
+    }))
+}
+
 /// 模型目录（`models.json`）。空对象表示还没登记。
 #[tauri::command]
 pub async fn gateway_models_get() -> Result<Value, String> {

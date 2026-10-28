@@ -760,6 +760,16 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
 ///
 /// 来源：官方 2026-09-10 起执行的峰谷价 —— 输入未命中 1/2 元、输出 4/8 元（空闲/高峰），
 /// 缓存命中 0.02/0.04 元。命中价不单独用：网关看不到上游的缓存命中拆分。
+/// 当前生效的单价与峰谷档：`(输入元/百万token, 输出元/百万token, 是否高峰)`。
+///
+/// 给界面用 —— 额度设置里要实时显示「≈ ¥X」，必须和网关算余额时**同一套常量**，
+/// 否则界面和桌宠对不上。
+pub fn pricing_now() -> (f64, f64, bool) {
+    let peak = is_deepseek_peak_now();
+    let (i, o) = deepseek_unit_price(peak);
+    (i, o, peak)
+}
+
 fn deepseek_unit_price(peak: bool) -> (f64, f64) {
     if peak {
         (2.0, 8.0)
