@@ -1617,7 +1617,6 @@ export async function gatewayPricing(): Promise<{
   currency: string;
   inputPerMtok: number;
   outputPerMtok: number;
-  peak: boolean;
 }> {
   return invoke("gateway_pricing");
 }

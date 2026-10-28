@@ -2817,12 +2817,11 @@ pub async fn gateway_key_reset_usage(id: String) -> Result<Value, String> {
 /// 当前生效的 token 单价与峰谷档（界面用它把额度换算成金额）。
 #[tauri::command]
 pub async fn gateway_pricing() -> Result<Value, String> {
-    let (input, output, peak) = gateway_server::pricing_now();
+    let (input, output) = gateway_server::pricing_now();
     Ok(json!({
         "currency": "CNY",
         "inputPerMtok": input,
         "outputPerMtok": output,
-        "peak": peak,
     }))
 }
 
