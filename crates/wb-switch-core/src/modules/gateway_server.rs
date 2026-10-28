@@ -692,9 +692,8 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
         .map(|k| (k.usage.prompt_tokens, k.usage.completion_tokens))
         .unwrap_or((0, 0));
 
-    // DeepSeek V4.1-Flash 官方单价（元/百万 token），峰谷两档。
-    let peak = is_deepseek_peak_now();
-    let (price_in, price_out) = deepseek_unit_price(peak);
+    // 固定单价（高峰价），不随时间段变化 —— 否则同一把 Key 的余额会随查询时间跳变。
+    let (price_in, price_out) = pricing_now();
 
     // 已花费：按真实的输入/输出拆分算，比套一个混合单价准。
     // 缓存命中价（0.02/0.04）不单独用 —— 网关拿不到上游的命中拆分，按未命中价估是保守的。
@@ -747,7 +746,6 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
             "budget_yuan": budget_yuan,
             "price_input_per_mtok": price_in,
             "price_output_per_mtok": price_out,
-            "peak": peak,
             "pool_remaining": pool_remaining,
             "pool_accounts": pool_accounts,
             "key_name": key.as_ref().map(|k| k.name.clone()),
@@ -760,36 +758,20 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
 ///
 /// 来源：官方 2026-09-10 起执行的峰谷价 —— 输入未命中 1/2 元、输出 4/8 元（空闲/高峰），
 /// 缓存命中 0.02/0.04 元。命中价不单独用：网关看不到上游的缓存命中拆分。
-/// 当前生效的单价与峰谷档：`(输入元/百万token, 输出元/百万token, 是否高峰)`。
+/// 折算用的固定单价（元 / 百万 token）：`(输入·缓存未命中, 输出)`。
 ///
-/// 给界面用 —— 额度设置里要实时显示「≈ ¥X」，必须和网关算余额时**同一套常量**，
-/// 否则界面和桌宠对不上。
-pub fn pricing_now() -> (f64, f64, bool) {
-    let peak = is_deepseek_peak_now();
-    let (i, o) = deepseek_unit_price(peak);
-    (i, o, peak)
-}
-
-fn deepseek_unit_price(peak: bool) -> (f64, f64) {
-    if peak {
-        (2.0, 8.0)
-    } else {
-        (1.0, 4.0)
-    }
-}
-
-/// 当前是否处于 DeepSeek 高峰时段：**工作日 9:00–12:00、14:00–18:00（北京时间）**，其余空闲。
+/// ⚠️ **固定取高峰价，不随时间段切换**。
+/// 原来按官方峰谷价动态取（空闲 1/4、高峰 2/8），结果同一把 Key 在 12 点查是 ¥23.70、
+/// 14 点查就变 ¥46.28 —— 余额看起来自己在跳。余额必须是个稳定的数，宁可一律按贵的算
+/// （偏保守，不会让人以为还有钱结果已经用完）。
 ///
-/// ⚠️ 法定节假日与调休没有日历，这里只按「周一~周五」近似 —— 会在节假日多算高峰价，
-/// 属已知偏差；要精确就得接节假日日历，目前不值当。
-fn is_deepseek_peak_now() -> bool {
-    use chrono::{Datelike, Timelike};
-    let now = chrono::Local::now();
-    if now.weekday().num_days_from_monday() >= 5 {
-        return false;
-    }
-    let h = now.hour();
-    (9..12).contains(&h) || (14..18).contains(&h)
+/// 数值取 DeepSeek V4.1-Flash 官方高峰单价：输入 2 元、输出 8 元每百万 token。
+const PRICE_INPUT_PER_MTOK: f64 = 2.0;
+const PRICE_OUTPUT_PER_MTOK: f64 = 8.0;
+
+/// 给界面用的单价（固定值，不再有峰谷档）。
+pub fn pricing_now() -> (f64, f64) {
+    (PRICE_INPUT_PER_MTOK, PRICE_OUTPUT_PER_MTOK)
 }
 
 async fn models() -> impl IntoResponse {

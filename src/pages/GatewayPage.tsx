@@ -288,7 +288,6 @@ export default function GatewayPage() {
   const [pricing, setPricing] = useState<{
     inputPerMtok: number;
     outputPerMtok: number;
-    peak: boolean;
   } | null>(null);
   /** 正在编辑额度的那把 Key（null = 没有展开的编辑器）。 */
   const [quotaEdit, setQuotaEdit] = useState<{
@@ -1240,9 +1239,8 @@ export default function GatewayPage() {
                                     ),
                                   )}
                                   <span className="text-muted-foreground">
-                                    （{pricing.peak ? "高峰" : "空闲"}价：输入{" "}
-                                    {pricing.inputPerMtok} / 输出 {pricing.outputPerMtok} 元每百万
-                                    token）
+                                    （固定高峰价：输入 {pricing.inputPerMtok} / 输出{" "}
+                                    {pricing.outputPerMtok} 元每百万 token）
                                   </span>
                                 </span>
                               ) : null}
