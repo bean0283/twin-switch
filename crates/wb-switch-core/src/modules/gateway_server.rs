@@ -689,34 +689,35 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
         .filter(|v| *v > 0.0)
         .unwrap_or(2.0);
 
-    // 口径开关（默认 pool）：
-    //   pool  —— 直接报账号池真实剩余积分，和「积分共享」页面上看到的数字一致；
-    //   token —— 按 Key 的 token 预算折算金额：剩余 token / 1e6 × 单价。
+    // 口径开关（默认 token）：
+    //   token —— 按这把 Key 的额度算：剩余 token = 额度上限 − 已用（**单位就是 token**，
+    //            不再乘单价。「我设了 100k」就该看到 100k 量级，折成钱会变成几毛，反而像坏了）；
+    //   pool  —— 报账号池真实剩余积分（和「积分共享」页面的数字一致，单位是积分）。
     //
-    // ⚠️ 默认给 pool 是因为两套单位量级差很大：10 万 token 预算折成钱只有 ¥0.2，
-    // 而池子里是两万多积分 —— 桌宠上突然显示 ¥0.20 会像坏了。要 token 估算时设
-    // `TWIN_TS_BALANCE_MODE=token` 即可，不用改代码。
-    let want_token = std::env::var("TWIN_TS_BALANCE_MODE")
-        .map(|v| v.trim().eq_ignore_ascii_case("token"))
+    // ⚠️ 两套单位不能混：Key 额度是 token、池子是积分，之前默认给 pool 导致
+    //    「设了 100k 却看到两万多」，是口径没对齐，不是算错。
+    let want_pool = std::env::var("TWIN_TS_BALANCE_MODE")
+        .map(|v| v.trim().eq_ignore_ascii_case("pool"))
         .unwrap_or(false);
 
     let budget = key.as_ref().and_then(|k| k.quota.max_total_tokens);
     let used = key.as_ref().map(|k| k.usage.total_tokens);
 
-    let (mode, token_remaining, yuan, available) = if want_token && budget.is_some() {
+    let (mode, currency, amount, token_remaining, available) = if !want_pool && budget.is_some() {
         let left = (budget.unwrap_or(0) - used.unwrap_or(0)).max(0);
-        let yuan = left as f64 / 1_000_000.0 * rate;
         (
             "token_budget",
+            "TOKEN",
+            left as f64,
             Some(left),
-            yuan,
             key.as_ref().map(|k| k.is_active()).unwrap_or(true) && left > 0,
         )
     } else {
         (
             "pool_remaining",
-            budget.map(|b| (b - used.unwrap_or(0)).max(0)),
+            "CNY",
             pool_remaining,
+            budget.map(|b| (b - used.unwrap_or(0)).max(0)),
             pool_remaining > 0.0,
         )
     };
@@ -724,14 +725,15 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
     Json(json!({
         "is_available": available,
         "balance_infos": [{
-            "currency": "CNY",
-            "total_balance": format!("{yuan:.2}"),
-            "granted_balance": format!("{yuan:.2}"),
+            "currency": currency,
+            "total_balance": format!("{amount:.2}"),
+            "granted_balance": format!("{amount:.2}"),
             "topped_up_balance": "0.00",
         }],
         // 网关扩展字段（非 DeepSeek 标准，客户端会忽略），用来解释这个数怎么来的
         "twin_switch": {
             "mode": mode,
+            "unit": currency,
             "token_remaining": token_remaining,
             "token_used": used,
             "token_budget": budget,
