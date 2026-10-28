@@ -667,14 +667,11 @@ async fn healthz(
 /// 为什么要有：dsh-pet 这类桌宠把「模型 base_url + `/user/balance`」当作余额地址，
 /// 网关没这个路由时它们会一直 404 重试（实测 2 秒内十几次），界面上余额永远空着。
 ///
-/// **口径：按 token 预算估算，不去查上游真实积分。**
-/// 上游积分不是按次回传的，硬查要额外请求、各家用不同接口；而 token 是每次请求
-/// 都拿得到的准确数字。所以：
-///     剩余 token = 该 Key 的额度上限 − 已用 token
-///     金额      = 剩余 token / 1e6 × 单价（默认 2.0 元/百万 token，`TWIN_TS_YUAN_PER_MTOK` 可改）
-///
-/// 没设额度的 Key 退回「账号池剩余积分」（真实值），并在 `twin_switch.mode` 里标明口径
-/// —— 两种口径的数不能混在一起还不自知。
+/// **口径**
+/// - 有额度（`max_total_tokens`）：用 **DeepSeek V4.1-Flash 官方单价**把「预算 token」
+///   和「已用 token」都折成钱，返回 `预算金额 − 已花费`。
+///   桌宠把币种写死成 `¥`，所以只能给金额；直接给 token 数会显示成「¥94900」。
+/// - 无额度：回落账号池真实剩余积分（和「积分共享」页面一致）。
 async fn balance(headers: HeaderMap) -> axum::response::Response {
     // Key 可选：带了按这把 Key 的额度算；没带（或已吊销）就只报池子。
     let key = bearer(&headers).and_then(|t| gateway_keys::find_by_token(&t).ok().flatten());
@@ -683,41 +680,50 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
     let pool_remaining: f64 = pool.iter().filter_map(|e| e.remaining).sum();
     let pool_accounts = pool.len();
 
-    let rate: f64 = std::env::var("TWIN_TS_YUAN_PER_MTOK")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(2.0);
-
-    // 口径开关（默认 token）：
-    //   token —— 按这把 Key 的额度算：剩余 token = 额度上限 − 已用（**单位就是 token**，
-    //            不再乘单价。「我设了 100k」就该看到 100k 量级，折成钱会变成几毛，反而像坏了）；
-    //   pool  —— 报账号池真实剩余积分（和「积分共享」页面的数字一致，单位是积分）。
-    //
-    // ⚠️ 两套单位不能混：Key 额度是 token、池子是积分，之前默认给 pool 导致
-    //    「设了 100k 却看到两万多」，是口径没对齐，不是算错。
+    // 口径开关：默认按 token 预算折算金额；`TWIN_TS_BALANCE_MODE=pool` 强制报账号池。
     let want_pool = std::env::var("TWIN_TS_BALANCE_MODE")
         .map(|v| v.trim().eq_ignore_ascii_case("pool"))
         .unwrap_or(false);
 
     let budget = key.as_ref().and_then(|k| k.quota.max_total_tokens);
-    let used = key.as_ref().map(|k| k.usage.total_tokens);
+    let used = key.as_ref().map(|k| k.usage.total_tokens).unwrap_or(0);
+    let (used_p, used_c) = key
+        .as_ref()
+        .map(|k| (k.usage.prompt_tokens, k.usage.completion_tokens))
+        .unwrap_or((0, 0));
 
-    let (mode, currency, amount, token_remaining, available) = if !want_pool && budget.is_some() {
-        let left = (budget.unwrap_or(0) - used.unwrap_or(0)).max(0);
+    // DeepSeek V4.1-Flash 官方单价（元/百万 token），峰谷两档。
+    let peak = is_deepseek_peak_now();
+    let (price_in, price_out) = deepseek_unit_price(peak);
+
+    // 已花费：按真实的输入/输出拆分算，比套一个混合单价准。
+    // 缓存命中价（0.02/0.04）不单独用 —— 网关拿不到上游的命中拆分，按未命中价估是保守的。
+    let spent_yuan = used_p as f64 / 1_000_000.0 * price_in
+        + used_c as f64 / 1_000_000.0 * price_out;
+
+    // 预算金额：用同一套单价、同一 p/c 比例把额度 token 折成钱；
+    // 还没产生用量时按纯输入价估（最保守，不会虚高）。
+    let blend_per_token = if used > 0 {
+        spent_yuan / used as f64
+    } else {
+        price_in / 1_000_000.0
+    };
+    let budget_yuan = budget.map(|b| b as f64 * blend_per_token);
+
+    let (mode, amount, token_remaining, available) = if !want_pool && budget.is_some() {
+        let left_tokens = (budget.unwrap_or(0) - used).max(0);
+        let left_yuan = (budget_yuan.unwrap_or(0.0) - spent_yuan).max(0.0);
         (
             "token_budget",
-            "TOKEN",
-            left as f64,
-            Some(left),
-            key.as_ref().map(|k| k.is_active()).unwrap_or(true) && left > 0,
+            left_yuan,
+            Some(left_tokens),
+            key.as_ref().map(|k| k.is_active()).unwrap_or(true) && left_tokens > 0,
         )
     } else {
         (
             "pool_remaining",
-            "CNY",
             pool_remaining,
-            budget.map(|b| (b - used.unwrap_or(0)).max(0)),
+            budget.map(|b| (b - used).max(0)),
             pool_remaining > 0.0,
         )
     };
@@ -725,25 +731,55 @@ async fn balance(headers: HeaderMap) -> axum::response::Response {
     Json(json!({
         "is_available": available,
         "balance_infos": [{
-            "currency": currency,
+            // 桌宠/客户端都按 ¥ 展示，这里统一 CNY
+            "currency": "CNY",
             "total_balance": format!("{amount:.2}"),
             "granted_balance": format!("{amount:.2}"),
             "topped_up_balance": "0.00",
         }],
-        // 网关扩展字段（非 DeepSeek 标准，客户端会忽略），用来解释这个数怎么来的
+        // 网关扩展字段（非 DeepSeek 标准，客户端会忽略），用来说明这个数怎么来的
         "twin_switch": {
             "mode": mode,
-            "unit": currency,
             "token_remaining": token_remaining,
             "token_used": used,
             "token_budget": budget,
-            "yuan_per_mtok": rate,
+            "spent_yuan": spent_yuan,
+            "budget_yuan": budget_yuan,
+            "price_input_per_mtok": price_in,
+            "price_output_per_mtok": price_out,
+            "peak": peak,
             "pool_remaining": pool_remaining,
             "pool_accounts": pool_accounts,
             "key_name": key.as_ref().map(|k| k.name.clone()),
         }
     }))
     .into_response()
+}
+
+/// DeepSeek V4.1-Flash 官方单价（元 / 百万 token）：`(输入·缓存未命中, 输出)`。
+///
+/// 来源：官方 2026-09-10 起执行的峰谷价 —— 输入未命中 1/2 元、输出 4/8 元（空闲/高峰），
+/// 缓存命中 0.02/0.04 元。命中价不单独用：网关看不到上游的缓存命中拆分。
+fn deepseek_unit_price(peak: bool) -> (f64, f64) {
+    if peak {
+        (2.0, 8.0)
+    } else {
+        (1.0, 4.0)
+    }
+}
+
+/// 当前是否处于 DeepSeek 高峰时段：**工作日 9:00–12:00、14:00–18:00（北京时间）**，其余空闲。
+///
+/// ⚠️ 法定节假日与调休没有日历，这里只按「周一~周五」近似 —— 会在节假日多算高峰价，
+/// 属已知偏差；要精确就得接节假日日历，目前不值当。
+fn is_deepseek_peak_now() -> bool {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    if now.weekday().num_days_from_monday() >= 5 {
+        return false;
+    }
+    let h = now.hour();
+    (9..12).contains(&h) || (14..18).contains(&h)
 }
 
 async fn models() -> impl IntoResponse {
