@@ -87,6 +87,12 @@
 //!     症状与第 10 条一模一样（`995001` + 界面「由于网络原因」），极难分辨。
 //!     `HistoryRawChatMessage` 的 `content`/`extra_info`/`name`/`role`/`tool_call_id`/`tool_calls`
 //!     原生 18/18 全有（可为 null），少键同样失败。
+//! 15. **`server_history_info` 一个回合只许有「一份」历史**（2026-10-28 第五处根因）：
+//!     镜像行按 `task_id` 被认成回合（原生：每回合恰好 1 个 `task_id`，`session_id` 必是该回合
+//!     用户消息 id，`client_history_id` 100% 命中 `history_v2`）。清理旧镜像**必须按
+//!     `conversation_id` 整条会话删**：重复导入会重建 `history_v2` 主键，只按
+//!     `client_history_id` 删会漏掉上一代，一个回合就有两份历史（行数、时间窗完全相同）。
+//!     「缺镜像」和「多一份镜像」是**同一个 995001**，方向相反。
 //!
 //! 旧数据由 `heal_legacy_rows()` 就地修（随每次导入自动跑一遍，幂等）。
 //!
@@ -127,7 +133,7 @@ use crate::modules::trae_delete::merge_wal_into_plain;
 use crate::modules::trae_discover::{database_path, get_client};
 use crate::modules::trae_import::{patch_reserved_field, write_db_incremental};
 use crate::modules::trae_memory_scan::{load_saved_key, save_key, scan_for_key};
-use crate::modules::trae_switch::{is_running, kill_all, launch, wait_until_stopped};
+use crate::modules::trae_switch::{is_running, launch};
 use crate::modules::workbuddy_accounts;
 use crate::modules::workbuddy_source::{self, WbBody, WbSession, WbTurn};
 
@@ -293,7 +299,7 @@ fn ensure_project(conn: &Connection, uid: &str, cwd: &str, start: i64) -> Result
          (project_id, source, user_id, name, description, absolute_path, biz_project_id, \
           created_at, updated_at, deleted_at, workspace_status, last_active_at, work_mode, \
           workspace_type, single_root_workspace_folder, workspace_folders, project_kind, domain_version) \
-         VALUES (?1, 'native-ide', ?2, ?3, NULL, ?4, ?5, ?6, ?6, NULL, ?7, ?6, 'work', \
+         VALUES (?1, 'native-ide', ?2, ?3, NULL, ?4, ?5, ?6, ?6, NULL, ?7, ?6, NULL, \
                  'single_root', ?4, ?8, 'workspace', 2)",
         params![pid, uid, name, path, biz, ts, workspace_status_of(&path), workspace_folders_of(&path)],
     )
@@ -322,9 +328,18 @@ fn workspace_folders_of(path: &str) -> String {
 /// 只对**单根工作区**做升级（多根项目本来就没有这个字段），已经是 v2 且填好路径的行不动。
 fn upgrade_project_row(conn: &Connection, pid: &str, path: &str) -> Result<(), String> {
     conn.execute(
+        // ⚠️⚠️ `work_mode` 不许乱填 'work'（第九处根因）。
+        // work 模式的项目在库里必须是「Trae 托管目录」形态：`absolute_path` 指向
+        // `...\ModularData\ai-agent\work-mode-projects\<id>`，且磁盘上有对应空目录。
+        // 把普通用户目录标成 work 模式 → 状态自相矛盾 → 客户端准备不了 workspace，
+        // 会话初始化直接失败（界面照旧只显示「由于网络原因，会话加载失败」）。
+        // 能正常打开的原生会话旁边的 project 行一律 `work_mode=NULL`。
+        // 判据就是路径：只有真·work 模式项目才保留原值。
         "UPDATE project SET domain_version = 2, workspace_type = 'single_root', \
          single_root_workspace_folder = ?2, workspace_folders = ?3, workspace_status = ?4, \
-         project_kind = 'workspace', work_mode = COALESCE(work_mode, 'work') \
+         project_kind = 'workspace', \
+         work_mode = CASE WHEN ifnull(absolute_path,'') LIKE '%work-mode-projects%' \
+                          THEN work_mode ELSE NULL END \
          WHERE project_id = ?1 \
            AND ifnull(workspace_type, 'single_root') = 'single_root' \
            AND (ifnull(domain_version, 0) < 2 \
@@ -532,6 +547,26 @@ fn build_turn_context(
             out.insert(k.clone(), neutralize(v));
         }
     }
+
+    // ⚠️⚠️ `turn_record` 必须**整键不写**（第六处根因，2026-10-28 夜）。
+    //
+    // 它是客户端「回合持久化元数据」的权威来源。全库 421 个回合的实测分布：
+    //   - 419 个：**完全没有这个键**（老会话）→ 走兼容路径，能打开；
+    //   - 1 个：原生新会话，7 个字段全填满（`task_id`=`task_…`、`agent_run_id`、
+    //     `trace_id`(32 hex)、`turn_type`="User"、`root_turn_id`、`message_index`=1、
+    //     `chat_start_time`=毫秒）→ 能打开；
+    //   - 1 个：**我们这个导入器造的，存在但全空**（`task_id`/`agent_run_id`/`trace_id`/
+    //     `turn_type`/`root_turn_id` 都是 `""`，`message_index`=0，`chat_start_time`=0）。
+    //
+    // 「键在、值空」是库里**只有导入器能造出来**的状态。上面那段「保留形状、清空取值」
+    // 会把模板里的 `turn_record` 一并拷进来再清空，正好落进这个坑：
+    // restorer 判定 `restored body has incomplete durable Turn metadata` /
+    // `invalid turn metadata for history entry` → 整条会话 995001
+    // （界面：「由于网络原因，会话加载失败」）。
+    //
+    // 「缺键」是安全的（419/421 原生就是缺键）；「写成空壳」是致命的。
+    // 宁可缺，不可空。
+    out.remove("turn_record");
 
     out.insert("references".into(), json!([]));
     out.insert("render_context".into(), nullify(&render_context));
@@ -886,7 +921,15 @@ fn build_task_content(
                 "result": {
                     "status": "success",
                     "error_message": "",
-                    "data": { "summary": "", "products": Value::Null },
+                    // ⚠️⚠️ `products` 必须是**对象**，`artifact_paths` 必须是**数组**。
+                    // 旧写法 `"products": null` 是第七处根因（2026-10-28 深夜三次）：
+                    // 客户端按 `Map<String, Value>` 读它，`null` 直接解码失败 →
+                    // `get_messages` 整条会话报 995001「由于网络原因，会话加载失败」。
+                    // 真实库：finish 项的 data 恒为
+                    // `{"products": {…}, "artifact_paths": [...]}`（`products` 取空对象
+                    // `{}` 的真实样本也存在，所以空对象是安全值）；非 finish 的工具项则
+                    // **完全没有** `products` 键 —— 空与缺不是一回事，别互相顶替。
+                    "data": { "products": {}, "artifact_paths": [] },
                     "render": Value::Null,
                     "is_truncated": Value::Null,
                     "interrupt": Value::Null,
@@ -1109,6 +1152,43 @@ pub fn purge_malformed_projects(conn: &Connection, on_log: &dyn Fn(&str)) -> Res
 /// 新版客户端按非 Option 解码，NULL 会让整行读不出来）。
 ///
 /// 幂等：已经是字符串 / 已有值的行不动。
+/// `turn_record` 是不是「空壳」。
+///
+/// 原生只有两种形态：**没有这个键**（实测 419/421）或 **7 个字段全填满**（1/421）。
+/// 只要不是全填满，就说明它是由导入器「保留形状、清空取值」清出来的壳子。
+/// 壳子留着 = restorer 判定 `restored body has incomplete durable Turn metadata`
+/// → 整条会话 995001。所以判据取「非全填满」，宁可删。
+fn turn_record_incomplete(v: &Value) -> bool {
+    let Some(o) = v.as_object() else {
+        return true;
+    };
+    let filled = |k: &str| {
+        o.get(k)
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let positive = |k: &str| o.get(k).and_then(Value::as_i64).map(|n| n > 0).unwrap_or(false);
+    !(filled("task_id")
+        && filled("agent_run_id")
+        && filled("trace_id")
+        && filled("turn_type")
+        && filled("root_turn_id")
+        && positive("message_index")
+        && positive("chat_start_time"))
+}
+
+/// 列出表的列名（表不存在时返回空）。
+fn cols_of(conn: &Connection, table: &str) -> Vec<String> {
+    let Ok(mut st) = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) else {
+        return Vec::new();
+    };
+    let Ok(it) = st.query_map([], |r| r.get::<_, String>(1)) else {
+        return Vec::new();
+    };
+    it.filter_map(Result::ok).collect()
+}
+
 pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Value, String> {
     let mut turns_fixed = 0usize;
     let mut projects_fixed = 0usize;
@@ -1144,6 +1224,13 @@ pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Valu
                 v["context_usage"] = json!(u.to_string());
                 changed = true;
             }
+        }
+        // 空壳 `turn_record`：只有老版本的导入器写得出来（原生要么没有这个键，
+        // 要么 7 个字段全填满）。留着它 = 「回合元数据不完整」→ 995001，
+        // 所以这里**整键删掉**，退回原生老会话那条能打开的路径。
+        if v.get("turn_record").map(turn_record_incomplete).unwrap_or(false) {
+            v.as_object_mut().map(|m| m.remove("turn_record"));
+            changed = true;
         }
         if changed {
             conn.execute(
@@ -1276,17 +1363,440 @@ pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Valu
              {history_json_fixed} 行历史补上 mode 与 raw_messages 缺键 / {projects_fixed} 个项目行升级到 domain v2"
         ));
     }
+
+    // 4) 补 / 重建 `server_history_info` 消息镜像。命中任一判据就整条会话重建：
+    //    ① 整条会话一行镜像都没有（第四处根因，旧版导入）；
+    //    ② 会话里有**悬空镜像行**（`client_history_id` 已不在 `history_v2`）——第五处根因：
+    //       重复导入会把 history_v2 主键全部换新，上一代镜像就再也删不掉，一个回合于是有了
+    //       两份历史（实测 17907 行，行数与时间窗和新版逐回合完全一致，只有 task_id 不同）。
+    //    两条都不会误伤原生会话：原生镜像的 `client_history_id` 全部命中 `history_v2`（18/18）。
+    let has_mirror_table = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_history_info'")
+        .and_then(|mut st| st.exists([]))
+        .unwrap_or(false);
+    let naked: Vec<String> = if has_messages && has_mirror_table {
+        let mut st = conn
+            .prepare(
+                "SELECT DISTINCT sid FROM ( \
+                     SELECT h.session_id AS sid FROM history_v2 h \
+                      WHERE ifnull(h.deleted_at,0)=0 \
+                        AND NOT EXISTS (SELECT 1 FROM server_history_info s \
+                                        WHERE s.client_history_id = h.history_v2_id) \
+                     UNION \
+                     SELECT s.conversation_id AS sid FROM server_history_info s \
+                      WHERE s.client_history_id NOT IN (SELECT history_v2_id FROM history_v2) \
+                 ) \
+                 WHERE sid IN (SELECT session_id FROM history_v2 WHERE ifnull(deleted_at,0)=0) \
+                 ORDER BY sid",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    } else {
+        Vec::new()
+    };
+    let mut mirrored_rows = 0usize;
+    let mut mirrored_sessions = 0usize;
+    for sid in &naked {
+        match mirror_server_history(conn, sid) {
+            Ok(n) if n > 0 => {
+                mirrored_rows += n;
+                mirrored_sessions += 1;
+            }
+            Ok(_) => {}
+            Err(e) => on_log(&format!("   补消息镜像失败（{sid}）：{e}")),
+        }
+    }
+    if mirrored_sessions > 0 {
+        on_log(&format!(
+            "   已补/重建消息镜像：{mirrored_sessions} 条会话 / {mirrored_rows} 行（缺它或多一份都打不开）"
+        ));
+    }
+
+    // 5) 镜像里的 `task_id` 归一成 UUID。
+    //    老版本写的是 `task:<turn_id>`，那是自造命名空间；真实值一律是 UUID
+    //    （全库 779 组全是 UUID）。按「旧值 → 新值」整组替换，保持「一回合一个 id」。
+    let mut task_ids_fixed = 0usize;
+    if has_messages && has_mirror_table {
+        let olds: Vec<String> = {
+            let mut st = conn
+                .prepare("SELECT DISTINCT task_id FROM server_history_info WHERE task_id LIKE 'task:%'")
+                .map_err(|e| e.to_string())?;
+            let it = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            it.filter_map(Result::ok).collect()
+        };
+        for old in olds {
+            conn.execute(
+                "UPDATE server_history_info SET task_id=?2 WHERE task_id=?1",
+                params![old, uuid::Uuid::new_v4().to_string()],
+            )
+            .map_err(|e| format!("修复镜像 task_id 失败: {e}"))?;
+            task_ids_fixed += 1;
+        }
+        if task_ids_fixed > 0 {
+            on_log(&format!(
+                "   已归一镜像 task_id：{task_ids_fixed} 个回合（`task:` 前缀不是客户端的命名空间）"
+            ));
+        }
+    }
+
+    // 6) `chat_message_task.content` 里 finish 项的 `result.data` 形状。
+    //    旧写法 `"products": null`，而客户端按对象读（真实库 finish 恒为对象，
+    //    空对象 `{}` 也有真实样本）；`artifact_paths` 则整键缺失（真实库恒为数组）。
+    //    这一个字段就让**每条助手消息**解码失败 ⇒ 整条会话 995001。
+    let mut task_data_fixed = 0usize;
+    let has_task_table = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_message_task'")
+        .and_then(|mut st| st.exists([]))
+        .unwrap_or(false);
+    let rows: Vec<(i64, String)> = if has_task_table {
+        let mut st = conn
+            .prepare("SELECT id, content FROM chat_message_task WHERE ifnull(content,'') <> ''")
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    } else {
+        Vec::new()
+    };
+    for (id, raw) in rows {
+        let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(items) = v.get_mut("messages").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut touched = false;
+        for it in items.iter_mut() {
+            let Some(tc) = it
+                .get_mut("plan_item")
+                .and_then(|p| p.get_mut("tool_call_info"))
+            else {
+                continue;
+            };
+            let is_finish = tc.get("name").and_then(Value::as_str) == Some("finish");
+            let Some(res) = tc.get_mut("result") else {
+                continue;
+            };
+            let Some(data) = res.get_mut("data") else {
+                continue;
+            };
+            let Some(obj) = data.as_object_mut() else {
+                continue;
+            };
+            let prod_bad = !matches!(obj.get("products"), Some(Value::Object(_)));
+            if is_finish {
+                if prod_bad {
+                    obj.insert("products".into(), json!({}));
+                    touched = true;
+                }
+                let ap_bad = !matches!(obj.get("artifact_paths"), Some(Value::Array(_)));
+                if ap_bad {
+                    obj.insert("artifact_paths".into(), json!([]));
+                    touched = true;
+                }
+            } else if prod_bad && obj.contains_key("products") {
+                // 非 finish 项在真实库里**没有** `products` 键；`null` 撑不起对象语义，
+                // 直接去掉而不是替换成 `{}`（空与缺不是一回事）。
+                obj.remove("products");
+                touched = true;
+            }
+        }
+        if touched {
+            conn.execute(
+                "UPDATE chat_message_task SET content=?2 WHERE id=?1",
+                params![id, v.to_string()],
+            )
+            .map_err(|e| format!("修复 chat_message_task.content 失败: {e}"))?;
+            task_data_fixed += 1;
+        }
+    }
+    if task_data_fixed > 0 {
+        on_log(&format!(
+            "   已修复步骤数据形状：{task_data_fixed} 条助手消息（`products` 必须是对象、`artifact_paths` 必须是数组）"
+        ));
+    }
+
+    // 7) 会话级的 `work_mode` / `session_icon` 归一。
+    //    旧版写死 `work_mode='work'`（会把请求切到 `trae-work` 频道）和
+    //    `session_icon='personal'`（原生没有这个值）。两者一起改，判据用
+    //    「personal + work」这个组合——原生会话不可能同时命中。
+    let mut sessions_fixed = 0usize;
+    let sess_cols: Vec<String> = {
+        let mut st = conn
+            .prepare("PRAGMA table_info(chat_session)")
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?;
+        it.filter_map(Result::ok).collect()
+    };
+    if sess_cols.iter().any(|c| c == "work_mode") && sess_cols.iter().any(|c| c == "session_icon") {
+        sessions_fixed += conn
+            .execute(
+                "UPDATE chat_session SET work_mode=NULL, session_icon='chat' \
+                 WHERE session_icon='personal' AND work_mode='work'",
+                [],
+            )
+            .map_err(|e| format!("修复会话 work_mode/icon 失败: {e}"))?;
+    }
+    if sessions_fixed > 0 {
+        on_log(&format!(
+            "   已归一 {sessions_fixed} 条会话的 work_mode/icon（`work` 会把请求切到 trae-work 频道）"
+        ));
+    }
+
+    // 8) 项目级 `work_mode` **不在这里批量清**：
+    //    实测原生库里有 22 个 `work_mode='work'` + 普通目录的项目，说明这个组合是合法的
+    //    （work 模式 ≠ 必须托管目录）。批量清会误伤用户正在用的 work 模式项目，
+    //    所以只在新导入/升级时不再凭空写 'work'（见 `create_project` / `upgrade_project_row`）。
+
     Ok(json!({
         "turns": turns_fixed,
         "history": history_fixed,
         "history_json": history_json_fixed,
         "projects": projects_fixed,
+        "mirror_sessions": mirrored_sessions,
+        "mirror_rows": mirrored_rows,
+        "mirror_task_ids": task_ids_fixed,
+        "task_data": task_data_fixed,
+        "sessions": sessions_fixed,
     }))
 }
 
 // ---------------------------------------------------------------------------
 // 单个会话写入
 // ---------------------------------------------------------------------------
+
+/// 把 `history_v2` 镜像进 `server_history_info`。
+///
+/// ⚠️⚠️ 2026-10-28 定位到的**第四处**不兼容：3.4.9 的 `lite.get_messages` 读的是
+/// `server_history_info`（消息持久化镜像），不是 `history_v2`。
+///
+/// 实测判据（同一个库里对照，容不得巧合）：
+/// - 所有**能打开**的会话，每条 `history_v2` 都有 1~2 行镜像
+///   （`server_history_info.client_history_id = history_v2.history_v2_id`），覆盖率 100%；
+/// - 所有旧版导入的会话**一行镜像都没有**（17907 / 748 / 1121 行全是 0%）。
+///
+/// 缺镜像就走到 harness 的 `message persistence unavailable`，前端统一渲染成
+/// 「由于网络原因，会话加载失败」（995001）。
+///
+/// ⚠️⚠️ 2026-10-28 定位到的**第五处**不兼容：镜像**多一份同样打不开**。
+/// 重复导入会重建 `history_v2`（主键换新），上一代镜像行不再命中 DELETE，于是同一个
+/// 回合在库里有两份历史（行数、时间窗逐回合完全一致，只有 `task_id` 不同）。
+/// harness 的 `history-archive` restorer 按 `task_id` 认出两个「被接受的历史」，
+/// 身份对不上 ⇒ 仍是同一个 995001。判据：`client_history_id` 必须 100% 命中
+/// `history_v2`（原生样本 18/18；出问题的库里是 18231/36138 = 50.5%）。
+///
+/// 拆分规则照抄原生样本：
+/// - `history_v2.messages.raw_messages` 的**每条消息拆成一行镜像**；
+/// - 首条 `source` = `user_input`（用户提问）或 `llm_default`（模型输出），
+///   后续条 `source` = `history_v2.content_source`（工具名）；
+/// - 首条的 `history_id` = `history_v2_id`，后续条另生成 24 位 hex；
+/// - ⚠️ `session_id` 列存的是**该回合用户消息的 id**，`conversation_id` 才是会话 id
+///   （按 `session_id` 查会一行都查不到，这是最容易踩的坑）。
+///
+/// 幂等：先清掉本会话已有的镜像行再重建，重复调用结果一致。
+fn mirror_server_history(conn: &Connection, session_id: &str) -> Result<usize, String> {
+    use std::collections::HashMap;
+
+    // ⚠️⚠️ 必须按 `conversation_id` 整条会话删，不能只删「client_history_id 命中当前
+    // history_v2」的行 —— 重复导入会重建 history_v2（`history_v2_id` 全换新），
+    // 上一代的镜像行就再也命中不了 DELETE，留在库里变成**同一回合的第二份历史**
+    // （实测 17907 行：与新版逐回合行数、时间窗完全相同，只是 task_id 不同）。
+    // harness 的 restorer 按 `task_id` 认回合，一个回合出现两份 ⇒ 995001。
+    conn.execute(
+        "DELETE FROM server_history_info WHERE conversation_id=?1 \
+           OR client_history_id IN (SELECT history_v2_id FROM history_v2 WHERE session_id=?1)",
+        params![session_id],
+    )
+    .map_err(|e| format!("清理旧的消息镜像失败: {e}"))?;
+
+    // 回合索引：message_id -> (该回合的用户消息 id, 服务器任务 id)
+    let mut owner: HashMap<String, (String, String)> = HashMap::new();
+    {
+        let mut st = conn
+            .prepare(
+                "SELECT turn_id, reply_to_message_id, response_message_id \
+                 FROM chat_turn WHERE session_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map(params![session_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for (_turn_id, user_msg, resp_msg) in it.flatten() {
+            // 一个回合一个「服务器任务 id」，同回合的多条历史共用（原生即如此）。
+            // ⚠️ 真实取值是 **UUID**（`8d0196d8-796f-4200-96e0-01a7095ac2c9` 这种，
+            // 全库 779 组全是 UUID），不是 `task:<turn_id>`。后者是我们自造的第 4 套 ID
+            // 命名空间，在任务表/回合表里都对不上任何一行。
+            let task_id = uuid::Uuid::new_v4().to_string();
+            owner.insert(user_msg.clone(), (user_msg.clone(), task_id.clone()));
+            owner.insert(resp_msg, (user_msg, task_id));
+        }
+    }
+    // 兜底：没有 turn 行（例如只有消息没有回合）时，至少别把行写成空 session_id。
+    let fallback_user = conn
+        .query_row(
+            "SELECT message_id FROM chat_message WHERE session_id=?1 AND message_role='user' \
+             ORDER BY message_index LIMIT 1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+
+    let (ws_path, ws_id) = conn
+        .query_row(
+            "SELECT ifnull(p.single_root_workspace_folder,''), ifnull(s.project_id,'') \
+             FROM chat_session s LEFT JOIN project p ON p.project_id = s.project_id \
+             WHERE s.session_id=?1",
+            params![session_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .unwrap_or((String::new(), String::new()));
+    let extra_info = json!({
+        "workspace_folder": ws_path,
+        "workspace_id": ws_id,
+        "workspace_path": ws_path,
+    })
+    .to_string();
+
+    let rows: Vec<(String, String, String, i64, i64, String, String, String)> = {
+        let mut st = conn
+            .prepare(
+                "SELECT history_v2_id, message_id, ifnull(messages,''), ifnull(token_usage,0), \
+                        created_at, ifnull(content_source,''), ifnull(agent_type,''), \
+                        ifnull(agent_run_id,'') \
+                 FROM history_v2 WHERE session_id=?1 ORDER BY created_at, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map(params![session_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        it.flatten().collect()
+    };
+
+    let mut written = 0usize;
+    for (hv_id, msg_id, raw, token_usage, created_at, source, agent_type, run_id) in rows {
+        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let mode = parsed
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or(HISTORY_MODE)
+            .to_string();
+        let Some(list) = parsed.get("raw_messages").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let (user_msg, task_ref) = owner
+            .get(&msg_id)
+            .cloned()
+            .unwrap_or_else(|| (fallback_user.clone(), format!("task:{session_id}")));
+        let n = list.len().max(1);
+        let per_item = token_usage / n as i64;
+
+        for (i, m) in list.iter().enumerate() {
+            let one = mirror_raw_message(m.clone());
+            let src = if i == 0 {
+                if source == "user_input" {
+                    "user_input"
+                } else {
+                    "llm_default"
+                }
+            } else {
+                source.as_str()
+            };
+            // 同一行拆出来的多条要保证顺序稳定：`created_at` 递增一秒，
+            // 避免同秒时客户端按 history_id 排序把我们拆散。
+            let ts = created_at + i as i64;
+            let history_id = if i == 0 {
+                hv_id.clone()
+            } else {
+                hex_id_at(ts, 24)
+            };
+            let payload = json!({ "mode": mode, "raw_messages": [one] }).to_string();
+
+            conn.execute(
+                "INSERT INTO server_history_info \
+                 (history_id, client_history_id, conversation_id, session_id, task_id, agent_run_id, \
+                  is_deleted, messages, token_usage, summary, created_at, updated_at, source, user_id, \
+                  agent_type, item_summary, item_token_usage, expired_at, history_source, \
+                  summarized_above, micro_compacted, extra_info, micro_compact_strategy) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 0, '', ?8, ?8, ?9, NULL, \
+                         ?10, '', ?11, NULL, 'server', 0, 0, ?12, '')",
+                params![
+                    history_id,
+                    hv_id,
+                    session_id,
+                    user_msg,
+                    task_ref,
+                    run_id,
+                    payload,
+                    ts,
+                    src,
+                    agent_type,
+                    per_item,
+                    extra_info
+                ],
+            )
+            .map_err(|e| format!("写入消息镜像失败: {e}"))?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// 镜像侧的 raw message 比 `history_v2` 多几个键（`content.tool_name`、
+/// `function_call.partial_arguments` / `namespace`）。缺了它们，非 Option 解码同样会失败。
+fn mirror_raw_message(mut m: Value) -> Value {
+    if let Some(blocks) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for b in blocks.iter_mut() {
+            if let Some(o) = b.as_object_mut() {
+                o.entry("image_url").or_insert(Value::Null);
+                o.entry("video_url").or_insert(Value::Null);
+                o.entry("cache_control").or_insert(Value::Null);
+                o.entry("tool_name").or_insert(Value::Null);
+            }
+        }
+    }
+    if let Some(calls) = m.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+        for c in calls.iter_mut() {
+            if let Some(f) = c.get_mut("function_call").and_then(|f| f.as_object_mut()) {
+                f.entry("partial_arguments").or_insert(Value::Null);
+                f.entry("namespace").or_insert(Value::Null);
+            }
+        }
+    }
+    if let Some(o) = m.as_object_mut() {
+        o.entry("name").or_insert(Value::Null);
+        o.entry("tool_call_id").or_insert(Value::Null);
+        o.entry("tool_calls").or_insert(Value::Null);
+        o.entry("extra_info").or_insert(Value::Null);
+    }
+    m
+}
 
 /// 单项写入统计。
 #[derive(Default, Debug)]
@@ -1370,12 +1880,20 @@ pub fn write_session(
     };
 
     // 1) chat_session
+    // ⚠️⚠️ `work_mode` 必须是 **NULL**、`session_icon` 用 `'chat'`（第八处根因）。
+    // 旧写法硬编码 `work_mode='work'`、`session_icon='personal'`：
+    //   - `work_mode` 不是装饰字段。客户端的 `_getContributionChannel` 见到 work_mode
+    //     就会把请求切到 **`trae-work` 频道**（`icube-ai` → `trae-work`），而那条频道
+    //     面向「Work 模式项目」，导入的会话在那里没有对应状态；
+    //   - 实测能正常打开的原生会话 `work_mode` 一律是 NULL（`chat_session` 全表如此），
+    //     只有我们导入的是 `'work'`；
+    //   - `session_icon` 原生取值是 `'chat'` / `'data'`，`'personal'` 是我们编的。
     conn.execute(
         "INSERT INTO chat_session \
          (session_id, project_id, created_at, updated_at, deleted_at, session_type, \
           agent_process_support, session_title, work_mode, context, session_icon, \
           is_pinned, pinned_at, extra, is_unread, last_unread_turn_id) \
-         VALUES (?1, ?2, ?3, ?4, 0, 'side_chat', 'v3', ?5, 'work', ?6, 'personal', \
+         VALUES (?1, ?2, ?3, ?4, 0, 'side_chat', 'v3', ?5, NULL, ?6, 'chat', \
                  0, 0, '{}', 0, '')",
         params![sid, pid, start, end, title, build_session_context(conn, &pid)],
     )
@@ -1642,9 +2160,12 @@ pub fn write_session(
     )
     .map_err(|e| format!("写入 session_project 失败: {e}"))?;
 
+    // 7) 消息持久化镜像（`lite.get_messages` 真正读的就是它，缺了整条会话打不开）
+    let mirrored = mirror_server_history(conn, &sid)?;
+
     on_log(&format!(
-        "  会话「{}」→ {} 个回合 / {} 个工具步骤 / {} 条历史行",
-        title, stats.turns, stats.steps, stats.history_rows
+        "  会话「{}」→ {} 个回合 / {} 个工具步骤 / {} 条历史行 / {} 条消息镜像",
+        title, stats.turns, stats.steps, stats.history_rows, mirrored
     ));
     Ok(stats)
 }
@@ -1739,6 +2260,70 @@ pub fn preview(session_ids: &[String]) -> Result<Value, String> {
     Ok(json!({ "preview": out }))
 }
 
+/// 导入前结束目标客户端，**失败时把真实原因带出来**。
+///
+/// ⚠️ 2026-10-28 的教训：这里原来只有 `if !wait_until_stopped(..10s) { return Err("未能退出") }`，
+/// 把 [`KillOutcome`] 里的残留 PID 与 `taskkill` 的原文全丢了 —— 界面上只剩一句
+/// 「目标客户端未能退出」，既分不清「杀不掉」还是「被杀后又自己起来了」，也没法判断
+/// 是不是提权问题。失败原因不许塌缩成 `bool`（同 MEMORY 里的硬规则）。
+///
+/// 现在的口径：
+/// 1. 结束**前**把现场进程表写进 `switch.log`，事后仅凭日志就能复盘；
+/// 2. 每轮 15 秒、最多 3 轮 —— 被更新器/崩溃恢复拉起来时重新等一遍，而不是直接失败；
+/// 3. 最终失败返回 `hint()`（残留 PID + `taskkill` 原文），并单独认出「拒绝访问」。
+fn stop_for_import(client: &crate::modules::trae_discover::TraeClient, log: &dyn Fn(&str)) -> Result<(), String> {
+    use crate::modules::trae_switch;
+
+    let before = trae_switch::list_processes(client);
+    log(&format!(
+        "{} 正在运行（{} 个进程），先将其退出…",
+        client.label,
+        before.len()
+    ));
+    // 现场留档：进程名 + PID。事后能判断出「只匹配到一个」还是「有进程没被匹配到」。
+    trae_switch::switch_log(&format!(
+        "[import] 退出目标客户端 {}：{}",
+        client.label,
+        before
+            .iter()
+            .map(|(n, p)| format!("{n}#{p}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let out = trae_switch::quit_client(client, 15_000);
+        if out.ok {
+            log(&format!("目标客户端已退出（第 {tries} 轮确认，进程表已清空）"));
+            return Ok(());
+        }
+        for e in &out.errors {
+            trae_switch::switch_log(&format!("[import] 结束进程失败：{e}"));
+        }
+        // 残留下来的 PID 与首轮完全不重叠 ⇒ 它是被重新拉起来的（自动更新 / 崩溃恢复），
+        // 隔一会儿再等一轮，而不是把一次「正在更新」判成「杀不掉」。
+        if out.restarted && tries < 3 {
+            log(&format!(
+                "{} 被重新拉起来了（进程号全换了），稍后再试一轮…",
+                client.label
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            continue;
+        }
+        let mut msg = out.hint(client.label);
+        let denied = out.errors.iter().any(|e| {
+            e.contains("拒绝访问") || e.to_lowercase().contains("access is denied")
+        });
+        if denied {
+            msg.push_str("；结束进程被系统拒绝，请以管理员身份运行 TwinSwitch 后重试");
+        }
+        trae_switch::switch_log(&format!("[import] 放弃退出目标客户端：{msg}"));
+        return Err(format!("{msg}。因此无法写入它本地的会话库"));
+    }
+}
+
 /// 执行 WorkBuddy → Trae 导入。
 ///
 /// 流程与 Trae↔Trae 导入一致（复用同一套页面级加解密链路）：
@@ -1822,12 +2407,7 @@ pub fn import_sessions(
         }
     };
     if is_running(dst_client) {
-        log(&format!("目标客户端 {} 正在运行，先将其退出…", dst_client.label));
-        let killed = kill_all(dst_client);
-        log(&format!("已结束 {} 个进程，等待退出…", killed.len()));
-        if !wait_until_stopped(dst_client, 10_000) {
-            return Err("目标客户端未能退出，无法写入数据库".into());
-        }
+        stop_for_import(dst_client, &log)?;
     }
     {
         use std::io::Read;
@@ -2254,6 +2834,22 @@ mod tests {
             msgs[0].pointer("/plan_item/tool_call_info/name").and_then(Value::as_str),
             Some("finish")
         );
+        // ⚠️⚠️ finish 项的 `result.data` 形状（第七处根因）：
+        // `products` 必须是**对象**（`null` 会让客户端按 Map 解码失败 → 995001），
+        // `artifact_paths` 必须是**数组**（真实库恒存在）。
+        let data = msgs[0]
+            .pointer("/plan_item/tool_call_info/result/data")
+            .expect("finish 必须有 result.data");
+        assert!(
+            data.get("products").map(Value::is_object).unwrap_or(false),
+            "products 必须是对象，实际 {}",
+            data.get("products").map(|x| x.to_string()).unwrap_or_default()
+        );
+        assert!(
+            data.get("artifact_paths").map(Value::is_array).unwrap_or(false),
+            "artifact_paths 必须是数组，实际 {}",
+            data.get("artifact_paths").map(|x| x.to_string()).unwrap_or_default()
+        );
     }
 
     #[test]
@@ -2485,6 +3081,18 @@ mod tests {
             "chat_start_time": 1791043687680_i64,
             "chat_end_time": 1791043907022_i64,
             "version_code": 20260917,
+            // 原生新会话的形态：turn_record 七项全填满。导入器**不许**把它抄进来
+            // （抄进来会被 neutralize 清空，变成「存在但全空」→ 995001）。
+            "turn_record": {
+                "task_id": "task_6ae1eddeab76cf15092c5a28",
+                "agent_run_id": "8e314e86-763f-5127-87c3-aa169fb0acb0",
+                "message_index": 1,
+                "chat_start_time": 1793191390346_i64,
+                "trace_id": "37cc5f6d21284b82ae43dbcd9e3f658a",
+                "turn_type": "User",
+                "root_turn_id": "6ae1eddeab76cf15092c5a27",
+                "user_message_context": { "query": "别人的" }
+            },
             "future_unknown_field": { "v": "别人的值" }
         })
         .to_string();
@@ -2543,6 +3151,17 @@ mod tests {
         let out2 = build_turn_context(&tpl.turn, None, "x", 1, 2);
         let v2: Value = serde_json::from_str(&out2).unwrap();
         assert_eq!(v2.pointer("/workspace_folders").and_then(Value::as_array).map(Vec::len), Some(0));
+        // 6) ⚠️⚠️ `turn_record` 必须**整键消失**。
+        //    它是客户端「回合持久化元数据」的权威来源：键在、值空 ⇒ restorer 判定
+        //    `restored body has incomplete durable Turn metadata`，整条会话 995001 打不开
+        //    （界面只显示「由于网络原因，会话加载失败」）。
+        //    实测全库 421 个回合：419 个没有这个键、1 个原生新会话七项全填满、
+        //    1 个就是我们导入的空壳 —— 空壳是库里只有导入器造得出来的畸形态。
+        assert!(
+            v.get("turn_record").is_none(),
+            "turn_record 必须不写：抄模板再清空会得到「键在、值空」的致命形态，实际 {}",
+            v.get("turn_record").map(|x| x.to_string()).unwrap_or_default()
+        );
     }
 
     #[test]
@@ -2688,6 +3307,249 @@ mod tests {
         assert_eq!(again["turns"], 0);
         assert_eq!(again["history"], 0);
         assert_eq!(again["projects"], 0);
+    }
+
+    #[test]
+    fn heal_rebuilds_stale_mirror_generation() {
+        // 第五处根因：重复导入重建 history_v2 后，上一代 server_history_info 删不掉，
+        // 同一个回合在库里有两份历史（行数、时间窗一致，只有 task_id 不同）⇒ 995001。
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE chat_session(session_id TEXT PRIMARY KEY, project_id TEXT, context TEXT);\
+             CREATE TABLE chat_turn(id INTEGER PRIMARY KEY, session_id TEXT, turn_id TEXT,\
+                reply_to_message_id TEXT, response_message_id TEXT, context TEXT);\
+             CREATE TABLE chat_message(id INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT,\
+                message_role TEXT, message_index INTEGER);\
+             CREATE TABLE history_v2(id INTEGER PRIMARY KEY, history_v2_id TEXT, session_id TEXT,\
+                message_id TEXT, messages TEXT, token_usage INTEGER, summary TEXT,\
+                accumulated_summary TEXT, compress_token_usage INTEGER, micro_compacted INTEGER,\
+                truncated_above INTEGER, micro_compact_strategy TEXT, created_at INTEGER,\
+                content_source TEXT, agent_type TEXT, agent_run_id TEXT, deleted_at INTEGER);\
+             CREATE TABLE server_history_info(history_id TEXT, client_history_id TEXT,\
+                conversation_id TEXT, session_id TEXT, task_id TEXT, agent_run_id TEXT,\
+                is_deleted INTEGER, messages TEXT, token_usage INTEGER, summary TEXT,\
+                created_at INTEGER, updated_at INTEGER, source TEXT, user_id TEXT,\
+                agent_type TEXT, item_summary TEXT, item_token_usage INTEGER, expired_at INTEGER,\
+                history_source TEXT, summarized_above INTEGER, micro_compacted INTEGER,\
+                extra_info TEXT, micro_compact_strategy TEXT);\
+             CREATE TABLE project(project_id TEXT PRIMARY KEY, absolute_path TEXT, deleted_at INTEGER,\
+                workspace_type TEXT, workspace_status TEXT, single_root_workspace_folder TEXT,\
+                workspace_folders TEXT, project_kind TEXT, work_mode TEXT, domain_version INTEGER);",
+        )
+        .unwrap();
+
+        let raw_msg = json!({
+            "mode": HISTORY_MODE,
+            "raw_messages": [{ "role": "assistant", "content": [{ "type": "text", "text": "答复" }] }]
+        })
+        .to_string();
+        c.execute("INSERT INTO project VALUES('p1','d:\\htw\\签到',NULL,'single_root','virtual',\
+                   'd:\\htw\\签到','[]','workspace','work',2)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO chat_session VALUES('s1','p1','{}')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_turn VALUES(1,'s1','T1','A1','B1','{}')",
+            [],
+        )
+        .unwrap();
+        c.execute("INSERT INTO chat_message VALUES(1,'s1','A1','user',1),(2,'s1','B1','task',2)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO history_v2 VALUES(1,'hv1','s1','B1',?1,10,'','{}',0,0,0,'',100,'llm_default',\
+             'solo_agent','run-1',0)",
+            params![raw_msg],
+        )
+        .unwrap();
+        // 上一代残留镜像：client_history_id 已不在 history_v2，task_id 也不是任何 turn
+        c.execute(
+            "INSERT INTO server_history_info VALUES('old1','gone','s1','A_old','task:OLD','run-0',\
+             NULL,?1,0,'',100,100,'llm_default',NULL,'solo_agent','',0,NULL,'server',0,0,'','')",
+            params![raw_msg],
+        )
+        .unwrap();
+
+        // 前置：残留行让「每回合一个 task_id」不成立
+        let stale: i64 = c
+            .query_row(
+                "SELECT count(*) FROM server_history_info WHERE client_history_id NOT IN \
+                 (SELECT history_v2_id FROM history_v2)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 1);
+
+        let n = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(n["mirror_sessions"], 1, "有悬空镜像的会话必须被重建");
+        assert_eq!(n["mirror_rows"], 1);
+
+        let left: i64 = c
+            .query_row("SELECT count(*) FROM server_history_info WHERE conversation_id='s1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 1, "整条会话只许留当前这一代镜像");
+        let (tid, sid): (String, String) = c
+            .query_row("SELECT task_id, session_id FROM server_history_info WHERE conversation_id='s1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(
+            tid.len() == 36 && tid.matches('-').count() == 4,
+            "镜像 task_id 必须是 UUID（原生全是 UUID），实际 {tid}"
+        );
+        assert_eq!(sid, "A1", "session_id 必须是该回合的用户消息 id");
+
+        // 幂等
+        let again = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(again["mirror_sessions"], 0);
+    }
+
+    #[test]
+    fn heal_drops_empty_turn_record_and_normalizes_mirror_task_id() {
+        // 第六处根因：`chat_turn.context.turn_record` 被写成「存在但全空」，
+        // restorer 判定 `restored body has incomplete durable Turn metadata` ⇒ 995001。
+        // 存量会话的镜像本身是好的（client_history_id 命中 history_v2），
+        // 所以第 4 步不会重建它 —— 必须靠这两步单独修。
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE chat_session(session_id TEXT PRIMARY KEY, project_id TEXT, context TEXT);\
+             CREATE TABLE chat_turn(id INTEGER PRIMARY KEY, session_id TEXT, turn_id TEXT,\
+                reply_to_message_id TEXT, response_message_id TEXT, context TEXT);\
+             CREATE TABLE chat_message(id INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT,\
+                message_role TEXT, message_index INTEGER);\
+             CREATE TABLE history_v2(id INTEGER PRIMARY KEY, history_v2_id TEXT, session_id TEXT,\
+                message_id TEXT, messages TEXT, token_usage INTEGER, summary TEXT,\
+                accumulated_summary TEXT, compress_token_usage INTEGER, micro_compacted INTEGER,\
+                truncated_above INTEGER, micro_compact_strategy TEXT, created_at INTEGER,\
+                content_source TEXT, agent_type TEXT, agent_run_id TEXT, deleted_at INTEGER);\
+             CREATE TABLE server_history_info(history_id TEXT, client_history_id TEXT,\
+                conversation_id TEXT, session_id TEXT, task_id TEXT, agent_run_id TEXT,\
+                is_deleted INTEGER, messages TEXT, token_usage INTEGER, summary TEXT,\
+                created_at INTEGER, updated_at INTEGER, source TEXT, user_id TEXT,\
+                agent_type TEXT, item_summary TEXT, item_token_usage INTEGER, expired_at INTEGER,\
+                history_source TEXT, summarized_above INTEGER, micro_compacted INTEGER,\
+                extra_info TEXT, micro_compact_strategy TEXT);\
+             CREATE TABLE project(project_id TEXT PRIMARY KEY, absolute_path TEXT, deleted_at INTEGER,\
+                workspace_type TEXT, workspace_status TEXT, single_root_workspace_folder TEXT,\
+                workspace_folders TEXT, project_kind TEXT, work_mode TEXT, domain_version INTEGER);\
+             CREATE TABLE chat_message_task(id INTEGER PRIMARY KEY, message_id TEXT, task_id TEXT,\
+                content TEXT, summary TEXT);",
+        )
+        .unwrap();
+
+        let raw_msg = json!({
+            "mode": HISTORY_MODE,
+            "raw_messages": [{ "role": "assistant", "content": [{ "type": "text", "text": "答复" }] }]
+        })
+        .to_string();
+        // 旧版写的 finish 项：`products` 是 null、`artifact_paths` 整键缺失
+        let bad_task = json!({
+            "task_id": "t1",
+            "messages": [{
+                "id": "pi1",
+                "type": "plan_item",
+                "plan_item": {
+                    "id": "pi1",
+                    "tool_call_info": {
+                        "name": "finish",
+                        "params": { "summary": "答复" },
+                        "result": { "status": "success", "error_message": "",
+                                    "data": { "summary": "", "products": Value::Null } }
+                    }
+                }
+            }]
+        })
+        .to_string();
+        // 空壳 turn_record：五个字符串全 ""、两个数字为 0（导入器的产物）
+        let turn_ctx = json!({
+            "chat_start_time": 1791114394000_i64,
+            "chat_end_time": 1791114410000_i64,
+            "turn_record": {
+                "task_id": "",
+                "agent_run_id": "",
+                "message_index": 0,
+                "chat_start_time": 0,
+                "trace_id": "",
+                "turn_type": "",
+                "root_turn_id": "",
+                "user_message_context": {}
+            }
+        })
+        .to_string();
+
+        c.execute("INSERT INTO project VALUES('p1','d:\\htw\\签到',NULL,'single_root','virtual',\
+                   'd:\\htw\\签到','[]','workspace','work',2)", [])
+            .unwrap();
+        c.execute("INSERT INTO chat_session VALUES('s1','p1','{}')", [])
+            .unwrap();
+        c.execute("INSERT INTO chat_turn VALUES(1,'s1','T1','A1','B1',?1)", params![turn_ctx])
+            .unwrap();
+        c.execute("INSERT INTO chat_message VALUES(1,'s1','A1','user',1),(2,'s1','B1','task',2)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO history_v2 VALUES(1,'hv1','s1','B1',?1,10,'','{}',0,0,0,'',100,'llm_default',\
+             'solo_agent','run-1',0)",
+            params![raw_msg],
+        )
+        .unwrap();
+        // 镜像完好（命中 history_v2），只有 task_id 是自造的 `task:` 前缀
+        c.execute(
+            "INSERT INTO server_history_info VALUES('hv1','hv1','s1','A1','task:T1','run-1',\
+             NULL,?1,0,'',100,100,'llm_default',NULL,'solo_agent','',0,NULL,'server',0,0,'','')",
+            params![raw_msg],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chat_message_task VALUES(1,'B1','t1',?1,'')",
+            params![bad_task],
+        )
+        .unwrap();
+
+        let n = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(n["turns"], 1, "空壳 turn_record 必须被清掉");
+        assert_eq!(n["mirror_sessions"], 0, "镜像本身是好的，不该整条重建");
+        assert_eq!(n["mirror_task_ids"], 1, "`task:` 前缀要归一成 UUID");
+        assert_eq!(n["task_data"], 1, "finish 项的 data 形状必须被修");
+
+        // finish 项的 products 必须是对象、artifact_paths 必须是数组
+        let fixed: String = c
+            .query_row("SELECT content FROM chat_message_task WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let fv: Value = serde_json::from_str(&fixed).unwrap();
+        let data = fv
+            .pointer("/messages/0/plan_item/tool_call_info/result/data")
+            .expect("data");
+        assert!(data.get("products").map(Value::is_object).unwrap_or(false), "实际 {fixed}");
+        assert!(data.get("artifact_paths").map(Value::is_array).unwrap_or(false), "实际 {fixed}");
+
+        let ctx: String = c
+            .query_row("SELECT context FROM chat_turn WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert!(
+            v.get("turn_record").is_none(),
+            "空壳 turn_record 必须删掉（缺键安全，空壳致命），实际 {ctx}"
+        );
+
+        let tid: String = c
+            .query_row("SELECT task_id FROM server_history_info WHERE conversation_id='s1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            tid.len() == 36 && tid.matches('-').count() == 4,
+            "task_id 必须是 UUID，实际 {tid}"
+        );
+
+        // 幂等
+        let again = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(again["turns"], 0);
+        assert_eq!(again["mirror_task_ids"], 0);
     }
 
     #[test]

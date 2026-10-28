@@ -292,49 +292,104 @@ pub fn kill_now(names: &[String]) -> (Vec<String>, Vec<String>) {
     seen.sort();
     seen.dedup();
 
+    // 绝不自杀：万一本工具恰好也落在匹配集里（例如以 WorkBuddy.exe 名义跑的
+    // 内嵌 CLI），杀了自己就没法把结果回给界面了。
     let me = std::process::id();
-    let mut errors = Vec::new();
-    for root in tree_roots(&procs) {
-        // 绝不自杀：万一本工具恰好也落在匹配集里（例如以 WorkBuddy.exe 名义跑的
-        // 内嵌 CLI），杀了自己就没法把结果回给界面了。
-        if root.pid == me {
-            continue;
+    let roots: Vec<ProcInfo> = tree_roots(&procs)
+        .into_iter()
+        .filter(|r| r.pid != me)
+        .collect();
+    if roots.is_empty() {
+        return (seen, Vec::new());
+    }
+
+    #[cfg(windows)]
+    {
+        // ⚠️⚠️ **一次 taskkill 打完所有树根**，不要逐 PID 各起一次。
+        // `/F /T` 对命令行上每个 `/PID` 都生效，语义与逐个调用等价；
+        // 但 `taskkill` 每次冷启动要 150–300 ms —— Trae 3.4.9 有二十来个同映像名进程，
+        // 逐个调用会把「等它退出」的整个预算吃光（2026-10-28 实测：一轮还没跑完就到点，
+        // 界面只报「未能退出」，像极了「杀不掉」，实际是「还没杀完」）。
+        let mut args: Vec<String> = vec!["/F".to_string(), "/T".to_string()];
+        for r in &roots {
+            args.push("/PID".into());
+            args.push(r.pid.to_string());
         }
-        #[cfg(windows)]
-        {
-            let args = vec![
-                "/PID".to_string(),
-                root.pid.to_string(),
-                "/T".to_string(),
-                "/F".to_string(),
-            ];
-            match run_cmd("taskkill", &args, std::time::Duration::from_secs(20)) {
-                Some(res) if res.ok() => {}
-                Some(res) => errors.push(format!(
-                    "结束 PID {} 失败（taskkill 返回 {:?}）：{}",
-                    root.pid,
-                    res.code,
-                    res.detail()
-                )),
-                None => errors.push(format!("结束 PID {} 失败：taskkill 未能启动或超时", root.pid)),
+        match run_cmd("taskkill", &args, std::time::Duration::from_secs(20)) {
+            Some(res) if res.ok() => (seen, Vec::new()),
+            Some(res) => {
+                // 合并调用失败时**退回逐个**：只有逐个跑才说得清「哪个 PID、为什么」，
+                // 而失败原因正是排查所需要的（拒绝访问 / 找不到进程 / 无法终止）。
+                let mut errors: Vec<String> = Vec::new();
+                // 「找不到进程」= 合并那一轮已经把它杀掉了，不算失败 ——
+                // 否则复核时满屏「找不到」，把真正的原因（拒绝访问）淹掉。
+                let gone = |s: &str| s.contains("找不到") || s.to_lowercase().contains("not found");
+                for r in &roots {
+                    let a = vec![
+                        "/PID".to_string(),
+                        r.pid.to_string(),
+                        "/T".to_string(),
+                        "/F".to_string(),
+                    ];
+                    match run_cmd("taskkill", &a, std::time::Duration::from_secs(20)) {
+                        Some(x) if x.ok() => {}
+                        Some(x) if gone(&x.detail()) => {}
+                        Some(x) => errors.push(format!(
+                            "结束 PID {} 失败（taskkill 返回 {:?}）：{}",
+                            r.pid,
+                            x.code,
+                            x.detail()
+                        )),
+                        None => errors.push(format!(
+                            "结束 PID {} 失败：taskkill 未能启动或超时",
+                            r.pid
+                        )),
+                    }
+                }
+                if errors.is_empty() {
+                    // 合并调用返回非 0、但逐个复查都成功（或本来就已经没了）⇒
+                    // 只是命令行上某个 PID 在那一瞬间退出过，不算失败。
+                    (seen, Vec::new())
+                } else {
+                    errors.insert(
+                        0,
+                        format!(
+                            "合并结束 {} 个进程失败（taskkill 返回 {:?}）：{}",
+                            roots.len(),
+                            res.code,
+                            res.detail()
+                        ),
+                    );
+                    (seen, errors)
+                }
             }
+            None => (
+                seen,
+                vec![format!(
+                    "结束 {} 个进程失败：taskkill 未能启动或超时",
+                    roots.len()
+                )],
+            ),
         }
-        #[cfg(not(windows))]
-        {
-            let args = vec!["-9".to_string(), root.pid.to_string()];
+    }
+    #[cfg(not(windows))]
+    {
+        let mut errors = Vec::new();
+        for r in &roots {
+            let args = vec!["-9".to_string(), r.pid.to_string()];
             match run_cmd("kill", &args, std::time::Duration::from_secs(20)) {
                 Some(res) if res.ok() => {}
                 Some(res) => errors.push(format!(
                     "结束 PID {} 失败（kill 返回 {:?}）：{}",
-                    root.pid,
+                    r.pid,
                     res.code,
                     res.detail()
                 )),
-                None => errors.push(format!("结束 PID {} 失败：kill 未能启动或超时", root.pid)),
+                None => errors.push(format!("结束 PID {} 失败：kill 未能启动或超时", r.pid)),
             }
         }
+        (seen, errors)
     }
-    (seen, errors)
 }
 
 /// 「结束客户端并确认真的没了」的结果。
