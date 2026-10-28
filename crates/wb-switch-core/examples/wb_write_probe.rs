@@ -68,12 +68,14 @@ fn main() {
         .find(|s| s.id == wb_id)
         .cloned()
         .expect("该 WorkBuddy 会话不在本机列表中");
+    let t_read = std::time::Instant::now();
     let body = load_body(&wb_id).expect("读取 WorkBuddy 会话正文失败");
     println!(
-        "源会话  : 「{}」{} 个回合 / cwd={}",
+        "源会话  : 「{}」{} 个回合 / cwd={}（读正文 {:?}）",
         meta.title,
         body.turns.len(),
-        meta.cwd
+        meta.cwd,
+        t_read.elapsed()
     );
 
     let start = meta.created_at / 1000;
@@ -101,11 +103,13 @@ fn main() {
         println!("        ↑ 正是线上事故的形态：孤儿 run 行（客户端删会话留下的）");
     }
 
+    let t_write = std::time::Instant::now();
     let r = write_session(&conn, "solo-cn", &uid, &meta, &body, &|m| println!("   {m}"));
+    let write_elapsed = t_write.elapsed();
     match &r {
         Ok(s) => println!(
-            "✅ 写入成功：{} 回合 / {} 工具步骤 / {} 消息 / {} history / 清理旧行 {}",
-            s.turns, s.steps, s.messages, s.history_rows, s.skipped_duplicates
+            "✅ 写入成功：{} 回合 / {} 工具步骤 / {} 消息 / {} history / 清理旧行 {}（write_session {:?}）",
+            s.turns, s.steps, s.messages, s.history_rows, s.skipped_duplicates, write_elapsed
         ),
         Err(e) => println!("❌ 写入失败：{e}"),
     }

@@ -37,6 +37,13 @@
 /// 插入的零宽空格。
 const ZWSP: char = '\u{200B}';
 
+/// `@` 规则里「同一段文本还必须出现路径类词根」的判据（小写）。
+///
+/// ⚠️ 用词根不用整词：真机那句是 `Tokens prefixed with @ are paths the user …`
+/// （`@` 后面紧跟的是 `are`，不是 `paths`），按整词紧邻匹配会漏掉（首版单测就是因此挂的）。
+/// 只认这几类，别的词不算 —— 免得把「`@` + 任意单词」都当成风控。
+const PATH_ROOTS: [&str; 4] = ["path", "director", "file", "folder"];
+
 /// 给 `deepseek harness` 之间插一个零宽空格，打断上游的子串匹配。
 ///
 /// 大小写不敏感、容忍中间的空格数量（`deepseek  harness` / `DeepSeek\tHarness`）。
@@ -46,13 +53,18 @@ fn neutralize_text(text: &str) -> Option<String> {
     // ⚠️ 这里只能粗筛 `deepseek`：`deepseek\tharness` / 多空格 都不含带单空格的
     // `deepseek harness`，用精确短语当闸门会把它们漏掉（单测就是因此挂过一次）。
     // 精判交给下面的扫描器，它按「词 + 任意空白 + 词」匹配。
-    if !lower.contains("deepseek") {
+    //
+    // 2026-10-28 起多了一条 `@` 规则，所以没 `deepseek` 时也不能直接返回；
+    // 但 `@` 极少出现，用它当第二道粗筛依然能挡掉近乎全部 system 文本。
+    if !lower.contains("deepseek") && !text.contains('@') {
         return None;
     }
     let mut out = String::with_capacity(text.len() + 8);
     let bytes = text.as_bytes();
     let mut i = 0usize;
     let mut changed = false;
+    // `@` 规则的总闸：既有 `@` 又有路径词根才启用，否则连判断都不做。
+    let at_rule = text.contains('@') && PATH_ROOTS.iter().any(|w| lower.contains(w));
     while i < bytes.len() {
         // 在 `i` 处尝试匹配 `deepseek` + 空白* + `harness`（全部按小写比较）。
         let rest_lower = &lower[i..];
@@ -73,6 +85,28 @@ fn neutralize_text(text: &str) -> Option<String> {
             }
         }
         let ch = text[i..].chars().next().unwrap_or(' ');
+        // ── 规则二：`@` + 空白，且同一段文本里出现路径类词根 ────────────────
+        // 2026-10-28 实测：上游新增了这条规则。dsh 的 system 里这两句（169 字符）
+        // 单独发出就回 400/11128：
+        //   `Tokens prefixed with @ are paths the user explicitly referenced.`
+        //   `Relative paths resolve from the workspace root; absolute paths identify
+        //    files or directories on the host`
+        // 只在 `@` 后插一个零宽空格即 200 通过；把 `paths` 改成单数 `path` 也通过
+        // ⇒ 触发条件是 `@` 与路径词的组合，不是某一句固定文案。
+        if ch == '@' && at_rule {
+            let after_at = i + 1;
+            let tail_orig = &text[after_at..];
+            let ws = tail_orig.len() - tail_orig.trim_start_matches([' ', '\t']).len();
+            // ⚠️ 必须真有空白：`@src/main.rs` / `a@b.com` 这类不含空白的写法要原样
+            // 保留（前者是用户显式引用语法，模型要靠它认文件）。
+            if ws > 0 {
+                out.push('@');
+                out.push(ZWSP);
+                i = after_at;
+                changed = true;
+                continue;
+            }
+        }
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -149,6 +183,32 @@ mod tests {
         }
         let once = neutralize_text("DeepSeek Harness").unwrap();
         assert!(neutralize_text(&once).is_none(), "已中和过就不该再改");
+    }
+
+    /// 2026-10-28 真机实测：`@` + 路径词那两句（169 字符）单独发出即 400/11128；
+    /// 只在 `@` 后插零宽空格就通过。这条必须命中，且同样无损。
+    #[test]
+    fn neutralizes_at_prefixed_path_sentence() {
+        let raw = "Tokens prefixed with @ are paths the user explicitly referenced. \
+                   Relative paths resolve from the workspace root; absolute paths \
+                   identify files or directories on the host";
+        let fixed = neutralize_text(raw).expect("必须命中");
+        assert_eq!(fixed.matches(ZWSP).count(), 1, "只该在 `@` 后插一处：{fixed:?}");
+        assert_eq!(fixed.replace(ZWSP, ""), raw, "去掉零宽空格必须逐字还原");
+        // 插完之后不再有「`@` + 空格 + paths」这个组合。
+        assert!(!fixed.contains("@ are"), "触发组合还在：{fixed:?}");
+    }
+
+    /// `@` 引用语法（无空格）必须原样保留 —— 模型要靠它认用户指的是哪个文件。
+    #[test]
+    fn keeps_at_reference_syntax_intact() {
+        for raw in [
+            "see @src/main.rs for details",
+            "open @C:/work/report.xlsx now",
+            "mail me at a@b.com",
+        ] {
+            assert!(neutralize_text(raw).is_none(), "不该动：{raw:?}");
+        }
     }
 
     /// 不含该短语的文本一个字都不许改（这是「无损」的底线）。
