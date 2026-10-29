@@ -4545,9 +4545,10 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 6,
-            "护栏失效或写路径数量变了：只扫到 {checked} 处「会毁掉 WAL」的写路径，预期 6 处\
-             （删除 / 自愈 / 复制 / 同步 / 回写 / WorkBuddy 导入）。\
+            checked, 9,
+            "护栏失效或写路径数量变了：只扫到 {checked} 处「会毁掉 WAL」的写路径，预期 9 处\
+             （删除 / 会话编辑 / WorkBuddy 导入 / Trae 导入 / 会话复制 / 分组同步 / \
+               项目修复 heal_session_projects / token 修复 heal_zero_token_usage / 通用写 apply_sql）。\
              新增写路径请一起加进来，别让护栏悄悄漏掉它。"
         );
     }

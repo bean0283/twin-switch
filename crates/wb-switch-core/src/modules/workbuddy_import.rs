@@ -1211,17 +1211,6 @@ fn turn_record_incomplete(v: &Value) -> bool {
         && positive("chat_start_time"))
 }
 
-/// 列出表的列名（表不存在时返回空）。
-fn cols_of(conn: &Connection, table: &str) -> Vec<String> {
-    let Ok(mut st) = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) else {
-        return Vec::new();
-    };
-    let Ok(it) = st.query_map([], |r| r.get::<_, String>(1)) else {
-        return Vec::new();
-    };
-    it.filter_map(Result::ok).collect()
-}
-
 pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Value, String> {
     let mut turns_fixed = 0usize;
     let mut projects_fixed = 0usize;
