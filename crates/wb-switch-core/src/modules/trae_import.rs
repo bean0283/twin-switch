@@ -1237,6 +1237,22 @@ fn copy_session(
                     }
                 }
                 n += out.len();
+                // 新版 lite 引擎按固定结构反序列化 `chat_turn.context`，旧版 SOLO 写进去的
+                // `context_usage`（值形如 `{"contexts":[]}`）会让整条会话在 `chat.getMessages`
+                // 里返回 995001「failed to load messages」。复制过来的行必须就地清掉这个键，
+                // 否则「导入成功但点开就报错」。
+                if let Ok(k) = dst.execute(
+                    "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
+                     WHERE session_id=?1 AND json_valid(context) \
+                       AND json_extract(context,'$.context_usage') IS NOT NULL",
+                    params![out_sid],
+                ) {
+                    if k > 0 {
+                        if let Some(log) = on_log {
+                            log(&format!("   已清理 {k} 条轮次里旧版遗留的 context_usage（会导致会话打不开）"));
+                        }
+                    }
+                }
                 if !turn_map.is_empty() {
                     let mut up = dst
                         .prepare("UPDATE chat_session SET last_unread_turn_id=? WHERE session_id=? AND last_unread_turn_id=?")
@@ -2132,6 +2148,1327 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
         "backup_mode": backup_mode,
         "relaunched": relaunched,
         "note": "已把副本的工程归属对齐到其真实账号的项目；客户端里现在应当能正常删除了",
+    }))
+}
+
+/// 用模板补齐 `ours` 里缺失的键（递归）。
+///
+/// 用途：lite 把这些 JSON 解析成**固定结构体**，缺字段会整条反序列化失败。
+/// 我们的 `model_info` 只有 12 个字段，原生有 29 个（`prompt_set` / `application_config` /
+/// `context_window_sizes` …），因此按原生模板把缺的补成「类型正确的空值」。
+fn fill_missing(ours: &mut Value, tmpl: &Value) {
+    match (ours, tmpl) {
+        (Value::Object(o), Value::Object(t)) => {
+            for (k, tv) in t.iter() {
+                match o.get_mut(k) {
+                    Some(ov) => fill_missing(ov, tv),
+                    None => {
+                        o.insert(k.clone(), default_like(tv));
+                    }
+                }
+            }
+        }
+        (Value::Array(a), Value::Array(t)) => {
+            if let Some(t0) = t.first() {
+                for it in a.iter_mut() {
+                    fill_missing(it, t0);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 按模板值的类型造一个空值（bool→false，number→0，string→""，array→[]，
+/// object→递归造空对象）。**不复制模板的业务值**，避免把别的会话的路径/ID 带进来。
+fn default_like(t: &Value) -> Value {
+    match t {
+        Value::Object(_) => {
+            let mut v = json!({});
+            fill_missing(&mut v, t);
+            v
+        }
+        Value::Array(_) => json!([]),
+        Value::Bool(_) => json!(false),
+        Value::Number(n) => {
+            if n.is_f64() {
+                json!(0.0)
+            } else {
+                json!(0)
+            }
+        }
+        Value::String(_) => json!(""),
+        Value::Null => Value::Null,
+    }
+}
+
+/// 估算一行历史要占多少 token —— 只用于把「导入时写成 0」的列填成合理值。
+///
+/// 取 JSON 里所有字符串的字符数 × 0.75（中文约 1 字 1 token、英文约 4 字符 1 token 的折中），
+/// 下限 8，保证不会又写成 0。**这是估算，不是真实用量**：WorkBuddy 的 `WbTurn` 里没有 usage，
+/// 真实值在源数据里就不存在。
+fn estimate_row_tokens(messages_json: &str) -> i64 {
+    fn walk(v: &Value, acc: &mut usize) {
+        match v {
+            Value::String(s) => *acc += s.chars().count(),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, acc)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, acc)),
+            _ => {}
+        }
+    }
+    let mut chars = 0usize;
+    if let Ok(v) = serde_json::from_str::<Value>(messages_json) {
+        walk(&v, &mut chars);
+    }
+    (((chars as f64) * 0.75) as i64).max(8)
+}
+
+/// 修复「导入时漏写必需字段」的会话（当前两项：`token_usage` 与
+/// `important_user_message_prompt_section`）。
+///
+/// ## 为什么需要
+/// 这类会话在客户端点开只有「由于网络原因，会话加载失败，请刷新页面」——但那是**误导文案**：
+/// 本地 lite 服务的 `lite.get_messages` 传输成功（`executeRequest success`），返回的是业务错误
+/// `bizCode=995001 / message=failed to load messages`，即服务端读库/构造响应失败。
+///
+/// ## 实测证据（本机 135 个会话，2026-10-29）
+/// - `token_usage` 全为 0 的会话：**2 个**
+/// - 打不开的会话：**同样这 2 个**（零误报、零漏报）
+/// - 对照：`打包飞牛应用FPK文件` 同样用过 WebSearch，但有真实用量 ⇒ 能正常打开，
+///   因此排除「工具调用形态」「mode 缺键」这两条此前的假设
+/// - 这 2 个会话的 `chat_message.id` 是全库最大 ⇒ 最近一次导入写进去的
+///
+/// 根因在导入器：写 `history_v2` 时 `token_usage` 被硬编码成 `0`。
+///
+/// ## 写什么值
+/// 见 [`estimate_row_tokens`] —— 估算值，不是真实用量。
+pub fn heal_zero_token_usage(
+    client_key: &str,
+    on_log: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    let Some(client) = get_client(client_key) else {
+        return Err(format!("未知客户端: {client_key}"));
+    };
+    let live = database_path(client);
+
+    // 1) 密钥 + 结束客户端（文件替换前提，且避免它在替换期间把旧页写回 WAL）
+    let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
+    log("结束客户端进程（文件替换前提）…");
+    let was_running;
+    match stop_for_maintenance(client, 20_000) {
+        Ok(MaintenanceStop::NotRunning) => was_running = false,
+        Ok(MaintenanceStop::NoOwnProgram) => {
+            was_running = false;
+            log(&format!(
+                "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+                client.label
+            ));
+        }
+        Ok(MaintenanceStop::Stopped(n)) => {
+            was_running = true;
+            if n > 0 {
+                log(&format!("已结束 {n} 个进程"));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    // 2) 实时库 → 明文副本（含 WAL 合并；否则回写后会丢掉客户端刚写入的内容）
+    let work = store_dir()
+        .join("trae")
+        .join("usage_heal_tmp")
+        .join(format!("{client_key}-{}", chrono::Local::now().timestamp()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("创建工作目录失败：{e}"))?;
+    let orig_plain = work.join("live-orig.db");
+    log("解密实时库为明文副本…");
+    let rep = decrypt_database(&live, &enc_key_hex, &orig_plain, Some(&|m| log(&format!("   {m}"))))?;
+    log(&format!("实时库 {} 页", rep.pages));
+    patch_reserved_field(&orig_plain)?;
+    let plain = work.join("live-plain.db");
+    std::fs::copy(&orig_plain, &plain).map_err(|e| format!("复制明文副本失败：{e}"))?;
+    patch_reserved_field(&plain)?;
+    merge_live_wal_into(&plain, &live, &enc_key_hex, &|m| log(m))?;
+
+    // 3) 把 token_usage=0 的行填成估算值
+    let (fixed_hist, fixed_srv, fixed_others, sessions) = {
+        let conn = Connection::open(&plain).map_err(|e| format!("打开明文副本失败：{e}"))?;
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT history_v2_id, session_id, ifnull(messages,'') FROM history_v2 \
+                     WHERE ifnull(token_usage, 0) = 0",
+                )
+                .map_err(|e| format!("查询零用量行失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("查询零用量行失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取零用量行失败：{e}"))?
+        };
+        log(&format!("待修的零用量历史行：{} 行", rows.len()));
+
+        let mut fixed_hist = 0usize;
+        let mut fixed_srv = 0usize;
+        let mut sessions: Vec<String> = Vec::new();
+        for (hid, sid, msgs) in &rows {
+            let est = estimate_row_tokens(msgs);
+            conn.execute(
+                "UPDATE history_v2 SET token_usage = ?1 WHERE history_v2_id = ?2",
+                params![est, hid],
+            )
+            .map_err(|e| format!("更新 history_v2 失败：{e}"))?;
+            fixed_hist += 1;
+            if !sessions.contains(sid) {
+                sessions.push(sid.clone());
+            }
+            // 镜像表同步（老库可能没这两列，失败不影响主修复）
+            if conn
+                .execute(
+                    "UPDATE server_history_info SET token_usage = ?1, item_token_usage = ?1 \
+                     WHERE history_id = ?2",
+                    params![est, hid],
+                )
+                .is_ok()
+            {
+                fixed_srv += 1;
+            }
+        }
+        // 2b) 补 `important_user_message_prompt_section`。
+        //
+        // 只对「整条会话一条都没有」的会话补：实测 133 个能打开的会话里 119 个是
+        // 「部分行有」，说明它按行可选；但整会话一条都没有时 lite 会直接失败。
+        let mut fixed_ps = 0usize;
+        let bare: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id FROM history_v2 GROUP BY session_id                      HAVING SUM(CASE WHEN messages LIKE '%important_user_message_prompt_section%' \
+                                     THEN 1 ELSE 0 END) = 0",
+                )
+                .map_err(|e| format!("查询缺段会话失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("查询缺段会话失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取缺段会话失败：{e}"))?
+        };
+        for sid in &bare {
+            let targets: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT history_v2_id, ifnull(messages,'') FROM history_v2                          WHERE session_id = ?1 AND ifnull(content_source,'') = 'user_input'",
+                    )
+                    .map_err(|e| format!("查询用户行失败：{e}"))?;
+                let mapped = stmt
+                    .query_map(params![sid], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("查询用户行失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取用户行失败：{e}"))?
+            };
+            for (hid, msgs) in targets {
+                let Ok(mut v) = serde_json::from_str::<Value>(&msgs) else { continue };
+                if v.get("important_user_message_prompt_section").is_some() {
+                    continue;
+                }
+                v["important_user_message_prompt_section"] = json!({
+                    "original_user_input": "",
+                    "must_keep_rules": Value::Null,
+                    "response_rules": Value::Null,
+                    "parent_agent_instruction": Value::Null
+                });
+                conn.execute(
+                    "UPDATE history_v2 SET messages = ?1 WHERE history_v2_id = ?2",
+                    params![v.to_string(), hid],
+                )
+                .map_err(|e| format!("补 prompt_section 失败：{e}"))?;
+                fixed_ps += 1;
+            }
+            if !sessions.contains(sid) {
+                sessions.push(sid.clone());
+            }
+        }
+        log(&format!("补 important_user_message_prompt_section：{fixed_ps} 行 / {} 个会话", bare.len()));
+
+        // 2c) 补 `content[]` 的三个可选键（image_url / video_url / cache_control）。
+        //
+        // 原生行 100% 都带这三个（值 null）；我们的行只有 type/text ⇒ `LiteMessagePart`
+        // 解码失败 ⇒ 整条会话「加载失败」。用 SQL 先筛掉已经带的行，避免全表反序列化。
+        let mut fixed_parts = 0usize;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT history_v2_id, ifnull(messages,'') FROM history_v2 \
+                     WHERE messages NOT LIKE '%image_url%' AND messages LIKE '%raw_messages%'",
+                )
+                .map_err(|e| format!("查询缺键行失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| format!("查询缺键行失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取缺键行失败：{e}"))?
+        };
+        for (hid, msgs) in rows {
+            let Ok(mut v) = serde_json::from_str::<Value>(&msgs) else { continue };
+            let mut changed = false;
+            if let Some(arr) = v.get_mut("raw_messages").and_then(Value::as_array_mut) {
+                for m in arr.iter_mut() {
+                    let Some(mo) = m.as_object_mut() else { continue };
+                    for k in ["content", "extra_info", "name", "role", "tool_call_id", "tool_calls"] {
+                        if !mo.contains_key(k) {
+                            mo.insert(k.into(), Value::Null);
+                            changed = true;
+                        }
+                    }
+                    if let Some(parts) = mo.get_mut("content").and_then(Value::as_array_mut) {
+                        for c in parts.iter_mut() {
+                            let Some(co) = c.as_object_mut() else { continue };
+                            for k in ["image_url", "video_url", "cache_control"] {
+                                if !co.contains_key(k) {
+                                    co.insert(k.into(), Value::Null);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if changed {
+                conn.execute(
+                    "UPDATE history_v2 SET messages = ?1 WHERE history_v2_id = ?2",
+                    params![v.to_string(), hid],
+                )
+                .map_err(|e| format!("补 content 键失败：{e}"))?;
+                fixed_parts += 1;
+            }
+        }
+        log(&format!("补 content 三键：{fixed_parts} 行"));
+
+        // 2d) 给 `chat_message_task.content` 补 `user_message_id`。
+        //
+        // 原生 task.content 顶层有 `{task_id, user_message_id, messages}`；我们只写了
+        // `task_id + messages`。取该助手消息的 `reply_to_message_id` 即本回合的用户消息。
+        let mut fixed_task = 0usize;
+        let tasks: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.message_id, ifnull(t.content,''), ifnull(m.reply_to_message_id,'') \
+                     FROM chat_message_task t JOIN chat_message m ON m.message_id = t.message_id \
+                     WHERE ifnull(t.content,'') NOT LIKE '%user_message_id%'",
+                )
+                .map_err(|e| format!("查询 task 失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("查询 task 失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取 task 失败：{e}"))?
+        };
+        for (mid, content, user_mid) in tasks {
+            let Ok(mut v) = serde_json::from_str::<Value>(&content) else { continue };
+            if v.get("user_message_id").is_some() || user_mid.is_empty() {
+                continue;
+            }
+            v["user_message_id"] = json!(user_mid);
+            conn.execute(
+                "UPDATE chat_message_task SET content = ?1 WHERE message_id = ?2",
+                params![v.to_string(), mid],
+            )
+            .map_err(|e| format!("补 user_message_id 失败：{e}"))?;
+            fixed_task += 1;
+        }
+        log(&format!("补 task.user_message_id：{fixed_task} 行"));
+
+        // 2e) 用原生模板补齐 `user_message_context.model_info` 的缺失字段。
+        //
+        // 我们的导入行是「自定义 OpenAI 兼容 + 本机网关地址」，只有 12 个字段；
+        // 原生是预置模型，有 29 个（prompt_set / application_config / context_window_sizes …）。
+        // lite 把这个 JSON 解析成固定结构体，缺字段 ⇒ 整条会话加载失败。
+        let tmpl_model_info: Option<Value> = {
+            let sql = "SELECT user_message_context FROM chat_message \
+                       WHERE message_type='general' \
+                         AND user_message_context LIKE '%application_config%' LIMIT 1";
+            let raw: Option<String> = conn.query_row(sql, [], |r| r.get::<_, String>(0)).ok();
+            raw.and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| v.get("model_info").cloned())
+        };
+
+        let mut fixed_mi = 0usize;
+        if let Some(tmpl) = tmpl_model_info {
+            // a) chat_message.user_message_context
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT message_id, user_message_context FROM chat_message                          WHERE ifnull(user_message_context,'') <> ''                            AND user_message_context NOT LIKE '%application_config%'",
+                    )
+                    .map_err(|e| format!("查询 umc 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("查询 umc 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 umc 失败：{e}"))?
+            };
+            for (mid, umc) in rows {
+                let Ok(mut v) = serde_json::from_str::<Value>(&umc) else { continue };
+                let Some(mi) = v.get_mut("model_info") else { continue };
+                fill_missing(mi, &tmpl);
+                conn.execute(
+                    "UPDATE chat_message SET user_message_context = ?1 WHERE message_id = ?2",
+                    params![v.to_string(), mid],
+                )
+                .map_err(|e| format!("补 model_info 失败：{e}"))?;
+                fixed_mi += 1;
+            }
+
+            // b) chat_turn.context.persist_user_message_context.model_info
+            let turns: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT turn_id, context FROM chat_turn                          WHERE ifnull(context,'') LIKE '%persist_user_message_context%'                            AND context NOT LIKE '%application_config%'",
+                    )
+                    .map_err(|e| format!("查询 turn context 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("查询 turn context 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 turn context 失败：{e}"))?
+            };
+            for (tid, ctx) in turns {
+                let Ok(mut v) = serde_json::from_str::<Value>(&ctx) else { continue };
+                let mut changed = false;
+                if let Some(mi) = v
+                    .get_mut("persist_user_message_context")
+                    .and_then(|p| p.get_mut("model_info"))
+                {
+                    fill_missing(mi, &tmpl);
+                    changed = true;
+                }
+                if changed {
+                    conn.execute(
+                        "UPDATE chat_turn SET context = ?1 WHERE turn_id = ?2",
+                        params![v.to_string(), tid],
+                    )
+                    .map_err(|e| format!("补 turn model_info 失败：{e}"))?;
+                    fixed_mi += 1;
+                }
+            }
+        }
+        log(&format!("补 model_info 缺失字段：{fixed_mi} 行"));
+
+        // 2f) 用原生模板补齐 `chat_message_task.content` 的结构（plan_item.confirm_info 等）。
+        let mut fixed_task_struct = 0usize;
+        let tmpl_task: Option<Value> = {
+            let sql = "SELECT c.content FROM chat_message_task c \
+                       JOIN chat_message m ON m.message_id = c.message_id \
+                       WHERE c.content LIKE '%plan_item%' \
+                       ORDER BY length(c.content) DESC LIMIT 1";
+            let raw: Option<String> = conn.query_row(sql, [], |r| r.get::<_, String>(0)).ok();
+            raw.and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        };
+        if let Some(tmpl) = tmpl_task {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT message_id, ifnull(content,'') FROM chat_message_task \
+                         WHERE ifnull(content,'') LIKE '%plan_item%' \
+                           AND content NOT LIKE '%already_emitted_run_event%'",
+                    )
+                    .map_err(|e| format!("查询 task.content 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("查询 task.content 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 task.content 失败：{e}"))?
+            };
+            for (mid, content) in rows {
+                let Ok(mut v) = serde_json::from_str::<Value>(&content) else { continue };
+                fill_missing(&mut v, &tmpl);
+                conn.execute(
+                    "UPDATE chat_message_task SET content = ?1 WHERE message_id = ?2",
+                    params![v.to_string(), mid],
+                )
+                .map_err(|e| format!("补 task 结构失败：{e}"))?;
+                fixed_task_struct += 1;
+            }
+        }
+        log(&format!("补 task.content 结构：{fixed_task_struct} 行"));
+
+        // 2g) 用原生模板补齐 `chat_turn.context` 的结构（render_context / metadata 等）。
+        let mut fixed_ctx_struct = 0usize;
+        let tmpl_ctx: Option<Value> = {
+            let sql = "SELECT context FROM chat_turn \
+                       WHERE context LIKE '%persist_user_message_context%' \
+                       ORDER BY length(context) DESC LIMIT 1";
+            let raw: Option<String> = conn.query_row(sql, [], |r| r.get::<_, String>(0)).ok();
+            raw.and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        };
+        if let Some(tmpl) = tmpl_ctx {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT turn_id, ifnull(context,'') FROM chat_turn \
+                         WHERE ifnull(context,'') <> '' \
+                           AND context NOT LIKE '%hash_code_browser_selections%'",
+                    )
+                    .map_err(|e| format!("查询 turn 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| format!("查询 turn 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 turn 失败：{e}"))?
+            };
+            for (tid, ctx) in rows {
+                let Ok(mut v) = serde_json::from_str::<Value>(&ctx) else { continue };
+                fill_missing(&mut v, &tmpl);
+                conn.execute(
+                    "UPDATE chat_turn SET context = ?1 WHERE turn_id = ?2",
+                    params![v.to_string(), tid],
+                )
+                .map_err(|e| format!("补 turn 结构失败：{e}"))?;
+                fixed_ctx_struct += 1;
+            }
+        }
+        log(&format!("补 turn.context 结构：{fixed_ctx_struct} 行"));
+
+        // 2h) 用「已知能打开的导入会话」做模板，按 content_source 分组强制补结构。
+        //
+        // 教训：上一版模板取的是「含 confirm_info 的第一条」，但那条的 messages[0]
+        // 往往不是 plan_item，递归补不进去，等于白跑。这里改成：
+        //   - 模板候选只从**能打开的会话**里选（排除 `{"mode"` 开头的、我们写的行）
+        //   - 每个 content_source 取**路径最多**的那条当模板（最富的一条）
+        let mut fixed_rich = 0usize;
+        let groups: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT content_source FROM history_v2 \
+                     WHERE messages LIKE '{\"mode\"%' AND ifnull(content_source,'') <> ''",
+                )
+                .map_err(|e| format!("查询分组失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("查询分组失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取分组失败：{e}"))?
+        };
+        for cs in groups {
+            // 选模板：同 content_source、不是我们写的行、JSON 最长（最富）
+            let tmpl_sql = "SELECT messages FROM history_v2 \
+                            WHERE content_source = ?1 \
+                              AND messages NOT LIKE '{\"mode\"%' \
+                            ORDER BY length(messages) DESC LIMIT 1";
+            let tmpl: Option<Value> = conn
+                .query_row(tmpl_sql, params![cs], |r| r.get::<_, String>(0))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            let Some(tmpl) = tmpl else { continue };
+
+            let rows: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT history_v2_id, messages FROM history_v2 \
+                         WHERE content_source = ?1 AND messages LIKE '{\"mode\"%'",
+                    )
+                    .map_err(|e| format!("查询行失败：{e}"))?;
+                let mapped = stmt
+                    .query_map(params![cs], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("查询行失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取行失败：{e}"))?
+            };
+            for (hid, msgs) in rows {
+                let Ok(mut v) = serde_json::from_str::<Value>(&msgs) else { continue };
+                let before = v.to_string().len();
+                fill_missing(&mut v, &tmpl);
+                if v.to_string().len() != before {
+                    conn.execute(
+                        "UPDATE history_v2 SET messages = ?1 WHERE history_v2_id = ?2",
+                        params![v.to_string(), hid],
+                    )
+                    .map_err(|e| format!("补富结构失败：{e}"))?;
+                    fixed_rich += 1;
+                }
+            }
+        }
+        log(&format!("按 content_source 补富结构：{fixed_rich} 行"));
+
+        // 2i) 诊断开关：把指定会话的 history_v2.messages 重写成「我们导入器的格式」。
+        //
+        // 用法：先克隆一条能打开的原生会话，再对它设置 TWIN_MUTATE_SID=该会话id 跑一次。
+        // 如果克隆体因此打不开 ⇒ 问题就在 messages 的格式上；仍能打开 ⇒ 格式没问题，
+        // 该去查 chat_message / chat_message_task / chat_turn 三张表。
+        let mut mutated = 0usize;
+        if let Ok(target) = std::env::var("TWIN_MUTATE_SID") {
+            let target = target.trim().to_string();
+            if !target.is_empty() {
+                let rows: Vec<(String, String)> = {
+                    let mut stmt = conn
+                        .prepare("SELECT history_v2_id, ifnull(messages,'') FROM history_v2 WHERE session_id = ?1")
+                        .map_err(|e| format!("查询待改行失败：{e}"))?;
+                    let mapped = stmt
+                        .query_map(params![target], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| format!("查询待改行失败：{e}"))?;
+                    mapped
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| format!("读取待改行失败：{e}"))?
+                };
+                for (hid, msgs) in rows {
+                    let Ok(v) = serde_json::from_str::<Value>(&msgs) else { continue };
+                    let mut rebuilt = Vec::new();
+                    for m in v.get("raw_messages").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        let role = m.get("role").and_then(Value::as_str).unwrap_or("assistant");
+                        let text = m
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .and_then(|a| a.first())
+                            .and_then(|c| c.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let mut one = serde_json::json!({
+                            "role": role,
+                            "content": [{
+                                "type": "text",
+                                "text": text,
+                                "image_url": Value::Null,
+                                "video_url": Value::Null,
+                                "cache_control": Value::Null
+                            }],
+                            "name": m.get("name").cloned().unwrap_or(Value::Null),
+                            "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                            "tool_calls": m.get("tool_calls").cloned().unwrap_or(Value::Null),
+                            "extra_info": Value::Null
+                        });
+                        if role == "user" {
+                            // 保持我们导入器的写法：用户的 content 只有 type/text
+                            one["content"] = serde_json::json!([{ "type": "text", "text": text }]);
+                        }
+                        rebuilt.push(one);
+                    }
+                    let mut out = serde_json::json!({
+                        "mode": "FunctionCall",
+                        "raw_messages": rebuilt
+                    });
+                    if let Some(arr) = out["raw_messages"].as_array() {
+                        if arr.iter().any(|x| x.get("role").and_then(Value::as_str) == Some("user")) {
+                            out["important_user_message_prompt_section"] = serde_json::json!({
+                                "original_user_input": "",
+                                "must_keep_rules": Value::Null,
+                                "response_rules": Value::Null,
+                                "parent_agent_instruction": Value::Null
+                            });
+                        }
+                    }
+                    conn.execute(
+                        "UPDATE history_v2 SET messages = ?1 WHERE history_v2_id = ?2",
+                        params![out.to_string(), hid],
+                    )
+                    .map_err(|e| format!("改写 messages 失败：{e}"))?;
+                    mutated += 1;
+                }
+                log(&format!("诊断：已把 {target} 的 {mutated} 行 messages 改写为导入器格式"));
+            }
+        }
+
+        // 2j) 清掉 `chat_turn.context.context_usage`（会话「打不开」的真正元凶）。
+        //
+        // 新版 lite 引擎按固定结构反序列化 turn.context；旧版 SOLO 时代写进去的
+        // `context_usage`（`{"contexts":[]}`）多出来就会让整个 `chat.getMessages` 返回
+        // 995001「failed to load messages」。2026-10-29 用克隆二分验证：只删这一个键，
+        // 原本打不开的会话立刻恢复。这条修复与导入无关，是升级后的兼容性清理。
+        let mut fixed_ctxu = 0usize;
+        if let Ok(k) = conn.execute(
+            "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
+             WHERE json_valid(context) AND json_extract(context,'$.context_usage') IS NOT NULL",
+            [],
+        ) {
+            fixed_ctxu = k;
+            if k > 0 {
+                log(&format!("清理旧版遗留 context_usage：{k} 条轮次"));
+            }
+        }
+
+        conn.close().map_err(|(_, e)| format!("关闭明文副本失败：{e}"))?;
+        (
+            fixed_hist,
+            fixed_srv,
+            fixed_ps
+                + fixed_parts
+                + fixed_task
+                + fixed_mi
+                + fixed_task_struct
+                + fixed_ctx_struct
+                + fixed_rich
+                + fixed_ctxu,
+            sessions,
+        )
+    };
+
+    if fixed_hist == 0 && fixed_others == 0 {
+        let _ = std::fs::remove_dir_all(&work);
+        log("没有需要补的历史行，库未改动");
+        if was_running {
+            let _ = launch(client_key);
+        }
+        return Ok(json!({
+            "checked": true,
+            "fixed_rows": 0,
+            "fixed_server_rows": 0,
+            "fixed_others": 0,
+            "sessions": [],
+            "relaunched": was_running,
+            "note": "所有历史行都已有 token_usage 与 prompt_section，无需修复",
+        }));
+    }
+
+    // 4) 增量加密回写 → 备份 → 原子替换（与其它写路径同一出口）
+    let new_db = work.join("live-new.db");
+    log("增量加密回写（只重写变动页）…");
+    let stats = write_db_incremental_with(
+        &enc_key_hex,
+        &live,
+        Some(&orig_plain),
+        &plain,
+        &new_db,
+        Some(&|m| log(&format!("   {m}"))),
+    )?;
+    log(&format!(
+        "回写完成：全库 {} 页，仅重写 {} 页（{:.2} MB）",
+        stats.pages,
+        stats.changed_pages,
+        stats.changed_bytes as f64 / 1_048_576.0
+    ));
+
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup = bdir.join(crate::modules::trae_backup::entry_name(
+        client_key,
+        "heal",
+        &crate::modules::trae_backup::new_stamp(),
+    ));
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &live,
+            &new_db,
+            &backup,
+            client_key,
+            "heal",
+            "补 token 用量前的整库备份",
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止写入：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
+    };
+    {
+        let (n, freed) = crate::modules::trae_export::prune_with_policy(&bdir);
+        if n > 0 {
+            log(&format!(
+                "已清理 {n} 个旧备份，回收 {:.1} MB（按设置里的整库备份保留策略）",
+                freed as f64 / 1_048_576.0
+            ));
+        }
+    }
+
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(format!("替换实时库失败（原库未被改动）：{e}"));
+    }
+    let _ = std::fs::remove_file(format!("{}-shm", live.to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&work);
+
+    // 5) 刷新解密快照
+    let _ = std::fs::remove_file(decrypted_db_path(client_key));
+    let _ = std::fs::remove_file(crate::modules::trae_export::snapshot_meta_path(client_key));
+
+    // 6) 重启客户端
+    let mut relaunched = false;
+    if was_running {
+        match launch(client_key) {
+            Ok(_) => relaunched = true,
+            Err(e) => log(&format!("重启客户端失败（请手动启动）：{e}")),
+        }
+    }
+
+    match backup_mode.as_str() {
+        "skipped" => log(&format!(
+            "已补 {fixed_hist} 行 token_usage（未备份：设置里已关闭「写库前整库备份」）"
+        )),
+        _ => log(&format!(
+            "已补 {fixed_hist} 行 token_usage（备份在 {}）",
+            backup.display()
+        )),
+    }
+    Ok(json!({
+        "checked": true,
+        "fixed_rows": fixed_hist,
+        "fixed_server_rows": fixed_srv,
+        "fixed_others": fixed_others,
+        "sessions": sessions,
+        "backup": if backup_mode == "skipped" { Value::Null } else { json!(backup.to_string_lossy()) },
+        "backup_mode": backup_mode,
+        "relaunched": relaunched,
+        "note": "已补 token_usage 与 prompt_section；客户端里那几条会话应当能打开了",
+    }))
+}
+
+/// 维护通道：对实时库执行一批 SQL（解密 → 执行 → 增量加密回写）。
+///
+/// 与 `heal_zero_token_usage` 走同一出口：结束客户端 → 解密合并 WAL → 执行 SQL →
+/// 备份 → 增量回写 → 原子替换 → 重启客户端。用于归属修正、批量清理等一次性运维，
+/// 避免为了改一行数据再发一版 GUI。
+pub fn apply_sql(
+    client_key: &str,
+    statements: &[String],
+    on_log: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    if statements.is_empty() {
+        return Err("没有要执行的 SQL".into());
+    }
+    let Some(client) = get_client(client_key) else {
+        return Err(format!("未知客户端: {client_key}"));
+    };
+    let live = database_path(client);
+    let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
+
+    log("结束客户端进程…");
+    let was_running = match stop_for_maintenance(client, 20_000) {
+        Ok(MaintenanceStop::Stopped(n)) => {
+            if n > 0 {
+                log(&format!("已结束 {n} 个进程"));
+            }
+            true
+        }
+        Ok(MaintenanceStop::NotRunning) => false,
+        Ok(MaintenanceStop::NoOwnProgram) => false,
+        Err(e) => return Err(e),
+    };
+
+    let work = store_dir()
+        .join("trae")
+        .join("sql_tmp")
+        .join(format!("{client_key}-{}", chrono::Local::now().timestamp()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("创建工作目录失败：{e}"))?;
+    let orig_plain = work.join("live-orig.db");
+    log("解密实时库…");
+    let rep = decrypt_database(&live, &enc_key_hex, &orig_plain, None)?;
+    patch_reserved_field(&orig_plain)?;
+    let plain = work.join("live-plain.db");
+    std::fs::copy(&orig_plain, &plain).map_err(|e| format!("复制明文副本失败：{e}"))?;
+    patch_reserved_field(&plain)?;
+    merge_live_wal_into(&plain, &live, &enc_key_hex, &|m| log(m))?;
+
+    let mut affected = Vec::new();
+    {
+        let conn = Connection::open(&plain).map_err(|e| format!("打开明文副本失败：{e}"))?;
+        for (i, sql) in statements.iter().enumerate() {
+            match conn.execute(sql, []) {
+                Ok(n) => {
+                    log(&format!("[{}/{}] 影响 {n} 行：{}", i + 1, statements.len(), sql));
+                    affected.push(json!({"sql": sql, "rows": n}));
+                }
+                Err(e) => {
+                    conn.close().ok();
+                    let _ = std::fs::remove_dir_all(&work);
+                    if was_running {
+                        let _ = launch(client_key);
+                    }
+                    return Err(format!("执行失败（第 {} 条）：{e}", i + 1));
+                }
+            }
+        }
+        conn.close().map_err(|(_, e)| format!("关闭明文副本失败：{e}"))?;
+    }
+
+    let new_db = work.join("live-new.db");
+    log("增量加密回写…");
+    let stats = write_db_incremental_with(
+        &enc_key_hex,
+        &live,
+        Some(&orig_plain),
+        &plain,
+        &new_db,
+        None,
+    )?;
+    log(&format!(
+        "回写完成：全库 {} 页，重写 {} 页（{:.2} MB）",
+        stats.pages,
+        stats.changed_pages,
+        stats.changed_bytes as f64 / 1_048_576.0
+    ));
+
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup = bdir.join(crate::modules::trae_backup::entry_name(
+        client_key,
+        "sql",
+        &crate::modules::trae_backup::new_stamp(),
+    ));
+    crate::modules::trae_backup::snapshot_before_write(
+        &live,
+        &new_db,
+        &backup,
+        client_key,
+        "sql",
+        "执行维护 SQL 前的整库备份",
+    )?;
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(format!("替换实时库失败（原库未被改动）：{e}"));
+    }
+    let _ = std::fs::remove_file(format!("{}-shm", live.to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_file(decrypted_db_path(client_key));
+    let _ = std::fs::remove_file(crate::modules::trae_export::snapshot_meta_path(client_key));
+
+    let mut relaunched = false;
+    if was_running {
+        match launch(client_key) {
+            Ok(_) => relaunched = true,
+            Err(e) => log(&format!("重启客户端失败（请手动启动）：{e}")),
+        }
+    }
+    Ok(json!({
+        "pages": rep.pages,
+        "affected": affected,
+        "backup": backup.to_string_lossy(),
+        "relaunched": relaunched,
+    }))
+}
+
+/// 诊断用：把某个**能打开的原生会话**整份复制成一个新会话（只换 session_id 与标题）。
+///
+/// 目的：验证「行内容」是不是加载失败的根因。
+/// - 复制体如果能打开 ⇒ 说明表结构与行内容本身没问题，坏的是我们写入的内容；
+///   之后可以逐步把复制体的行替换成我们写的行，替换到哪一步坏就是哪一步的问题。
+/// - 复制体也打不开 ⇒ 说明问题在 session 级标识（与行内容无关）。
+///
+/// ⚠️ 只复制**带 session_id 的表**；`chat_message_general` / `chat_message_task` 按
+/// `message_id` 关联，复制体与被复制体共用（本就按 message_id 唯一）。
+/// FTS 表跳过：它们是索引，重复插入易失败，且不参与加载。
+pub fn clone_session_diag(
+    client_key: &str,
+    src_sid: &str,
+    title: &str,
+    on_log: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    let Some(client) = get_client(client_key) else {
+        return Err(format!("未知客户端: {client_key}"));
+    };
+    let live = database_path(client);
+    let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
+
+    log("结束客户端进程（文件替换前提）…");
+    let was_running = match stop_for_maintenance(client, 20_000) {
+        Ok(MaintenanceStop::NotRunning) => false,
+        Ok(MaintenanceStop::NoOwnProgram) => false,
+        Ok(MaintenanceStop::Stopped(n)) => {
+            if n > 0 {
+                log(&format!("已结束 {n} 个进程"));
+            }
+            true
+        }
+        Err(e) => return Err(e),
+    };
+
+    let work = store_dir()
+        .join("trae")
+        .join("clone_diag")
+        .join(format!("{client_key}-{}", chrono::Local::now().timestamp()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("创建工作目录失败：{e}"))?;
+    let orig_plain = work.join("live-orig.db");
+    let rep = decrypt_database(&live, &enc_key_hex, &orig_plain, None)?;
+    patch_reserved_field(&orig_plain)?;
+    let plain = work.join("live-plain.db");
+    std::fs::copy(&orig_plain, &plain).map_err(|e| format!("复制明文副本失败：{e}"))?;
+    patch_reserved_field(&plain)?;
+    merge_live_wal_into(&plain, &live, &enc_key_hex, &|m| log(m))?;
+    log(&format!("实时库 {} 页", rep.pages));
+
+    // 新 session_id：与客户端一致的 24 位 hex（前 8 位是秒级时间戳）
+    let now_s = chrono::Utc::now().timestamp() as u64;
+    let rnd: u128 = (chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u128)
+        ^ (std::process::id() as u128) << 32;
+    let new_sid = format!("{:08x}{:016x}", now_s & 0xffff_ffff, (rnd as u64));
+
+    let (copied, tables) = {
+        let conn = Connection::open(&plain).map_err(|e| format!("打开明文副本失败：{e}"))?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_session WHERE session_id = ?1",
+                params![src_sid],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("查询源会话失败：{e}"))?;
+        if exists == 0 {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err("源会话不存在".into());
+        }
+
+        let tbls: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'fts_%' AND name NOT LIKE 'sqlite_%'",
+                )
+                .map_err(|e| format!("列表失败：{e}"))?;
+            let mapped = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("列表失败：{e}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读列表失败：{e}"))?
+        };
+
+        // 1) 先把源会话的各类 id 收集起来，生成新 id 映射。
+        //
+        // ⚠️ 这些列都有 UNIQUE 约束（实测直接复制会撞 `UNIQUE constraint failed:
+        //    chat_message.message_id` 等），所以「复制会话」必须换 id 并改写所有引用 ——
+        //    Trae 自己的 fork 也是这么做的。
+        let id_tables: [(&str, &str); 5] = [
+            ("chat_message", "message_id"),
+            ("task", "task_id"),
+            ("chat_turn", "turn_id"),
+            ("history_v2", "history_v2_id"),
+            ("agent_run", "agent_run_id"),
+        ];
+        let mut idmap: Vec<(String, String)> = Vec::new();
+        let mut seq: u64 = 0;
+        for (t, c) in id_tables {
+            let sql = format!("SELECT {c} FROM \"{t}\" WHERE session_id = ?1");
+            let olds: Vec<String> = {
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询 {t}.{c} 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map(params![src_sid], |r| r.get::<_, String>(0))
+                    .map_err(|e| format!("查询 {t}.{c} 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 {t}.{c} 失败：{e}"))?
+            };
+            for old in olds {
+                seq += 1;
+                let neu = if c == "agent_run_id" {
+                    // UUID 形态：8-4-4-4-12
+                    let h = format!("{:032x}", (now_s as u128) << 64 | (seq as u128) * 0x9e3779b97f4a7c15);
+                    format!("{}-{}-4{}-8{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
+                } else {
+                    format!("{:08x}{:016x}", (now_s & 0xffff_ffff) as u32, seq.wrapping_mul(0x9e3779b97f4a7c15))
+                };
+                idmap.push((old, neu));
+            }
+        }
+        // 2) server_history_info.history_id 与 history_v2_id 同一映射
+        let shi: Vec<String> = {
+            match conn.prepare("SELECT history_id FROM server_history_info WHERE session_id = ?1") {
+                Ok(mut stmt) => {
+                    let mapped = stmt.query_map(params![src_sid], |r| r.get::<_, String>(0));
+                    match mapped {
+                        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        for old in shi {
+            if let Some((_, neu)) = idmap.iter().find(|(o, _)| *o == old) {
+                // 已映射（与 history_v2_id 同名时跳过）
+                let _ = neu;
+            }
+        }
+
+        let remap = |val: &str| -> String {
+            let mut out = val.to_string();
+            for (old, neu) in &idmap {
+                if out == *old {
+                    return neu.clone();
+                }
+                if out.contains(old.as_str()) {
+                    out = out.replace(old.as_str(), neu);
+                }
+            }
+            out
+        };
+
+        let mut copied = 0usize;
+        let mut done: Vec<String> = Vec::new();
+
+        // 3) 按 session_id 复制（自增 id 交给 SQLite，文本列做 id 重映射）
+        for t in &tbls {
+            let cols: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA table_info(\"{t}\")"))
+                    .map_err(|e| format!("pragma 失败：{e}"))?;
+                let mapped = stmt
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .map_err(|e| format!("pragma 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读列失败：{e}"))?
+            };
+            if !cols.iter().any(|c| c == "session_id") {
+                continue;
+            }
+            let cols: Vec<String> = cols.into_iter().filter(|c| c != "id").collect();
+            let select_list: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    if c == "session_id" {
+                        "'__NEWSID__'".to_string()
+                    } else if c == "session_title" {
+                        // 标题在 SELECT 里直接给字面量：原先用 UPDATE 改，实测会被静默丢掉，
+                        // 结果克隆体和源会话同名，用户根本分不清点哪个。
+                        format!("'{}'", title.replace('\'', "''"))
+                    } else {
+                        format!("\"{c}\"")
+                    }
+                })
+                .collect();
+            let sql = format!(
+                "SELECT {} FROM \"{t}\" WHERE session_id = ?1",
+                select_list.join(",")
+            );
+            let rows: Vec<Vec<rusqlite::types::Value>> = {
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询 {t} 失败：{e}"))?;
+                let ncol = cols.len();
+                let mapped = stmt
+                    .query_map(params![src_sid], |r| {
+                        let mut v = Vec::with_capacity(ncol);
+                        for i in 0..ncol {
+                            v.push(r.get::<_, rusqlite::types::Value>(i)?);
+                        }
+                        Ok(v)
+                    })
+                    .map_err(|e| format!("查询 {t} 失败：{e}"))?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取 {t} 失败：{e}"))?
+            };
+            let ins_cols: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+            let ph: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+            let ins_sql = format!(
+                "INSERT INTO \"{t}\" ({}) VALUES ({})",
+                ins_cols.join(","),
+                ph.join(",")
+            );
+            for mut row in rows {
+                for (i, c) in cols.iter().enumerate() {
+                    match &row[i] {
+                        rusqlite::types::Value::Text(sv) => {
+                            let newv = if c == "session_id" {
+                                new_sid.clone()
+                            } else {
+                                remap(sv)
+                            };
+                            row[i] = rusqlite::types::Value::Text(newv);
+                        }
+                        _ => {}
+                    }
+                }
+                match conn.execute(&ins_sql, rusqlite::params_from_iter(row.iter())) {
+                    Ok(_) => copied += 1,
+                    Err(e) => log(&format!("插入 {t} 失败：{e}")),
+                }
+            }
+            if copied > 0 {
+                done.push(t.clone());
+            }
+        }
+
+        // 4) 复制按 message_id 关联的两张子表（它们没有 session_id）
+        for t in ["chat_message_general", "chat_message_task"] {
+            let sql = format!(
+                "SELECT message_id FROM \"{t}\" WHERE message_id IN \
+                 (SELECT message_id FROM chat_message WHERE session_id = ?1)"
+            );
+            let mids: Vec<String> = match conn.prepare(&sql) {
+                Ok(mut stmt) => {
+                    let mapped = stmt.query_map(params![src_sid], |r| r.get::<_, String>(0));
+                    match mapped {
+                        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            };
+            for old_mid in mids {
+                let Some(new_mid) = idmap.iter().find(|(o, _)| *o == old_mid).map(|(_, n)| n.clone())
+                else {
+                    continue;
+                };
+                let cols: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare(&format!("PRAGMA table_info(\"{t}\")"))
+                        .map_err(|e| format!("pragma 失败：{e}"))?;
+                    let mapped = stmt
+                        .query_map([], |r| r.get::<_, String>(1))
+                        .map_err(|e| format!("pragma 失败：{e}"))?;
+                    mapped
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| format!("读列失败：{e}"))?
+                };
+                let cols: Vec<String> = cols.into_iter().filter(|c| c != "id").collect();
+                let sel: Vec<String> = cols
+                    .iter()
+                    .map(|c| if c == "message_id" { "'__MID__'".to_string() } else { format!("\"{c}\"") })
+                    .collect();
+                let sel_sql = format!("SELECT {} FROM \"{t}\" WHERE message_id = ?1", sel.join(","));
+                let ncol = cols.len();
+                let rows: Vec<Vec<rusqlite::types::Value>> = match conn.prepare(&sel_sql) {
+                    Ok(mut stmt) => {
+                        let mapped = stmt.query_map(params![old_mid], |r| {
+                            let mut v = Vec::with_capacity(ncol);
+                            for i in 0..ncol {
+                                v.push(r.get::<_, rusqlite::types::Value>(i)?);
+                            }
+                            Ok(v)
+                        });
+                        match mapped {
+                            Ok(it) => it.filter_map(|x| x.ok()).collect(),
+                            Err(_) => Vec::new(),
+                        }
+                    }
+                    Err(_) => Vec::new(),
+                };
+                let ins_cols: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let ph: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+                let ins_sql = format!(
+                    "INSERT INTO \"{t}\" ({}) VALUES ({})",
+                    ins_cols.join(","),
+                    ph.join(",")
+                );
+                for mut row in rows {
+                    for (i, c) in cols.iter().enumerate() {
+                        if let rusqlite::types::Value::Text(sv) = &row[i] {
+                            let newv = if c == "message_id" {
+                                new_mid.clone()
+                            } else {
+                                remap(sv)
+                            };
+                            row[i] = rusqlite::types::Value::Text(newv);
+                        }
+                    }
+                    if conn
+                        .execute(&ins_sql, rusqlite::params_from_iter(row.iter()))
+                        .is_ok()
+                    {
+                        copied += 1;
+                    }
+                }
+            }
+        }
+        conn.close().map_err(|(_, e)| format!("关闭失败：{e}"))?;
+        (copied, done)
+    };
+
+    if copied == 0 {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err("没有复制到任何行".into());
+    }
+
+    let new_db = work.join("live-new.db");
+    let stats = write_db_incremental_with(
+        &enc_key_hex,
+        &live,
+        Some(&orig_plain),
+        &plain,
+        &new_db,
+        None,
+    )?;
+    log(&format!(
+        "回写：全库 {} 页，重写 {} 页",
+        stats.pages, stats.changed_pages
+    ));
+    crate::modules::trae_backup::swap_in_place(&new_db, &live)
+        .map_err(|e| format!("替换实时库失败：{e}"))?;
+    let _ = std::fs::remove_file(format!("{}-shm", live.to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_file(decrypted_db_path(client_key));
+    let _ = std::fs::remove_file(crate::modules::trae_export::snapshot_meta_path(client_key));
+
+    if was_running {
+        let _ = launch(client_key);
+    }
+    Ok(json!({
+        "new_session_id": new_sid,
+        "title": title,
+        "rows_copied": copied,
+        "tables": tables,
+    }))
+}
+
+/// 把实时库解密成一份**只读分析快照**（不写线上库、不结束客户端）。
+///
+/// 用途：排查「会话打不开」这类问题时，需要看客户端真实库的最新内容（含 WAL），
+/// 而 GUI 的列表页不一定触发解密。产物写到 `<store>/trae/decrypted/<client>.db`。
+pub fn write_analysis_snapshot(client_key: &str) -> Result<Value, String> {
+    let Some(client) = get_client(client_key) else {
+        return Err(format!("未知客户端: {client_key}"));
+    };
+    let live = database_path(client);
+    if !live.exists() {
+        return Err(format!("实时库不存在：{}", live.display()));
+    }
+    let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
+
+    let out = decrypted_db_path(client_key);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败：{e}"))?;
+    }
+    let rep = decrypt_database(&live, &enc_key_hex, &out, None)?;
+    patch_reserved_field(&out)?;
+    // 合并 WAL：否则看不到客户端刚写入、还没 checkpoint 的会话
+    let wal = PathBuf::from(format!("{}-wal", live.to_string_lossy()));
+    let merged = crate::modules::trae_delete::merge_wal_into_plain(&out, &wal, &enc_key_hex)
+        .map_err(|e| format!("合并 WAL 失败：{e}"))?;
+    if merged > 0 {
+        patch_reserved_field(&out)?;
+    }
+    Ok(json!({
+        "path": out.to_string_lossy(),
+        "pages": rep.pages,
+        "wal_frames_merged": merged,
     }))
 }
 
