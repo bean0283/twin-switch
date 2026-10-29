@@ -578,6 +578,87 @@ fn verified_after_sync_at(path: &Path, pairs: &[(String, PathBuf)]) -> Option<(u
     }
 }
 
+/// 强制比对完成后把**每个成员自己的**结论落盘（不要求全组一致）。
+///
+/// 与 [`mark_verified`] 的区别：那里只在「同步后回读校验一致」时登记，
+/// 每条存的是**整组共同**的摘要；这里存的是各文件自己的摘要 ——
+/// 全组一致时四条摘要自然相同（[`verified_after_sync`] 照样能命中），
+/// 不一致时也能把「内容不同」这个结论保下来，重启工具后不再退回「未比对」。
+///
+/// 输入是「会话 id、正文路径、行数、摘要前 16 位」四元组（**不重新读盘**，
+/// 摘要由调用方从刚算完的列表里带来）；摘要为空的成员跳过（没有可信结论可存）。
+/// 返回实际登记的条数。
+pub fn mark_compared(values: &[(String, PathBuf, usize, String)]) -> usize {
+    mark_compared_at(&verified_store_path(), values)
+}
+
+fn mark_compared_at(
+    path: &Path,
+    values: &[(String, PathBuf, usize, String)],
+) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut map = load_verified_at(path);
+    let at = chrono::Local::now().timestamp_millis();
+    let mut n = 0;
+    for (id, p, lines, digest) in values {
+        if digest.is_empty() {
+            continue;
+        }
+        let Some((len, mtime)) = file_stamp(p) else {
+            continue;
+        };
+        map.insert(
+            id.clone(),
+            VerifiedEntry {
+                len,
+                mtime,
+                lines: *lines,
+                digest: digest.clone(),
+                at,
+            },
+        );
+        n += 1;
+    }
+    save_verified_at(path, &map);
+    n
+}
+
+/// 这些副本是否都留有「上次比对」的落盘结论，且**每份文件的指纹都没变**？
+///
+/// 全部命中才返回 `Some`（按传入顺序给出各成员的 `行数 + 摘要`）；
+/// 任一份没有记录或被改过就返回 `None` —— 老实说不知道，绝不拿旧结论冒充。
+///
+/// 与 [`verified_after_sync`] 的区别：那条只在**全部摘要相同**时命中，
+/// 这条把「摘要不同」也带回来，由调用方决定怎么呈现。
+pub fn compared_from_disk(pairs: &[(String, PathBuf)]) -> Option<Vec<(usize, String)>> {
+    compared_from_disk_at(&verified_store_path(), pairs)
+}
+
+fn compared_from_disk_at(
+    path: &Path,
+    pairs: &[(String, PathBuf)],
+) -> Option<Vec<(usize, String)>> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let map = load_verified_at(path);
+    let mut out = Vec::with_capacity(pairs.len());
+    for (id, p) in pairs {
+        let e = map.get(id)?;
+        let (len, mtime) = file_stamp(p)?;
+        if e.len != len || e.mtime != mtime {
+            return None;
+        }
+        if e.digest.is_empty() {
+            return None;
+        }
+        out.push((e.lines, e.digest.clone()));
+    }
+    Some(out)
+}
+
 /// 内容既然已经一致，「谁最新」就只能按更新时间定，其余一律 `equal`。
 ///
 /// 抽成纯函数是为了能单测：这条判据一旦歪掉，界面就会重新长出
@@ -647,8 +728,18 @@ fn decide_mode(force: bool, f: &GroupFacts) -> Decide {
     Decide::Unknown
 }
 
-/// 用「已同步并回读校验一致」的记录直接给整组下结论（不读一个字节）。
-fn apply_synced_group(list: &mut [WbSession], idx: &[usize], key: &str, lines: usize, digest: &str) {
+/// 用「已校验一致」的落盘结论直接给整组下结论（不读一个字节）。
+///
+/// `note` 说明结论来历（「同步后回读校验」还是「上次强制比对」），界面原样展示 ——
+/// 用户看到「一致」时必须能知道这是谁说的。
+fn apply_synced_group(
+    list: &mut [WbSession],
+    idx: &[usize],
+    key: &str,
+    lines: usize,
+    digest: &str,
+    note: &str,
+) {
     let stamps: Vec<i64> = idx.iter().map(|&i| list[i].updated_at).collect();
     let (newest, rels) = synced_relations(&stamps);
     let label: String = key.chars().take(16).collect();
@@ -661,7 +752,60 @@ fn apply_synced_group(list: &mut [WbSession], idx: &[usize], key: &str, lines: u
         list[i].dup_note = if pos == newest {
             format!("共 {} 份重复标题副本", idx.len())
         } else {
-            "已与来源同步，回读校验一致（文件未再改动）".to_string()
+            note.to_string()
+        };
+    }
+}
+
+/// 用「上次比对（不要求一致）」的落盘结论下结论：全同 → 与同步回读同形状；
+/// 不同 → 只能如实说「内容不同」——落盘的只有整份摘要，没有行级摘要，
+/// 判不出包含关系（谁落后于谁），绝不冒充更细的结论。
+fn apply_compared_from_disk(
+    list: &mut [WbSession],
+    idx: &[usize],
+    key: &str,
+    per: &[(usize, String)],
+) {
+    let first = &per[0];
+    if per.iter().all(|(_, d)| d == &first.1) {
+        apply_synced_group(
+            list,
+            idx,
+            key,
+            first.0,
+            &first.1,
+            "上次强制比对逐行一致（文件未再改动）",
+        );
+        return;
+    }
+    let stamps: Vec<i64> = idx.iter().map(|&i| list[i].updated_at).collect();
+    let mut newest = 0usize;
+    for pos in 1..idx.len() {
+        if stamps[pos] > stamps[newest] {
+            newest = pos;
+        }
+    }
+    let newest_digest = &per[newest].1;
+    let label: String = key.chars().take(16).collect();
+    for (pos, &i) in idx.iter().enumerate() {
+        let (lines, digest) = (&per[pos].0, &per[pos].1);
+        list[i].dup_group = label.clone();
+        list[i].body_lines = *lines;
+        list[i].content_digest = digest.clone();
+        list[i].is_newest = pos == newest;
+        list[i].dup_relation = if pos == newest {
+            "latest".to_string()
+        } else if digest == newest_digest {
+            "equal".to_string()
+        } else {
+            "diverged".to_string()
+        };
+        list[i].dup_note = if pos == newest {
+            format!("共 {} 份重复标题副本", idx.len())
+        } else if digest == newest_digest {
+            "与最新副本内容相同（上次强制比对的结论）".to_string()
+        } else {
+            "上次强制比对：内容不同。要判定谁包含谁，请再次强制比对".to_string()
         };
     }
 }
@@ -709,6 +853,7 @@ fn annotate_duplicates_opt(list: &mut [WbSession], force: bool) {
         let all_fit = all_body && idx.iter().all(|&i| list[i].body_bytes <= DUP_MAX_BYTES);
         let mut all_cached = false;
         let mut recorded: Option<(usize, String)> = None;
+        let mut from_disk: Option<Vec<(usize, String)>> = None;
         if !force && all_body && !all_fit && idx.len() <= DUP_MAX_MEMBERS {
             // ① 摘要是否都已在缓存里（强制比对 / 同步回读校验留下的）——只查不读盘。
             all_cached = idx.iter().all(|&i| {
@@ -726,6 +871,11 @@ fn annotate_duplicates_opt(list: &mut [WbSession], force: bool) {
                     .collect();
                 if pairs.len() == idx.len() {
                     recorded = verified_after_sync(&pairs);
+                    // ③ 落盘的「上次比对」结论（强制比对留下的，不要求一致）：
+                    //    指纹没变就直接复用，重启工具也不退回「未比对」。
+                    if recorded.is_none() {
+                        from_disk = compared_from_disk(&pairs);
+                    }
                 }
             }
         }
@@ -741,7 +891,22 @@ fn annotate_duplicates_opt(list: &mut [WbSession], force: bool) {
         );
         if mode == Decide::ReuseRecord {
             if let Some((lines, digest)) = recorded {
-                apply_synced_group(list, &idx, &key, lines, &digest);
+                apply_synced_group(
+                    list,
+                    &idx,
+                    &key,
+                    lines,
+                    &digest,
+                    "已与来源同步，回读校验一致（文件未再改动）",
+                );
+                continue;
+            }
+        }
+        // 内存缓存没命中、但落盘结论还在（指纹没变）⇒ 不读一个字节直接复用。
+        // 只在非强制路径生效：强制比对永远重算，绝不吃旧结论。
+        if !force {
+            if let Some(per) = from_disk {
+                apply_compared_from_disk(list, &idx, &key, &per);
                 continue;
             }
         }
@@ -1747,6 +1912,98 @@ mod tests {
         let (newest, rels) = synced_relations(&[500, 500]);
         assert_eq!(newest, 0);
         assert_eq!(rels, vec!["latest", "equal"]);
+    }
+
+    /// 强制比对结论的落盘与复用：摘要各存各的，指纹没变就能整组取回；
+    /// 摘要不同时 `verified_after_sync` 不命中（它只认全同），`compared_from_disk` 命中。
+    #[test]
+    fn compared_record_roundtrips_and_dies_on_change() {
+        let dir = std::env::temp_dir().join(format!("wbsrc-c-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.jsonl");
+        let b = dir.join("b.jsonl");
+        let store = dir.join("verified.json");
+        std::fs::write(&a, "{\"n\":1}\n").unwrap();
+        std::fs::write(&b, "{\"n\":1}\n{\"n\":2}\n").unwrap();
+        let pairs = vec![
+            ("aaaa".to_string(), a.clone()),
+            ("bbbb".to_string(), b.clone()),
+        ];
+        let values = vec![
+            ("aaaa".to_string(), a.clone(), 1usize, "aaaaaaaaaaaaaaaa".to_string()),
+            ("bbbb".to_string(), b.clone(), 2usize, "bbbbbbbbbbbbbbbb".to_string()),
+        ];
+
+        assert!(compared_from_disk_at(&store, &pairs).is_none(), "没登记过 = 不知道");
+        assert_eq!(mark_compared_at(&store, &values), 2, "两条都该登记上");
+
+        // 摘要不同：verified_after_sync（只认全同）不命中；compared_from_disk 带回各自结论
+        assert!(verified_after_sync_at(&store, &pairs).is_none());
+        let hit = compared_from_disk_at(&store, &pairs).expect("指纹没变就该复用");
+        assert_eq!(hit, vec![(1usize, "aaaaaaaaaaaaaaaa".into()), (2usize, "bbbbbbbbbbbbbbbb".into())]);
+
+        // 摘要全相同时两条出口都要命中（同步回读与强制比对的结论互通）
+        let same = vec![
+            ("aaaa".to_string(), a.clone(), 1usize, "dddddddddddddddd".to_string()),
+            ("bbbb".to_string(), b.clone(), 1usize, "dddddddddddddddd".to_string()),
+        ];
+        // b 的长度变了，先重登记（mark_compared 会取当前指纹）
+        mark_compared_at(&store, &same);
+        assert_eq!(
+            verified_after_sync_at(&store, &pairs),
+            Some((1usize, "dddddddddddddddd".to_string())),
+            "全同结论走旧出口也要能命中"
+        );
+
+        // 文件被改 ⇒ 结论失效（这里改回 2 行，长度与最初登记不同）
+        std::fs::write(&b, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
+        assert!(compared_from_disk_at(&store, &pairs).is_none(), "文件动了不许拿旧结论冒充");
+        assert!(verified_after_sync_at(&store, &pairs).is_none());
+
+        // 只有 一份成员 ⇒ 不够下结论
+        assert!(compared_from_disk_at(&store, &pairs[..1]).is_none());
+        // 空摘要跳过不登记
+        let empty = vec![("cccc".to_string(), a.clone(), 1usize, String::new())];
+        assert_eq!(mark_compared_at(&store, &empty), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘结论全同 ⇒ 与「同步回读一致」同形状（latest + equal）。
+    #[test]
+    fn apply_compared_from_disk_equal_uses_synced_shape() {
+        let mut list = vec![mk("a", "T", 100, true), mk("b", "T", 200, true)];
+        let idx = vec![0usize, 1usize];
+        apply_compared_from_disk(
+            &mut list,
+            &idx,
+            "T",
+            &[(7usize, "0123456789abcdef".to_string()), (7, "0123456789abcdef".to_string())],
+        );
+        assert!(list[1].is_newest, "updated_at 大的判最新");
+        assert_eq!(list[0].dup_relation, "equal");
+        assert_eq!(list[1].dup_relation, "latest");
+        assert_eq!(list[0].body_lines, 7);
+        assert!(list[0].dup_note.contains("一致"), "来历要写清楚：{}", list[0].dup_note);
+        assert!(!list[0].dup_relation.is_empty());
+    }
+
+    /// 落盘结论不同 ⇒ 只能如实报「内容不同」；没有行级摘要，绝不冒充
+    /// `behind` / `ahead`（那需要逐行包含关系，落盘的只有整份摘要）。
+    #[test]
+    fn apply_compared_from_disk_diff_reports_diverged_honestly() {
+        let mut list = vec![mk("a", "T", 100, true), mk("b", "T", 200, true)];
+        let idx = vec![0usize, 1usize];
+        apply_compared_from_disk(
+            &mut list,
+            &idx,
+            "T",
+            &[(3usize, "aaaaaaaaaaaaaaaa".to_string()), (5, "bbbbbbbbbbbbbbbb".to_string())],
+        );
+        assert_eq!(list[1].dup_relation, "latest");
+        assert_eq!(list[0].dup_relation, "diverged", "摘要不同且无行级信息 ⇒ 只能说 diverged");
+        assert_eq!(list[0].body_lines, 3);
+        assert_eq!(list[0].content_digest, "aaaaaaaaaaaaaaaa");
+        assert!(list[0].dup_note.contains("内容不同"), "{}", list[0].dup_note);
     }
 
     /// 判据优先级：强制 > 成员超限 > 体积合规 > 摘要缓存 > 校验记录 > 不知道。
