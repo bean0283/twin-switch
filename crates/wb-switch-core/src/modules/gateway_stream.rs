@@ -859,16 +859,26 @@ pub fn respond(
         .into_response()
 }
 
-/// 上游本来就是标准 OpenAI SSE（WorkBuddy）⇒ 直接透传字节，不解析。
+/// 上游本来就是标准 OpenAI SSE（WorkBuddy）⇒ 字节原样透传。
 ///
 /// 少一层解析就少一处出错：它的 `tool_calls`、`finish_reason`、`[DONE]` 本来就是
 /// 客户端认识的样子，重新拼一遍只会把细节拼丢。
+///
+/// ⚠️⚠️ **透传 ≠ 不记账**。这里曾经一个字节都不解析，于是「WorkBuddy 的 Key 已用
+/// 永远是 0」—— 因为 WorkBuddy 客户端**一律走流式**，用量全在这条路上：
+/// 非流式（网关自己聚合）能拿到 usage，流式却拿不到，指标里就成了一排
+/// `prompt_tokens: null`（2026-10-29 从 `gateway-metrics.jsonl` 反查确认：
+/// 18 条 wb-cn 流式请求全部无用量，非流式的几条都有）。
+///
+/// 现在边转发边扫 `data:` 行里的 `usage`，扫到就交给 `trace`；
+/// `trace.finish` 是所有请求（流式/非流式/成功/失败）记额度与指标的**唯一收口**。
 pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
     use futures_util::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
         let mut seen = 0usize;
+        let mut buf = String::new();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(b) => {
@@ -879,7 +889,12 @@ pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
                     if trace.first_byte_ms.is_none() {
                         trace.first_byte();
                     }
+                    // 只扫描、不改字节：给客户端的仍是上游原样。
+                    scan_sse_usage(&mut buf, &b, &mut trace);
                     if tx.send(Ok(b)).await.is_err() {
+                        // 客户端提前断开：上游可能已经算过费，按已经看到的部分记一笔，
+                        // 否则这条请求在指标与 Key 额度里完全不存在。
+                        trace.finish(false, 499, "客户端提前断开（按已收到的部分记账）");
                         return;
                     }
                 }
@@ -903,6 +918,7 @@ pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
         }
     });
 
+
     (
         StatusCode::OK,
         [
@@ -913,4 +929,83 @@ pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
         Body::from_stream(RxStream { rx }),
     )
         .into_response()
+}
+
+/// 透传时扫用量：把已完整的 `data:` 行交给 [`sse_usage`]，命中就写进 `trace`。
+///
+/// 只保留**没凑齐一行的尾巴**：完整行处理完立刻丢掉，所以内存不随流长度增长。
+/// 单行异常大（上游把整个工具结果塞进一个 chunk）时放弃这一行 —— 用量帧本身很小，
+/// 不会长成这样。
+fn scan_sse_usage(buf: &mut String, chunk: &[u8], trace: &mut Trace) {
+    /// 单行上限：超过就认为不是用量帧，丢掉这半行。
+    const MAX_LINE: usize = 8 * 1024 * 1024;
+    buf.push_str(&String::from_utf8_lossy(chunk));
+    while let Some(pos) = buf.find('\n') {
+        let line: String = buf.drain(..=pos).collect();
+        if let Some(u) = sse_usage(&line) {
+            trace.usage(&u);
+        }
+    }
+    if buf.len() > MAX_LINE {
+        buf.clear();
+    }
+}
+
+/// 从一行 SSE 里取 `usage`。认两种位置：
+/// - OpenAI 标准：`data: {"usage":{"prompt_tokens":..,"completion_tokens":..}}`
+/// - 信封式（少数上游）：`data: {"data":{"usage":{...}}}`
+///
+/// 两个数都没有就返回 `None` —— 「上游没给」和「上游给了 0」必须区分开，
+/// 前者不记（不让失败/空请求消耗额度），后者照记。
+fn sse_usage(line: &str) -> Option<Value> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    if data.is_empty() || data == "[DONE]" || !data.contains("\"usage\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    let has_num = |u: &Value| {
+        u.get("prompt_tokens").and_then(Value::as_i64).is_some()
+            || u.get("completion_tokens").and_then(Value::as_i64).is_some()
+    };
+    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+        if has_num(u) {
+            return Some(u.clone());
+        }
+    }
+    if let Some(u) = v.pointer("/data/usage").filter(|u| !u.is_null()) {
+        if has_num(u) {
+            return Some(u.clone());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::sse_usage;
+
+    #[test]
+    fn picks_openai_usage() {
+        let line = "data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34}}\n";
+        let u = sse_usage(line).expect("应当取到 usage");
+        assert_eq!(u.get("prompt_tokens").and_then(|v| v.as_i64()), Some(12));
+        assert_eq!(u.get("completion_tokens").and_then(|v| v.as_i64()), Some(34));
+    }
+
+    #[test]
+    fn keeps_zero_but_rejects_empty_usage() {
+        let zero = "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}";
+        assert!(sse_usage(zero).is_some());
+        assert!(sse_usage("data: {\"usage\":null}").is_none());
+        assert!(sse_usage("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}").is_none());
+        assert!(sse_usage("data: [DONE]").is_none());
+        assert!(sse_usage(": keep-alive").is_none());
+    }
+
+    #[test]
+    fn picks_envelope_usage() {
+        let line = "data: {\"code\":0,\"data\":{\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}}";
+        let u = sse_usage(line).expect("信封里的 usage 也要认");
+        assert_eq!(u.get("completion_tokens").and_then(|v| v.as_i64()), Some(9));
+    }
 }
