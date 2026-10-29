@@ -1320,6 +1320,33 @@ pub fn heal_legacy_rows(conn: &Connection, on_log: &dyn Fn(&str)) -> Result<Valu
                         changed = true;
                     }
                 }
+                // `content[].*` 与 `tool_calls[].*` 的**可选键**同样要补齐：
+                // 实测全库「有 mode 的行」100% 都带 image_url/video_url/cache_control
+                // 与 index/type —— 旧版导入写出来的行全都缺，光补 mode 不够。
+                if let Some(parts) = mo.get_mut("content").and_then(Value::as_array_mut) {
+                    for c in parts.iter_mut() {
+                        let Some(co) = c.as_object_mut() else { continue };
+                        for k in ["image_url", "video_url", "cache_control"] {
+                            if !co.contains_key(k) {
+                                co.insert(k.into(), Value::Null);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if let Some(calls) = mo.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for (i, c) in calls.iter_mut().enumerate() {
+                        let Some(co) = c.as_object_mut() else { continue };
+                        if !co.contains_key("index") {
+                            co.insert("index".into(), json!(i as i64));
+                            changed = true;
+                        }
+                        if !co.contains_key("type") {
+                            co.insert("type".into(), json!("function"));
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         if changed {
@@ -3710,4 +3737,142 @@ mod tests {
         let run_id = uuid5(&format!("{sid}:1790475240"));
         assert_eq!(purge_session_rows(&c, &sid, &run_id).unwrap(), 0);
     }
+    /// 复现用户实测故障：导入会话点开报
+    /// 「由于网络原因，会话加载失败」/ `chat.getMessages bizCode=995001`。
+    ///
+    /// 真实数据里故障会话的 history_v2 行长这样（30/30 行）：
+    /// `{"raw_messages":[{"content":[{"text":"…","type":"text"}],"role":"user"}]}`
+    /// —— 缺 `mode`、缺 `content[].image_url/video_url/cache_control`、
+    /// 缺 `tool_calls[].index/type`。而全库「能打开的」行 100% 都带这些键。
+    #[test]
+    fn heal_fills_mode_and_optional_keys_on_old_import_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            r#"CREATE TABLE history_v2 ( id integer NOT NULL PRIMARY KEY AUTOINCREMENT, history_v2_id text NOT NULL,
+                 session_id text NOT NULL, message_id text NOT NULL, messages text NOT NULL,
+                 token_usage integer NOT NULL, summary text, summarized_above boolean NOT NULL DEFAULT FALSE,
+                 created_at bigint NOT NULL DEFAULT 0, updated_at bigint NOT NULL DEFAULT 0,
+                 deleted_at bigint NOT NULL DEFAULT 0, agent_type text NOT NULL DEFAULT '',
+                 content_source text NOT NULL DEFAULT '', accumulated_summary text,
+                 agent_run_id text NOT NULL DEFAULT '', compress_token_usage integer,
+                 micro_compacted boolean NULL, micro_compact_strategy text NULL, truncated_above boolean NULL);
+               CREATE TABLE server_history_info ( history_id text NOT NULL PRIMARY KEY, client_history_id text NOT NULL,
+                 conversation_id text NULL, session_id text NULL, task_id text NOT NULL, agent_run_id text NULL,
+                 is_deleted boolean NULL DEFAULT FALSE, messages text NOT NULL, token_usage bigint NULL DEFAULT 0,
+                 summary text NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL, source text NOT NULL,
+                 user_id text NULL, agent_type text NOT NULL, item_summary text NULL, item_token_usage bigint NULL,
+                 expired_at bigint NULL, history_source text NOT NULL, summarized_above boolean NOT NULL DEFAULT FALSE,
+                 micro_compacted boolean NULL, extra_info text NULL, micro_compact_strategy text NULL);
+               CREATE TABLE chat_turn ( id integer NOT NULL PRIMARY KEY AUTOINCREMENT, session_id text NOT NULL,
+                 turn_id text NOT NULL, reply_to_message_id text NOT NULL, response_message_id text NOT NULL,
+                 requirement_id text NOT NULL, rewritten_user_message text NOT NULL, turn_status text NOT NULL,
+                 error_message text NOT NULL, context text NOT NULL, created_at bigint NOT NULL DEFAULT 0,
+                 updated_at bigint NOT NULL DEFAULT 0, deleted_at bigint NOT NULL DEFAULT 0,
+                 agent_type text NOT NULL DEFAULT 'builder', agent_id text NOT NULL DEFAULT '',
+                 agent_name text NOT NULL DEFAULT '', additional_context text NOT NULL DEFAULT '{}',
+                 agent_avatar_id text, is_worktree boolean NOT NULL DEFAULT FALSE, products text, merged_commit text NULL);
+               CREATE TABLE chat_session ( id integer NOT NULL PRIMARY KEY AUTOINCREMENT, session_id text NOT NULL,
+                 project_id text NOT NULL, created_at bigint NOT NULL DEFAULT 0, updated_at bigint NOT NULL DEFAULT 0,
+                 deleted_at bigint NOT NULL DEFAULT 0, session_type text NOT NULL DEFAULT 'side_chat',
+                 agent_process_support text NOT NULL DEFAULT 'v2', session_title text NOT NULL DEFAULT '',
+                 worktree_id text NOT NULL DEFAULT '', context text NOT NULL DEFAULT '{}', work_mode text NULL,
+                 session_icon text NOT NULL DEFAULT '', hidden_status text NULL, is_pinned boolean NOT NULL DEFAULT FALSE,
+                 pinned_at bigint NOT NULL DEFAULT 0, extra text NOT NULL DEFAULT '{}', is_unread boolean NOT NULL DEFAULT FALSE,
+                 last_unread_turn_id text NOT NULL DEFAULT '');
+               CREATE TABLE project ( id integer NOT NULL PRIMARY KEY AUTOINCREMENT, project_id text NOT NULL,
+                 source text NOT NULL DEFAULT 'native-ide', user_id text NOT NULL, name text NULL, description text NULL,
+                 absolute_path text NULL, biz_project_id text NOT NULL, created_at bigint NULL, updated_at bigint NULL,
+                 deleted_at bigint NULL, workspace_status text NOT NULL DEFAULT 'single_root',
+                 transient_fallback_project_id text NULL, remote_project_id text NULL, last_active_at bigint NULL,
+                 work_mode text NULL, workspace_type text NOT NULL DEFAULT 'single_root',
+                 single_root_workspace_folder text NULL, multi_root_workspace_id text NULL,
+                 multi_root_workspace_config_path text NULL, workspace_folders text NOT NULL DEFAULT '[]',
+                 project_kind text NOT NULL DEFAULT 'workspace', domain_version integer NOT NULL DEFAULT 1);"#,
+        )
+        .unwrap();
+
+        // 与故障会话同形：user 那条只有 content/role
+        let user = json!({
+            "raw_messages": [{
+                "content": [{ "text": "双组分聚氨酯碎石透水混合料的BPN最大可以做到多少", "type": "text" }],
+                "role": "user"
+            }]
+        })
+        .to_string();
+        // 带工具调用的那条：缺 index/type，content 缺 image_url 等键
+        let asst = json!({
+            "raw_messages": [{
+                "content": [{ "text": "", "type": "text" }],
+                "name": null,
+                "role": "assistant",
+                "tool_call_id": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function_call": { "name": "WebSearch", "arguments": "{}" }
+                }]
+            }]
+        })
+        .to_string();
+        c.execute(
+            "INSERT INTO history_v2(id, history_v2_id, session_id, message_id, messages, token_usage) \
+             VALUES(1,'h1','s1','m1',?1,0)",
+            params![user],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO history_v2(id, history_v2_id, session_id, message_id, messages, token_usage) \
+             VALUES(2,'h2','s1','m2',?1,0)",
+            params![asst],
+        )
+        .unwrap();
+        // 会话与回合也建上，heal 的镜像重建那一步会用到
+        c.execute(
+            "INSERT INTO chat_session(session_id, project_id, session_title) VALUES('s1','p1','测试')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO project(project_id, user_id, biz_project_id, absolute_path, \
+                single_root_workspace_folder, workspace_folders, domain_version) \
+             VALUES('p1','u1','b1','d:/t','d:/t','[]',2)",
+            [],
+        )
+        .unwrap();
+
+        let n = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert!(
+            n["history_json"].as_u64().unwrap_or(0) >= 2,
+            "两行都该被修，heal 返回 {n}"
+        );
+
+        for id in [1, 2] {
+            let raw: String = c
+                .query_row("SELECT messages FROM history_v2 WHERE id=?1", params![id], |r| r.get(0))
+                .unwrap();
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                v.get("mode").and_then(Value::as_str),
+                Some("FunctionCall"),
+                "缺 mode 会让新版客户端整条会话加载失败（995001）"
+            );
+            for m in v["raw_messages"].as_array().unwrap() {
+                for part in m["content"].as_array().unwrap() {
+                    for k in ["image_url", "video_url", "cache_control"] {
+                        assert!(part.get(k).is_some(), "content 缺 {k}");
+                    }
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                    for call in calls {
+                        assert!(call.get("index").is_some(), "tool_calls 缺 index");
+                        assert_eq!(call.get("type").and_then(Value::as_str), Some("function"));
+                    }
+                }
+            }
+        }
+
+        // 幂等：再跑一遍不应该再改任何行
+        let again = heal_legacy_rows(&c, &|_| {}).unwrap();
+        assert_eq!(again["history_json"].as_u64().unwrap_or(0), 0);
+    }
+
 }
