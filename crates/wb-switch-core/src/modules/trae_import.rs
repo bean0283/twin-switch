@@ -329,9 +329,10 @@ pub fn write_db_incremental(
 ///
 /// 放在统一写库出口，导入 / 覆盖 / 自愈 / 删改 / 手工 SQL 全部覆盖；
 /// 目标库没有这张表（例如 WorkBuddy 库）时静默跳过。返回清掉的行数。
-fn sanitize_loadable(plain: &Path) -> usize {
+/// 返回 `(清掉的 context_usage 轮次数, 归一 work_mode 的工程数)`。
+fn sanitize_loadable(plain: &Path) -> (usize, usize) {
     let Ok(conn) = Connection::open(plain) else {
-        return 0;
+        return (0, 0);
     };
     let has: Option<i64> = conn
         .query_row(
@@ -343,14 +344,39 @@ fn sanitize_loadable(plain: &Path) -> usize {
         .ok()
         .flatten();
     if has.is_none() {
-        return 0;
+        return (0, 0);
     }
-    conn.execute(
-        "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
-         WHERE json_valid(context) AND json_extract(context,'$.context_usage') IS NOT NULL",
-        [],
-    )
-    .unwrap_or(0)
+    let turns = conn
+        .execute(
+            "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
+             WHERE json_valid(context) AND json_extract(context,'$.context_usage') IS NOT NULL",
+            [],
+        )
+        .unwrap_or(0);
+    // `work_mode='work'` 的工程必须是 Trae 托管的目录（`…\work-mode-projects\<id>`）。
+    // 普通目录被标成 Work 模式工程时，客户端启动校验会连工程带**名下的会话**一起清掉。
+    // 实测 2026-10-29：25 个 `work_mode='work'` 的工程全部 0 会话，有会话的工程一律 NULL。
+    let has_proj: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let projects = if has_proj.is_some() {
+        conn.execute(
+            "UPDATE project SET work_mode=NULL \
+             WHERE work_mode IS NOT NULL AND work_mode <> '' \
+               AND ifnull(absolute_path,'') NOT LIKE '%work-mode-projects%'",
+            [],
+        )
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    (turns, projects)
 }
 
 pub fn write_db_incremental_with(
@@ -396,11 +422,17 @@ pub fn write_db_incremental_with(
     let src_pages = src_size / PAGE_SZ as u64;
 
     // 写库前的统一修补（见 sanitize_loadable）：必须在读页数之前做，否则页数对不上。
-    let sanitized = sanitize_loadable(new_plain);
-    if sanitized > 0 {
-        if let Some(p) = on_progress {
+    let (sanitized, proj_fixed) = sanitize_loadable(new_plain);
+    if let Some(p) = on_progress {
+        if sanitized > 0 {
             p(&format!(
                 "已清理 {sanitized} 条轮次里旧版遗留的 context_usage（不清理会让会话打不开）"
+            ));
+        }
+        if proj_fixed > 0 {
+            p(&format!(
+                "已把 {proj_fixed} 个「普通目录却被标成 Work 模式」的工程改回普通工程\
+                 （这类工程名下的会话会被客户端清掉）"
             ));
         }
     }
@@ -1568,11 +1600,23 @@ pub(crate) fn ensure_project_for(
         }
     }
     // 新建：复制源 project 行，project_id / biz_project_id 换新，user_id = dst_uid
+    //
+    // ⚠️⚠️ `work_mode` **绝不许照抄**（第十处根因，2026-10-29）。
+    // `work_mode='work'` 意味着「Work 模式项目」——这类项目的 workspace 必须由 Trae
+    // 自己托管在 `…\ModularData\ai-agent\work-mode-projects\<id>` 下。把普通目录标成
+    // work 模式，客户端启动校验时不认这条工程，**连带把它名下的会话一起清掉**。
+    //
+    // 实测（2026-10-29，用户实时库）：25 个 `work_mode='work'` 的工程**全部 0 会话**；
+    // 有会话的 4 个工程 work_mode 一律 NULL。用户「全选 4 条复制到另一个账号」，
+    // 只有 1 条活下来 —— 正是复用了原生工程（NULL）的那条；另外 3 条各自新建了
+    // 继承 `work_mode='work'` 的工程，几分钟后连会话带工程一起被清空（关联表里
+    // 4 条记录都在，库里只剩 1 条）。
     let new_pid = native_hex_id();
     let new_biz = native_hex_id();
     for (name, v) in [
         ("project_id", rusqlite::types::Value::Text(new_pid.clone())),
         ("user_id", rusqlite::types::Value::Text(dst_uid.to_string())),
+        ("work_mode", rusqlite::types::Value::Null),
     ] {
         if let Some(idx) = cols.iter().position(|c| *c == name) {
             row[idx] = v;
@@ -4864,6 +4908,46 @@ mod tests {
             .unwrap();
         }
         conn.close().unwrap();
+    }
+
+    /// ⚠️ 回归护栏：复制时为**目标账号新建的工程**不许继承源工程的 `work_mode`。
+    ///
+    /// 实测（2026-10-29）：用户「全选 4 条复制到另一个账号」，只有 1 条活下来。
+    /// 活下来的那条复用了目标账号**已有的**工程；另外 3 条各自新建了工程，
+    /// 而这些新工程照抄了源工程的 `work_mode='work'` —— 客户端启动校验时不认
+    /// 这种「普通目录 + work 模式」的工程，**连带把名下会话一起清空**：
+    /// 关联表里 4 条记录都在，`chat_session` 只剩 1 条，工程成了 0 会话的孤儿。
+    #[test]
+    fn copied_project_drops_inherited_work_mode() {
+        let src = Connection::open_in_memory().unwrap();
+        let dst = Connection::open_in_memory().unwrap();
+        for c in [&src, &dst] {
+            c.execute_batch(
+                "CREATE TABLE project(id INTEGER PRIMARY KEY, project_id TEXT, user_id TEXT, \
+                    absolute_path TEXT, biz_project_id TEXT, work_mode TEXT, project_kind TEXT);\
+                 CREATE TABLE chat_session(session_id TEXT, project_id TEXT);",
+            )
+            .unwrap();
+        }
+        src.execute(
+            "INSERT INTO project VALUES(1,'p1','u1','c:\\Users\\x\\WorkBuddy\\a','b1','work','workspace')",
+            [],
+        )
+        .unwrap();
+        src.execute("INSERT INTO chat_session VALUES('s1','p1')", [])
+            .unwrap();
+
+        let new_pid = ensure_project_for(&src, &dst, "s1", "u2").unwrap();
+        let (uid, wm, kind): (String, Option<String>, String) = dst
+            .query_row(
+                "SELECT user_id, work_mode, project_kind FROM project WHERE project_id=?1",
+                rusqlite::params![new_pid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(uid, "u2", "归属必须改写为目标账号");
+        assert_eq!(wm, None, "work_mode 必须为 NULL：普通目录不许标成 Work 模式工程");
+        assert_eq!(kind, "workspace", "其余列的取值照常保真");
     }
 
     /// ⚠️ 回归护栏：同库复制**多个**会话时，每个会话都必须拿到各自的新 id。
