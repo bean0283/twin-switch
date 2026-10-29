@@ -1442,6 +1442,9 @@ async fn forward(
     trace: Trace,
 ) -> Result<Upstream, (StatusCode, String)> {
     let scope = cand.scope.as_str();
+    // 客户端要的**公开名**（`wb:deepseek-v4.1-flash` 这种带作用域前缀的）先留一份：
+    // 下面会把它换成上游代号，而回给客户端时必须还原成公开名（不能露出中转站命名）。
+    let public_model = model.to_string();
     // ⚠️⚠️ **公开名 → 这一家的代号**，必须在这里做、且每家各算一次。
     //
     // Qoder 对外叫 `GLM-5.3`（客户端里那个名字），上游只认 `gmodel`；而同一行在
@@ -1526,6 +1529,31 @@ async fn forward(
             ),
         )
     })?;
+
+    // ---- WorkBuddy：走「伪装成官方会话」的多档适配层 ----------------------
+    //
+    // 2026-10-29：上游加了一层渠道校验（11128），只查 `role: system` 的内容，
+    // 且是「多个特征同时出现」才命中。这里按档位重试并记住成功的那一档，
+    // 具体实证与各档含义见 `modules::gateway_wb` 的模块头注释。
+    if cand.product == "workbuddy" || scope.starts_with("wb") {
+        let uid = cand
+            .key
+            .split_once(':')
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        return wb_forward(
+            scope,
+            spec,
+            &token,
+            &uid,
+            model,
+            &public_model,
+            req,
+            want_stream,
+            trace,
+        )
+        .await;
+    }
 
     let upstream_model = spec.model_override.clone().unwrap_or_else(|| model.to_string());
     let mut body = req.clone();
@@ -1674,8 +1702,9 @@ async fn forward(
             .map(|v| v.contains("event-stream"))
             .unwrap_or(false);
         if sse {
+            // 非 WorkBuddy 的通用透传：不做任何改写（模型名就是客户端请求的那个）。
             return Ok(Upstream::Sse(crate::modules::gateway_stream::passthrough(
-                resp, trace,
+                resp, trace, None,
             )));
         }
         let text = resp.text().await.unwrap_or_default();
@@ -1704,6 +1733,218 @@ async fn forward(
                 format!("上游返回的不是 JSON（{e}）：{}", text.chars().take(200).collect::<String>()),
             )
         })
+}
+
+/// WorkBuddy 的多档转发（档位含义与实证过程见 `modules::gateway_wb` 模块头）。
+///
+/// 顺序：粘住的方案优先，其后按固定顺序补齐。**只有「渠道校验拦截」才换下一档**；
+/// 鉴权/限流/模型名这类错误换档也救不了，直接如实报（不白花额度）。
+async fn wb_forward(
+    scope: &str,
+    spec: UpstreamSpec,
+    token: &str,
+    uid: &str,
+    upstream_model: &str,
+    public_model: &str,
+    req: &Value,
+    want_stream: bool,
+    trace: Trace,
+) -> Result<Upstream, (StatusCode, String)> {
+    use crate::modules::gateway_wb::{self, Variant};
+
+    let sticky = gateway_wb::sticky_get(scope, upstream_model);
+    // 已知会被拦的档位直接跳过：每次先撞一遍 11128 只是白白多花一次往返。
+    let banned = gateway_wb::banned(scope, upstream_model);
+    let mut order: Vec<Variant> = Vec::new();
+    if let Some(v) = sticky {
+        order.push(v);
+    }
+    for v in Variant::order() {
+        if !order.contains(v) && !banned.contains(v) {
+            order.push(*v);
+        }
+    }
+    // 全被封禁且没有粘住方案时不能空转：老老实实按顺序重探一遍。
+    if order.is_empty() {
+        order.extend(Variant::order().iter().copied());
+    }
+
+    let mut builder = reqwest::Client::builder();
+    builder = if want_stream {
+        builder
+            .timeout(std::time::Duration::from_secs(1800))
+            .read_timeout(std::time::Duration::from_secs(120))
+    } else {
+        builder.timeout(std::time::Duration::from_secs(300))
+    };
+    let client = builder
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构造 HTTP 客户端失败：{e}")))?;
+    let url = format!("{}{}", spec.base_url, spec.chat_path);
+
+    let mut tried: Vec<&'static str> = Vec::new();
+    let mut last: Option<(StatusCode, String)> = None;
+
+    for v in order {
+        let mut body = req.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".into(), json!(upstream_model));
+            if spec.force_stream {
+                obj.insert("stream".into(), json!(true));
+            }
+        }
+        normalize_first_role(&mut body);
+        let rep = gateway_wb::adapt(&mut body, v, public_model);
+        // 双保险：旧的零宽空格中和仍然保留（`official_scrub` 已替换品牌词，
+        // 但 `legacy` 档完全靠它；两者叠加没有副作用）。
+        let _ = crate::modules::gateway_prompt::neutralize_system(&mut body);
+
+        let mut rb = client.post(&url).header(
+            "accept",
+            if spec.force_stream { "text/event-stream" } else { "application/json" },
+        );
+        for (k, val) in gateway_wb::headers(v, token, uid) {
+            rb = rb.header(k, val);
+        }
+
+        let resp = match rb.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 传输失败与档位无关（网络抖动 / 上游宕机），换档只会白等一遍。
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("传输失败（可能是网络抖动，可重试）：{e}"),
+                ));
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            if sticky != Some(v) {
+                gateway_wb::sticky_ok(scope, upstream_model, v);
+                crate::modules::diag_log::info(
+                    "gateway",
+                    format!(
+                        "WorkBuddy 渠道方案已锁定：{}（{}，模型 {}，清洗 {rep:?}）",
+                        v.label(),
+                        v.key(),
+                        upstream_model
+                    ),
+                );
+            }
+            // 回给客户端的 model 必须是它请求的那个公开名（`wb:` 前缀是本地命名）。
+            let rewrite = if public_model != upstream_model {
+                Some((upstream_model.to_string(), public_model.to_string()))
+            } else {
+                None
+            };
+            if want_stream {
+                let sse = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|x| x.to_str().ok())
+                    .map(|x| x.contains("event-stream"))
+                    .unwrap_or(false);
+                if sse {
+                    return Ok(Upstream::Sse(crate::modules::gateway_stream::passthrough(
+                        resp, trace, rewrite,
+                    )));
+                }
+                let text = resp.text().await.unwrap_or_default();
+                return serde_json::from_str::<Value>(&text)
+                    .map(Upstream::Json)
+                    .map_err(|e| {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "上游既不是 SSE 也不是 JSON（{e}）：{}",
+                                text.chars().take(200).collect::<String>()
+                            ),
+                        )
+                    });
+            }
+            let text = resp.text().await.unwrap_or_default();
+            if spec.force_stream {
+                return aggregate_sse(&text, public_model).map(Upstream::Json);
+            }
+            return serde_json::from_str::<Value>(&text)
+                .map(Upstream::Json)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "上游返回的不是 JSON（{e}）：{}",
+                            text.chars().take(200).collect::<String>()
+                        ),
+                    )
+                });
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        if gateway_wb::is_channel_block(status.as_u16(), &text) {
+            crate::modules::diag_log::error(
+                "gateway",
+                format!(
+                    "WorkBuddy 渠道校验拦截（{}）：{}",
+                    v.label(),
+                    text.chars().take(200).collect::<String>()
+                ),
+            );
+            tried.push(v.label());
+            // 记下这一档对当前作用域+模型不适用（7 天后自动过期，上游可能又变）。
+            gateway_wb::ban(scope, upstream_model, v);
+            if sticky == Some(v) && gateway_wb::sticky_fail(scope, upstream_model) {
+                crate::modules::diag_log::warn(
+                    "gateway",
+                    "已记住的 WorkBuddy 渠道方案连续 3 次被拦，已作废并重新探测",
+                );
+            }
+            let dumped = dump_rejected_body(&body);
+            let where_hint = match &dumped {
+                Some(p) => format!("\n本次被拒的请求已原样保存：{p}（含对话正文，只在本机，可直接删除）"),
+                None => String::new(),
+            };
+            last = Some((
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!(
+                    "上游返回 HTTP {}（渠道校验 11128，已自动换档重试）：{}\n请求形状：{}{where_hint}",
+                    status.as_u16(),
+                    explain_upstream_error(&text),
+                    req_shape(req)
+                ),
+            ));
+            continue;
+        }
+
+        let hint = match status.as_u16() {
+            401 | 403 => "（上游鉴权失败：token 可能已过期，需重新登录该账号）",
+            429 => "（上游限流 / 当日额度用完）",
+            _ => "",
+        };
+        return Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!(
+                "上游返回 HTTP {}{hint}：{}\n请求形状：{}",
+                status.as_u16(),
+                explain_upstream_error(&text),
+                req_shape(req)
+            ),
+        ));
+    }
+
+    let (code, mut msg) = last.unwrap_or((
+        StatusCode::BAD_GATEWAY,
+        "所有 WorkBuddy 渠道方案都失败了".to_string(),
+    ));
+    if tried.len() > 1 {
+        msg.push_str(&format!(
+            "\n已依次尝试 {} 档：{}。上游判据可能又变了；客户端升级后也要同步更新 \
+             gateway_wb::CLIENT_VERSION。",
+            tried.len(),
+            tried.join(" → ")
+        ));
+    }
+    Err((code, msg))
 }
 
 /// 把上游的业务错误码翻成人能懂的句子（原文一并带上，便于排查）。
@@ -3471,3 +3712,4 @@ mod tool_call_tests {
         assert_eq!(finish_with_calls(Some("length".into()), true), "length");
     }
 }
+

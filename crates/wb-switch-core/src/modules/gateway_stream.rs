@@ -872,24 +872,36 @@ pub fn respond(
 ///
 /// 现在边转发边扫 `data:` 行里的 `usage`，扫到就交给 `trace`；
 /// `trace.finish` 是所有请求（流式/非流式/成功/失败）记额度与指标的**唯一收口**。
-pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
+pub fn passthrough(
+    resp: reqwest::Response,
+    mut trace: Trace,
+    rewrite_model: Option<(String, String)>,
+) -> Response {
     use futures_util::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
         let mut seen = 0usize;
         let mut buf = String::new();
+        // 上游名 → 客户端看到的公开名，**只在首块做一次**。
+        // 只改这一个字段：客户端（dsh 等）会把它显示/记进会话，露出中转站的代号很怪；
+        // 但流式字节不能整体解析重拼（会拼丢 tool_calls），所以做等价的字节替换。
+        let mut rewrite = rewrite_model;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(b) => {
                     if b.is_empty() {
                         continue;
                     }
+                    let b = match rewrite.take() {
+                        Some((from, to)) => rewrite_model_bytes(&b, &from, &to).unwrap_or(b),
+                        None => b,
+                    };
                     seen += b.len();
                     if trace.first_byte_ms.is_none() {
                         trace.first_byte();
                     }
-                    // 只扫描、不改字节：给客户端的仍是上游原样。
+                    // 只扫描、不改字节：给客户端的仍是上游原样（唯一例外是上面那一次 model 替换）。
                     scan_sse_usage(&mut buf, &b, &mut trace);
                     if tx.send(Ok(b)).await.is_err() {
                         // 客户端提前断开：上游可能已经算过费，按已经看到的部分记一笔，
@@ -929,6 +941,24 @@ pub fn passthrough(resp: reqwest::Response, mut trace: Trace) -> Response {
         Body::from_stream(RxStream { rx }),
     )
         .into_response()
+}
+
+/// 透传时把首块里的 `"model":"上游代号"` 换成客户端要的公开名。
+///
+/// 只在**首块**调用一次，且只匹配这一个 JSON 字段的字节序列 ——
+/// 不做 UTF-8 解码、不动其它任何字节（SSE 里全是文本，但分块边界可能切断多字节
+/// 字符，解码重拼有风险）。匹配不到就原样返回 `None`（模型名不是功能性问题，
+/// 宁可还原失败也不能弄坏流）。
+fn rewrite_model_bytes(b: &[u8], from: &str, to: &str) -> Option<Bytes> {
+    let needle = format!("\"model\":\"{from}\"");
+    let repl = format!("\"model\":\"{to}\"");
+    let nb = needle.as_bytes();
+    let idx = b.windows(nb.len()).position(|w| w == nb)?;
+    let mut out = Vec::with_capacity(b.len() + repl.len());
+    out.extend_from_slice(&b[..idx]);
+    out.extend_from_slice(repl.as_bytes());
+    out.extend_from_slice(&b[idx + nb.len()..]);
+    Some(Bytes::from(out))
 }
 
 /// 透传时扫用量：把已完整的 `data:` 行交给 [`sse_usage`]，命中就写进 `trace`。
