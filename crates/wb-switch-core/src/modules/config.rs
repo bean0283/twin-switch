@@ -437,6 +437,7 @@ pub async fn http_request_with_proxy(
         },
         None => http_client().clone(),
     };
+    let method_label = method.as_str().to_string();
     let mut req = client.request(method, url);
     req = req.header("Content-Type", "application/json");
     if let Some(h) = headers {
@@ -454,6 +455,19 @@ pub async fn http_request_with_proxy(
             if status.is_success() {
                 serde_json::from_str(&text).unwrap_or(Value::Null)
             } else {
+                // ⚠️ 所有上游请求的唯一 HTTP 出口之一：非 2xx 一律留一条诊断日志
+                //（默认 error 级别就会记）。这是「账号刷新失败 / 401 / 5xx 只在
+                // 别人机器上出现」时唯一能留下证据的地方。
+                crate::modules::diag_log::error(
+                    "http",
+                    format!(
+                        "{} {} → HTTP {} {}",
+                        method_label,
+                        url,
+                        status.as_u16(),
+                        normalize_error_body(&text)
+                    ),
+                );
                 serde_json::from_str(&text).unwrap_or_else(|_| {
                     json!({
                         "code": status.as_u16(),
@@ -462,7 +476,13 @@ pub async fn http_request_with_proxy(
                 })
             }
         }
-        Err(e) => json!({"code": -1, "message": e.to_string()}),
+        Err(e) => {
+            crate::modules::diag_log::error(
+                "http",
+                format!("{} {} → 网络错误: {e}", method_label, url),
+            );
+            json!({"code": -1, "message": e.to_string()})
+        }
     }
 }
 
@@ -527,6 +547,7 @@ pub async fn http_request_raw(
             }
         }
     };
+    let method_label = method.as_str().to_string();
     let mut req = client.request(method, url);
     req = req.header("Content-Type", "application/json");
     if let Some(h) = headers {
@@ -547,9 +568,22 @@ pub async fn http_request_raw(
                 }
             }
             let text = resp.text().await.unwrap_or_default();
+            // 与 [`http_request_with_proxy`] 同一条纪律：非 2xx / 网络错误留诊断日志。
+            if status >= 400 {
+                crate::modules::diag_log::error(
+                    "http",
+                    format!("{} {} → HTTP {} {}", method_label, url, status, normalize_error_body(&text)),
+                );
+            }
             (status, resp_headers, text)
         }
-        Err(e) => (0, HashMap::new(), e.to_string()),
+        Err(e) => {
+            crate::modules::diag_log::error(
+                "http",
+                format!("{} {} → 网络错误: {e}", method_label, url),
+            );
+            (0, HashMap::new(), e.to_string())
+        }
     }
 }
 

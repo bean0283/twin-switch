@@ -1239,11 +1239,31 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
             next.qoder_exe = clean;
         }
         let path = settings::save(&next)?;
+        // 开着诊断日志就立刻写一条自证行：默认 error 级别下没有失败就是 0 个文件，
+        // 用户没法区分「在跑但还没错」和「根本没生效」（实测反馈过后者）。
+        if saved_by_patch_log_enabled(patch.log.as_ref()) {
+            let l = &next.log;
+            wb_switch_core::modules::diag_log::system_note(
+                "settings",
+                format!(
+                    "诊断日志已开启（级别 {}，保留 {} 天 / 每天最多 {} 份 / 单文件 {} MB）",
+                    l.level, l.max_days, l.max_files, l.max_mb
+                ),
+            );
+        }
         // 回读一次：把「实际落盘的值」返回给界面，而不是「用户刚提交的值」
         let saved = settings::load_strict()?;
         Ok(settings_snapshot(&saved, &path))
     })
     .await?
+}
+
+/// 这次保存里诊断日志的总开关是不是「开」。
+///
+/// 只有用户这次把 `log` 块交上来且 enabled=true 才写自证行；
+/// 改其它设置不动日志（否则每次保存都多一行，很快把「最近日志」刷满）。
+fn saved_by_patch_log_enabled(patch: Option<&wb_switch_core::modules::diag_log::DiagLogConfig>) -> bool {
+    patch.map(|l| l.enabled).unwrap_or(false)
 }
 
 /// 取「正在运行的客户端」的主程序路径（设置页的「用运行中的客户端」按钮）。
@@ -2608,13 +2628,27 @@ pub async fn diag_log_clear() -> Value {
 ///
 /// ⚠️ 目录不存在时**先建出来**再打开 —— 否则「打开了但什么都没有」会让人以为
 /// 「日志功能没生效」，而其实是「还没写过日志」。
+///
+/// ⚠️⚠️ 必须**真的调 opener**：以前这里只建目录就返回 ok，前端也没跟进打开 ——
+/// 用户点「打开文件夹」什么都不会发生（2026-10-29 实测反馈「打开文件夹也没有用」）。
 #[tauri::command]
-pub fn diag_log_open() -> Value {
+pub fn diag_log_open(app: tauri::AppHandle) -> Value {
+    use tauri_plugin_opener::OpenerExt;
+
     let dir = wb_switch_core::modules::diag_log::log_root();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return json!({ "ok": false, "error": format!("创建日志目录失败：{e}") });
     }
-    json!({ "ok": true, "dir": dir.to_string_lossy() })
+    match app
+        .opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+    {
+        Ok(_) => json!({ "ok": true, "dir": dir.to_string_lossy() }),
+        Err(e) => json!({
+            "ok": false,
+            "error": format!("打开目录失败：{e}（目录在 {}）", dir.to_string_lossy())
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------

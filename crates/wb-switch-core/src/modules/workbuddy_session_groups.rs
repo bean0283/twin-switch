@@ -483,8 +483,38 @@ pub fn detail(group_key: &str) -> Result<Value, String> {
 ///
 /// ⚠️ 慢是预期：一份 227 MB 的正文要读几秒，几个副本就是十几秒。
 /// 所以只在用户**手动点「强制比对」**时调用（默认路径绝不走这里）。
+///
+/// ⚠️⚠️ 算完**必须把结论落盘**（[`workbuddy_source::mark_compared`]）：
+/// 用户反馈「强制比对后后面又要重新比对」——一次比对十几秒，结论却只活在
+/// 内存里，刷新一次 / 重启一次就退回「未比对」，等于白等。落盘后只要文件
+/// 没再被改动，刷新、重启都直接复用（一致 → 显示一致；不同 → 显示有分歧）。
 pub fn detail_forced(group_key: &str) -> Result<Value, String> {
-    detail_opt(group_key, true)
+    let payload = detail_opt(group_key, true)?;
+    let members = payload
+        .get("members")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let values: Vec<(String, std::path::PathBuf, usize, String)> = members
+        .iter()
+        .filter_map(|m| {
+            let sid = m.get("sessionId")?.as_str()?.to_string();
+            if sid.is_empty() {
+                return None;
+            }
+            let digest = m.get("digest")?.as_str()?.to_string();
+            if digest.is_empty() {
+                return None; // 读不出来的成员没有可信结论，不落盘
+            }
+            let lines = m.get("recordCount")?.as_u64()? as usize;
+            let path = workbuddy_source::find_jsonl(&sid)?;
+            Some((sid, path, lines, digest))
+        })
+        .collect();
+    if values.len() >= 2 {
+        let _ = workbuddy_source::mark_compared(&values);
+    }
+    Ok(payload)
 }
 
 fn detail_opt(group_key: &str, force: bool) -> Result<Value, String> {

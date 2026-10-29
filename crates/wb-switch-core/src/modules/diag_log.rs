@@ -158,6 +158,20 @@ pub fn info(scope: &str, message: impl AsRef<str>) {
     write("INFO", scope, message.as_ref());
 }
 
+/// 记一条 **系统备注**：只看总开关，**不受级别门槛限制**。
+///
+/// 为什么需要：默认级别是 `error`，用户刚把开关拨开时如果没有失败发生，
+/// 日志就永远是 0 个文件 —— 用户没法确认「功能真的在跑」，只会觉得它坏了
+/// （实测反馈：「日志功能不可用，没有写入」）。保存设置的那一刻写一条自证行，
+/// 「打开文件夹」立刻能看到东西。
+pub fn system_note(scope: &str, message: impl AsRef<str>) {
+    let cfg = config_now();
+    if !cfg.enabled {
+        return;
+    }
+    let _ = append_at(&log_root(), &cfg, "NOTE", scope, message.as_ref(), now_ms());
+}
+
 /// 统一写入口：开关关着就**立刻返回**（一个字符串都不拼，避免给热路径加成本）。
 fn write(level: &str, scope: &str, message: &str) {
     let cfg = config_now();
