@@ -965,18 +965,51 @@ const HISTORY_MODE: &str = "FunctionCall";
 ///    `tool_call_id` / `tool_calls` 必须齐，缺的写 `null` —— 原生行就是这么写的，
 ///    少键会让 `HistoryRawChatMessage` 解码失败。
 fn history_messages(role: &str, text: &str) -> String {
-    json!({
+    let mut v = json!({
         "mode": HISTORY_MODE,
         "raw_messages": [{
             "role": role,
-            "content": [{ "type": "text", "text": text }],
+            // ⚠️ content 元素必须是五个键（type/text/image_url/video_url/cache_control）。
+            // 原生行 100% 都带后三个（值为 null）；少键会让 `LiteMessagePart` 解码失败，
+            // 整条会话就渲染成「由于网络原因，会话加载失败」。
+            "content": [{
+                "type": "text",
+                "text": text,
+                "image_url": Value::Null,
+                "video_url": Value::Null,
+                "cache_control": Value::Null
+            }],
             "name": Value::Null,
             "tool_call_id": Value::Null,
             "tool_calls": Value::Null,
             "extra_info": Value::Null
         }]
+    });
+    // ⚠️ 用户行还必须带 `important_user_message_prompt_section`。
+    //
+    // 这是「导入的会话点开就报『会话加载失败』」的**最后一处根因**（2026-10-29 查实）：
+    // `harness.dll` 里 `HistoryV2Messages` 的字段序列是
+    //   raw_messages · important_user_message_prompt_section · bottom_line_tool_call_summary ·
+    //   mode · …
+    // 它与 `mode` 紧邻、同样**不是 Option**。实测本机 136 个会话：
+    //   - 该段「0 条命中」的会话：3 个 —— 正是打不开的那 3 个（零误报、零漏报）
+    //   - 只要有一条 user_input 行带它，会话就能打开（133 个里有 119 个是部分覆盖）
+    // 原生行的该段形状固定为 `{original_user_input, must_keep_rules, response_rules,
+    // parent_agent_instruction}`；抽样 1635 行，`original_user_input` 基本都是空串。
+    if role == "user" {
+        v["important_user_message_prompt_section"] = prompt_section();
+    }
+    v.to_string()
+}
+
+/// `important_user_message_prompt_section` 的固定形状（从原生行反推）。
+fn prompt_section() -> Value {
+    json!({
+        "original_user_input": "",
+        "must_keep_rules": Value::Null,
+        "response_rules": Value::Null,
+        "parent_agent_instruction": Value::Null
     })
-    .to_string()
 }
 
 // ---------------------------------------------------------------------------
