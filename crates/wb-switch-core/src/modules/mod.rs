@@ -12,6 +12,7 @@ pub mod gateway_pool;
 pub mod gateway_prompt;
 pub mod gateway_server;
 pub mod gateway_stream;
+pub mod gateway_wb;
 pub mod jwt;
 pub mod process_list;
 pub mod qoder_accounts;
