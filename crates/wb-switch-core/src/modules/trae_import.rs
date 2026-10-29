@@ -3723,6 +3723,23 @@ pub fn import_sessions(
         }
     }
 
+    // 兜底清理：旧版 SOLO 写进 `chat_turn.context` 的 `context_usage`（`{"contexts":[]}`）
+    // 会让新版 lite 引擎按固定结构反序列化失败 —— 症状就是「会话加载失败 / 995001」。
+    // 导入是把源行原样搬过来，所以在这条统一出口上清一遍，不管走哪个复制分支都不会漏。
+    // 跨客户端目标（例如写 WorkBuddy 库）没有这张表，execute 失败按 0 处理。
+    let stripped_ctxu = dst_conn
+        .execute(
+            "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
+             WHERE json_valid(context) AND json_extract(context,'$.context_usage') IS NOT NULL",
+            [],
+        )
+        .unwrap_or(0);
+    if stripped_ctxu > 0 {
+        log(&format!(
+            "已清理 {stripped_ctxu} 条轮次里旧版遗留的 context_usage（不清理会导致会话打不开）"
+        ));
+    }
+
     dst_conn.close().map_err(|(_, e)| format!("关闭明文副本失败: {e}"))?;
     if copied == 0 && skipped.is_empty() {
         let _ = std::fs::remove_dir_all(&work);
