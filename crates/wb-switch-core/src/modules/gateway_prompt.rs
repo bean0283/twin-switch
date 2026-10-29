@@ -64,7 +64,20 @@ fn neutralize_text(text: &str) -> Option<String> {
     let mut i = 0usize;
     let mut changed = false;
     // `@` 规则的总闸：既有 `@` 又有路径词根才启用，否则连判断都不做。
-    let at_rule = text.contains('@') && PATH_ROOTS.iter().any(|w| lower.contains(w));
+    // 只有「`@` 后面紧跟空白或引号」才算标记语法（`a@b.com` 不算），
+    // 再加路径词根做闸门 —— 两个条件都满足才动。
+    let at_rule = PATH_ROOTS.iter().any(|w| lower.contains(w))
+        && text.match_indices('@').any(|(idx, _)| {
+            // 跳过零宽字符后再判断：老版本插过 U+200B，那种文本也要能升级
+            let mut j = idx + 1;
+            while text[j..].starts_with(ZWSP) {
+                j += ZWSP.len_utf8();
+            }
+            matches!(
+                text[j..].chars().next(),
+                Some(' ') | Some('\t') | Some('\n') | Some('"')
+            )
+        });
     while i < bytes.len() {
         // 在 `i` 处尝试匹配 `deepseek` + 空白* + `harness`（全部按小写比较）。
         let rest_lower = &lower[i..];
@@ -94,14 +107,30 @@ fn neutralize_text(text: &str) -> Option<String> {
         // 只在 `@` 后插一个零宽空格即 200 通过；把 `paths` 改成单数 `path` 也通过
         // ⇒ 触发条件是 `@` 与路径词的组合，不是某一句固定文案。
         if ch == '@' && at_rule {
-            let after_at = i + 1;
+            // 跳过已有的零宽字符：老版本网关插过 U+200B，这次要把它一并换成文字，
+            // 否则规则看到「`@` 后面不是空白」就跳过，旧文本永远升级不过来。
+            let mut after_at = i + 1;
+            while text[after_at..].starts_with(ZWSP) {
+                after_at += ZWSP.len_utf8();
+            }
             let tail_orig = &text[after_at..];
             let ws = tail_orig.len() - tail_orig.trim_start_matches([' ', '\t']).len();
-            // ⚠️ 必须真有空白：`@src/main.rs` / `a@b.com` 这类不含空白的写法要原样
-            // 保留（前者是用户显式引用语法，模型要靠它认文件）。
+            // 2026-10-29 真机复测：**零宽空格那招失效了**。同一句
+            //   `Tokens prefixed with @ are paths …`（带 U+200B）仍然 400/11128，
+            // 上游显然是先把零宽字符归一化掉再做匹配。
+            // 改成把 `@` **写成一个词**：语义不变（模型照样知道是 at-sign），
+            // 但不再有「`@` + 路径词」这个组合。整段 27KB 重发实测 200。
+            if tail_orig.starts_with('"') {
+                // `@"…"` 这种紧贴写法
+                out.push_str("at-sign followed by ");
+                i = after_at;
+                changed = true;
+                continue;
+            }
             if ws > 0 {
-                out.push('@');
-                out.push(ZWSP);
+                // ⚠️ 必须真有空白：`@src/main.rs` / `a@b.com` 这类不是标记语法，
+                // 改写会把邮箱、引用路径写坏。
+                out.push_str("at-sign");
                 i = after_at;
                 changed = true;
                 continue;
@@ -185,18 +214,44 @@ mod tests {
         assert!(neutralize_text(&once).is_none(), "已中和过就不该再改");
     }
 
-    /// 2026-10-28 真机实测：`@` + 路径词那两句（169 字符）单独发出即 400/11128；
-    /// 只在 `@` 后插零宽空格就通过。这条必须命中，且同样无损。
+    /// 2026-10-29 真机复测：`@` + 路径词这句单独发出即 400/11128，而且**带零宽空格
+    /// 也拦**（上游会先做 Unicode 归一化）。所以这里改成把 `@` 写成词。
+    ///
+    /// 实测对照（同一账号、同一模型、同一请求头，只改这一句）：
+    /// | system 内容 | 结果 |
+    /// |---|---|
+    /// | 整段 27KB，`@` 原样 | 400 / 11128 |
+    /// | 整段 27KB，`@` 后插 U+200B | 400 / 11128 |
+    /// | 整段 27KB，`@` 改写成 `at-sign` | **200** |
     #[test]
-    fn neutralizes_at_prefixed_path_sentence() {
+    fn rewrites_at_prefixed_path_sentence() {
         let raw = "Tokens prefixed with @ are paths the user explicitly referenced. \
                    Relative paths resolve from the workspace root; absolute paths \
                    identify files or directories on the host";
         let fixed = neutralize_text(raw).expect("必须命中");
-        assert_eq!(fixed.matches(ZWSP).count(), 1, "只该在 `@` 后插一处：{fixed:?}");
-        assert_eq!(fixed.replace(ZWSP, ""), raw, "去掉零宽空格必须逐字还原");
-        // 插完之后不再有「`@` + 空格 + paths」这个组合。
         assert!(!fixed.contains("@ are"), "触发组合还在：{fixed:?}");
+        assert!(fixed.contains("prefixed with at-sign"), "改写后要读得通：{fixed:?}");
+        // 后面的正文一个字都不能丢
+        assert!(fixed.contains("identify files or directories on the host"));
+    }
+
+    /// `@"…"` 紧贴写法也要改；邮箱这种「不是标记语法」的 `@` 一律不碰。
+    #[test]
+    fn handles_quoted_marker_but_keeps_emails() {
+        let raw = "A path with spaces is written @\"...\" inside the message. \
+                   Mail me at a@b.com, files list here.";
+        let fixed = neutralize_text(raw).expect("必须命中");
+        assert!(fixed.contains("at-sign followed by"), "{fixed:?}");
+        assert!(fixed.contains("a@b.com"), "邮箱不能被改写：{fixed:?}");
+    }
+
+    /// 老版本网关插过零宽空格；同一段文本再来一次必须**升级**成文字，而不是跳过。
+    #[test]
+    fn upgrades_previously_zwsp_neutralized_text() {
+        let old = "Tokens prefixed with @\u{200B} are paths the user explicitly referenced.";
+        let fixed = neutralize_text(old).expect("旧文本也要命中");
+        assert!(!fixed.contains(ZWSP), "零宽空格应被替换掉：{fixed:?}");
+        assert!(fixed.contains("prefixed with at-sign"), "{fixed:?}");
     }
 
     /// `@` 引用语法（无空格）必须原样保留 —— 模型要靠它认用户指的是哪个文件。
