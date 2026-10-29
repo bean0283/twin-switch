@@ -320,6 +320,39 @@ pub fn write_db_incremental(
 /// 那是又一次整库解密。调用方（`import_sessions`）为了改数据本来就已经解出过一份原库明文，
 /// 把它留下来直接做字节比对，就能省掉这一整轮解密（8 万页量级）。
 /// `old_plain` 必须与 `src_enc` 逐页一一对应，否则比对结果无效。
+/// 任何一次写库前的统一「可加载性」修补：清掉旧版 SOLO 遗留的
+/// `chat_turn.context.context_usage`（值形如 `{"contexts":[]}`）。
+///
+/// 新版 Trae 的 lite 引擎按**固定结构**反序列化 `chat_turn.context`，多出这个键就让整条
+/// 会话的 `chat.getMessages` 返回 995001「failed to load messages」——用户看到的是
+/// 「会话加载失败」。2026-10-29 用克隆二分验证到这一个键。
+///
+/// 放在统一写库出口，导入 / 覆盖 / 自愈 / 删改 / 手工 SQL 全部覆盖；
+/// 目标库没有这张表（例如 WorkBuddy 库）时静默跳过。返回清掉的行数。
+fn sanitize_loadable(plain: &Path) -> usize {
+    let Ok(conn) = Connection::open(plain) else {
+        return 0;
+    };
+    let has: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_turn'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if has.is_none() {
+        return 0;
+    }
+    conn.execute(
+        "UPDATE chat_turn SET context=json_remove(context,'$.context_usage') \
+         WHERE json_valid(context) AND json_extract(context,'$.context_usage') IS NOT NULL",
+        [],
+    )
+    .unwrap_or(0)
+}
+
 pub fn write_db_incremental_with(
     enc_key_hex: &str,
     src_enc: &Path,
@@ -361,6 +394,16 @@ pub fn write_db_incremental_with(
         return Err(format!("原加密库大小 {src_size} 不是页大小整数倍，结构异常"));
     }
     let src_pages = src_size / PAGE_SZ as u64;
+
+    // 写库前的统一修补（见 sanitize_loadable）：必须在读页数之前做，否则页数对不上。
+    let sanitized = sanitize_loadable(new_plain);
+    if sanitized > 0 {
+        if let Some(p) = on_progress {
+            p(&format!(
+                "已清理 {sanitized} 条轮次里旧版遗留的 context_usage（不清理会让会话打不开）"
+            ));
+        }
+    }
 
     let new_size = std::fs::metadata(new_plain)
         .map_err(|e| format!("读取明文副本大小失败: {e}"))?
