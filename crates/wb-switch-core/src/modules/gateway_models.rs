@@ -396,6 +396,395 @@ pub fn models_file() -> PathBuf {
     store_dir().join("models.json")
 }
 
+/// 模型清单文件的**权威上游**（用户自己维护、推到 GitHub 的那份）。
+///
+/// 读取顺序固定为：本地文件 → 后台拉这个地址覆盖 `defaults` → 拉不到就用本地。
+pub const MODELS_REMOTE_URL: &str =
+    "https://raw.githubusercontent.com/bean0283/twin-switch/main/models.json";
+
+/// 同内容的备用源（**逐个试**，第一个成功的算数）。
+///
+/// ⚠️ 2026-10-30 用户反馈「GitHub 上的模型数据文件没有上传，无法获取更新」。
+/// 国内直连 `raw.githubusercontent.com` 经常整条超时（真机 curl 返回 000/35），
+/// 看起来和「文件不存在」一模一样 —— 所以必须：① 有镜像源可退；② 把
+/// 「404 文件不存在」与「网络不通」在文案上分开，否则用户不知道该找谁。
+///
+/// jsDelivr 是 GitHub 仓库的公开 CDN，同样按分支取文件，不需要 token。
+pub const MODELS_REMOTE_MIRRORS: [&str; 2] = [
+    // 主源：GitHub 原始文件（国外 / 有代理时最快）
+    MODELS_REMOTE_URL,
+    // 镜像：jsDelivr CDN（国内可达，内容与仓库同分支同步，有几分钟缓存）
+    "https://cdn.jsdelivr.net/gh/bean0283/twin-switch@main/models.json",
+];
+
+/// `models.json` 的结构版本。
+///
+/// v1 是扁平的 `{ 作用域: [模型…] }`（老机器上就是它）；
+/// v2 拆成 `defaults`（GitHub / 本机扫描给的，**会被覆盖**）与 `user`（用户手动加的，**永不覆盖**）。
+pub const MODELS_VERSION: u32 = 2;
+
+/// 模型清单（v2）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModelsCatalog {
+    #[serde(default)]
+    pub version: u32,
+    /// 上次写入的来源：`github` / `discover` / `migrated` / `user`。
+    #[serde(default)]
+    pub source: String,
+    /// 上次同步时间（RFC3339 本地时间，界面原样展示）。
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: String,
+    /// 默认清单：会被 GitHub / 本机扫描**整体覆盖**。
+    #[serde(default)]
+    pub defaults: BTreeMap<String, Vec<String>>,
+    /// 用户手动添加的清单：与 `defaults` 合并，**任何自动更新都不许动它**。
+    #[serde(default)]
+    pub user: BTreeMap<String, Vec<String>>,
+}
+
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 去重并保序（空串/空白丢弃）。
+fn tidy(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in list {
+        let t = m.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if out.iter().any(|x| x == t) {
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out
+}
+
+impl ModelsCatalog {
+    /// 合并后的「作用域 → 模型」：`defaults` 打头，`user` 追加（去重）。
+    ///
+    /// 顺序有意义：网关 `/v1/models` 与界面的列表都按它显示，用户自己加的排在后面。
+    pub fn effective(&self) -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (scope, list) in self.defaults.iter().chain(self.user.iter()) {
+            let entry = out.entry(scope.clone()).or_default();
+            for m in tidy(list) {
+                if !entry.contains(&m) {
+                    entry.push(m);
+                }
+            }
+        }
+        // 清掉合并后为空的条目（用户把某作用域全删了、默认也没有）。
+        out.retain(|_, v| !v.is_empty());
+        out
+    }
+
+    /// 某个模型是否来自用户手动添加（界面据此决定「能不能删」）。
+    pub fn is_user(&self, scope: &str, model: &str) -> bool {
+        self.user
+            .get(scope)
+            .map(|l| l.iter().any(|m| m == model))
+            .unwrap_or(false)
+    }
+}
+
+/// 读清单：**只管读，修不了就返回空**（老机器上本来就没有这个文件）。
+///
+/// 兼容 v1：顶层直接是 `{ 作用域: [模型…] }` 时，整份当作 `defaults`。
+pub fn load_catalog() -> ModelsCatalog {
+    let Ok(text) = std::fs::read_to_string(models_file()) else {
+        return ModelsCatalog::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return ModelsCatalog::default();
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return ModelsCatalog::default(),
+    };
+    // v2：明确带 defaults / user 两个键之一
+    if obj.contains_key("defaults") || obj.contains_key("user") {
+        let mut cat: ModelsCatalog = serde_json::from_value(v).unwrap_or_default();
+        cat.version = MODELS_VERSION;
+        return cat;
+    }
+    // v1：整份是扁平 map ⇒ 全部当默认清单（迁移，不丢数据）
+    let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, val) in obj {
+        if let Some(list) = val.as_array() {
+            let models: Vec<String> = list
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+            if !models.is_empty() {
+                defaults.insert(k.clone(), tidy(&models));
+            }
+        }
+    }
+    ModelsCatalog {
+        version: MODELS_VERSION,
+        source: "migrated".into(),
+        updated_at: String::new(),
+        defaults,
+        user: BTreeMap::new(),
+    }
+}
+
+/// 落盘（写临时文件再 rename：写一半断电不会留半个 JSON）。
+pub fn save_catalog(cat: &ModelsCatalog) -> Result<(), String> {
+    let path = models_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    let body = serde_json::to_vec_pretty(cat).map_err(|e| format!("序列化模型清单失败：{e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("写入模型清单失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("替换模型清单失败：{e}"))?;
+    Ok(())
+}
+
+/// 合并后的清单（网关选号、`/v1/models`、界面共用这一个出口）。
+pub fn load_effective() -> BTreeMap<String, Vec<String>> {
+    load_catalog().effective()
+}
+
+/// 用户手动添加一个模型（写到 `user` 段；重复添加是幂等的）。
+pub fn add_user_model(scope: &str, model: &str) -> Result<ModelsCatalog, String> {
+    let scope = scope.trim();
+    let model = model.trim();
+    if scope.is_empty() {
+        return Err("请选择模型所属的作用域（如 trae-cn / wb-cn）".into());
+    }
+    if model.is_empty() {
+        return Err("模型名不能为空".into());
+    }
+    let mut cat = load_catalog();
+    let list = cat.user.entry(scope.to_string()).or_default();
+    if !list.iter().any(|m| m == model) {
+        list.push(model.to_string());
+    }
+    // 默认段里已经有同名条目时不必重复留在 user（但那属于「默认」，删了会被下次同步加回来，
+    // 所以仍写进 user —— 这样用户删默认模型时它有额外一层保护）。
+    cat.version = MODELS_VERSION;
+    cat.source = "user".into();
+    cat.updated_at = now_stamp();
+    save_catalog(&cat)?;
+    Ok(cat)
+}
+
+/// 删除用户手动添加的模型（**只删 user 段**；默认段由同步负责）。
+pub fn remove_user_model(scope: &str, model: &str) -> Result<ModelsCatalog, String> {
+    let mut cat = load_catalog();
+    let mut changed = false;
+    if let Some(list) = cat.user.get_mut(scope) {
+        let before = list.len();
+        list.retain(|m| m != model);
+        changed = list.len() != before;
+        if list.is_empty() {
+            cat.user.remove(scope);
+        }
+    }
+    if !changed {
+        return Err(format!("「{model}」不在你手动添加的清单里（默认清单由 GitHub 同步，不能在这里删）"));
+    }
+    cat.version = MODELS_VERSION;
+    cat.updated_at = now_stamp();
+    save_catalog(&cat)?;
+    Ok(cat)
+}
+
+/// 把一份「作用域 → 模型」整体写进 `defaults`（覆盖），**保留 `user` 不动**。
+///
+/// `source` 说明来源（`github` / `discover`），界面据此告诉用户「这份是哪来的」。
+pub fn replace_defaults(
+    map: BTreeMap<String, Vec<String>>,
+    source: &str,
+) -> Result<ModelsCatalog, String> {
+    let mut cat = load_catalog();
+    let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (scope, list) in map {
+        let models = tidy(&list);
+        if !models.is_empty() {
+            defaults.insert(scope, models);
+        }
+    }
+    cat.defaults = defaults;
+    cat.version = MODELS_VERSION;
+    cat.source = source.to_string();
+    cat.updated_at = now_stamp();
+    save_catalog(&cat)?;
+    Ok(cat)
+}
+
+/// 从 GitHub 拉清单并覆盖 `defaults`。
+///
+/// 失败时**不写任何东西**：界面拿到的是一句原因，本地清单继续可用（用户要的「不可用就用本地」）。
+///
+/// 会按 [`MODELS_REMOTE_MIRRORS`] **逐个源尝试**：主源超时（国内常见）就换镜像源。
+/// 文案必须把「文件不存在（404）」和「连不上网」分开说 —— 前者是仓库里没这个文件、
+/// 需要作者补；后者是本机网络问题，用户自己能解决（开代理 / 换网络）。
+pub async fn sync_from_remote() -> Result<Value, String> {
+    let mut attempts: Vec<String> = Vec::new();
+    let mut not_found = 0usize;
+    let mut total = 0usize;
+
+    for url in MODELS_REMOTE_MIRRORS {
+        total += 1;
+        match fetch_remote(url).await {
+            Ok(map) => {
+                let cat = replace_defaults(map, "github")?;
+                let count: usize = cat.defaults.values().map(|v| v.len()).sum();
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "source": "github",
+                    "url": url,
+                    "scopes": cat.defaults.len(),
+                    "models": count,
+                    "updatedAt": cat.updated_at,
+                    "userKept": cat.user.values().map(|v| v.len()).sum::<usize>(),
+                    // 退到镜像源时要说清楚，别让用户以为主源也通了。
+                    "mirrored": url != MODELS_REMOTE_URL,
+                }));
+            }
+            Err((kind, msg)) => {
+                if kind == FailureKind::NotFound {
+                    not_found += 1;
+                }
+                attempts.push(format!("{url} → {msg}"));
+            }
+        }
+    }
+
+    let detail = attempts.join("；");
+    // ⚠️ 只有**每个源都说 404**才算「仓库里真没这个文件」。只要有一个源是网络问题，
+    // 就不能断言文件缺失 —— 那会把用户引向错误的方向（去仓库里找根本不缺的文件）。
+    Err(if not_found == total {
+        format!(
+            "GitHub 仓库里没有 models.json（404）：{detail}。\
+             这是清单文件缺失，不是你的网络问题 —— 需要把 models.json 推到仓库根目录后才能同步。"
+        )
+    } else {
+        format!(
+            "拉取 GitHub 模型清单失败（本地清单继续可用）：{detail}。\
+             国内直连 raw.githubusercontent.com 经常超时，可以开代理再试。"
+        )
+    })
+}
+
+/// 单次拉取的失败类别：**决定文案**，所以必须分开，不能塌缩成一个 bool。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// 连不上（超时 / DNS / TLS）。
+    Network,
+    /// 连上了但服务端说没有这个文件。
+    NotFound,
+    /// 拉到了但内容不是我们认的形态。
+    Bad,
+}
+
+async fn fetch_remote(
+    url: &str,
+) -> Result<BTreeMap<String, Vec<String>>, (FailureKind, String)> {
+    let resp = crate::modules::config::http_request(url, "GET", None, None).await;
+    // 传输层失败统一是 `{"code": -1, "message": …}`（项目里唯一的判据）。
+    if resp.get("code").and_then(|c| c.as_i64()) == Some(-1) {
+        let msg = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("网络不可用")
+            .to_string();
+        return Err((FailureKind::Network, msg));
+    }
+    // 非 2xx 会带 HTTP 状态码（`http_request` 的约定）：404 是「文件不存在」。
+    if let Some(code) = resp.get("code").and_then(|c| c.as_i64()) {
+        if code == 404 {
+            return Err((
+                FailureKind::NotFound,
+                "HTTP 404 文件不存在".to_string(),
+            ));
+        }
+        if (400..600).contains(&code) {
+            let msg = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            // 403 也可能是限流/被墙，仍归「网络类」便于用户开代理重试。
+            return Err((
+                FailureKind::Network,
+                format!("HTTP {code} {}", msg.trim()).trim().to_string(),
+            ));
+        }
+    }
+
+    let v: Value = resp;
+    parse_remote_body(&v)
+}
+
+/// 解析远端文件体（**纯函数**，便于单测钉住「只取 defaults」这条铁律）。
+///
+/// 两种形态都收：v2（`defaults`/`user`）与 v1（扁平）。
+/// ⚠️ **只取 `defaults`**，绝不把远端文件里的 `user` 段搬过来 —— 那会覆盖
+/// 用户本机手动添加的模型（用户明确要求「我加的模型永不被覆盖」）。
+fn parse_remote_body(v: &Value) -> Result<BTreeMap<String, Vec<String>>, (FailureKind, String)> {
+    let collect = |obj: &serde_json::Map<String, Value>| -> BTreeMap<String, Vec<String>> {
+        let mut m = BTreeMap::new();
+        for (k, val) in obj {
+            if let Some(list) = val.as_array() {
+                m.insert(
+                    k.clone(),
+                    list.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        m
+    };
+
+    let map = if let Some(d) = v.get("defaults").and_then(|d| d.as_object()) {
+        collect(d)
+    } else if let Some(o) = v.as_object() {
+        // 扁平 v1：注意 `version` / `source` 这类标量不是数组，会被 `as_array` 过滤掉，
+        // 但 `user` 若是对象也不会误收 —— 只有数组值才算名单。
+        collect(o)
+    } else {
+        return Err((FailureKind::Bad, "既不是对象也不是 v2 结构".to_string()));
+    };
+    if map.is_empty() {
+        return Err((
+            FailureKind::Bad,
+            "文件里没有任何模型（未覆盖本地清单）".to_string(),
+        ));
+    }
+    Ok(map)
+}
+
+/// 清单概览（界面用）：两份分开给，前端才知道哪些能删。
+pub fn catalog_overview() -> Value {
+    let cat = load_catalog();
+    let effective = cat.effective();
+    let user_count: usize = cat.user.values().map(|v| v.len()).sum();
+    let default_count: usize = cat.defaults.values().map(|v| v.len()).sum();
+    serde_json::json!({
+        "ok": true,
+        "version": cat.version.max(MODELS_VERSION),
+        "source": cat.source,
+        "updatedAt": cat.updated_at,
+        "remoteUrl": MODELS_REMOTE_URL,
+        // 备用镜像源（主源不通时会自动退到这里）。
+        "remoteMirrors": MODELS_REMOTE_MIRRORS,
+        "path": models_file().to_string_lossy(),
+        "defaults": cat.defaults,
+        "user": cat.user,
+        "effective": effective,
+        "defaultCount": default_count,
+        "userCount": user_count,
+    })
+}
+
 /// 模型**显示名**表：`{ 作用域: { 代号: 显示名 } }`。
 ///
 /// 为什么单独一份：`models.json` 的形态是「作用域 → 名单」（`Vec<String>`），被选号、
@@ -635,27 +1024,13 @@ pub async fn discover_and_save() -> (Vec<DiscoveredModel>, Vec<SourceReport>) {
     if models.is_empty() {
         return (models, reports);
     }
-    let path = models_file();
-    let mut map: BTreeMap<String, Vec<String>> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-
+    // ⚠️ 只覆盖 `defaults`：本机扫描是「默认清单」的来源之一，绝不能顺手把用户手动添加的
+    //    模型冲掉（旧实现读整个文件再整份写回，user 段会被丢）。见 `replace_defaults`。
     let mut by_scope: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in &models {
         by_scope.entry(m.scope.clone()).or_default().push(m.model.clone());
     }
-    for (scope, list) in by_scope {
-        if !list.is_empty() {
-            map.insert(scope, list);
-        }
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(&path, text);
-    }
+    let _ = replace_defaults(by_scope, "discover");
 
     // 显示名表：增量写入（识别失败的作用域保留旧值，与 models.json 同一策略）。
     // 只收「显示名 ≠ 代号」的条目 —— Trae / WorkBuddy 两边同名，存进去只是噪音。
@@ -721,10 +1096,13 @@ mod sync_tests {
     ///
     /// 这是「让某个产品的积分可以被别的程序用」的关键一步：`models.json` 决定了
     /// 网关 `/v1/models` 能列什么、以及裸模型名路由到哪个作用域。
+    ///
+    /// ⚠️ 必须走 [`replace_defaults`]（v2 出口）：早期这里直接 `serde_json::to_string`
+    /// 写 `{作用域:[…]}`，一跑就把用户的 v2 文件**降级成 v1 扁平格式** —— 虽然能被
+    /// 自动迁移回来，但 `user` 段（用户手动添加的模型）会在这一步被整份抹掉。
     #[tokio::test]
     #[ignore]
     async fn sync_models_json() {
-        let path = crate::modules::config::store_dir().join("models.json");
         let (models, reports) = discover().await;
         let mut map: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for m in &models {
@@ -736,16 +1114,81 @@ mod sync_tests {
         for r in &reports {
             eprintln!("  {}", r.note.chars().take(90).collect::<String>());
         }
-        if let Ok(text) = serde_json::to_string_pretty(&map) {
-            let _ = std::fs::write(&path, text);
-            eprintln!("已写 {}", path.display());
-        }
+        let cat = replace_defaults(map, "discover").expect("写清单失败");
+        let total: usize = cat.defaults.values().map(|v| v.len()).sum();
+        eprintln!(
+            "已写 {}（{} 个作用域 / {} 个模型，user 段保留 {} 个）",
+            models_file().display(),
+            cat.defaults.len(),
+            total,
+            cat.user.values().map(|v| v.len()).sum::<usize>()
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// v1（扁平 `{作用域:[模型]}`）读进来必须整份当 `defaults`，一个模型都不许丢 ——
+    /// 老机器上文件就是这个形状，迁移时静默清空等于把用户清单清零。
+    #[test]
+    fn v1_flat_catalog_migrates_into_defaults() {
+        // 直接构造等价 JSON 验证解析规则（`load_catalog` 走 store_dir()，单测不落盘）。
+        let flat: Value =
+            serde_json::from_str(r#"{"trae-cn":["glm-5","kimi"],"wb-cn":["deepseek-v4"]}"#)
+                .unwrap();
+        let obj = flat.as_object().unwrap();
+        assert!(obj.get("defaults").is_none(), "v1 没有 defaults 键 → 走迁移分支");
+        let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, val) in obj {
+            let list: Vec<String> = val
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect();
+            defaults.insert(k.clone(), tidy(&list));
+        }
+        let cat = ModelsCatalog {
+            version: MODELS_VERSION,
+            source: "migrated".into(),
+            updated_at: String::new(),
+            defaults,
+            user: BTreeMap::new(),
+        };
+        let eff = cat.effective();
+        assert_eq!(eff.get("trae-cn").unwrap().len(), 2);
+        assert_eq!(eff.get("wb-cn").unwrap()[0], "deepseek-v4");
+    }
+
+    /// 用户手动添加的模型必须与默认清单合并，且**同名的只出现一次**。
+    #[test]
+    fn user_models_merge_with_defaults_without_duplicates() {
+        let mut cat = ModelsCatalog::default();
+        cat.defaults.insert("trae-cn".into(), vec!["glm-5".into(), "kimi".into()]);
+        cat.user.insert("trae-cn".into(), vec!["kimi".into(), "my-own".into()]);
+        let eff = cat.effective();
+        let list = eff.get("trae-cn").unwrap();
+        assert_eq!(list, &vec!["glm-5".to_string(), "kimi".into(), "my-own".into()]);
+        assert_eq!(list.iter().filter(|m| *m == "kimi").count(), 1);
+        assert!(cat.is_user("trae-cn", "my-own"));
+        assert!(!cat.is_user("trae-cn", "glm-5"), "默认段的模型不算用户添加");
+    }
+
+    /// 同步（`replace_defaults`）只换默认段，用户段一个字都不许动。
+    #[test]
+    fn replacing_defaults_keeps_user_models() {
+        let mut cat = ModelsCatalog::default();
+        cat.user.insert("trae-cn".into(), vec!["my-own".into()]);
+        let mut next = BTreeMap::new();
+        next.insert("trae-cn".to_string(), vec!["glm-5".to_string()]);
+        // 直接验证合并语义（不落盘）：replace 只赋值 defaults。
+        cat.defaults = next;
+        let eff = cat.effective();
+        assert_eq!(eff.get("trae-cn").unwrap().last().unwrap(), "my-own");
+    }
 
     #[test]
     fn trae_db_path_uses_appdata() {
@@ -772,5 +1215,51 @@ mod tests {
             .collect();
         assert_eq!(cleaned.get("trae-cn").unwrap(), &vec!["a".to_string(), "b".to_string()]);
         assert!(cleaned.get("wb-cn").is_none());
+    }
+
+    /// 远端文件里带了 `user` 段也**绝不许**收进来：那是别人的本机私有清单，
+    /// 收进来就会覆盖用户自己手动添加的模型（用户明确要求「我加的永不被覆盖」）。
+    #[test]
+    fn remote_body_takes_only_defaults() {
+        let v = json!({
+            "version": 2,
+            "source": "github",
+            "defaults": { "trae-cn": ["a", "b"], "wb-cn": ["c"] },
+            "user": { "trae-cn": ["only-on-my-machine"] },
+        });
+        let map = parse_remote_body(&v).expect("v2 应能解析");
+        assert_eq!(map.get("trae-cn").unwrap(), &vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(map.len(), 2, "只该有 defaults 里的两个作用域，user 不许进来");
+        assert!(
+            !map.values().flatten().any(|m| m == "only-on-my-machine"),
+            "远端 user 段被搬过来了，会覆盖用户手加的模型"
+        );
+
+        // v1 扁平形态也要能读（老仓库 / 用户手写的文件）
+        let flat = json!({ "trae-cn": ["x", "y"] });
+        let map = parse_remote_body(&flat).expect("v1 扁平应能解析");
+        assert_eq!(map.get("trae-cn").unwrap(), &vec!["x".to_string(), "y".to_string()]);
+
+        // 空名单必须报错，不能「成功覆盖成空」—— 那等于把本地清单清空
+        let empty = json!({ "version": 2, "defaults": {} });
+        let e = parse_remote_body(&empty).expect_err("空清单不许当成功");
+        assert_eq!(e.0, FailureKind::Bad);
+
+        // 不是对象 ⇒ 格式错
+        let bad = json!([1, 2, 3]);
+        assert_eq!(parse_remote_body(&bad).unwrap_err().0, FailureKind::Bad);
+    }
+
+    /// 备用镜像源必须都指向**同一个仓库的 models.json**，否则「拉到了」却不是同一份清单。
+    #[test]
+    fn mirrors_all_point_to_the_same_file() {
+        for u in MODELS_REMOTE_MIRRORS {
+            assert!(
+                u.contains("bean0283/twin-switch") && u.ends_with("models.json"),
+                "镜像源必须指向同一份清单：{u}"
+            );
+            assert!(u.starts_with("https://"), "只允许 https：{u}");
+        }
+        assert_eq!(MODELS_REMOTE_MIRRORS[0], MODELS_REMOTE_URL, "主源必须排第一");
     }
 }
