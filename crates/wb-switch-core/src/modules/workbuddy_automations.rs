@@ -204,9 +204,15 @@ fn sync_owner_on(conn: &Connection, from_uid: &str, to_uid: &str) -> Result<Valu
         if n == 0 {
             continue;
         }
-        copied.push(name);
-        runs_total += copy_runs(conn, &src_id, &new_id).unwrap_or(0);
-        states_total += copy_runtime_state(conn, &src_id, &new_id).unwrap_or(0);
+        copied.push(name.clone());
+        // ⚠️ 子表复制失败必须**冒泡**，不能 `unwrap_or(0)` 吞掉：
+        //    否则「复制失败」在界面上就是 `copiedRuns: 0`，与「源账号本来就没有
+        //    运行记录」长得一模一样 —— 这正是这次要修的那个毛病本身。
+        //    表不存在时 `columns_of` 返回空表头、`copy_runs` 早早返回 0，不算失败。
+        runs_total += copy_runs(conn, &src_id, &new_id)
+            .map_err(|e| format!("复制任务「{name}」的运行记录失败：{e}"))?;
+        states_total += copy_runtime_state(conn, &src_id, &new_id)
+            .map_err(|e| format!("复制任务「{name}」的运行状态失败：{e}"))?;
     }
 
     Ok(json!({
@@ -301,12 +307,13 @@ fn copy_runs(conn: &Connection, src_id: &str, new_id: &str) -> Result<usize, Str
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
-        conn.execute(
-            &format!("insert or ignore into automation_runs ({col_list}) values ({placeholders})"),
-            rusqlite::params_from_iter(args),
-        )
-        .map_err(|e| format!("写运行记录失败：{e}"))?;
-        n += 1;
+        // `insert or ignore` 被忽略时返回 0 —— 计「真写进去的行」，别把忽略也算成复制成功。
+        n += conn
+            .execute(
+                &format!("insert or ignore into automation_runs ({col_list}) values ({placeholders})"),
+                rusqlite::params_from_iter(args),
+            )
+            .map_err(|e| format!("写运行记录失败：{e}"))?;
     }
     Ok(n)
 }
