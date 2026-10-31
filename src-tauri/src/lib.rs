@@ -144,7 +144,10 @@ pub fn run() {
                 }
             );
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = wb_switch_core::modules::gateway_server::serve(
+                // ⚠️ 用 `serve_with_retry` 而不是 `serve`：自动更新是「装新版 → 拉起新进程 →
+                // 旧进程才退出」，这几秒里端口还被旧进程占着。只试一次就放弃的话，
+                // 界面会一直显示「未启动」，用户必须再手动重启一次软件（2026-10-30 反馈）。
+                if let Err(e) = wb_switch_core::modules::gateway_server::serve_with_retry(
                     wb_switch_core::modules::gateway_keys::GATEWAY_PORT,
                 )
                 .await
@@ -221,6 +224,11 @@ pub fn run() {
             commands::gateway_models_selected,
             commands::gateway_models_save,
             commands::gateway_models_get,
+            commands::gateway_models_catalog,
+            commands::gateway_models_add_user,
+            commands::gateway_models_remove_user,
+            commands::gateway_models_remove_local,
+            commands::gateway_models_sync_remote,
             commands::gateway_models_set,
             commands::gateway_upstreams_get,
             commands::gateway_upstreams_set,
@@ -259,6 +267,7 @@ pub fn run() {
             commands::trae_list_sessions,
             commands::trae_session_detail,
             commands::trae_session_edit_doc,
+            commands::trae_session_turns,
             commands::trae_session_edit_targets,
             commands::trae_session_edit_new_ids,
             commands::trae_session_edit_validate,
@@ -271,8 +280,15 @@ pub fn run() {
             commands::trae_import_run,
             commands::trae_find_misaligned_projects,
             commands::trae_heal_session_projects,
+            commands::trae_heal_project_uid,
             commands::trae_session_links_preview,
+            commands::trae_session_links_overview,
+            commands::trae_normalize_link_store,
+            commands::trae_switch_session_plan,
+            commands::trae_reset_login_preview,
+            commands::trae_reset_login_state,
             commands::trae_session_unlink,
+            commands::trae_session_unlink_member,
             commands::trae_session_sync_group,
             commands::trae_session_sync_groups,
             commands::trae_session_links_diverged,
@@ -318,6 +334,7 @@ pub fn run() {
             commands::workbuddy_account_add_token,
             commands::workbuddy_switch_precheck,
             commands::workbuddy_switch_to,
+            commands::workbuddy_switch_session_plan,
             commands::workbuddy_rollback,
             commands::workbuddy_import_local,
             commands::workbuddy_import_reference_accounts,

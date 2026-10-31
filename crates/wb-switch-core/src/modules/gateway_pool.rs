@@ -1128,17 +1128,15 @@ fn is_known_scope(s: &str) -> bool {
     )
 }
 
-/// 读模型目录 `~/.twin-switch/models.json`（空 = 没登记）。
+/// 读模型目录（空 = 没登记）。
+///
+/// ⚠️ 唯一出口是 `gateway_models::load_effective()`：`models.json` 已升级成
+/// `defaults` + `user` 两段（GitHub 同步只覆盖前者、用户手动添加的永不覆盖），
+/// 这里不能再自己解析那份文件 —— 否则用户加的模型会被静默忽略。
 pub fn catalog() -> Vec<(String, Vec<String>)> {
-    let path = store_dir().join("models.json");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(&text)
-    else {
-        return Vec::new();
-    };
-    map.into_iter().collect()
+    crate::modules::gateway_models::load_effective()
+        .into_iter()
+        .collect()
 }
 
 /// 选号：在候选作用域里挑**最紧迫且可用**的一个。

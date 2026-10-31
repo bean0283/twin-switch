@@ -246,6 +246,10 @@ export interface TraeSwitchResult {
   uid: string | null;
   message: string;
   progress?: string[];
+  /** 切号时顺带复制的会话数（0 = 没勾 / 没复制）。 */
+  copied_sessions?: number;
+  /** 会话复制失败的原因（成功或没复制时为空）。与 `message` 分开，两件事各自说清。 */
+  copy_error?: string | null;
 }
 
 export interface TraeTableStat {
@@ -670,6 +674,83 @@ export interface TraeLinksPreview {
 export type TraeSyncDirection = "sourceToTarget" | "targetToSource";
 
 /**
+ * 「关联会话」矩阵里的一个成员（某个账号在这段对话上的副本）。
+ *
+ * ⚠️ 这是**跨产品统一形状**（WorkBuddy 的 `member_payload` 同构），Trae / Qoder 的
+ *    适配层只要填齐这几个字段，就能共用同一个界面组件。
+ */
+export interface TraeLinkMemberRow {
+  uid: string;
+  /** 账号显示名（昵称 / 手机号 + uid 尾号）。 */
+  accountName: string;
+  sessionId: string;
+  /** 这个账号里是否真的还有这条会话（存在 + 未被软删 + 归属对得上）。 */
+  alive: boolean;
+  title?: string | null;
+  updated?: string | null;
+  messages?: number | null;
+  /** 数据自检问题清单（空 = 健康）；写坏的副本在客户端里渲染不出来。 */
+  integrity?: string[];
+  /** `latest` / `equal` / `behind` / `gone` / `unknown`。 */
+  relation?: string;
+  /** 关系的自然语言说明（界面原样显示，别自己再编一套）。 */
+  reason?: string;
+  isNewest?: boolean;
+  /**
+   * `unreadable` = 该账号的本地库这次没有解密，**不能**当成「副本已失效」。
+   * Trae 的解密快照只覆盖一个账号的库（真机实测：不区分会把 6 组全标成缺失）。
+   */
+  contentState?: "ready" | "missing" | "gone" | "unreadable";
+}
+
+/** 「关联会话」矩阵里的一组（同一段对话在各账号的副本）。 */
+export interface TraeLinkGroupRow {
+  groupId: string;
+  key: string;
+  title: string;
+  /** 归属工作空间（卡片左上角的「来源」标签）。 */
+  project?: string;
+  /** 组内最新更新时间（卡片右上角的相对时间用它）。 */
+  updatedAt?: string;
+  memberCount: number;
+  accountNames: string[];
+  status: "consistent" | "pending" | "diverged" | "missing" | "unknown";
+  statusText: string;
+  statusReason?: string;
+  behindCount?: number;
+  /** 「以某端为准」的默认来源（组内最新那份）。 */
+  sourceSessionId: string;
+  /** 组里的「规范 source」账号（最早登记的成员）：同步方向由它决定，界面不许自己猜。 */
+  canonicalUid?: string;
+  /** 只有两端时才允许「以某端为准」（后端同步接口是两两处理，多端会漏）。 */
+  pairwise?: boolean;
+  canUnify: boolean;
+  canCopy: boolean;
+  /** 还没有这份副本的账号 —— 「补齐」按钮的候选。 */
+  missingAccounts: { uid: string; label: string }[];
+  missingCount: number;
+  members: TraeLinkMemberRow[];
+}
+
+/** `trae_session_links_overview`：该客户端下全部账号的副本矩阵。 */
+export interface TraeLinkOverview {
+  ok: boolean;
+  error?: string;
+  storeStatus?: string;
+  clientKey?: string;
+  accounts?: { uid: string; label: string }[];
+  counts?: {
+    total: number;
+    consistent: number;
+    pending: number;
+    missing: number;
+    unknown: number;
+  };
+  groups?: TraeLinkGroupRow[];
+  storePath?: string;
+}
+
+/**
  * 切号后探测到的一项：**肯定已分叉**的关联组。
  *
  * 除常规组字段外，带一组「当前账号视角」的信息，前端据此写「谁比谁新」。
@@ -882,6 +963,18 @@ export interface TraeWorkbuddySession {
   is_newest: boolean;
   /** 相对最新副本的差异说明（无重复时为空串）。 */
   dup_note: string;
+  /**
+   * 归属工作空间：展示名（`D:/htw/签到` → `签到`；一次性目录 → `临时空间 · 10-27 22:07`）。
+   *
+   * ⚠️ 这三个字段由后端 `workspace_of()` 统一算出，与「会话管理 → 会话记录」页**同源**；
+   *    前端不许自己从 `cwd` 切目录名，否则 `D:/x` 与 `d:\x` 会在两页拆成两个空间。
+   *    旧版后端没有这几个字段（`undefined`）时，界面按 `cwd` 兜底显示、不分组。
+   */
+  workspace?: string;
+  /** 分组键（路径归一化后的小写）。 */
+  workspace_key?: string;
+  /** 归一化后的路径（正斜杠）。 */
+  workspace_path?: string;
 }
 
 /** WorkBuddy 账号的可展示信息（不含任何凭据；由本机多个来源合并而来）。 */
@@ -994,6 +1087,10 @@ export interface TraeWbSourceSession {
   cwd: string;
   /** 正文将落到 `projects/{workspace_key}/`。 */
   workspace_key: string;
+  /** 工作区展示名（`D:/htw/签到` → `签到`），由后端 `workspace_of()` 统一算出。 */
+  workspace?: string;
+  /** 归一化后的工作目录（正斜杠），只用于悬停提示。 */
+  workspace_path?: string;
   created_ms: number;
   updated_ms: number;
   /** 用户提问数（= 回合数）。 */
@@ -1347,7 +1444,77 @@ export interface WorkbuddySwitchResult {
     planned?: number;
     skipped?: number;
     noBody?: number;
+    /** 已关联副本里真正被内容同步（纯追加）改写的份数。 */
+    refreshed?: number;
+    /** 没能同步的逐条原因（分歧 / 正文缺失 / 读失败）—— 界面要能说清为什么没动。 */
+    refreshSkipped?: Array<{
+      id: string;
+      title?: string;
+      targetSessionId?: string;
+      reason: string;
+    }>;
   } | null;
+}
+
+/** 切号弹窗里「会话同步」那一栏的状态。 */
+export type WorkbuddySwitchLinkState = "linked" | "missing" | "twin" | "unlinked";
+
+export interface WorkbuddySwitchSessionRow {
+  sessionId: string;
+  title: string;
+  updatedAt: number;
+  hasBody: boolean;
+  bodyBytes: number;
+  cwd: string;
+  state: WorkbuddySwitchLinkState;
+  /** 已关联（linked/missing/twin）默认勾选；没关联的留给用户主动新增。 */
+  defaultChecked: boolean;
+  /** 没正文的会话复制不了 —— 界面要禁掉勾选框并说明。 */
+  disabled: boolean;
+  targetSessionId?: string | null;
+  /**
+   * 同标题重复组（空串 = 标题唯一）。
+   *
+   * WorkBuddy 的定时任务每次运行都新建会话、标题相同（「每日 AI 推送」），
+   * 一个账号里会有好几条同名会话。`isNewest` 为 false 的是同组较旧副本：
+   * 后端默认不勾（避免切一次号就搬 N 份重复副本），界面用「只看最新」默认折叠。
+   */
+  dupGroup?: string;
+  /** 同组在**当前账号**里的份数（唯一标题为 1）。 */
+  dupGroupSize?: number;
+  isNewest?: boolean;
+  /** `latest` 组内最新；`equal` 与最新逐行一致；`diverged` 内容不同。 */
+  dupRelation?: string;
+  dupNote?: string;
+}
+
+export interface WorkbuddySwitchSessionPlan {
+  ok: boolean;
+  error?: string;
+  sourceUid: string;
+  targetUid: string;
+  counts: {
+    total: number;
+    linked: number;
+    missing: number;
+    twin: number;
+    unlinked: number;
+    /** 与逐行 `defaultChecked` 同源（已排除同标题较旧副本）。 */
+    checked: number;
+    /** 同标题重复组数。 */
+    dupGroups?: number;
+    /** 较旧副本条数。 */
+    dupOlders?: number;
+    /** 其中「本来会默认勾上、因重复被跳过」的条数。 */
+    dupSkipped?: number;
+  };
+  sessions: WorkbuddySwitchSessionRow[];
+}
+
+/** 切号时传给后端的会话同步选择。 */
+export interface WorkbuddySwitchSessionSelection {
+  mode: "selected" | "none";
+  sessionIds: string[];
 }
 
 export interface WorkbuddyOAuthStart {
@@ -1534,6 +1701,20 @@ export interface WbEditSaveResult {
   /** `ok=false` 时：校验阶段说明。 */
   stage?: string;
   errors?: string[];
+  /**
+   * `ok=false` 时的机器判据。
+   *
+   * `clientRunning` = 目标账号正被 WorkBuddy 占用，后端**没有**写入，等界面确认
+   * 「要不要退出客户端再写」（确认后重调并带 `closeClient: true`）。
+   * 不用错误文案做匹配，改了文案就失效。
+   */
+  code?: "clientRunning" | string;
+  /** 本次是否由本工具退出了 WorkBuddy（只有确认过才会）。 */
+  clientStopped?: boolean;
+  /** 退出过的话：有没有重新拉起来。 */
+  clientRelaunched?: boolean;
+  /** 重新拉起失败的原因（必须如实展示，不能假装开回来了）。 */
+  restartError?: string;
 }
 
 /** 正文改动操作（只回传**改动过**的那几行）。 */
@@ -1566,6 +1747,13 @@ export interface WbSessionItem {
   hasBody: boolean;
   bodyBytes: number;
   dupGroup: string;
+  /**
+   * 同组内是否为最新副本 —— **跨账号的全局标记**（同一段对话在多账号各有一份，全局只有一份最新）。
+   *
+   * ⚠️ 不要用它决定「列表里显示哪一条」：某个账号的那一组可能一条都不是全局最新
+   *    （真机实测「每日 AI 新闻推送」在账号 e925618e / fbd4139a 里全为 false），
+   *    按它折叠会把整组折叠掉。要折叠请用 `@/lib/wb-dup` 的 `newestIdByGroup()`（本账号口径）。
+   */
   isNewest: boolean;
   dupNote: string;
 }
@@ -1768,11 +1956,15 @@ export interface WbSessionGroup {
   statusText: string;
   /**
    * 「待同步」的原因，界面文案据此分开说：
-   * `behind` = 有副本内容真的落后。缺账号不再占用状态（用户要求「显示相同就行」）。
+   * `behind` = 有副本内容真的落后（可安全快进）；
+   * `stale`  = 上次比对之后这份又有新内容（只有它自己的结论作废，其余仍然有效）。
+   * 缺账号不再占用状态（用户要求「显示相同就行」）。
    */
-  statusReason?: "behind" | "";
+  statusReason?: "behind" | "stale" | "";
   /** 内容确实落后的副本数（`statusReason === "behind"` 时 > 0）。 */
   behindCount?: number;
+  /** 上次比对之后又有新内容的副本数（`statusReason === "stale"` 时 > 0）。 */
+  staleCount?: number;
   /** 推荐来源副本（内容最新）。 */
   sourceSessionId: string;
   canUnify: boolean;

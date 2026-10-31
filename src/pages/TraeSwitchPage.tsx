@@ -58,9 +58,11 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
+import { TraeResetLogin } from "@/components/trae-reset-login";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
 import * as api from "@/lib/api";
 import { resolveSelectableKey, selectableClients } from "@/lib/trae-client-list";
+import { cn } from "@/lib/utils";
 import type {
   TraeAccountOverview,
   TraeAdoptMergedResult,
@@ -241,6 +243,18 @@ interface PendingSwitch {
   kind: "switch" | "rollback";
   /** 目标账号的 uid —— 探测分叉必须有一个「自己」，拿不到就无从探测。 */
   targetUid: string;
+  /**
+   * 切号时要顺带处理的会话（用户在确认框里勾中的那些）。
+   *
+   * 为什么挂在 pending 上：分叉弹窗可能插在中间（用户先答完「同步」才轮到切），
+   * 这一路必须把勾选原样带过去，否则用户勾的东西会静默丢掉。
+   */
+  copyItems?: {
+    sessionId: string;
+    mode: "sync" | "copy" | "link";
+    groupId?: string | null;
+    direction?: string | null;
+  }[];
 }
 
 /**
@@ -251,6 +265,24 @@ interface PendingSwitch {
  */
 function targetUidOf(entry: TraeVaultEntry): string | null {
   return entry.meta?.verified_uid ?? entry.oauth?.uid ?? null;
+}
+
+/**
+ * 账号在界面上显示的名字 —— **唯一出口**（账号卡、切号弹窗、toast 全用它）。
+ *
+ * ⚠️ 为什么必须统一：账号库条目 id 是 `oauth_882023` 这种**内部标识**，
+ * 用户看不懂、也不该看到。之前切号弹窗标题写的是 `entry.id`，
+ * 于是账号卡上写「用户1181093986」、弹窗标题写「oauth_882023」——
+ * 同一个账号两个名字（2026-10-31 用户截图）。
+ *
+ * 优先级：用户自定义显示名 → 客户端里的用户名（`oauth.displayName`）→ 内部 id 兜底。
+ */
+function accountNameOf(entry: TraeVaultEntry): string {
+  const custom = entry.displayName?.trim();
+  if (custom) return custom;
+  const oauthName = entry.kind === "oauth" ? entry.oauth?.displayName?.trim() : null;
+  if (oauthName) return oauthName;
+  return entry.id;
 }
 
 export default function TraeSwitchPage() {
@@ -314,6 +346,54 @@ export default function TraeSwitchPage() {
    */
   const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
+
+  // 「切换到某账号」确认弹窗（与 WorkBuddy 的 `switchTarget` 同款）：
+  // 列出当前账号的全部会话 + 每一条与目标账号的关联状态。
+  const [switchTarget, setSwitchTarget] = useState<{
+    entry: TraeVaultEntry;
+    uid: string;
+    name: string;
+  } | null>(null);
+  const [plan, setPlan] = useState<{
+    ok: boolean;
+    error?: string;
+    counts?: {
+      total: number;
+      linked: number;
+      missing: number;
+      twin: number;
+      unlinked: number;
+      checked: number;
+    };
+    sessions?: {
+      sessionId: string;
+      title: string;
+      workspace: string;
+      workspacePath: string;
+      messages: number;
+      updated: string;
+      state: "linked" | "missing" | "twin" | "unlinked";
+      stateText: string;
+      defaultChecked: boolean;
+      targetSessionId: string | null;
+      groupId: string | null;
+      syncMode: "sync" | "copy" | "link";
+      direction: string | null;
+      targetAhead: boolean;
+      disabled: boolean;
+    }[];
+  } | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  /** 会话清单的搜索词（与 WorkBuddy 的 `sessionQuery` 同名同义）。 */
+  const [sessionQuery, setSessionQuery] = useState("");
+  /**
+   * 勾中的会话（**源账号里的 session id**）。
+   *
+   * 默认值只来自后端（`defaultChecked`：已关联 / 关联断开 / 已有同内容副本），
+   * 未关联的空着 —— 与 WorkBuddy 同一条口径：勾选决定这次复制什么。
+   */
+  const [checked, setChecked] = useState<Set<string>>(new Set());
   const [syncLog, setSyncLog] = useState<string[]>([]);
 
   // 交接记忆表单
@@ -711,7 +791,7 @@ export default function TraeSwitchPage() {
   /** 把待执行的那次动作跑完（切 / 回滚走同一套确认，只有最后一步不同）。 */
   async function runPending(p: PendingSwitch) {
     if (p.kind === "rollback") await doRollback(p.entry.id);
-    else await doSwitch(p.entry);
+    else await doSwitch(p.entry, p.copyItems);
   }
 
   /**
@@ -761,17 +841,41 @@ export default function TraeSwitchPage() {
   }
 
   /** 真正执行一次切换。先经过 [`onSwitch`] 的分叉探测与确认。 */
-  async function doSwitch(entry: TraeVaultEntry) {
+  async function doSwitch(
+    entry: TraeVaultEntry,
+    copyItems?: PendingSwitch["copyItems"],
+  ) {
     if (!clientKey) return;
     setBusy(true);
     setProgress([]);
     try {
-      const res = await api.traeSwitchTo(clientKey, entry.id);
+      // 会话处理在**写登录态之前**完成（那时进程已停、库空闲），
+      // 所以切号全程仍然只重启一次客户端。
+      const sourceUid = overview?.vault.find((v) => v.isCurrent === true);
+      const copy =
+        copyItems && copyItems.length > 0
+          ? { sourceUid: targetUidOf(sourceUid ?? entry) ?? "", items: copyItems }
+          : undefined;
+      const res = await api.traeSwitchTo(clientKey, entry.id, copy);
       pushProgress(res.progress ?? []);
       const badge = outcomeBadge(res.outcome);
-      toast.success(`${badge.label}：${entry.id}`, {
-        description: res.message || undefined,
-      });
+      // 名字走统一出口：toast 里也不许出现 `oauth_882023` 这种内部 id。
+      const who = accountNameOf(entry);
+      // ⚠️ 切号成功与会话处理是**两件事**，各自说清：
+      // 处理失败不许被「切换成功」的绿 toast 盖掉。
+      if (res.copy_error) {
+        toast.warning(`${badge.label}：${who}`, {
+          description: `但会话没同步上：${res.copy_error}`,
+        });
+      } else if ((res.copied_sessions ?? 0) > 0) {
+        toast.success(`${badge.label}：${who}`, {
+          description: `已同步 ${res.copied_sessions} 个会话到该账号`,
+        });
+      } else {
+        toast.success(`${badge.label}：${who}`, {
+          description: res.message || undefined,
+        });
+      }
       await loadOverview(clientKey);
       // ⚠️ 切完**不再**弹同步确认：T35 起已经在切换之前问过了。
       //    再弹一次等于把同一个问题问两遍，而且是真的「切完才问」。
@@ -791,17 +895,92 @@ export default function TraeSwitchPage() {
   async function onSwitch(entry: TraeVaultEntry) {
     if (!clientKey || busy) return;
     const uid = targetUidOf(entry);
-    // 拿不到 uid 就无从探测（探测必须有一个 uid 当「自己」）⇒ 不打扰，直接切。
-    if (uid) {
-      setBusy(true);
-      const v = await probeTargetDivergence(uid);
-      setBusy(false);
-      if (v) {
-        openDivergencePrompt(v, { entry, kind: "switch", targetUid: uid });
+    if (!uid) {
+      // 拿不到 uid 就无从列出「与目标账号的关联状态」⇒ 不打扰，直接切。
+      await doSwitch(entry);
+      return;
+    }
+    // 与 WorkBuddy 同一条流程：先弹「切换到某账号」确认框（内含会话清单与关联状态），
+    // 用户确认后才真正切。⚠️ 分叉探测仍保留：切之前若有分叉副本，先弹那一层。
+    setSwitchTarget({ entry, uid, name: accountNameOf(entry) });
+    setSessionQuery("");
+    await loadPlan(uid);
+  }
+
+  /** 读「当前账号全部会话 + 与目标账号的关联状态」（只读）。 */
+  async function loadPlan(targetUid: string) {
+    if (!clientKey) return;
+    setPlanLoading(true);
+    setPlanError(null);
+    setPlan(null);
+    try {
+      // 源账号 = 当前登录的那个（后端按它筛会话）。判据用后端算好的 `isCurrent`
+      // （唯一出口，与账号卡上「当前登录」标签同源），不在这里自己拼 uid 比较。
+      const current = overview?.vault.find((v) => v.isCurrent === true);
+      const sourceUid = current ? targetUidOf(current) ?? "" : "";
+      if (!sourceUid) {
+        setPlanError("读不到当前登录账号，无法列出会话");
         return;
       }
+      const r = await api.traeSwitchSessionPlan(clientKey, sourceUid, targetUid);
+      if (!r.ok) throw new Error(r.error || "读取会话清单失败");
+      setPlan(r);
+      // 默认勾选**只来自后端**（已关联 / 断开 / 已有同内容副本），
+      // 未关联的空着，由用户主动勾。与 WorkBuddy 同一条口径。
+      setChecked(
+        new Set((r.sessions ?? []).filter((s) => s.defaultChecked && !s.disabled).map((s) => s.sessionId)),
+      );
+    } catch (cause) {
+      setPlanError(api.asError(cause));
+    } finally {
+      setPlanLoading(false);
     }
-    await doSwitch(entry);
+  }
+
+  /** 筛选后的会话行（搜索标题 / 工作空间）。 */
+  const visiblePlanSessions = useMemo(() => {
+    const q = sessionQuery.trim().toLowerCase();
+    const list = plan?.sessions ?? [];
+    if (!q) return list;
+    return list.filter((r) =>
+      [r.title, r.workspace, r.workspacePath, r.sessionId].some((v) =>
+        (v ?? "").toLowerCase().includes(q),
+      ),
+    );
+  }, [plan, sessionQuery]);
+
+  /**
+   * 弹窗里点了「确认切换」：先做分叉探测（有分叉就转弹那一层），否则直接切。
+   *
+   * ⚠️ 顺序不能反：分叉提醒必须**在写库之前**给出，切完再说「你刚才有分叉」
+   * 已经晚了（客户端已经按新账号启动了）。
+   */
+  async function confirmSwitch() {
+    const t = switchTarget;
+    if (!t || busy) return;
+    // 勾中的会话（只算**当前看得见**的，与 WorkBuddy 同一条口径：
+    // 把搜索藏起来的行一起勾上等于绕过用户的筛选意图）。
+    //
+    // ⚠️ 每项带上后端算好的 `syncMode` / `groupId` / `direction`：
+    // 已关联的必须**就地同步**（原 id 不变），只有未关联的才新建副本。
+    // 之前一律按「复制」下发 ⇒ 每切一次号客户端里就多出一个「新对话」。
+    const items = visiblePlanSessions
+      .filter((r) => checked.has(r.sessionId))
+      .map((r) => ({
+        sessionId: r.sessionId,
+        mode: r.syncMode,
+        groupId: r.groupId,
+        direction: r.direction,
+      }));
+    setSwitchTarget(null);
+    setBusy(true);
+    const v = await probeTargetDivergence(t.uid);
+    setBusy(false);
+    if (v) {
+      openDivergencePrompt(v, { entry: t.entry, kind: "switch", targetUid: t.uid, copyItems: items });
+      return;
+    }
+    await doSwitch(t.entry, items);
   }
 
   /**
@@ -856,9 +1035,10 @@ export default function TraeSwitchPage() {
   async function onRename() {
     if (!clientKey || !renameTarget || !renameName.trim()) return;
     try {
-      const res = await api.traeRenameAccount(clientKey, renameTarget.id, renameName.trim());
+      await api.traeRenameAccount(clientKey, renameTarget.id, renameName.trim());
       setRenameTarget(null);
-      toast.success("已重命名", { description: `新名称：${res.id}` });
+      // 报的是**用户刚输入的名字**，不是后端回的内部 id（`oauth_882023` 那种）。
+      toast.success("已重命名", { description: `新名称：${renameName.trim()}` });
       await loadOverview(clientKey);
     } catch (cause) {
       toast.error("重命名失败", { description: api.asError(cause) });
@@ -880,10 +1060,10 @@ export default function TraeSwitchPage() {
 
   async function onRemove(entry: TraeVaultEntry) {
     if (!clientKey) return;
-    if (!window.confirm(`确定从账号库移除「${entry.id}」？\n只删本地档案，不影响客户端当前登录态。`)) return;
+    if (!window.confirm(`确定从账号库移除「${accountNameOf(entry)}」？\n只删本地档案，不影响客户端当前登录态。`)) return;
     try {
       await api.traeRemoveAccount(clientKey, entry.id);
-      toast.success("已从账号库移除", { description: entry.id });
+      toast.success("已从账号库移除", { description: accountNameOf(entry) });
       await loadOverview(clientKey);
     } catch (cause) {
       toast.error("移除失败", { description: api.asError(cause) });
@@ -1300,7 +1480,11 @@ export default function TraeSwitchPage() {
                 ) : null}
                 <span className="block min-w-0 font-mono text-[11px] break-all text-muted-foreground/80">
                   {mergePending.adopted
-                    .map((a) => `${a.source_id}${a.uid ? `（uid …${a.uid.slice(-6)}）` : ""}`)
+                    .map((a) => {
+                      // 展示 uid（用户认得），内部 id（`oauth_882023`）只作兜底。
+                      const tail = a.uid ? `…${a.uid.slice(-6)}` : a.source_id;
+                      return `${a.from_label}：${tail}`;
+                    })
                     .join(" · ")}
                   {mergePending.adopted.length && mergePending.repaired.length ? " · " : ""}
                   {mergePending.repaired
@@ -1348,8 +1532,8 @@ export default function TraeSwitchPage() {
                   // `meta.verified_uid` 只在**切换成功**时写、oauth 账号连 `meta` 都没有
                   // ⇒ 三个账号一个「当前登录」徽标都不亮（T65 四改，用户截图）。
                   const isLive = entry.isCurrent === true;
-                  const name =
-                    entry.displayName || (isOauth && oa?.displayName ? oa.displayName : null) || entry.id;
+                  // 名字走统一出口（与切号弹窗、toast 同一份逻辑）。
+                  const name = accountNameOf(entry);
                   // uid **优先用后端那一份**（与 `isCurrent` 同源，见 `TraeVaultEntry.uid`）；
                   // 后端读不出时才回退到自己解析的旧路径。
                   const uid =
@@ -1361,8 +1545,8 @@ export default function TraeSwitchPage() {
                       key={entry.id}
                       name={name}
                       avatarUrl={oa?.avatar ?? credit?.avatar ?? null}
-                      identity={uid ? `uid ${shortUid(uid)}` : entry.id}
-                      identityTitle={uid ?? entry.id}
+                      identity={uid ? `uid ${shortUid(uid)}` : name}
+                      identityTitle={uid ?? name}
                       identityMono
                       isCurrent={isLive}
                       onAvatarClick={() => setTokenTarget(entry)}
@@ -1402,7 +1586,10 @@ export default function TraeSwitchPage() {
                             label="重命名"
                             onClick={() => {
                               setRenameTarget(entry);
-                              setRenameName(entry.id);
+                              // 预填**用户自定义名**（不是内部 id）：
+                              // 内部 id 是 `oauth_882023` 这种标识，用户既不该看到、
+                              // 更不该以为「改名」是在改它。
+                              setRenameName(entry.displayName ?? "");
                             }}
                           />
                           <IconAction
@@ -1602,6 +1789,10 @@ export default function TraeSwitchPage() {
               </CardContent>
             ) : null}
           </Card>
+
+          {/* 重置登录态：切到某账号后「能进界面但发不了消息」时的自救入口（issue #10）。
+              只清客户端侧登录载体，账号档案与会话数据不动。 */}
+          <TraeResetLogin clientKey={clientKey} />
         </>
       ) : (
         <Alert>
@@ -1631,17 +1822,238 @@ export default function TraeSwitchPage() {
           弹窗一并删除（留着就是永远打不开的死 UI）。
           现在整库搬家走文件：「导出账号包」下载 JSON、「导入账号包」选文件导入。 */}
 
+      {/* 切换到某账号：与 WorkBuddy 的切号弹窗**逐项同构** ——
+          头部说明 + 会话清单（当前账号全部会话 + 与目标账号的关联状态）+ 确认/关闭。 */}
+      <Dialog
+        open={switchTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            setSwitchTarget(null);
+            setPlan(null);
+            setPlanError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>切换到「{switchTarget?.name}」</DialogTitle>
+            <DialogDescription>
+              切换会结束 {selected?.label ?? "Trae"} 的全部进程，未保存的会话会中断；
+              写登录态失败会自动还原备份。
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* 会话清单：当前账号全部会话，已关联的默认勾上 */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-medium">会话同步</span>
+              {plan?.counts && (
+                <span className="text-xs text-muted-foreground">
+                  已勾 {checked.size} / {plan.counts.total}
+                  {plan.counts.unlinked > 0 ? ` · 未关联 ${plan.counts.unlinked}` : ""}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              已关联的默认勾选：切换后把当前账号的内容<b>就地更新</b>到目标账号那份副本上
+              （会话 id 不变，客户端里不会多出新对话）；取消勾选 = 这次不动。
+              未关联的默认空着，勾上才会新建副本。
+              <span className="block">
+                处理在<b>写登录态之前</b>完成（那时客户端已停、库空闲），
+                所以整个切换仍然只重启一次客户端。
+              </span>
+            </p>
+            {planLoading && (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                正在读取当前账号的会话…
+              </div>
+            )}
+            {planError && (
+              <div className="text-xs text-destructive">
+                读取会话清单失败：{planError}
+                <span className="block text-muted-foreground">
+                  不影响切换本身，只是这次看不到关联状态。
+                </span>
+              </div>
+            )}
+            {plan && (
+              <>
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={sessionQuery}
+                    onChange={(e) => setSessionQuery(e.target.value)}
+                    placeholder="搜索标题或工作空间…"
+                    className="h-8"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      // 只勾**当前看得见**的行（与 WorkBuddy 同一条口径）：
+                      // 把搜索藏起来的行一起勾上，等于绕过用户的筛选意图。
+                      setChecked(
+                        new Set(visiblePlanSessions.filter((r) => !r.disabled).map((r) => r.sessionId)),
+                      )
+                    }
+                  >
+                    全选
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => setChecked(new Set())}>
+                    清空
+                  </Button>
+                </div>
+                {(plan.sessions?.length ?? 0) === 0 ? (
+                  <p className="py-6 text-center text-xs text-muted-foreground">
+                    当前账号名下没有会话。
+                  </p>
+                ) : visiblePlanSessions.length === 0 ? (
+                  <p className="py-6 text-center text-xs text-muted-foreground">
+                    没有匹配「{sessionQuery.trim()}」的会话。
+                  </p>
+                ) : (
+                  <div className="max-h-64 overflow-auto rounded-md border">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 border-b bg-muted/40 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="w-10 px-3 py-2" />
+                          <th className="px-3 py-2 text-left font-medium">会话</th>
+                          <th className="w-56 px-3 py-2 text-left font-medium">关联状态</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visiblePlanSessions.map((r) => (
+                          <tr key={r.sessionId} className="border-b last:border-0 hover:bg-muted/30">
+                            <td className="px-3 py-2">
+                              <input
+                                type="checkbox"
+                                className="size-4 disabled:cursor-not-allowed"
+                                checked={checked.has(r.sessionId)}
+                                disabled={r.disabled}
+                                title={r.disabled ? "这份会话没有正文，复制过去也是空壳" : undefined}
+                                onChange={() =>
+                                  setChecked((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(r.sessionId)) next.delete(r.sessionId);
+                                    else next.add(r.sessionId);
+                                    return next;
+                                  })
+                                }
+                              />
+                            </td>
+                            <td className="max-w-[420px] px-3 py-2">
+                              <div className="truncate font-medium" title={r.title}>
+                                {r.title || "(无标题)"}
+                              </div>
+                              <div className="truncate text-xs text-muted-foreground">
+                                {r.updated} · {r.messages.toLocaleString("zh-CN")} 条
+                                {r.workspace ? ` · ${r.workspace}` : ""}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2 text-xs">
+                              <span
+                                className={cn(
+                                  "rounded-full border px-1.5 py-px text-[10px] font-medium",
+                                  r.state === "linked"
+                                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                                    : r.state === "missing"
+                                      ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                                      : r.state === "twin"
+                                        ? "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+                                        : "border-border bg-muted/60 text-muted-foreground",
+                                )}
+                              >
+                                {r.stateText}
+                              </span>
+                              {/* 处理方式：勾上之后到底会「就地同步」还是「新建副本」，
+                                  必须让人一眼看出来 —— 这正是之前「每切一次多一个新对话」的坑。 */}
+                              {r.syncMode === "sync" ? (
+                                <span
+                                  className="ml-1 rounded-full border border-emerald-500/30 bg-emerald-500/[0.06] px-1.5 py-px text-[10px] text-emerald-700 dark:text-emerald-300"
+                                  title="在原会话 id 上就地更新，客户端里不会多出新对话"
+                                >
+                                  就地同步
+                                </span>
+                              ) : r.syncMode === "link" ? (
+                                <span
+                                  className="ml-1 rounded-full border px-1.5 py-px text-[10px] text-muted-foreground"
+                                  title="目标已有同内容副本，只登记关联、不写内容"
+                                >
+                                  仅登记
+                                </span>
+                              ) : (
+                                <span
+                                  className="ml-1 rounded-full border border-sky-500/30 bg-sky-500/[0.06] px-1.5 py-px text-[10px] text-sky-700 dark:text-sky-300"
+                                  title="目标还没有这份副本，勾上会新建一份并登记关联"
+                                >
+                                  新建副本
+                                </span>
+                              )}
+                              {r.targetAhead ? (
+                                <span
+                                  className="ml-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
+                                  title="目标那份的条数比当前账号多：同步会用它盖掉，请确认这是你要的方向"
+                                >
+                                  目标更新
+                                </span>
+                              ) : null}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setSwitchTarget(null);
+                setPlan(null);
+                setPlanError(null);
+              }}
+            >
+              取消
+            </Button>
+            <Button onClick={() => void confirmSwitch()} disabled={busy}>
+              确认切换
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 重命名对话框 */}
       <Dialog open={renameTarget !== null} onOpenChange={(v) => !v && setRenameTarget(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>重命名账号</DialogTitle>
-            <DialogDescription>改名只影响账号库条目，不影响客户端登录态。</DialogDescription>
+            <DialogDescription>
+              只改本工具里的显示名，不会改动 Trae 账号本身的昵称。
+              留空则回落到客户端里的用户名（当前是「
+              {renameTarget ? accountNameOf(renameTarget) : ""}」）。
+            </DialogDescription>
           </DialogHeader>
-          <Input value={renameName} onChange={(e) => setRenameName(e.target.value)} autoFocus />
+          <Input
+            value={renameName}
+            onChange={(e) => setRenameName(e.target.value)}
+            placeholder={renameTarget ? accountNameOf(renameTarget) : ""}
+            autoFocus
+          />
           <DialogFooter>
             <Button variant="outline" onClick={() => setRenameTarget(null)}>取消</Button>
-            <Button onClick={() => void onRename()} disabled={!renameName.trim() || renameName.trim() === renameTarget?.id}>
+            <Button
+              onClick={() => void onRename()}
+              // 没改动就不让点（原来比的是内部 id，改完名再打开会因为
+              // 预填值≠id 而永远可点，纯属噪音）。
+              disabled={
+                !renameName.trim() ||
+                renameName.trim() === (renameTarget?.displayName ?? "")
+              }
+            >
               确定
             </Button>
           </DialogFooter>
@@ -1664,7 +2076,7 @@ export default function TraeSwitchPage() {
             <DialogTitle className="flex items-center gap-2">
               <GitCompare className="size-4 text-amber-500" />
               {pendingSwitch
-                ? `${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${pendingSwitch.entry.id}」前，先处理 ${diverged?.count ?? 0} 个会话？`
+                ? `${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${accountNameOf(pendingSwitch.entry)}」前，先处理 ${diverged?.count ?? 0} 个会话？`
                 : `检测到 ${diverged?.count ?? 0} 个会话需要处理`}
             </DialogTitle>
             <DialogDescription>
@@ -1702,7 +2114,7 @@ export default function TraeSwitchPage() {
               （730px 实测折成 8 行）。单独占一行，任何宽度都正常。 */}
           <p className="text-xs text-muted-foreground">
             {pendingSwitch
-              ? `会先整份备份再回写；同步完成后自动${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${pendingSwitch.entry.id}」`
+              ? `会先整份备份再回写；同步完成后自动${pendingSwitch.kind === "rollback" ? "回滚" : "切换"}到「${accountNameOf(pendingSwitch.entry)}」`
               : "会先整份备份再回写，并自动重启客户端"}
           </p>
           <DialogFooter>

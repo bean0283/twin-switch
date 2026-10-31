@@ -53,6 +53,8 @@ import type {
   WorkbuddyOAuthStart,
   WorkbuddySwitchPrecheck,
   WorkbuddySwitchResult,
+  WorkbuddySwitchSessionPlan,
+  WorkbuddySwitchSessionRow,
 } from "@/lib/trae-types";
 
 /**
@@ -72,6 +74,20 @@ function expiryLabel(expiresAt: number | null): string | null {
   if (days === 0) return "今天过期";
   if (days <= 7) return `${days} 天后过期`;
   return null;
+}
+
+/** 会话与目标账号的关联状态的人话。 */
+function linkStateLabel(state: WorkbuddySwitchSessionRow["state"]): string {
+  switch (state) {
+    case "linked":
+      return "已关联 · 切换后同步内容";
+    case "missing":
+      return "关联断开 · 会补一份副本";
+    case "twin":
+      return "目标已有同内容副本 · 只登记关联";
+    default:
+      return "未关联 · 勾选后新建副本";
+  }
 }
 
 /** uid 只显示首尾，中间省略（完整值挂在 title 上）。 */
@@ -183,6 +199,20 @@ export default function WorkbuddySwitchPage() {
   const [switchTarget, setSwitchTarget] = useState<WorkbuddyAccount | null>(null);
   const [precheck, setPrecheck] = useState<WorkbuddySwitchPrecheck | null>(null);
   const [switchResult, setSwitchResult] = useState<WorkbuddySwitchResult | null>(null);
+  // 会话同步勾选表：`plan` 是后端算的「当前账号全部会话 + 与目标账号的关联状态」。
+  const [plan, setPlan] = useState<WorkbuddySwitchSessionPlan | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [sessionQuery, setSessionQuery] = useState("");
+  /**
+   * 「只看最新副本」（默认开）。
+   *
+   * 定时任务（如「每日 AI 推送」）每次运行都新建一个同名会话，一个账号里会有好几条同标题会话。
+   * 以前它们会全部平铺出来，切一次号就把 N 份副本全搬过去 —— 用户看到的就是「复制后重复多次」。
+   * 现在默认折叠同标题的较旧副本（后端也默认不勾它们），想看/想同步时关掉这个开关即可。
+   */
+  const [onlyNewest, setOnlyNewest] = useState(true);
 
   /**
    * 切换成功后的自动关窗定时器。
@@ -295,19 +325,57 @@ export default function WorkbuddySwitchPage() {
     setSwitchTarget(acc);
     setSwitchResult(null);
     setPrecheck(null);
+    setPlan(null);
+    setPlanError(null);
+    setChecked(new Set());
+    setSessionQuery("");
     try {
       setPrecheck(await api.workbuddySwitchPrecheck(acc.id));
     } catch (e) {
       toast.error(api.asError(e));
     }
+    // 会话清单单独加载：要扫一遍会话库，别拖住上面的预检。
+    setPlanLoading(true);
+    try {
+      const p = await api.workbuddySwitchSessionPlan(acc.uid);
+      if (!p.ok) throw new Error(p.error || "读取会话清单失败");
+      setPlan(p);
+      // 默认勾选**只来自后端**：已关联（linked / missing / twin）才勾上。
+      setChecked(new Set(p.sessions.filter((r) => r.defaultChecked && !r.disabled).map((r) => r.sessionId)));
+    } catch (e) {
+      setPlanError(api.asError(e));
+    } finally {
+      setPlanLoading(false);
+    }
   };
+
+  /** 同标题的「较旧副本」（定时任务每次都建同名会话，一账号里会有好几份）。 */
+  const dupOlders = useMemo(
+    () => (plan?.sessions ?? []).filter((r) => (r.dupGroupSize ?? 1) > 1 && r.isNewest === false),
+    [plan],
+  );
+
+  /** 筛选后的会话行（搜索标题 / 路径；「只看最新」时折叠同标题较旧副本）。 */
+  const visibleSessions = useMemo<WorkbuddySwitchSessionRow[]>(() => {
+    const list = (plan?.sessions ?? []).filter((r) => !onlyNewest || r.isNewest !== false);
+    const q = sessionQuery.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(
+      (r) => r.title.toLowerCase().includes(q) || r.cwd.toLowerCase().includes(q),
+    );
+  }, [plan, sessionQuery, onlyNewest]);
 
   const runSwitch = async () => {
     const acc = switchTarget;
     if (!acc) return;
     setBusyId(acc.id);
     try {
-      const r = await api.workbuddySwitchTo(acc.id, true);
+      // 勾选表 → 后端的同步范围。⚠️ 读不到清单（planError）时**不传**，
+      // 让它按设置走 —— 传一个空勾选等于「用户要求不同步」，那是另一回事。
+      const selection = plan
+        ? { mode: "selected" as const, sessionIds: [...checked] }
+        : undefined;
+      const r = await api.workbuddySwitchTo(acc.id, true, selection);
       setSwitchResult(r);
       // 定时任务同步的结果要一起报：删/增都对用户有影响，不能只说「切换成功」。
       const sync = r.automationSync;
@@ -332,9 +400,15 @@ export default function WorkbuddySwitchPage() {
         if (link.notNeeded) return "";
         const n = link.copied ?? 0;
         const ad = link.adopted ?? 0;
-        if (n > 0) return `会话互通 ${n} 个副本`;
-        if (ad > 0) return `会话登记 ${ad} 组关联`;
-        return "";
+        const rf = link.refreshed ?? 0;
+        const parts: string[] = [];
+        if (n > 0) parts.push(`新增 ${n} 个副本`);
+        if (rf > 0) parts.push(`同步 ${rf} 份内容`);
+        if (ad > 0) parts.push(`登记 ${ad} 组关联`);
+        // 没能同步的要照实说，不能只报成功的数字。
+        const bad = link.refreshSkipped?.length ?? 0;
+        if (bad > 0) parts.push(`${bad} 份未同步（有分歧或缺正文）`);
+        return parts.length ? `会话${parts.join("、")}` : "";
       })();
       const notes = [syncNote.replace(/^；/, ""), linkNote]
         .filter((s) => s.length > 0)
@@ -837,6 +911,128 @@ export default function WorkbuddySwitchPage() {
                   <CheckCircle2 className="size-4" />
                   该账号已经是当前登录账号
                 </div>
+              )}
+            </div>
+          )}
+          {/* 会话同步勾选表：当前账号全部会话，已关联的默认勾上 */}
+          {switchTarget && !precheck?.alreadyCurrent && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium">会话同步</span>
+                {plan && (
+                  <span className="text-xs text-muted-foreground">
+                    已勾 {checked.size} / {plan.counts.total}
+                    {(plan.counts.dupGroups ?? 0) > 0
+                      ? ` · 同标题重复 ${plan.counts.dupGroups} 组（默认只同步最新一份）`
+                      : ""}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                已关联的默认勾选：切换后把当前账号的内容同步过去；取消勾选 = 这次不同步。
+                未关联的默认空着，勾上才会新建副本并建立关联。
+              </p>
+              {planLoading && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  正在读取当前账号的会话…
+                </div>
+              )}
+              {planError && (
+                <div className="text-xs text-destructive">
+                  读取会话清单失败：{planError}
+                  <span className="block text-muted-foreground">
+                    本次切换将按设置里的「自动同步会话」执行，不会动你没看到的会话。
+                  </span>
+                </div>
+              )}
+              {plan && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      value={sessionQuery}
+                      onChange={(e) => setSessionQuery(e.target.value)}
+                      placeholder="搜索标题或目录…"
+                      className="h-8"
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        // 只勾**当前看得见**的行：把折叠起来的较旧副本一起勾上，
+                        // 等于绕过「不同步重复副本」这个默认，不能悄悄发生。
+                        setChecked(
+                          new Set(visibleSessions.filter((r) => !r.disabled).map((r) => r.sessionId)),
+                        )
+                      }
+                    >
+                      全选
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => setChecked(new Set())}>
+                      清空
+                    </Button>
+                  </div>
+                  {dupOlders.length > 0 && (
+                    <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        className="size-3.5"
+                        checked={onlyNewest}
+                        onChange={(e) => setOnlyNewest(e.target.checked)}
+                      />
+                      只看最新副本（已折叠 {dupOlders.length} 个同标题较旧副本；定时任务每次运行都会新建一条同名会话）
+                    </label>
+                  )}
+                  <div className="max-h-56 space-y-0.5 overflow-auto rounded-md border p-1">
+                    {visibleSessions.length === 0 && (
+                      <div className="px-2 py-3 text-xs text-muted-foreground">没有匹配的会话</div>
+                    )}
+                    {visibleSessions.map((row) => {
+                      const on = checked.has(row.sessionId);
+                      const older = (row.dupGroupSize ?? 1) > 1 && row.isNewest === false;
+                      return (
+                        <label
+                          key={row.sessionId}
+                          title={row.sessionId}
+                          className={
+                            "flex items-start gap-2 rounded px-2 py-1.5 hover:bg-accent/50 " +
+                            (row.disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer")
+                          }
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 size-3.5"
+                            checked={on}
+                            disabled={row.disabled}
+                            onChange={(e) => {
+                              const next = new Set(checked);
+                              if (e.target.checked) next.add(row.sessionId);
+                              else next.delete(row.sessionId);
+                              setChecked(next);
+                            }}
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="flex items-center gap-1.5">
+                              <span className="min-w-0 flex-1 truncate text-[13px]">{row.title}</span>
+                              {older && (
+                                <span className="shrink-0 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-600">
+                                  同组较旧
+                                </span>
+                              )}
+                            </span>
+                            <span className="block truncate text-[11px] text-muted-foreground">
+                              {linkStateLabel(row.state)}
+                              {row.disabled
+                                ? " · 无正文，无法复制"
+                                : ` · ${new Date(row.updatedAt).toLocaleString()}`}
+                              {older && row.dupNote ? ` · ${row.dupNote}` : ""}
+                            </span>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </>
               )}
             </div>
           )}

@@ -30,6 +30,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { TraeSessionEditor } from "@/components/trae-session-editor";
+import { SessionLinkGroups } from "@/components/session-link-groups";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,6 +63,9 @@ import type {
   TraeImportReport,
   TraeInstalledClient,
   TraeLinkGroup,
+  TraeLinkGroupRow,
+  TraeLinkMemberRow,
+  TraeLinkOverview,
   TraeLinksPreview,
   TraeSessionInfo,
 } from "@/lib/trae-types";
@@ -176,6 +180,12 @@ export default function TraeRecordsPage() {
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyReport, setCopyReport] = useState<TraeImportReport | null>(null);
   const [copyProgress, setCopyProgress] = useState<string[]>([]);
+  /// 复制页的搜索词 / 空间筛选 / 视图（与「会话记录」页同一套交互与口径）。
+  /// 用户 2026-10-31 要求「与 WorkBuddy 风格一致，不要自创类型」——所以这里
+  /// 照 `WorkbuddyRecordsPage` 的 `copyQuery`/`copyWs`/`copyByWorkspace` 三条来。
+  const [copyQuery, setCopyQuery] = useState("");
+  const [copyWs, setCopyWs] = useState("");
+  const [copyByWorkspace, setCopyByWorkspace] = useState(true);
 
   // 工程归属自愈（历史副本遗留的 session_project.project_id 不一致）
   const [healBusy, setHealBusy] = useState<"check" | "heal" | null>(null);
@@ -183,6 +193,23 @@ export default function TraeRecordsPage() {
 
   // 差异同步：把关联组里较新一端的内容就地覆盖到较旧一端（写库，会重启客户端）
   const [syncBusy, setSyncBusy] = useState<string | null>(null);
+
+  /**
+   * 「跨账号关联」卡片是否展开。**默认收起**（与 WorkBuddy 复制页一致）。
+   *
+   * 为什么收起：这块是低频操作（看关联组、就地同步），却常驻半屏，
+   * 把上面的「会话复制」列表挤得只剩三四行 —— 用户 2026-10-26 在 WB 侧提过同样的问题，
+   * 2026-10-31 又要求 Trae 侧「与 WorkBuddy 风格一致」，所以两边一起收起。
+   */
+  const [linkOpen, setLinkOpen] = useState(false);
+
+  // 「关联会话」页签：该客户端下**全部账号**的副本矩阵（与「复制与关联」那对固定账号不同）。
+  const [linkOv, setLinkOv] = useState<TraeLinkOverview | null>(null);
+  const [linkOvLoading, setLinkOvLoading] = useState(false);
+  const [linkOvError, setLinkOvError] = useState<string | null>(null);
+  /** 正在操作的组（组内按钮全禁用，避免连点）。 */
+  const [linkOvBusy, setLinkOvBusy] = useState<string | null>(null);
+  const [linkOvBusyNote, setLinkOvBusyNote] = useState("");
 
   // 进入「复制与关联」时，若有已分叉的副本，弹一次提醒（可勾选不再提示）。
   const [divergencePrompt, setDivergencePrompt] = useState<
@@ -727,6 +754,113 @@ export default function TraeRecordsPage() {
     void loadLinks();
   }, [tab, loadLinks]);
 
+  // ── 「关联会话」页签：全账号矩阵 ─────────────────────────────────────────
+  const loadLinkOverview = useCallback(async () => {
+    if (!clientKey) return;
+    setLinkOvLoading(true);
+    setLinkOvError(null);
+    try {
+      const r = await api.traeSessionLinksOverview(clientKey);
+      if (!r.ok) throw new Error(r.error || "读取关联会话失败");
+      setLinkOv(r);
+    } catch (cause) {
+      setLinkOvError(api.asError(cause));
+    } finally {
+      setLinkOvLoading(false);
+    }
+  }, [clientKey]);
+
+  useEffect(() => {
+    if (tab !== "groups") return;
+    void loadLinkOverview();
+  }, [tab, loadLinkOverview]);
+
+  /** 把这段对话补一份到某个账号（同客户端跨账号复制，复制成功会自动登记关联）。 */
+  async function linkCopyTo(group: TraeLinkGroupRow, targetUid: string) {
+    if (!clientKey || !group.sourceSessionId) return;
+    setLinkOvBusy(group.key);
+    setLinkOvBusyNote("正在补齐副本（会先退出客户端，写完自动重启）…");
+    try {
+      const res = await api.traeImportRun(clientKey, clientKey, targetUid, [
+        group.sourceSessionId,
+      ]);
+      const label = linkOv?.accounts?.find((a) => a.uid === targetUid)?.label ?? targetUid;
+      toast.success(`已补到 ${label}`, {
+        description: `写入 ${res.copied_rows} 行 · 校验会话 ${res.verified_sessions} 个 · ${
+          res.relaunched ? "已自动重启客户端" : "客户端未自动重启"
+        }`,
+      });
+      await loadLinkOverview();
+    } catch (cause) {
+      toast.error("补齐失败", { description: api.asError(cause) });
+    } finally {
+      setLinkOvBusy(null);
+      setLinkOvBusyNote("");
+    }
+  }
+
+  /** 以某个成员为准覆盖其它副本（方向由后端的规范 source 决定，不猜）。 */
+  async function linkUnifyFrom(group: TraeLinkGroupRow, member: TraeLinkMemberRow) {
+    if (!clientKey) return;
+    const direction =
+      member.uid === group.canonicalUid ? "sourceToTarget" : "targetToSource";
+    setLinkOvBusy(group.key);
+    setLinkOvBusyNote(`正在以「${member.accountName}」的副本为准覆盖…`);
+    try {
+      const r = await api.traeSessionSyncGroup(clientKey, group.groupId, direction);
+      toast.success("已同步", {
+        description: `保留 ${String(r.keptSid ?? "").slice(0, 8)} · 清理 ${r.removedRows ?? 0} 行`,
+      });
+      await loadLinkOverview();
+    } catch (cause) {
+      toast.error("同步失败", { description: api.asError(cause) });
+    } finally {
+      setLinkOvBusy(null);
+      setLinkOvBusyNote("");
+    }
+  }
+
+  async function linkUnlinkGroup(group: TraeLinkGroupRow) {
+    setLinkOvBusy(group.key);
+    try {
+      const r = await api.traeSessionUnlink(group.groupId);
+      toast.success("已解除关联", { description: `剩余 ${r.remaining} 组` });
+      await loadLinkOverview();
+    } catch (cause) {
+      toast.error("解除关联失败", { description: api.asError(cause) });
+    } finally {
+      setLinkOvBusy(null);
+    }
+  }
+
+  /** 把一个账号从关联组里拆出去（只删关联记录，会话数据一个字不动）。 */
+  async function linkUnlinkMember(group: TraeLinkGroupRow, member: TraeLinkMemberRow) {
+    // 与 `loadLinkOverview` 同一个守卫：没有选中的客户端就没法定位这条成员记录。
+    if (!clientKey) {
+      toast.error("先选择一个客户端");
+      return;
+    }
+    setLinkOvBusy(group.key);
+    try {
+      const r = await api.traeSessionUnlinkMember(group.groupId, member.uid, clientKey);
+      if (r.groupRemoved) {
+        // 后端在剩不到 2 份时会整组删掉：要说明白，否则用户以为组还在。
+        toast.success("已取消关联，整组已解散", {
+          description: `${member.accountName} 已从这条关联里拆出；组里只剩不到两份，关联组一并删除了（会话数据没动）`,
+        });
+      } else {
+        toast.success("已取消关联", {
+          description: `${member.accountName} 已拆出，组里还剩 ${r.remainingMembers} 个账号（会话数据没动）`,
+        });
+      }
+      await loadLinkOverview();
+    } catch (cause) {
+      toast.error("取消关联失败", { description: api.asError(cause) });
+    } finally {
+      setLinkOvBusy(null);
+    }
+  }
+
   // 关联结果回来后，若发现已分叉的副本就弹一次提醒。
   //
   // ⚠️ 只在**关联数据刚加载完**时判一次（`divergencePrompted` 挡住后续刷新重复弹）：
@@ -758,6 +892,89 @@ export default function TraeRecordsPage() {
     [sessions, linkSrcUid],
   );
 
+  /** 源账号涉及的工作空间（最近活动的在前；同名空间补一级目录区分）。
+   *
+   * 与 [`wsOptions`] 同一套口径，只是数据源换成「源账号的会话」：
+   * 空间键与展示名仍由后端 `modules::workspace` 给，前端不做路径归一化。
+   */
+  const copyWsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; last: string }
+    >();
+    for (const s of copySrcSessions) {
+      const key = s.workspace_key ?? "";
+      // Trae 的时间是 `YYYY-MM-DD HH:mm:ss` 字符串，可以直接比字典序
+      const at = s.updated || "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        if (at > cur.last) cur.last = at;
+      } else {
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspace_path || "",
+          count: 1,
+          last: at,
+        });
+      }
+    }
+    const list = [...map.values()];
+    const dup = new Map<string, number>();
+    for (const w of list) dup.set(w.label, (dup.get(w.label) ?? 0) + 1);
+    return list
+      .map((w) => {
+        if ((dup.get(w.label) ?? 0) <= 1) return w;
+        const segs = (w.path || "").split("/").filter(Boolean);
+        return { ...w, label: segs.slice(-2).join("/") || w.label };
+      })
+      .sort((a, b) => b.last.localeCompare(a.last) || a.label.localeCompare(b.label));
+  }, [copySrcSessions]);
+
+  /** 搜索 + 空间筛选后的源会话（勾选只作用于这些行）。
+   *
+   * ⚠️ 「可见」与「勾选」是两件事：筛选把行藏起来时，已勾中的不动
+   * （和会话记录页的批量删除同一条口径），否则用户切一下筛选就被清空选择。
+   */
+  const copyVisible = useMemo(() => {
+    const q = copyQuery.trim().toLowerCase();
+    return copySrcSessions.filter((s) => {
+      if (copyWs && (s.workspace_key ?? "") !== copyWs) return false;
+      if (!q) return true;
+      return [s.title, s.workspace, s.workspace_path, s.id].some((v) =>
+        (v ?? "").toLowerCase().includes(q),
+      );
+    });
+  }, [copySrcSessions, copyWs, copyQuery]);
+
+  /** 按空间分组的渲染块（分组顺序跟着 `copyWsOptions`）；平铺视图合成一块。 */
+  const copyRenderGroups = useMemo(() => {
+    if (!copyByWorkspace) {
+      return [{ key: "__flat__", label: "", path: "", items: copyVisible }];
+    }
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; items: TraeSessionInfo[] }
+    >();
+    for (const s of copyVisible) {
+      const key = s.workspace_key ?? "";
+      const g = map.get(key);
+      if (g) g.items.push(s);
+      else
+        map.set(key, {
+          key,
+          label: s.workspace || "（未归属）",
+          path: s.workspace_path || "",
+          items: [s],
+        });
+    }
+    const order = new Map(copyWsOptions.map((w, i) => [w.key, i]));
+    return [...map.values()].sort(
+      (a, b) => (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+    );
+  }, [copyByWorkspace, copyVisible, copyWsOptions]);
+
   function toggleCopy(id: string) {
     setCopySel((prev) => {
       const next = new Set(prev);
@@ -772,10 +989,13 @@ export default function TraeRecordsPage() {
    *
    * 用户反馈：几百条会话一条条点不动 —— 全选必须只选**真能复制**的那些，
    * 否则一次全选就会带上一堆必然跳过的空会话，选完还得手动剔。
+   *
+   * ⚠️ 只算**当前可见**的行：筛选到某个空间后点全选，不该把别的空间也选上
+   * （那会让「复制到目标账号」突然带上几百条没在眼前出现过的会话）。
    */
   const copyableIds = useMemo(
-    () => copySrcSessions.filter((s) => (s.messages ?? 0) > 0).map((s) => s.id),
-    [copySrcSessions],
+    () => copyVisible.filter((s) => (s.messages ?? 0) > 0).map((s) => s.id),
+    [copyVisible],
   );
   const allCopyPicked = copyableIds.length > 0 && copyableIds.every((id) => copySel.has(id));
   const someCopyPicked = !allCopyPicked && copyableIds.some((id) => copySel.has(id));
@@ -848,15 +1068,47 @@ export default function TraeRecordsPage() {
     setHealReport("");
     setCopyProgress([]);
     try {
+      // ⓪ 先规范化关联表：把写成内部 id 的成员 uid 改回真实 uid，
+      //    并合并「同一组里同一账号出现两次」的脏数据。
+      //    ⚠️ 这一步不碰会话数据、不用停客户端，但**必须最先做**：
+      //    关联表对不上，界面就判不出「已关联」，只会提示「新建副本」，
+      //    于是每切一次号客户端里就多出一个新对话。
+      let linkNote = "";
+      try {
+        const n = await api.traeNormalizeLinkStore(clientKey);
+        if (n.renamed > 0 || n.merged > 0) {
+          linkNote = `已规范 ${n.renamed} 条关联 uid、合并 ${n.merged} 条重复成员。`;
+        }
+      } catch (cause) {
+        linkNote = `关联表规范化失败（跳过）：${api.asError(cause)}。`;
+      }
+
+      // ① 再把「project.user_id 写成本工具内部 id」的错位改回真实 uid。
+      //    ⚠️ 必须先修这个：不修的话会话在客户端里根本看不到，
+      //    后面「对齐工程归属」修了也没用（客户端压根不认那个账号）。
+      let uidNote = "";
+      try {
+        const uidFix = await api.traeHealProjectUid(clientKey);
+        if (uidFix.fixed > 0) {
+          uidNote = `已修正 ${uidFix.fixed} 个工程的账号归属（涉及 ${uidFix.sessions.length} 条会话）。`;
+        }
+      } catch (cause) {
+        // 这一步失败**不阻断**后面：工程归属对齐本身也能修一部分问题。
+        uidNote = `账号归属修正失败（跳过）：${api.asError(cause)}。`;
+      }
+
+      // ② 再对齐工程归属（历史副本挂在源账号旧项目下那个老问题）。
       const res = await api.traeHealSessionProjects(clientKey);
       const msg =
-        res.fixed_sessions === 0
+        linkNote +
+        uidNote +
+        (res.fixed_sessions === 0
           ? "检查完成：没有需要修复的会话。"
           : `已修复 ${res.fixed_sessions} 条会话的工程归属` +
             (res.fixed_contexts > 0 ? `、${res.fixed_contexts} 条会话上下文` : "") +
-            `。${res.relaunched ? "客户端已自动重启。" : "请手动启动客户端查看。"}`;
+            `。${res.relaunched ? "客户端已自动重启。" : "请手动启动客户端查看。"}`);
       setHealReport(msg);
-      if (res.fixed_sessions === 0) {
+      if (res.fixed_sessions === 0 && !uidNote.startsWith("已修正") && !linkNote.startsWith("已规范")) {
         toast.success("没有需要修复的会话");
       } else {
         toast.success("修复完成", { description: msg });
@@ -968,6 +1220,7 @@ export default function TraeRecordsPage() {
         <TabsList className="self-start">
           <TabsTrigger value="records">会话记录</TabsTrigger>
           <TabsTrigger value="links">复制与关联</TabsTrigger>
+          <TabsTrigger value="groups">关联会话</TabsTrigger>
         </TabsList>
 
         <TabsContent value="records" className="mt-0 flex flex-col gap-4">
@@ -1428,6 +1681,9 @@ export default function TraeRecordsPage() {
                         onChange={(e) => {
                           setLinkSrcUid(e.target.value);
                           setCopySel(new Set());
+                          // 空间筛选跟着源账号走：留着上一个账号的空间键，
+                          // 新账号下多半不存在，表格会直接空掉（看着像「这个账号没会话」）。
+                          setCopyWs("");
                         }}
                         className="h-8 max-w-56 rounded-md border border-border bg-background px-2 text-xs"
                       >
@@ -1480,12 +1736,92 @@ export default function TraeRecordsPage() {
                     </Alert>
                   )}
 
+                  {/* 搜索 + 空间筛选 + 视图切换：与 WorkBuddy「复制与关联」**逐项对齐**
+                      （同一套 Input / 同一组图标 / 同一种切换按钮），不做自创样式。 */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative">
+                      <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={copyQuery}
+                        onChange={(e) => setCopyQuery(e.target.value)}
+                        placeholder="搜索标题 / 工作空间 / 会话 id"
+                        className="h-9 w-[230px] pl-7 pr-7 text-sm"
+                      />
+                      {copyQuery ? (
+                        <button
+                          type="button"
+                          title="清除搜索"
+                          className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                          onClick={() => setCopyQuery("")}
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
+
+                    <select
+                      value={copyWs}
+                      onChange={(e) => setCopyWs(e.target.value)}
+                      className="h-9 max-w-[220px] rounded-md border border-input bg-background px-2 text-sm"
+                      title="按工作空间筛选"
+                    >
+                      <option value="">全部工作空间（{copyWsOptions.length}）</option>
+                      {copyWsOptions.map((w) => (
+                        <option key={w.key} value={w.key}>
+                          {w.label} · {w.count}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+                      <button
+                        type="button"
+                        className={cn(
+                          "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                          copyByWorkspace
+                            ? "bg-muted font-medium"
+                            : "text-muted-foreground hover:bg-muted/60",
+                        )}
+                        onClick={() => setCopyByWorkspace(true)}
+                      >
+                        <Layers className="size-3" />
+                        按空间
+                      </button>
+                      <button
+                        type="button"
+                        className={cn(
+                          "flex items-center gap-1 rounded px-1.5 py-0.5 text-xs",
+                          !copyByWorkspace
+                            ? "bg-muted font-medium"
+                            : "text-muted-foreground hover:bg-muted/60",
+                        )}
+                        onClick={() => setCopyByWorkspace(false)}
+                      >
+                        <LayoutList className="size-3" />
+                        平铺
+                      </button>
+                    </div>
+
+                    {(copyQuery || copyWs) && (
+                      <span className="text-xs text-muted-foreground">
+                        {copyVisible.length} / {copySrcSessions.length} 条
+                      </span>
+                    )}
+                  </div>
+
                   {copySrcSessions.length === 0 ? (
                     <p className="py-4 text-center text-sm text-muted-foreground">
                       该账号名下没有会话可复制
                     </p>
                   ) : (
-                    <div className="max-h-80 overflow-auto rounded-md border">
+                    <div
+                      className={cn(
+                        "overflow-auto rounded-md border",
+                        // 与 WorkBuddy 同一条口径：关联卡片收起时把腾出的高度给列表，
+                        // 展开时回到 20rem。用 vh 不写死像素，窗口大小不同也不会有半屏空白。
+                        linkOpen ? "max-h-80" : "max-h-[max(20rem,calc(100vh-24rem))]",
+                      )}
+                    >
                       <table className="w-full text-sm">
                         <thead className="sticky top-0 border-b bg-muted/40 text-xs text-muted-foreground">
                           <tr>
@@ -1509,41 +1845,99 @@ export default function TraeRecordsPage() {
                               />
                             </th>
                             <th className="px-3 py-2 text-left font-medium">会话</th>
+                            <th className="px-3 py-2 text-left font-medium">工作空间</th>
                             <th className="w-32 px-3 py-2 text-left font-medium">复制状态</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {copySrcSessions.map((s) => {
-                            const disabled = !s.messages;
-                            return (
-                              <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
-                                <td className="px-3 py-2">
-                                  <input
-                                    type="checkbox"
-                                    className="size-4"
-                                    disabled={disabled}
-                                    checked={copySel.has(s.id)}
-                                    onChange={() => toggleCopy(s.id)}
-                                  />
-                                </td>
-                                <td className="max-w-[420px] px-3 py-2">
-                                  <div className="truncate font-medium" title={s.title}>
-                                    {s.title || "(无标题)"}
-                                  </div>
-                                  <div className="truncate text-xs text-muted-foreground">
-                                    {s.updated} · {s.messages.toLocaleString("zh-CN")} 条
-                                  </div>
-                                </td>
-                                <td className="px-3 py-2 text-xs">
-                                  {!s.messages ? (
-                                    <span className="text-muted-foreground">无正文</span>
-                                  ) : (
-                                    <span className="text-muted-foreground">可复制</span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
+                          {copyRenderGroups.map((g) => (
+                            <Fragment key={g.key}>
+                              {/* 分组表头（只有「按空间」视图才画）。点一下 = 只看这个空间。
+                                  样式与 WorkBuddy 复制页的分组行逐项一致。 */}
+                              {copyByWorkspace ? (
+                                <tr className="bg-muted/50">
+                                  <td colSpan={4} className="px-3 py-1.5">
+                                    <button
+                                      type="button"
+                                      className="flex w-full items-center gap-2 text-left"
+                                      title="只看这个工作空间"
+                                      onClick={() => setCopyWs(g.key)}
+                                    >
+                                      <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                                      <span className="shrink-0 text-xs font-semibold">
+                                        {g.label}
+                                      </span>
+                                      <Badge variant="secondary" className="shrink-0">
+                                        {g.items.length}
+                                      </Badge>
+                                      <span
+                                        className="truncate text-xs text-muted-foreground"
+                                        title={g.path}
+                                      >
+                                        {g.path}
+                                      </span>
+                                    </button>
+                                  </td>
+                                </tr>
+                              ) : null}
+                              {g.items.map((s) => {
+                                const disabled = !s.messages;
+                                return (
+                                  <tr
+                                    key={s.id}
+                                    className="border-b last:border-0 hover:bg-muted/30"
+                                  >
+                                    <td className="px-3 py-2">
+                                      <input
+                                        type="checkbox"
+                                        className="size-4"
+                                        disabled={disabled}
+                                        checked={copySel.has(s.id)}
+                                        onChange={() => toggleCopy(s.id)}
+                                      />
+                                    </td>
+                                    <td className="max-w-[420px] px-3 py-2">
+                                      <div className="truncate font-medium" title={s.title}>
+                                        {s.title || "(无标题)"}
+                                      </div>
+                                      <div className="truncate text-xs text-muted-foreground">
+                                        {s.updated} · {s.messages.toLocaleString("zh-CN")} 条
+                                      </div>
+                                    </td>
+                                    <td className="max-w-[240px] px-3 py-2">
+                                      <div
+                                        className="truncate text-xs text-muted-foreground"
+                                        title={s.workspace_path}
+                                      >
+                                        {s.workspace || "（未归属）"}
+                                      </div>
+                                    </td>
+                                    <td className="px-3 py-2 text-xs">
+                                      {!s.messages ? (
+                                        <span className="text-muted-foreground">无正文</span>
+                                      ) : (
+                                        <span className="text-muted-foreground">可复制</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </Fragment>
+                          ))}
+                          {/* 筛选后 0 条：要在**表格里**说，别把表格整个撤掉 ——
+                              撤掉的话筛选框会跟着消失，用户连「改回来」的地方都找不到。 */}
+                          {copyVisible.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={4}
+                                className="px-3 py-8 text-center text-xs text-muted-foreground"
+                              >
+                                {copyQuery.trim()
+                                  ? `没有匹配「${copyQuery.trim()}」的会话 —— 筛选后 0 条，该账号共 ${copySrcSessions.length} 条。`
+                                  : "这个工作空间下没有会话。"}
+                              </td>
+                            </tr>
+                          ) : null}
                         </tbody>
                       </table>
                     </div>
@@ -1608,13 +2002,40 @@ export default function TraeRecordsPage() {
               ) : (
                 <Card>
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-base">跨账号关联</CardTitle>
-                    <CardDescription>
-                      复制过的会话会自动登记成一个关联组。复制之后两端各自继续聊天会
-                      <b>分叉</b>，这里会标出「源更新 / 目标更新」，并可<b>就地同步</b>
-                      （覆盖内容但保持会话 id 不变）。
-                    </CardDescription>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 space-y-1.5">
+                        <CardTitle className="text-base">跨账号关联</CardTitle>
+                        <CardDescription>
+                          复制过的会话会自动登记成一个关联组。复制之后两端各自继续聊天会
+                          <b>分叉</b>，这里会标出「源更新 / 目标更新」，并可<b>就地同步</b>
+                          （覆盖内容但保持会话 id 不变）。
+                          {linkOpen
+                            ? null
+                            : "（默认收起：关联组列表点右侧「展开」查看）"}
+                        </CardDescription>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {!linkOpen && (links?.groups.length ?? 0) > 0 ? (
+                          <span className="rounded-full border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
+                            {links?.groups.length} 组
+                          </span>
+                        ) : null}
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          aria-expanded={linkOpen}
+                          title={linkOpen ? "收起跨账号关联" : "展开跨账号关联"}
+                          onClick={() => setLinkOpen((v) => !v)}
+                        >
+                          <ChevronDown
+                            className={cn("size-4 transition-transform", linkOpen && "rotate-180")}
+                          />
+                          {linkOpen ? "收起" : "展开"}
+                        </Button>
+                      </div>
+                    </div>
                   </CardHeader>
+                  {linkOpen ? (
                   <CardContent className="space-y-3">
                     {linksLoading && !links ? (
                       <Skeleton className="h-24 rounded-lg" />
@@ -1805,6 +2226,7 @@ export default function TraeRecordsPage() {
                       </p>
                     )}
                   </CardContent>
+                  ) : null}
                 </Card>
               )}
 
@@ -1854,6 +2276,45 @@ export default function TraeRecordsPage() {
                 </CardContent>
               </Card>
             </>
+          )}
+        </TabsContent>
+
+        {/* ── 关联会话：全账号矩阵（补齐 / 以某端为准 / 解除） ─────────── */}
+        <TabsContent value="groups" className="mt-0 flex flex-col gap-4">
+          {!clientKey ? (
+            <p className="text-sm text-muted-foreground">先在上方选择 Trae 客户端</p>
+          ) : (
+            <SessionLinkGroups
+              productLabel="Trae"
+              accounts={linkOv?.accounts ?? []}
+              groups={linkOv?.groups ?? []}
+              loading={linkOvLoading}
+              error={linkOvError}
+              storePath={linkOv?.storePath}
+              busyGroup={linkOvBusy}
+              busyNote={linkOvBusyNote}
+              note="同一段对话在每个账号里各有一份副本（会话 id 不同）。这里把它们摆在一起看谁落后、谁缺，并按需补齐或以某一份为准。判据只有「消息条数 + 更新时间」—— Trae 的正文在加密库里，不做逐行内容比对，所以不会出现「有分歧」这种更强结论。"
+              onReload={() => void loadLinkOverview()}
+              onNewLink={() => setTab("links")}
+              onCopy={(g, uid) => void linkCopyTo(g, uid)}
+              onUnify={(g, m) => void linkUnifyFrom(g, m)}
+              onUnlink={(g) => void linkUnlinkGroup(g)}
+              onUnlinkMember={(g, m) => void linkUnlinkMember(g, m)}
+              onViewTurns={async (sessionId) => {
+                // 「查看内容」：只读预览某份副本的对话。
+                // Trae 多账号共用一个库，不需要先切到那个账号就能读。
+                if (!clientKey) {
+                  return { ok: false, title: "", updated: "", turns: [] };
+                }
+                const r = await api.traeSessionTurns(clientKey, sessionId);
+                return {
+                  ok: r.ok,
+                  title: r.title,
+                  updated: r.updated,
+                  turns: r.turns ?? [],
+                };
+              }}
+            />
           )}
         </TabsContent>
       </Tabs>

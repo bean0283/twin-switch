@@ -42,6 +42,7 @@ pub mod trae_oauth;
 pub mod trae_import;
 pub mod trae_profile;
 pub mod trae_remote;
+pub mod trae_reset;
 pub mod trae_session_edit;
 pub mod trae_session_links;
 pub mod trae_switch;

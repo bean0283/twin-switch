@@ -2256,11 +2256,35 @@ fn prune_backups(client_key: &str, on_log: &dyn Fn(&str)) -> usize {
     removed
 }
 
+/// 一条来源会话 + 它的工作空间归属（键 / 展示名 / 原样路径）。
+///
+/// 字段名与「WorkBuddy 会话记录」的 `session_item` 一一对应，前端才能用同一套分组逻辑。
+fn session_with_workspace(s: workbuddy_source::WbSession) -> Result<Value, String> {
+    let (key, label) = crate::modules::workspace::workspace_of(&s.cwd);
+    let path = s.cwd.replace('\\', "/");
+    let mut v = serde_json::to_value(&s)
+        .map_err(|e| format!("序列化会话 {} 失败: {e}", s.id))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| format!("会话 {} 的序列化结果不是对象", s.id))?;
+    obj.insert("workspace".to_string(), json!(label));
+    obj.insert("workspace_key".to_string(), json!(key));
+    obj.insert("workspace_path".to_string(), json!(path));
+    Ok(v)
+}
+
 /// 列出本机 WorkBuddy 会话（供前端勾选）。
+///
+/// 每条附上 `workspace` / `workspace_key` / `workspace_path`：判定一律走
+/// [`crate::modules::workspace::workspace_of`]，与「会话管理 → 会话记录」页**同一个出口**。
+/// 前端不自己从 `cwd` 切目录名 —— 否则 `D:/x` 与 `d:\x` 会在两页被拆成两个空间。
 pub fn list_source_sessions() -> Result<Value, String> {
     let available = workbuddy_source::is_available();
-    let sessions = if available {
+    let sessions: Vec<Value> = if available {
         workbuddy_source::list_sessions()?
+            .into_iter()
+            .map(session_with_workspace)
+            .collect::<Result<Vec<_>, String>>()?
     } else {
         Vec::new()
     };

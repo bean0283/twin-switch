@@ -1,16 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
   Database,
+  FolderOpen,
   HardDriveUpload,
   KeyRound,
+  Layers,
+  LayoutList,
   Loader2,
   Pencil,
   RefreshCw,
   ScanSearch,
+  Search,
+  Users,
+  X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
@@ -25,7 +31,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -35,6 +40,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -83,6 +89,16 @@ export default function WorkbuddyExportPage() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState("");
+  /**
+   * 账号 / 工作区 / 分组（与「WorkBuddy → Trae」导入页、会话管理页同一套交互）。
+   *
+   * 这里的「账号」是**源侧 Trae 账号**（`owner_uid`）：同一个 Trae 客户端下登录过多个账号时，
+   * 会话是混在一起的；导出到 WorkBuddy 只写目标那个号，所以先按账号看清再勾。
+   */
+  const [acctView, setAcctView] = useState("");
+  /** 工作区筛选：键用 `workspace_key`（就是正文落盘的 `projects/{key}/` 目录名）。 */
+  const [wsView, setWsView] = useState("");
+  const [groupBy, setGroupBy] = useState<"account" | "workspace" | "flat">("account");
 
   const [uid, setUid] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -177,17 +193,130 @@ export default function WorkbuddyExportPage() {
     if (clientKey) void loadSessions(clientKey);
   }, [clientKey, loadSessions]);
 
+  /** 工作区展示名：优先用后端 `workspace_of()` 给的，旧后端缺字段时退回目录名。 */
+  const wsLabelOf = useCallback((s: TraeWbSourceSession) => {
+    if (s.workspace) return s.workspace;
+    const key = s.workspace_key || "";
+    if (!key) return "（未归属）";
+    return key;
+  }, []);
+
+  /** 账号分布（数量与列表同源）：最近活跃的排前面。 */
+  const acctOptions = useMemo(() => {
+    const map = new Map<string, { uid: string; label: string; count: number; last: number }>();
+    for (const s of sessions ?? []) {
+      const cur =
+        map.get(s.owner_uid) ?? { uid: s.owner_uid, label: s.owner_label, count: 0, last: 0 };
+      cur.count += 1;
+      cur.last = Math.max(cur.last, s.updated_ms || 0);
+      map.set(s.owner_uid, cur);
+    }
+    return [...map.values()].sort((a, b) => b.last - a.last || a.label.localeCompare(b.label));
+  }, [sessions]);
+
+  /** 账号筛选后的范围（工作区下拉从这里算，所以换账号时空间列表跟着变）。 */
+  const scopeSessions = useMemo(
+    () => (sessions ?? []).filter((s) => !acctView || s.owner_uid === acctView),
+    [sessions, acctView],
+  );
+
+  /** 工作区分布（当前范围内）：最近活跃的排前面。 */
+  const wsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; last: number }
+    >();
+    for (const s of scopeSessions) {
+      const key = s.workspace_key ?? "";
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.last = Math.max(cur.last, s.updated_ms || 0);
+      } else {
+        map.set(key, {
+          key,
+          label: wsLabelOf(s),
+          path: (s.workspace_path ?? s.cwd).replace(/\\/g, "/"),
+          count: 1,
+          last: s.updated_ms || 0,
+        });
+      }
+    }
+    return [...map.values()].sort((a, b) => b.last - a.last || a.label.localeCompare(b.label));
+  }, [scopeSessions, wsLabelOf]);
+
   const shown = useMemo(() => {
-    const all = sessions ?? [];
     const q = filter.trim().toLowerCase();
-    if (!q) return all;
-    return all.filter(
-      (s) =>
-        s.title.toLowerCase().includes(q) ||
-        s.cwd.toLowerCase().includes(q) ||
-        s.id.toLowerCase().includes(q),
+    return scopeSessions
+      .filter((s) => {
+        if (wsView && (s.workspace_key ?? "") !== wsView) return false;
+        if (!q) return true;
+        return [s.title, s.cwd, s.id, s.owner_label, s.workspace, s.workspace_key].some((v) =>
+          (v ?? "").toLowerCase().includes(q),
+        );
+      })
+      .slice()
+      .sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0));
+  }, [scopeSessions, wsView, filter]);
+
+  /** 列表要渲染的「块」：按账号 / 按工作区 / 平铺（勾选集合始终是全局的，不随分组变化）。 */
+  const groups = useMemo(() => {
+    type Block = {
+      key: string;
+      label: string;
+      sub: string;
+      count: number;
+      items: TraeWbSourceSession[];
+      filter: { kind: "account" | "workspace"; value: string } | null;
+    };
+    if (groupBy === "flat") {
+      return [
+        { key: "__flat__", label: "", sub: "", count: shown.length, items: shown, filter: null },
+      ] satisfies Block[];
+    }
+    const map = new Map<string, Block>();
+    for (const s of shown) {
+      if (groupBy === "account") {
+        const uid = s.owner_uid;
+        const cur = map.get(uid);
+        if (cur) cur.items.push(s);
+        else
+          map.set(uid, {
+            key: uid,
+            label: s.owner_label,
+            sub: "",
+            count: 0,
+            items: [s],
+            filter: { kind: "account", value: uid },
+          });
+      } else {
+        const key = s.workspace_key ?? "";
+        const cur = map.get(key);
+        if (cur) cur.items.push(s);
+        else
+          map.set(key, {
+            key,
+            label: wsLabelOf(s),
+            // 副标题给落盘目录名 —— 这才是它在 WorkBuddy 里真正的工作区
+            sub: key || "（正文落 projects/ 根）",
+            count: 0,
+            items: [s],
+            filter: { kind: "workspace", value: key },
+          });
+      }
+    }
+    const blocks = [...map.values()];
+    for (const b of blocks) b.count = b.items.length;
+    const order =
+      groupBy === "account"
+        ? new Map(acctOptions.map((a, i) => [a.uid, i]))
+        : new Map(wsOptions.map((w, i) => [w.key, i]));
+    blocks.sort(
+      (a, b) =>
+        (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
     );
-  }, [sessions, filter]);
+    return blocks;
+  }, [groupBy, shown, acctOptions, wsOptions, wsLabelOf]);
 
   const selectedSessions = useMemo(
     () => (sessions ?? []).filter((s) => selected.has(s.id)),
@@ -210,9 +339,16 @@ export default function WorkbuddyExportPage() {
   }
 
   function toggleAll() {
-    setSelected((prev) =>
-      prev.size === shown.length ? new Set() : new Set(shown.map((s) => s.id)),
-    );
+    // 只作用于**当前可见**的行；已勾选但被筛掉的行保持原样（操作条会说清有几个）。
+    setSelected((prev) => {
+      const allShown = shown.length > 0 && shown.every((s) => prev.has(s.id));
+      const next = new Set(prev);
+      for (const s of shown) {
+        if (allShown) next.delete(s.id);
+        else next.add(s.id);
+      }
+      return next;
+    });
   }
 
   async function onScanAndDecrypt() {
@@ -441,7 +577,9 @@ export default function WorkbuddyExportPage() {
               <CardTitle className="text-base">选择要导出的 Trae 会话</CardTitle>
               <CardDescription>
                 {sessions
-                  ? `共 ${sessions.length} 个会话${filter ? `，筛选出 ${shown.length} 个` : ""}；已选 ${selectedSessions.length} 个`
+                  ? `共 ${sessions.length} 个会话${
+                      acctView || wsView || filter ? `，筛选出 ${shown.length} 条` : ""
+                    }；已选 ${selectedSessions.length} 个`
                   : "正在读取…"}
               </CardDescription>
             </div>
@@ -476,12 +614,113 @@ export default function WorkbuddyExportPage() {
             label="Trae 客户端（导出源）"
           />
 
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="按标题 / 工作目录 / 会话 id 筛选…"
-            className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring/40"
-          />
+          {/* 筛选条一：账号 → 工作区 → 搜索（数量与列表同源，都从当前 `sessions` 数出来） */}
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              className="h-8 min-w-[170px] max-w-[240px] rounded-md border border-input bg-background px-2 text-xs"
+              value={acctView}
+              onChange={(e) => {
+                setAcctView(e.target.value);
+                // 换账号 = 换一批工作区，旧的工作区键在这里没有意义。
+                setWsView("");
+              }}
+              title="按 Trae 账号筛选（会话的归属 uid）"
+            >
+              <option value="">全部账号（{sessions?.length ?? 0}）</option>
+              {acctOptions.map((a) => (
+                <option key={a.uid} value={a.uid}>
+                  {a.label} · {a.count}
+                </option>
+              ))}
+            </select>
+
+            <select
+              className="h-8 min-w-[160px] max-w-[220px] rounded-md border border-input bg-background px-2 text-xs"
+              value={wsView}
+              onChange={(e) => setWsView(e.target.value)}
+              title="按工作区筛选（= 正文落盘目录 projects/{key}）"
+            >
+              <option value="">全部工作区（{wsOptions.length}）</option>
+              {wsOptions.map((w) => (
+                <option key={w.key} value={w.key}>
+                  {w.label} · {w.count}
+                </option>
+              ))}
+            </select>
+
+            <div className="relative min-w-48 flex-1">
+              <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="搜索标题 / 工作目录 / 账号 / 会话 id"
+                className="h-8 pl-7 pr-7 text-xs"
+              />
+              {filter ? (
+                <button
+                  type="button"
+                  title="清除搜索"
+                  className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground"
+                  onClick={() => setFilter("")}
+                >
+                  <X className="size-3.5" />
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          {/* 筛选条二：分组视图 + 同源计数 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+              {(
+                [
+                  { key: "account", label: "按账号", icon: Users },
+                  { key: "workspace", label: "按工作区", icon: Layers },
+                  { key: "flat", label: "平铺", icon: LayoutList },
+                ] as const
+              ).map((v) => (
+                <button
+                  key={v.key}
+                  type="button"
+                  className={cn(
+                    "flex items-center gap-1 rounded px-2 py-0.5 text-xs",
+                    groupBy === v.key
+                      ? "bg-muted font-medium text-foreground"
+                      : "text-muted-foreground hover:bg-muted/60",
+                  )}
+                  onClick={() => setGroupBy(v.key)}
+                >
+                  <v.icon className="size-3" />
+                  {v.label}
+                </button>
+              ))}
+            </div>
+            {(acctView || wsView || filter) && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 text-xs"
+                onClick={() => {
+                  setAcctView("");
+                  setWsView("");
+                  setFilter("");
+                }}
+              >
+                清除筛选
+              </Button>
+            )}
+            <Badge variant="secondary" className="ml-auto">
+              {shown.length === scopeSessions.length
+                ? `${shown.length} 条`
+                : `${shown.length} / ${scopeSessions.length} 条`}
+            </Badge>
+            {acctOptions.length > 1 ? (
+              <Badge variant="outline">{acctOptions.length} 个账号</Badge>
+            ) : null}
+            {wsOptions.length > 0 ? (
+              <Badge variant="outline">{wsOptions.length} 个工作区</Badge>
+            ) : null}
+          </div>
 
           {hint ? (
             <div className="flex flex-wrap items-center gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-700">
@@ -506,51 +745,130 @@ export default function WorkbuddyExportPage() {
             <Skeleton className="h-40 rounded-xl" />
           ) : shown.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              {sessions ? "没有符合条件的会话。" : "该客户端暂无可导出的会话。"}
+              {sessions
+                ? `没有匹配的会话 —— 筛选后 0 条，该客户端共 ${sessions.length} 条。`
+                : "该客户端暂无可导出的会话。"}
             </p>
           ) : (
-            <div className="max-h-96 space-y-1 overflow-auto rounded-lg border p-2">
-              {shown.map((s) => (
-                <label
-                  key={s.id}
-                  className={cn(
-                    "flex items-start gap-2.5 rounded-md px-2 py-1.5 transition-colors",
-                    busy ? "opacity-50" : "cursor-pointer hover:bg-foreground/[0.03]",
-                  )}
-                >
-                  <Checkbox
-                    className="mt-0.5"
-                    checked={selected.has(s.id)}
-                    disabled={busy}
-                    onCheckedChange={() => toggle(s.id)}
-                  />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-medium">{s.title}</span>
-                    <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                      {formatTime(s.updated_ms)} · {s.turns} 轮 · {s.owner_label}
-                    </span>
-                    <span className="block truncate font-mono text-[11px] text-muted-foreground/80">
-                      {s.cwd || "(无工作目录)"} → 工作区 {s.workspace_key || "?"}
-                    </span>
-                  </span>
-                  {/* ⚠️ 这一行整体是个 <label>：编辑按钮必须 preventDefault + stopPropagation，
-                      否则点它会顺手把勾选翻掉。 */}
-                  <button
-                    type="button"
-                    title="编辑这条 Trae 会话（导出前可先改）"
-                    aria-label="编辑这条 Trae 会话"
-                    className="text-muted-foreground hover:text-foreground mt-0.5 shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
-                    disabled={busy || !clientKey}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setEditSeed(s.id);
-                    }}
-                  >
-                    <Pencil className="size-3.5" />
-                  </button>
-                </label>
-              ))}
+            <div className="max-h-[min(62vh,34rem)] overflow-auto rounded-lg border">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 border-b bg-muted/60 text-xs text-muted-foreground backdrop-blur">
+                  <tr>
+                    <th className="w-10 px-3 py-2">
+                      <input
+                        type="checkbox"
+                        className="size-4 align-middle"
+                        title="全选当前可见的会话"
+                        checked={shown.length > 0 && shown.every((s) => selected.has(s.id))}
+                        onChange={toggleAll}
+                      />
+                    </th>
+                    <th className="px-3 py-2 text-left font-medium">会话</th>
+                    <th className="px-3 py-2 text-left font-medium">工作区</th>
+                    <th className="px-3 py-2 text-left font-medium">账号</th>
+                    <th className="w-12 px-3 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {groups.map((g) => (
+                    <Fragment key={g.key}>
+                      {groupBy !== "flat" ? (
+                        <tr className="bg-muted/50">
+                          <td colSpan={5} className="px-3 py-1.5">
+                            <button
+                              type="button"
+                              className="flex w-full items-center gap-2 text-left"
+                              title="只看这一组"
+                              onClick={() => {
+                                if (!g.filter) return;
+                                if (g.filter.kind === "account") {
+                                  setAcctView((prev) =>
+                                    prev === g.filter!.value ? "" : g.filter!.value,
+                                  );
+                                  setWsView("");
+                                } else {
+                                  setWsView((prev) =>
+                                    prev === g.filter!.value ? "" : g.filter!.value,
+                                  );
+                                }
+                              }}
+                            >
+                              {groupBy === "account" ? (
+                                <Users className="size-3.5 shrink-0 text-muted-foreground" />
+                              ) : (
+                                <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                              )}
+                              <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                              <Badge variant="secondary" className="shrink-0">
+                                {g.count}
+                              </Badge>
+                              {g.sub ? (
+                                <span className="truncate font-mono text-[11px] text-muted-foreground">
+                                  {g.sub}
+                                </span>
+                              ) : null}
+                            </button>
+                          </td>
+                        </tr>
+                      ) : null}
+                      {g.items.map((s) => (
+                        <tr
+                          key={s.id}
+                          className={cn(
+                            "border-b transition-colors last:border-0",
+                            busy ? "opacity-50" : "hover:bg-muted/30",
+                          )}
+                        >
+                          <td className="px-3 py-2 align-top">
+                            <input
+                              type="checkbox"
+                              className="size-4"
+                              checked={selected.has(s.id)}
+                              disabled={busy}
+                              onChange={() => toggle(s.id)}
+                              aria-label={`选择 ${s.title}`}
+                            />
+                          </td>
+                          <td className="max-w-[420px] px-3 py-2 align-top">
+                            <div className="truncate font-medium">{s.title}</div>
+                            <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                              {formatTime(s.updated_ms)} · {s.turns} 轮
+                            </div>
+                          </td>
+                          <td className="max-w-[200px] px-3 py-2 align-top">
+                            <div
+                              className="truncate text-xs text-muted-foreground"
+                              title={(s.workspace_path ?? s.cwd).replace(/\\/g, "/")}
+                            >
+                              {wsLabelOf(s)}
+                            </div>
+                            <div className="truncate font-mono text-[11px] text-muted-foreground/70">
+                              {s.workspace_key || "（根目录）"}
+                            </div>
+                          </td>
+                          <td className="max-w-[180px] px-3 py-2 align-top">
+                            <div className="truncate text-xs text-muted-foreground" title={s.owner_label}>
+                              {s.owner_label}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 align-top">
+                            <button
+                              type="button"
+                              title="编辑这条 Trae 会话（导出前可先改）"
+                              aria-label="编辑这条 Trae 会话"
+                              className="text-muted-foreground hover:text-foreground shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
+                              disabled={busy || !clientKey}
+                              onClick={() => setEditSeed(s.id)}
+                            >
+                              <Pencil className="size-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
 

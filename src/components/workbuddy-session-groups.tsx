@@ -97,6 +97,9 @@ const RELATION: Record<string, string> = {
   ahead: "超前",
   diverged: "分叉",
   "no-body": "无正文",
+  // ⚠️ 与 `unknown`（压根没比对过）必须分开显示：这份是「上次比对过、之后又有新内容」，
+  // 结论只对它自己失效。混成「未比对」会让用户以为整组的结论都丢了（2026-10-30 反馈）。
+  stale: "有新改动",
   unknown: "未比对",
 };
 
@@ -721,13 +724,30 @@ export function WorkbuddySessionGroups() {
                   <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3.5 py-3">
                     <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
                     <div className="min-w-0 flex-1">
-                      {/* 「待同步」只剩一种原因：真有副本落后（缺账号已不算状态）。 */}
-                      <div className="text-[13px] font-semibold text-amber-700 dark:text-amber-300">
-                        {`有 ${detail.behindCount ?? detail.memberCount} 个副本落后了，可以安全同步`}
-                      </div>
-                      <div className="mt-1 text-xs leading-relaxed text-amber-700/80 dark:text-amber-300/80">
-                        落后的是「最新副本的前半段」，没有冲突内容。选一份作为标准即可补齐。
-                      </div>
+                      {/* ⚠️「待同步」有两种完全不同的原因，必须分开说：
+                          `behind` = 确认过确实落后（可安全快进）；
+                          `stale`  = 上次比对之后这份又有新内容（其余副本的结论仍然有效）。
+                          混在一起就会出现「有 0 个副本落后了，可以安全同步」这种自相矛盾的文案。 */}
+                      {detail.statusReason === "stale" ? (
+                        <>
+                          <div className="text-[13px] font-semibold text-amber-700 dark:text-amber-300">
+                            {`有 ${detail.staleCount || 1} 份在上次比对之后又有了新内容`}
+                          </div>
+                          <div className="mt-1 text-xs leading-relaxed text-amber-700/80 dark:text-amber-300/80">
+                            其余副本的比对结论仍然有效，只有变动的那份需要重新确认。
+                            点「强制比对」重新判定（会重新读取全组副本，大文件要等一会儿）。
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="text-[13px] font-semibold text-amber-700 dark:text-amber-300">
+                            {`有 ${detail.behindCount ?? detail.memberCount} 个副本落后了，可以安全同步`}
+                          </div>
+                          <div className="mt-1 text-xs leading-relaxed text-amber-700/80 dark:text-amber-300/80">
+                            落后的是「最新副本的前半段」，没有冲突内容。选一份作为标准即可补齐。
+                          </div>
+                        </>
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -1189,6 +1209,9 @@ function relPill(relation: string): string {
     case "equal":
       return "border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-700/80 dark:text-emerald-300/80";
     case "behind":
+      return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    // 「有新改动」：同 `behind` 的警示色，但绝不用「未比对」那种灰（那是另外一种状态）。
+    case "stale":
       return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300";
     case "ahead":
     case "diverged":

@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BookOpen, Copy, KeyRound, Loader2, RefreshCw, Server, Trash2, XCircle } from "lucide-react";
+import { BookOpen, ChevronDown, Copy, KeyRound, Loader2, Plus, RefreshCw, Server, Trash2, XCircle } from "lucide-react";
 
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -18,6 +18,10 @@ import {
   gatewayPool,
   gatewayPreview,
   gatewayModelsGet,
+  gatewayModelsCatalog,
+  gatewayModelsAddUser,
+  gatewayModelsRemoveUser,
+  gatewayModelsSyncRemote,
   gatewayModelLabels,
   gatewaySetEnabled,
   gatewaySetLan,
@@ -109,6 +113,14 @@ function fmtTok(n: number | undefined | null): string {
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 1 : 2)}M`;
   if (v >= 1000) return `${(v / 1000).toFixed(v >= 10_000 ? 0 : 1)}k`;
   return String(v);
+}
+
+/** 模型清单（`defaults` 会被同步覆盖，`user` 永不覆盖）。 */
+type Catalog = Awaited<ReturnType<typeof gatewayModelsCatalog>>;
+
+/** 把任意抛出物变成一句人话（沿用本页 `String(e)` 的口径，但 Error 只取 message）。 */
+function apiMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 type Status = {
@@ -220,6 +232,21 @@ const FILTER_PRODUCTS: { key: string; label: string }[] = [
   { key: "qoder", label: "Qoder" },
 ];
 
+/**
+ * 手动添加模型时可选的作用域（= 后端 `models.json` 的键）。
+ *
+ * 必须与 `gateway_pool::scope_alias()` 认的那 6 个一致：写错就等于登记了一个
+ * 永远不会被选中的模型（请求时反查不到作用域）。
+ */
+const SCOPES: { key: string; label: string }[] = [
+  { key: "trae-cn", label: "Trae 国内（trae-cn）" },
+  { key: "trae-global", label: "Trae 国际（trae-global）" },
+  { key: "wb-cn", label: "WorkBuddy 国内（wb-cn）" },
+  { key: "wb-global", label: "WorkBuddy 国际（wb-global）" },
+  { key: "qoder-cn", label: "Qoder 国内（qoder-cn）" },
+  { key: "qoder-global", label: "Qoder 国际（qoder-global）" },
+];
+
 /// 模型名归一化指纹（与后端 `gateway_pool::normalize_model_key` **同一条规则**）。
 ///
 /// 「通用模型」靠它把 `GLM-5.3`（Qoder）和 `glm-5.3`（Trae）认成同一个模型 ——
@@ -253,27 +280,58 @@ function ModelName({ display, name }: { display: string; name: string }) {
   return <span className="font-mono">{name}</span>;
 }
 
+/**
+ * 一个可折叠区：折叠态只留标题 + 一句说明（`badge` 放数量），点标题展开。
+ *
+ * 为什么加：这张页面原来七块全铺开，从上到下一页放不下（用户 2026-10-30 反馈）。
+ * 折叠状态由页面统一管（`openCards`）：**各区互相独立**，点开一个不会把别的收回去，
+ * 只有再次点击同一个标题才收起 —— 对照「地址 / Key / 模型」时不用反复重开。
+ */
 function Card({
   title,
   desc,
   right,
+  badge,
+  collapsed,
+  onToggle,
   children,
 }: {
   title: string;
   desc?: string;
   right?: React.ReactNode;
+  /** 标题旁的小徽标（数量）。 */
+  badge?: React.ReactNode;
+  collapsed?: boolean;
+  onToggle?: () => void;
   children: React.ReactNode;
 }) {
   return (
     <section className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold">{title}</h2>
-          {desc && <p className="mt-0.5 text-xs text-muted-foreground">{desc}</p>}
-        </div>
+        <button
+          type="button"
+          className="flex min-w-0 flex-col items-start gap-0.5 text-left"
+          onClick={onToggle}
+          disabled={!onToggle}
+          title={onToggle ? (collapsed ? "展开" : "收起") : undefined}
+        >
+          <span className="flex items-center gap-1.5">
+            {onToggle ? (
+              <ChevronDown
+                className={cn(
+                  "size-3.5 shrink-0 text-muted-foreground transition-transform",
+                  collapsed && "-rotate-90",
+                )}
+              />
+            ) : null}
+            <h2 className="text-sm font-semibold">{title}</h2>
+            {badge}
+          </span>
+          {desc ? <p className="text-xs text-muted-foreground">{desc}</p> : null}
+        </button>
         {right}
       </div>
-      {children}
+      {!collapsed && <div>{children}</div>}
     </section>
   );
 }
@@ -297,6 +355,24 @@ export default function GatewayPage() {
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 当前展开的区（**可以同时展开多个**）。
+   *
+   * ⚠️ 2026-10-30 用户明确要求：点开一个区不许把别的区收回去，只有**再次点击同一个**
+   * 才收起。早期是手风琴（一次只开一个），用户要对照「网关地址 / Key / 模型」时
+   * 每切一次就得重开一次，等于没折叠。
+   */
+  const [openCards, setOpenCards] = useState<Set<string>>(() => new Set(["gateway"]));
+  const fold = (key: string) => ({
+    collapsed: !openCards.has(key),
+    onToggle: () =>
+      setOpenCards((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      }),
+  });
 
   const [keyName, setKeyName] = useState("");
   const [plaintext, setPlaintext] = useState<string | null>(null);
@@ -321,6 +397,12 @@ export default function GatewayPage() {
 
   const [upstreamsText, setUpstreamsText] = useState("");
   const [upstreamsOpen, setUpstreamsOpen] = useState(false);
+
+  /** 模型清单（defaults 来自 GitHub / 本机扫描，user 是用户手动加的，永不覆盖）。 */
+  const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [catalogBusy, setCatalogBusy] = useState<"" | "sync" | "add" | "remove">("");
+  const [newScope, setNewScope] = useState("trae-cn");
+  const [newModel, setNewModel] = useState("");
 
   /// 唯一的复制出口：真的写进剪贴板才弹成功，失败必须报错（不许「看着像成功」）。
   const doCopy = useCallback(async (text: string, hint: string) => {
@@ -353,6 +435,10 @@ export default function GatewayPage() {
       setPool(rows);
       setPoolCollapsed((prev) => (prev.size > 0 ? prev : new Set(rows.map((r) => r.product))));
       setKeys(Array.isArray(k) ? (k as KeyRow[]) : []);
+      // 模型清单单独取：读的是本地文件，毫秒级；失败不拖垮上面几块。
+      void gatewayModelsCatalog()
+        .then(setCatalog)
+        .catch(() => setCatalog(null));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -499,6 +585,32 @@ export default function GatewayPage() {
   });
 
 
+  /// 「仅本机」模型：本机识别到、但 GitHub 清单里没有。
+  ///
+  /// 为什么要在界面上标出来：本机识别只做补充（`local` 段），所以这里必然会出现
+  /// GitHub 没收录的东西（内部实验代号、作者还没加的新模型）。不标的话用户会以为
+  /// 这些是「官方支持的模型」，换台电脑发现没了就会以为工具出错。
+  ///
+  /// 判据：`local` 里有、且 `defaults` 里没有（同作用域同名才算）。
+  const localOnly = useMemo(() => {
+    const set = new Set<string>();
+    const defs = catalog?.defaults ?? {};
+    Object.entries(catalog?.local ?? {}).forEach(([scope, list]) => {
+      const known = new Set(defs[scope] ?? []);
+      list.forEach((m) => {
+        if (!known.has(m)) set.add(`${scope}::${m}`);
+      });
+    });
+    return set;
+  }, [catalog]);
+
+  /// 某个模型行是不是「仅本机」：它的所有作用域都在 `local` 里出现过且都不在 `defaults`。
+  const isLocalOnlyRow = useCallback(
+    (name: string, scopes: string[]) =>
+      scopes.length > 0 && scopes.every((sc) => localOnly.has(`${sc}::${name}`)),
+    [localOnly],
+  );
+
   async function createKey() {
     setBusy(true);
     setError(null);
@@ -559,7 +671,14 @@ export default function GatewayPage() {
     })();
     // ② 页面空闲 2.5 秒后再联网刷新（各平台模型更新时自然同步）。
     const timer = setTimeout(() => void scanModels(), 2500);
-    return () => clearTimeout(timer);
+    // ③ 本机识别之后（6 秒）再静默拉一次 GitHub 的默认清单：用户要求「默认以 GitHub 为准」。
+    //    放在识别之后是有意的 —— 拉取失败时本机识别已经写好了 defaults，清单不会空。
+    //    静默：断网是常态，不该每次开页都弹错误。
+    const timerRemote = setTimeout(() => void syncModelsFromGithub(true), 6000);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timerRemote);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -570,10 +689,69 @@ export default function GatewayPage() {
       const r = await gatewayModelsDiscover();
       setDiscovered(r.models ?? []);
       setReports(r.reports ?? []);
+      setCatalog(await gatewayModelsCatalog());
     } catch (e) {
       setError(String(e));
     } finally {
       setScanning(false);
+    }
+  }
+
+  /** 从 GitHub 拉默认清单（覆盖 `defaults`，用户手动加的 `user` 原样保留）。 */
+  async function syncModelsFromGithub(silent = false) {
+    setCatalogBusy("sync");
+    try {
+      const r = await gatewayModelsSyncRemote();
+      setCatalog(await gatewayModelsCatalog());
+      if (!silent) {
+        toast.success("已从 GitHub 更新默认清单", {
+          description: `${r.scopes ?? 0} 个作用域 / ${r.models ?? 0} 个模型 · 你手动添加的 ${
+            r.userKept ?? 0
+          } 个未受影响${r.mirrored ? "（主源不通，走的是镜像源）" : ""}`,
+        });
+      }
+    } catch (e) {
+      // 拉不到就继续用本地：这句话必须说清，否则用户会以为清单没更新是 bug。
+      // 后台静默同步（silent）时连错误都不弹 —— 断网是常态，不该每次开页都报错。
+      if (!silent) {
+        toast.error("没能从 GitHub 更新", {
+          description: `${apiMessage(e)} —— 已继续使用本地清单`,
+        });
+      }
+    } finally {
+      setCatalogBusy("");
+    }
+  }
+
+  async function addUserModel() {
+    const model = newModel.trim();
+    if (!model) {
+      toast.error("请先填模型名");
+      return;
+    }
+    setCatalogBusy("add");
+    try {
+      setCatalog(await gatewayModelsAddUser(newScope, model));
+      setNewModel("");
+      toast.success(`已添加 ${newScope} / ${model}`, {
+        description: "写进「用户添加」段：以后同步 GitHub 也不会覆盖它",
+      });
+    } catch (e) {
+      toast.error("添加失败", { description: apiMessage(e) });
+    } finally {
+      setCatalogBusy("");
+    }
+  }
+
+  async function removeUserModel(scope: string, model: string) {
+    setCatalogBusy("remove");
+    try {
+      setCatalog(await gatewayModelsRemoveUser(scope, model));
+      toast.success(`已删除 ${scope} / ${model}`);
+    } catch (e) {
+      toast.error("删除失败", { description: apiMessage(e) });
+    } finally {
+      setCatalogBusy("");
     }
   }
 
@@ -667,11 +845,12 @@ export default function GatewayPage() {
       )}
 
       <Card
-        title="网关状态"
+        {...fold("gateway")}
+        title="网关状态与接入"
         desc={
           status?.lan
-            ? "随应用启动，已开给同网段的设备（非本机来源一律强制 Key）"
-            : "随应用启动，只绑定 127.0.0.1"
+            ? "随应用启动，已开给同网段的设备（非本机来源一律强制 Key）；下面两条地址按客户端要求二选一"
+            : "随应用启动，只绑定 127.0.0.1；下面两条地址按客户端要求二选一"
         }
         right={
           <span
@@ -774,192 +953,64 @@ export default function GatewayPage() {
           )}
         </div>
 
-        <p className="mt-3 text-xs text-muted-foreground">
-          本机客户端填 <span className="font-mono">{status?.localAddr ?? `http://127.0.0.1:${status?.port ?? 57892}/v1`}</span>，
-          Key 用下面新建的 <span className="font-mono">sk-ts-…</span>。
-        </p>
-      </Card>
-
-      <Card
-        title="接入自定义模型（以 WorkBuddy 为例）"
-        desc="把网关当 OpenAI 兼容服务用；下面两条地址按客户端的要求二选一，点右侧复制"
-      >
-        <div className="space-y-2 text-xs">
-          <div className="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">WorkBuddy 的「接口地址」要填完整端点</div>
-              <div className="truncate font-mono text-[11px] text-muted-foreground">
-                {hostBase}/v1/chat/completions
+        {/* 接入说明紧接在状态下面：地址、Key、模型是同一件事的三步，分开三张卡反而要来回滚。 */}
+        <div className="mt-5 border-t border-border pt-4">
+          <div className="mb-2 text-xs font-semibold">接入自定义模型（以 WorkBuddy 为例）</div>
+          <div className="space-y-2 text-xs">
+            <div className="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium">WorkBuddy 的「接口地址」要填完整端点</div>
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {hostBase}/v1/chat/completions
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  它会把填的地址<strong>原样当作对话端点直接 POST</strong>，必须填到 /chat/completions 这一层。
+                </div>
               </div>
-              <div className="text-[11px] text-muted-foreground">
-                它会把填的地址**原样当作对话端点直接 POST**，必须填到 /chat/completions 这一层。
-              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => void doCopy(`${hostBase}/v1/chat/completions`, "填进客户端的接口地址")}
+              >
+                <Copy className="size-3.5" /> 复制
+              </Button>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => void doCopy(`${hostBase}/v1/chat/completions`, "填进客户端的接口地址")}
-            >
-              <Copy className="size-3.5" /> 复制
-            </Button>
-          </div>
-          <div className="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">其他 OpenAI 兼容客户端（Trae 等）填 Base URL</div>
-              <div className="truncate font-mono text-[11px] text-muted-foreground">
-                {hostBase}/v1
+            <div className="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium">其他 OpenAI 兼容客户端（Trae 等）填 Base URL</div>
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {hostBase}/v1
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  标准 OpenAI 惯例：客户端自己拼 /chat/completions。
+                </div>
               </div>
-              <div className="text-[11px] text-muted-foreground">
-                标准 OpenAI 惯例：客户端自己拼 /chat/completions。
-              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => void doCopy(`${hostBase}/v1`, "只填到 base_url 的客户端用这个")}
+              >
+                <Copy className="size-3.5" /> 复制
+              </Button>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => void doCopy(`${hostBase}/v1`, "只填到 base_url 的客户端用这个")}
-            >
-              <Copy className="size-3.5" /> 复制
-            </Button>
+            <p className="text-[11px] text-muted-foreground">
+              API Key 在下面「网关 Key」里创建；模型名在下方「模型管理」里勾选后点复制，填进客户端。
+              {status?.lan && status.lanAddr && (
+                <>
+                  {" "}
+                  上面是<strong>局域网地址</strong>（给 NAS / 其它设备）；本机自己用{" "}
+                  <span className="font-mono">{status.localAddr}</span> 也行。
+                </>
+              )}
+            </p>
           </div>
-          <p className="text-[11px] text-muted-foreground">
-            API Key 在上方创建；模型名在下方「模型」卡片里勾选后点复制，填进客户端。
-            {status?.lan && status.lanAddr && (
-              <>
-                {" "}
-                上面是**局域网地址**（给 NAS / 其它设备）；本机自己用{" "}
-                <span className="font-mono">{status.localAddr}</span> 也行。
-              </>
-            )}
-          </p>
         </div>
       </Card>
 
-      <Card title="账号池" desc="最紧迫（最早过期）的排在最前面">
-        {pool.length === 0 ? (
-          <p className="py-6 text-center text-xs text-muted-foreground">
-            还没有账号。先去各产品的账号管理里添加。
-          </p>
-        ) : (
-          <div className="flex flex-col gap-4">
-            {grouped.map(([product, rows]) => {
-              const on = rows.filter((r) => r.usable).length;
-              const collapsed = poolCollapsed.has(product);
-              return (
-                <div key={product} className="rounded-lg border border-border">
-                  {/* 块头：产品 + 可用数 + 展开/收起（与清理页同一套交互） */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/20 px-3 py-2">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="text-[11px] font-medium tracking-wide text-muted-foreground">
-                        {PRODUCTS[product] ?? product}
-                      </span>
-                      <span
-                        className={cn(
-                          "rounded px-1 text-[10px] tabular-nums",
-                          on === rows.length
-                            ? "bg-emerald-500/10 text-emerald-600"
-                            : on === 0
-                              ? "bg-destructive/10 text-destructive"
-                              : "bg-amber-500/10 text-amber-600",
-                        )}
-                      >
-                        {on}/{rows.length} 可用
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setPoolCollapsed((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(product)) next.delete(product);
-                          else next.add(product);
-                          return next;
-                        })
-                      }
-                      className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
-                    >
-                      {collapsed ? "展开" : "收起"}
-                    </button>
-                  </div>
-
-                  {collapsed ? null : (
-                    <div className="overflow-hidden">
-                      <table className="w-full text-xs">
-                        <thead className="bg-muted/40 text-muted-foreground">
-                          <tr>
-                            <th className="px-3 py-2 text-left font-medium">账号</th>
-                            <th className="px-3 py-2 text-left font-medium">作用域</th>
-                            <th className="px-3 py-2 text-right font-medium">剩余</th>
-                            <th className="px-3 py-2 text-left font-medium">到期</th>
-                            <th className="px-3 py-2 text-left font-medium">状态</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {rows.map((r) => (
-                            <tr
-                              key={r.key}
-                              className={cn(
-                                "border-t border-border/60",
-                                !r.usable && "bg-destructive/[0.03]",
-                              )}
-                            >
-                              <td className="px-3 py-2">{r.label}</td>
-                              <td className="px-3 py-2 font-mono">{r.scope}</td>
-                              <td className="px-3 py-2 text-right font-mono">
-                                {r.remaining == null ? (
-                                  <span className="text-muted-foreground">未知</span>
-                                ) : (
-                                  Math.round(r.remaining)
-                                )}
-                              </td>
-                              <td className="px-3 py-2">{fmtExpiry(r.expires_at)}</td>
-                              <td className="px-3 py-2">
-                                {r.cooldown_until && r.cooldown_until > Date.now() ? (
-                                  /* 整号冷却：上游明确拒绝了这个账号（凭据死 / 传输炸） */
-                                  <span
-                                    className="cursor-help text-amber-600"
-                                    title={`上游报错后暂停到 ${new Date(r.cooldown_until).toLocaleString()}，期间不会选它`}
-                                  >
-                                    {fmtRecover(r.cooldown_until)}
-                                  </span>
-                                ) : r.limited_models.length > 0 ? (
-                                  /* 模型级冷却：只有这几个模型用完，别的模型照常能用 */
-                                  <span
-                                    className="cursor-help text-amber-600"
-                                    title={r.limited_models
-                                      .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
-                                      .join("\n")}
-                                  >
-                                    {r.limited_models.length} 个模型受限 ·{" "}
-                                    {fmtRecover(r.limited_models[0].reset_at)}
-                                  </span>
-                                ) : r.usable ? (
-                                  <span className="text-emerald-600">可用</span>
-                                ) : (
-                                  /* 原因可能很长（401 / 过期 / 无凭据），放 title，表格不被撑宽 */
-                                  <span
-                                    className="cursor-help text-destructive"
-                                    title={r.reason ?? "不可用"}
-                                  >
-                                    不可用
-                                  </span>
-                                )}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </Card>
-
       <Card
+        {...fold("keys")}
         title="网关 Key"
         desc="明文只在创建时显示一次；库里只存哈希与前后 4 位"
         right={<KeyRound className="size-4 text-muted-foreground" />}
@@ -1260,7 +1311,132 @@ export default function GatewayPage() {
         )}
       </Card>
 
+      <Card {...fold("pool")} title="账号池" desc="最紧迫（最早过期）的排在最前面">
+        {pool.length === 0 ? (
+          <p className="py-6 text-center text-xs text-muted-foreground">
+            还没有账号。先去各产品的账号管理里添加。
+          </p>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {grouped.map(([product, rows]) => {
+              const on = rows.filter((r) => r.usable).length;
+              const collapsed = poolCollapsed.has(product);
+              return (
+                <div key={product} className="rounded-lg border border-border">
+                  {/* 块头：产品 + 可用数 + 展开/收起（与清理页同一套交互） */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/20 px-3 py-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="text-[11px] font-medium tracking-wide text-muted-foreground">
+                        {PRODUCTS[product] ?? product}
+                      </span>
+                      <span
+                        className={cn(
+                          "rounded px-1 text-[10px] tabular-nums",
+                          on === rows.length
+                            ? "bg-emerald-500/10 text-emerald-600"
+                            : on === 0
+                              ? "bg-destructive/10 text-destructive"
+                              : "bg-amber-500/10 text-amber-600",
+                        )}
+                      >
+                        {on}/{rows.length} 可用
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPoolCollapsed((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(product)) next.delete(product);
+                          else next.add(product);
+                          return next;
+                        })
+                      }
+                      className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      {collapsed ? "展开" : "收起"}
+                    </button>
+                  </div>
+
+                  {collapsed ? null : (
+                    <div className="overflow-hidden">
+                      <table className="w-full text-xs">
+                        <thead className="bg-muted/40 text-muted-foreground">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-medium">账号</th>
+                            <th className="px-3 py-2 text-left font-medium">作用域</th>
+                            <th className="px-3 py-2 text-right font-medium">剩余</th>
+                            <th className="px-3 py-2 text-left font-medium">到期</th>
+                            <th className="px-3 py-2 text-left font-medium">状态</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rows.map((r) => (
+                            <tr
+                              key={r.key}
+                              className={cn(
+                                "border-t border-border/60",
+                                !r.usable && "bg-destructive/[0.03]",
+                              )}
+                            >
+                              <td className="px-3 py-2">{r.label}</td>
+                              <td className="px-3 py-2 font-mono">{r.scope}</td>
+                              <td className="px-3 py-2 text-right font-mono">
+                                {r.remaining == null ? (
+                                  <span className="text-muted-foreground">未知</span>
+                                ) : (
+                                  Math.round(r.remaining)
+                                )}
+                              </td>
+                              <td className="px-3 py-2">{fmtExpiry(r.expires_at)}</td>
+                              <td className="px-3 py-2">
+                                {r.cooldown_until && r.cooldown_until > Date.now() ? (
+                                  /* 整号冷却：上游明确拒绝了这个账号（凭据死 / 传输炸） */
+                                  <span
+                                    className="cursor-help text-amber-600"
+                                    title={`上游报错后暂停到 ${new Date(r.cooldown_until).toLocaleString()}，期间不会选它`}
+                                  >
+                                    {fmtRecover(r.cooldown_until)}
+                                  </span>
+                                ) : r.limited_models.length > 0 ? (
+                                  /* 模型级冷却：只有这几个模型用完，别的模型照常能用 */
+                                  <span
+                                    className="cursor-help text-amber-600"
+                                    title={r.limited_models
+                                      .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
+                                      .join("\n")}
+                                  >
+                                    {r.limited_models.length} 个模型受限 ·{" "}
+                                    {fmtRecover(r.limited_models[0].reset_at)}
+                                  </span>
+                                ) : r.usable ? (
+                                  <span className="text-emerald-600">可用</span>
+                                ) : (
+                                  /* 原因可能很长（401 / 过期 / 无凭据），放 title，表格不被撑宽 */
+                                  <span
+                                    className="cursor-help text-destructive"
+                                    title={r.reason ?? "不可用"}
+                                  >
+                                    不可用
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+
       <Card
+        {...fold("models")}
         title="模型管理"
         desc="通用模型默认由后端自动选号（积分到期最早的先用）；专有模型选中即走对应产品的积分"
         right={
@@ -1275,6 +1451,127 @@ export default function GatewayPage() {
           </button>
         }
       >
+        {/* 清单来源 + 手动添加：默认清单由 GitHub 覆盖更新，用户加的单独一段、永不覆盖 */}
+        <div className="mb-3 rounded-lg border border-border bg-muted/30 px-3 py-2.5">
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+            <span className="font-medium text-foreground">模型清单</span>
+            <span title="默认 = GitHub 权威清单；仅本机 = 本机识别到、GitHub 清单里没有的；你添加 = 手动加的">
+              默认 {catalog?.defaultCount ?? 0} 个
+              {catalog?.localCount ? ` · 仅本机 ${catalog.localCount} 个` : ""} · 你添加{" "}
+              {catalog?.userCount ?? 0} 个
+            </span>
+            <span
+              title={
+                catalog?.remoteUrl
+                  ? `${catalog.remoteUrl}\n备用镜像：${
+                      (catalog.remoteMirrors ?? []).slice(1).join("\n") || "—"
+                    }`
+                  : undefined
+              }
+            >
+              来源：
+              {catalog?.source === "github"
+                ? "GitHub"
+                : catalog?.source === "discover"
+                  ? "本机识别"
+                  : catalog?.source === "user"
+                    ? "你手动添加后"
+                    : catalog?.source === "migrated"
+                      ? "旧格式迁移"
+                      : "未知"}
+              {catalog?.updatedAt ? ` · ${catalog.updatedAt}` : ""}
+            </span>
+            <button
+              type="button"
+              onClick={() => void syncModelsFromGithub()}
+              disabled={catalogBusy !== ""}
+              className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+              title={catalog?.remoteUrl}
+            >
+              {catalogBusy === "sync" ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <RefreshCw className="size-3" />
+              )}
+              从 GitHub 更新默认清单
+            </button>
+          </div>
+
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <select
+              value={newScope}
+              onChange={(e) => setNewScope(e.target.value)}
+              className="h-7 rounded border border-border bg-background px-1.5 text-[11px] outline-none focus:border-primary"
+              title="这个模型属于哪个作用域（决定走哪家的积分）"
+            >
+              {SCOPES.map((s) => (
+                <option key={s.key} value={s.key}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+            <input
+              value={newModel}
+              onChange={(e) => setNewModel(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void addUserModel();
+              }}
+              placeholder="手动添加模型名（如 deepseek-v4.1-flash）"
+              className="h-7 min-w-[16rem] flex-1 rounded border border-border bg-background px-2 text-[11px] outline-none focus:border-primary"
+            />
+            <button
+              type="button"
+              onClick={() => void addUserModel()}
+              disabled={catalogBusy !== ""}
+              className="inline-flex h-7 items-center gap-1 rounded-md bg-primary px-2.5 text-[11px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
+            >
+              {catalogBusy === "add" ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <Plus className="size-3" />
+              )}
+              添加
+            </button>
+          </div>
+
+          {/* 用户自己加的那几个单独列出来（可删）；默认清单不在这里删 —— 它由同步负责。 */}
+          {Object.keys(catalog?.user ?? {}).length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {Object.entries(catalog?.user ?? {}).map(([scope, list]) =>
+                list.map((m) => (
+                  <span
+                    key={`${scope}::${m}`}
+                    className="inline-flex items-center gap-1 rounded-full border border-border bg-background px-2 py-0.5 text-[10px]"
+                  >
+                    <span className="text-muted-foreground">{scope}</span>
+                    <span className="font-mono">{m}</span>
+                    <button
+                      type="button"
+                      title="从「你添加的」里删掉（默认清单不受影响）"
+                      disabled={catalogBusy !== ""}
+                      onClick={() => void removeUserModel(scope, m)}
+                      className="text-muted-foreground hover:text-destructive disabled:opacity-40"
+                    >
+                      <XCircle className="size-3" />
+                    </button>
+                  </span>
+                )),
+              )}
+            </div>
+          ) : null}
+
+          <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+            读取顺序：先用本地 <code className="font-mono">models.json</code> 立即可用 → 后台从
+            GitHub 拉默认清单覆盖更新 → 拉不到就继续用本地。
+            <br />
+            <b className="text-foreground">本机识别只做补充</b>：GitHub 清单里没有的模型单独存一段
+            （标「仅本机」），
+            <b className="text-foreground">不会覆盖 GitHub 的清单</b>
+            ；只有第一次装、还没有 GitHub 清单时才由本机识别兜底。你手动添加的模型另存一段，
+            <b className="text-foreground">任何同步都不会覆盖或删除它</b>。
+          </p>
+        </div>
+
         {reports.length > 0 && (
           <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
             {reports.map((r) => (
@@ -1372,6 +1669,14 @@ export default function GatewayPage() {
                         <ModelName display={display} name={name} />
                       </button>
                       <span className="flex shrink-0 flex-wrap items-center justify-end gap-0.5">
+                        {isLocalOnlyRow(name, scopes) && (
+                          <span
+                            title="仅本机：本机识别到、GitHub 清单里没有。换台电脑不一定还有"
+                            className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] text-amber-700 dark:text-amber-300"
+                          >
+                            仅本机
+                          </span>
+                        )}
                         {scopes.map((sc) => (
                           <button
                             key={sc}
@@ -1431,7 +1736,7 @@ export default function GatewayPage() {
                   <span className="ml-auto text-[10px] text-muted-foreground">专有</span>
                 </div>
                 <div className="max-h-72 overflow-y-auto p-1">
-                  {ownModels[board].map(({ key, name, display }) => (
+                  {ownModels[board].map(({ key, name, display, scopes }) => (
                     // 专有块只有一个动作：点右边的复制按钮复制裸名。
                     // ⚠️ 以前名字本身是按钮、右边那个 `<Copy>` 只是装饰（没有 onClick）——
                     //    用户照着形状点图标，一点反应都没有（2026-10-24 反馈）。
@@ -1443,6 +1748,14 @@ export default function GatewayPage() {
                       <span className="min-w-0 flex-1 truncate">
                         <ModelName display={display} name={name} />
                       </span>
+                      {isLocalOnlyRow(name, scopes) && (
+                        <span
+                          title="仅本机：本机识别到、GitHub 清单里没有。换台电脑不一定还有"
+                          className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] text-amber-700 dark:text-amber-300"
+                        >
+                          仅本机
+                        </span>
+                      )}
                       <button
                         type="button"
                         onClick={() =>
@@ -1474,7 +1787,7 @@ export default function GatewayPage() {
         )}
       </Card>
 
-      <Card title="选号预览" desc="只算不发，不消耗额度">
+      <Card {...fold("preview")} title="选号预览" desc="只算不发，不消耗额度">
         <div className="flex flex-wrap items-center gap-2">
           <input
             value={model}
@@ -1531,7 +1844,7 @@ export default function GatewayPage() {
         )}
       </Card>
 
-      <Card title="上游地址" desc="决定请求真正发到哪里；没登记的产品会返回 501 并说明原因">
+      <Card {...fold("upstream")} title="上游地址" desc="决定请求真正发到哪里；没登记的产品会返回 501 并说明原因">
         <div className="flex flex-wrap gap-2">
           <button
             type="button"
