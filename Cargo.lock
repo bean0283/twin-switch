@@ -5539,7 +5539,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-core"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5571,7 +5571,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-rust"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "libc",
  "objc2",
