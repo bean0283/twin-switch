@@ -1,15 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
   Database,
+  FolderOpen,
   HardDriveDownload,
   KeyRound,
+  Layers,
+  LayoutList,
   Loader2,
   Pencil,
   RefreshCw,
+  Search,
+  Users,
+  X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
@@ -33,6 +39,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { cn } from "@/lib/utils";
@@ -108,6 +115,22 @@ export default function WorkbuddyImportPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showDeleted, setShowDeleted] = useState(false);
   const [filter, setFilter] = useState("");
+  /**
+   * 账号维度（用户要求：与会话管理一致，支持按账号显示）。
+   *
+   * `""` = 全部账号一起看（跨账号挑选、一次导入），否则只看这一个 uid。
+   * 账号下拉的数量与列表同源（都从 `list.sessions` 数出来），不另算一份。
+   */
+  const [acctView, setAcctView] = useState("");
+  /** 工作空间筛选：`""` = 全部。键是后端 `workspace_key`（归一化路径）。 */
+  const [wsView, setWsView] = useState("");
+  /**
+   * 分组视图：按账号 / 按空间 / 平铺。
+   *
+   * 默认「按账号」—— 这个页面的核心动作是「把哪个号里的哪段对话搬去 Trae」，
+   * 账号是第一维度；同一段对话在不同账号下的副本也正好按账号并排看见（谁最新一目了然）。
+   */
+  const [groupBy, setGroupBy] = useState<"account" | "workspace" | "flat">("account");
 
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
@@ -284,27 +307,217 @@ export default function WorkbuddyImportPage() {
     };
   }, [target]);
 
-  const shown = useMemo(() => {
-    const all = list?.sessions ?? [];
-    const visible = all.filter((s) => (showDeleted ? true : !s.deleted));
-    const q = filter.trim().toLowerCase();
-    if (!q) return visible;
-    return visible.filter(
-      (s) =>
-        s.title.toLowerCase().includes(q) ||
-        s.cwd.toLowerCase().includes(q) ||
-        s.id.toLowerCase().includes(q),
+  /**
+   * 工作空间键 / 展示名：优先用后端算好的（与会话管理同源），旧后端缺字段时才按 `cwd` 兜底。
+   *
+   * ⚠️ 兜底只做「显示」级归一化（反斜杠→正斜杠、小写、折叠重复），判据仍在后端；
+   *    这样旧数据也不会出现 `D:/x` 与 `d:\x` 两个分组。
+   */
+  const wsKeyOf = useCallback((s: TraeWorkbuddySession) => {
+    if (s.workspace_key !== undefined) return s.workspace_key;
+    return s.cwd.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
+  }, []);
+  const wsLabelOf = useCallback(
+    (s: TraeWorkbuddySession, key: string) => {
+      if (s.workspace) return s.workspace;
+      if (!key) return "（未归属）";
+      const segs = key.split("/").filter(Boolean);
+      return segs[segs.length - 1] || key;
+    },
+    [],
+  );
+
+  /** 只看「已删除开关」的全量行：账号下拉永远列出全部账号（否则选了一个号就再也切不到别的号）。 */
+  const baseSessions = useMemo(
+    () => (list?.sessions ?? []).filter((s) => showDeleted || !s.deleted),
+    [list, showDeleted],
+  );
+
+  /** 账号筛选 / 已删除开关之后的「当前范围」——空间下拉与分组都从这一份算。 */
+  const scopeSessions = useMemo(
+    () => baseSessions.filter((s) => !acctView || s.user_id === acctView),
+    [baseSessions, acctView],
+  );
+
+  /** 账号分布（数量与列表同源）：最近活跃的排前面。 */
+  const acctOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { uid: string; label: string; count: number; importable: number; last: number }
+    >();
+    for (const s of baseSessions) {
+      const cur =
+        map.get(s.user_id) ??
+        { uid: s.user_id, label: ownerOf(s.user_id), count: 0, importable: 0, last: 0 };
+      cur.count += 1;
+      if (s.has_body) cur.importable += 1;
+      cur.last = Math.max(cur.last, s.updated_at || 0);
+      map.set(s.user_id, cur);
+    }
+    return [...map.values()].sort(
+      (a, b) => b.last - a.last || a.label.localeCompare(b.label),
     );
-  }, [list, showDeleted, filter]);
+  }, [baseSessions, ownerOf]);
+
+  /** 空间分布（当前范围内）：最近活跃的排前面；同名空间补一级目录区分。 */
+  const wsOptions = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; label: string; path: string; count: number; last: number; uids: Set<string> }
+    >();
+    for (const s of scopeSessions) {
+      const key = wsKeyOf(s);
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += 1;
+        cur.last = Math.max(cur.last, s.updated_at || 0);
+        cur.uids.add(s.user_id);
+      } else {
+        map.set(key, {
+          key,
+          label: wsLabelOf(s, key),
+          path: (s.workspace_path ?? s.cwd).replace(/\\/g, "/"),
+          count: 1,
+          last: s.updated_at || 0,
+          uids: new Set([s.user_id]),
+        });
+      }
+    }
+    const list2 = [...map.values()];
+    // 同名空间（两个不同目录都叫 `bin`）在下拉里得能区分，否则是两行一模一样的字。
+    const dup = new Map<string, number>();
+    for (const w of list2) dup.set(w.label, (dup.get(w.label) ?? 0) + 1);
+    return list2
+      .map((w) => {
+        if ((dup.get(w.label) ?? 0) <= 1) return w;
+        const segs = (w.path || "").split("/").filter(Boolean);
+        return { ...w, label: segs.slice(-2).join("/") || w.label };
+      })
+      .sort((a, b) => b.last - a.last || a.label.localeCompare(b.label));
+  }, [scopeSessions, wsKeyOf, wsLabelOf]);
+
+  /**
+   * 搜索 + 账号 + 空间 + 已删除 之后的可见行（勾选与全选只作用于这些行）。
+   *
+   * 搜索走**元数据**（标题 / 工作目录 / 会话 id / 归属账号 / 空间名 / 模型）——
+   * 正文在 `projects/*.jsonl` 里，逐条读会让输入框卡死，占位符已写明。
+   */
+  const shown = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return scopeSessions
+      .filter((s) => {
+        if (wsView && wsKeyOf(s) !== wsView) return false;
+        if (!q) return true;
+        return [
+          s.title,
+          s.cwd,
+          s.id,
+          accountLabels.get(s.user_id),
+          s.workspace,
+          s.model,
+        ].some((v) => (v ?? "").toLowerCase().includes(q));
+      })
+      .slice()
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  }, [scopeSessions, wsView, filter, wsKeyOf, accountLabels]);
+
+  /**
+   * 列表要渲染的「块」：按账号（账号顺序 = `acctOptions`）/ 按空间（顺序 = `wsOptions`）/ 平铺。
+   *
+   * 分组只为**看**：勾选集合始终是全局的会话 id 集合，不随分组变化。
+   */
+  const groups = useMemo(() => {
+    type Block = {
+      key: string;
+      label: string;
+      sub: string;
+      count: number;
+      items: TraeWorkbuddySession[];
+      /** 组头点击后要应用的筛选（切到「只看这组」）。 */
+      filter: { kind: "account" | "workspace"; value: string } | null;
+    };
+    if (groupBy === "flat") {
+      return [
+        {
+          key: "__flat__",
+          label: "",
+          sub: "",
+          count: shown.length,
+          items: shown,
+          filter: null,
+        },
+      ] satisfies Block[];
+    }
+    const map = new Map<string, Block>();
+    for (const s of shown) {
+      if (groupBy === "account") {
+        const uid = s.user_id;
+        const cur = map.get(uid);
+        if (cur) cur.items.push(s);
+        else
+          map.set(uid, {
+            key: uid,
+            label: ownerOf(uid),
+            sub: "",
+            count: 0,
+            items: [s],
+            filter: { kind: "account", value: uid },
+          });
+      } else {
+        const key = wsKeyOf(s);
+        const cur = map.get(key);
+        if (cur) cur.items.push(s);
+        else
+          map.set(key, {
+            key,
+            label: wsLabelOf(s, key),
+            sub: (s.workspace_path ?? s.cwd).replace(/\\/g, "/"),
+            count: 0,
+            items: [s],
+            filter: { kind: "workspace", value: key },
+          });
+      }
+    }
+    const blocks = [...map.values()];
+    for (const b of blocks) b.count = b.items.length;
+    if (groupBy === "account") {
+      const order = new Map(acctOptions.map((a, i) => [a.uid, i]));
+      blocks.sort(
+        (a, b) =>
+          (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+      );
+    } else {
+      const order = new Map(wsOptions.map((w, i) => [w.key, i]));
+      blocks.sort(
+        (a, b) =>
+          (order.get(a.key) ?? 999) - (order.get(b.key) ?? 999) || a.label.localeCompare(b.label),
+      );
+    }
+    return blocks;
+  }, [groupBy, shown, acctOptions, wsOptions, ownerOf, wsKeyOf, wsLabelOf]);
 
   const importable = useMemo(() => shown.filter((s) => s.has_body), [shown]);
+  /** 全量可导入数（不受筛选影响）：卡头那句「共 N 个可导入」用它，避免与筛选结果混为一谈。 */
+  const totalImportable = useMemo(
+    () => (list?.sessions ?? []).filter((s) => s.has_body && (showDeleted || !s.deleted)).length,
+    [list, showDeleted],
+  );
   const deletedCount = useMemo(
     () => (list?.sessions ?? []).filter((s) => s.deleted).length,
     [list],
   );
+  /**
+   * 将被导入的会话 = **全部**已勾选且带正文的行，不受当前筛选影响。
+   *
+   * ⚠️ 早前这里写的是 `importable.filter(...)`（`importable` 已经是筛选后的可见行），
+   *    于是「筛掉的行」既不会被导入、又永远进不了下面的 `hiddenSelected` ——
+   *    操作条上那句「另有 N 个被藏起来，仍会一起导入」永远显示不出来，
+   *    等于把用户勾过的东西静默吃掉（与 MEMORY 里「空与失败不许同形」同一类错误）。
+   *    现在勾选集合是全局的：筛掉也照导入，数量由 `hiddenSelected` 明说。
+   */
   const selectedSessions = useMemo(
-    () => importable.filter((s) => selected.has(s.id)),
-    [importable, selected],
+    () => (list?.sessions ?? []).filter((s) => s.has_body && selected.has(s.id)),
+    [list, selected],
   );
 
   /**
@@ -537,7 +750,9 @@ export default function WorkbuddyImportPage() {
               <CardDescription className="flex flex-wrap items-center gap-x-2">
                 <span>
                   {list
-                    ? `共 ${importable.length} 个可导入${filter ? `，筛选出 ${shown.length} 个` : ""}；已选 ${selectedSessions.length} 个`
+                    ? `共 ${totalImportable} 个可导入${
+                        acctView || wsView || filter ? `，筛选出 ${shown.length} 条` : ""
+                      }；已选 ${selectedSessions.length} 个`
                     : "正在读取…"}
                 </span>
                 <span className="break-all font-mono text-xs text-muted-foreground/80">
@@ -564,13 +779,63 @@ export default function WorkbuddyImportPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
+          {/* 筛选条一：账号 → 空间 → 搜索（与会话管理的口径一致：
+              账号数量 / 空间数量 / 列表条数全部从同一份 `list.sessions` 数出来） */}
           <div className="flex flex-wrap items-center gap-2">
-            <input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="按标题 / 工作目录 / 会话 id 筛选…"
-              className="h-8 min-w-52 flex-1 rounded-md border border-border bg-background px-2.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring/40"
-            />
+            <select
+              className="h-8 min-w-[170px] max-w-[240px] rounded-md border border-input bg-background px-2 text-xs"
+              value={acctView}
+              onChange={(e) => {
+                setAcctView(e.target.value);
+                // 换账号 = 换一批空间，旧的空间键在这里没有意义。
+                setWsView("");
+              }}
+              title="按账号筛选（跨账号浏览时选「全部账号」）"
+            >
+              <option value="">
+                全部账号（{baseSessions.length}）
+              </option>
+              {acctOptions.map((a) => (
+                <option key={a.uid} value={a.uid}>
+                  {a.label} · {a.count} 条（可导入 {a.importable}）
+                </option>
+              ))}
+            </select>
+
+            <select
+              className="h-8 min-w-[160px] max-w-[220px] rounded-md border border-input bg-background px-2 text-xs"
+              value={wsView}
+              onChange={(e) => setWsView(e.target.value)}
+              title="按工作空间筛选"
+            >
+              <option value="">全部工作空间（{wsOptions.length}）</option>
+              {wsOptions.map((w) => (
+                <option key={w.key} value={w.key}>
+                  {w.label} · {w.count}
+                </option>
+              ))}
+            </select>
+
+            <div className="relative min-w-48 flex-1">
+              <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="搜索标题 / 工作空间 / 账号 / 会话 id"
+                className="h-8 pl-7 pr-7 text-xs"
+              />
+              {filter ? (
+                <button
+                  type="button"
+                  title="清除搜索"
+                  className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground"
+                  onClick={() => setFilter("")}
+                >
+                  <X className="size-3.5" />
+                </button>
+              ) : null}
+            </div>
+
             <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
               <Checkbox checked={showDeleted} onCheckedChange={(v) => setShowDeleted(Boolean(v))} />
               显示已删除（{deletedCount}）
@@ -588,25 +853,152 @@ export default function WorkbuddyImportPage() {
             ) : null}
           </div>
 
+          {/* 筛选条二：分组视图 + 同源计数 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+              {(
+                [
+                  { key: "account", label: "按账号", icon: Users },
+                  { key: "workspace", label: "按空间", icon: Layers },
+                  { key: "flat", label: "平铺", icon: LayoutList },
+                ] as const
+              ).map((v) => (
+                <button
+                  key={v.key}
+                  type="button"
+                  className={cn(
+                    "flex items-center gap-1 rounded px-2 py-0.5 text-xs",
+                    groupBy === v.key
+                      ? "bg-muted font-medium text-foreground"
+                      : "text-muted-foreground hover:bg-muted/60",
+                  )}
+                  onClick={() => setGroupBy(v.key)}
+                >
+                  <v.icon className="size-3" />
+                  {v.label}
+                </button>
+              ))}
+            </div>
+            {(acctView || wsView || filter) && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 text-xs"
+                onClick={() => {
+                  setAcctView("");
+                  setWsView("");
+                  setFilter("");
+                }}
+              >
+                清除筛选
+              </Button>
+            )}
+            <Badge variant="secondary" className="ml-auto">
+              {shown.length === scopeSessions.length
+                ? `${shown.length} 条`
+                : `${shown.length} / ${scopeSessions.length} 条`}
+            </Badge>
+            {acctOptions.length > 1 ? (
+              <Badge variant="outline">{acctOptions.length} 个账号</Badge>
+            ) : null}
+            {wsOptions.length > 0 ? (
+              <Badge variant="outline">{wsOptions.length} 个空间</Badge>
+            ) : null}
+          </div>
+
           {loading && !list ? (
             <Skeleton className="h-40 rounded-xl" />
           ) : shown.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              {list?.sessions.length ? "没有符合条件的会话。" : "本机暂无可导入的 WorkBuddy 会话。"}
+              {list?.sessions.length
+                ? `没有匹配的会话 —— 筛选后 0 条，本机共 ${list.sessions.length} 条。`
+                : "本机暂无可导入的 WorkBuddy 会话。"}
             </p>
           ) : (
-            <div className="max-h-96 space-y-1 overflow-auto rounded-lg border p-2">
-              {shown.map((s) => (
-                <SessionRow
-                  key={s.id}
-                  session={s}
-                  owner={ownerOf(s.user_id)}
-                  checked={selected.has(s.id)}
-                  disabled={!s.has_body || busy}
-                  onToggle={() => toggle(s.id)}
-                  onEdit={() => setEditTarget({ uid: s.user_id, id: s.id })}
-                />
-              ))}
+            <div className="max-h-[min(62vh,34rem)] overflow-auto rounded-lg border">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 border-b bg-muted/60 text-xs text-muted-foreground backdrop-blur">
+                  <tr>
+                    <th className="w-10 px-3 py-2">
+                      <input
+                        type="checkbox"
+                        className="size-4 align-middle"
+                        title="全选当前可见的可导入会话"
+                        checked={
+                          importable.length > 0 && importable.every((s) => selected.has(s.id))
+                        }
+                        onChange={toggleAll}
+                      />
+                    </th>
+                    <th className="px-3 py-2 text-left font-medium">会话</th>
+                    <th className="px-3 py-2 text-left font-medium">工作空间</th>
+                    <th className="px-3 py-2 text-left font-medium">账号</th>
+                    <th className="w-12 px-3 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {groups.map((g) => (
+                    <Fragment key={g.key}>
+                      {groupBy !== "flat" ? (
+                        <tr className="bg-muted/50">
+                          <td colSpan={5} className="px-3 py-1.5">
+                            <button
+                              type="button"
+                              className="flex w-full items-center gap-2 text-left"
+                              title="只看这一组"
+                              onClick={() => {
+                                if (!g.filter) return;
+                                if (g.filter.kind === "account") {
+                                  // 再点一次 = 取消（不然「只看这个账号」进去就出不来）
+                                  setAcctView((prev) =>
+                                    prev === g.filter!.value ? "" : g.filter!.value,
+                                  );
+                                  setWsView("");
+                                } else {
+                                  setWsView((prev) =>
+                                    prev === g.filter!.value ? "" : g.filter!.value,
+                                  );
+                                }
+                              }}
+                            >
+                              {groupBy === "account" ? (
+                                <Users className="size-3.5 shrink-0 text-muted-foreground" />
+                              ) : (
+                                <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                              )}
+                              <span className="shrink-0 text-xs font-semibold">{g.label}</span>
+                              <Badge variant="secondary" className="shrink-0">
+                                {g.count}
+                              </Badge>
+                              {g.sub ? (
+                                <span
+                                  className="truncate text-xs text-muted-foreground"
+                                  title={g.sub}
+                                >
+                                  {g.sub}
+                                </span>
+                              ) : null}
+                            </button>
+                          </td>
+                        </tr>
+                      ) : null}
+                      {g.items.map((s) => (
+                        <SessionRow
+                          key={s.id}
+                          session={s}
+                          owner={ownerOf(s.user_id)}
+                          workspace={wsLabelOf(s, wsKeyOf(s))}
+                          workspacePath={(s.workspace_path ?? s.cwd).replace(/\\/g, "/")}
+                          checked={selected.has(s.id)}
+                          disabled={!s.has_body || busy}
+                          onToggle={() => toggle(s.id)}
+                          onEdit={() => setEditTarget({ uid: s.user_id, id: s.id })}
+                        />
+                      ))}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
 
@@ -802,6 +1194,8 @@ export default function WorkbuddyImportPage() {
 function SessionRow({
   session,
   owner,
+  workspace,
+  workspacePath,
   checked,
   disabled,
   onToggle,
@@ -810,6 +1204,10 @@ function SessionRow({
   session: TraeWorkbuddySession;
   /** 归属账号的显示名（`昵称（uid …97eac1）`）。 */
   owner: string;
+  /** 归属工作空间的展示名（后端 `workspace_of()` 算出的，与会话管理同源）。 */
+  workspace: string;
+  /** 归一化后的路径（正斜杠），只用于 `title` 提示。 */
+  workspacePath: string;
   checked: boolean;
   disabled: boolean;
   onToggle: () => void;
@@ -820,21 +1218,24 @@ function SessionRow({
   // 重复组里的旧副本整体压暗一档，让「最新」那份一眼看见
   const dimmed = disabled || (dup && !session.is_newest);
   return (
-    <label
+    <tr
       className={cn(
-        "flex items-start gap-2.5 rounded-md px-2 py-1.5 transition-colors",
-        dimmed ? "opacity-60" : "cursor-pointer hover:bg-foreground/[0.03]",
-        !disabled && "cursor-pointer",
+        "border-b transition-colors last:border-0",
+        dimmed ? "opacity-60" : "hover:bg-muted/30",
       )}
     >
-      <Checkbox
-        className="mt-0.5"
-        checked={checked}
-        disabled={disabled}
-        onCheckedChange={() => onToggle()}
-      />
-      <span className="min-w-0 flex-1">
-        <span className="flex flex-wrap items-center gap-1.5">
+      <td className="px-3 py-2 align-top">
+        <input
+          type="checkbox"
+          className="size-4"
+          checked={checked}
+          disabled={disabled}
+          onChange={() => onToggle()}
+          aria-label={`选择 ${session.title}`}
+        />
+      </td>
+      <td className="max-w-[420px] px-3 py-2 align-top">
+        <div className="flex flex-wrap items-center gap-1.5">
           <span className="truncate font-medium">{session.title}</span>
           {dup && session.is_newest ? (
             <Badge className="bg-emerald-500/15 text-[10px] text-emerald-600">最新</Badge>
@@ -854,46 +1255,49 @@ function SessionRow({
               无正文
             </Badge>
           ) : null}
-        </span>
-        <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+        </div>
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
           {/* 相对时间在前：重复副本的绝对时间只差一两分钟，看不出谁靠后 */}
-          {relativeTime(session.updated_at)}（{formatTime(session.updated_at)}） · {owner} ·{" "}
+          {relativeTime(session.updated_at)}（{formatTime(session.updated_at)}） ·{" "}
           {humanSize(session.body_bytes)}
           {session.body_lines > 0 ? ` · ${session.body_lines} 条记录` : ""}
           {session.model ? ` · ${session.model}` : ""}
-        </span>
-        <span className="block truncate font-mono text-[11px] text-muted-foreground/80">
-          {session.cwd || "(无工作目录)"}
-        </span>
+        </div>
         {session.dup_note ? (
-          <span
+          <div
             className={cn(
-              "mt-0.5 block truncate text-[11px]",
+              "mt-0.5 truncate text-[11px]",
               dup && !session.is_newest ? "text-amber-600" : "text-muted-foreground/80",
             )}
           >
             {session.dup_group}
             {dup ? "｜" : ""}
             {session.dup_note}
-          </span>
+          </div>
         ) : null}
-      </span>
-      {/* ⚠️ 这一行整体是个 <label>（点哪儿都切换勾选）：编辑按钮必须
-          `preventDefault` + `stopPropagation`，否则点它会顺手把勾选翻掉。 */}
-      <button
-        type="button"
-        title="编辑这条会话（导入前可先改）"
-        aria-label="编辑这条会话"
-        className="text-muted-foreground hover:text-foreground mt-0.5 shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
-        disabled={!session.has_body || disabled}
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          onEdit();
-        }}
-      >
-        <Pencil className="size-3.5" />
-      </button>
-    </label>
+      </td>
+      <td className="max-w-[180px] px-3 py-2 align-top">
+        <div className="truncate text-xs text-muted-foreground" title={workspacePath}>
+          {workspace}
+        </div>
+      </td>
+      <td className="max-w-[180px] px-3 py-2 align-top">
+        <div className="truncate text-xs text-muted-foreground" title={owner}>
+          {owner}
+        </div>
+      </td>
+      <td className="px-3 py-2 align-top">
+        <button
+          type="button"
+          title="编辑这条会话（导入前可先改）"
+          aria-label="编辑这条会话"
+          className="text-muted-foreground hover:text-foreground shrink-0 rounded-sm p-1 disabled:pointer-events-none disabled:opacity-40"
+          disabled={!session.has_body || disabled}
+          onClick={onEdit}
+        >
+          <Pencil className="size-3.5" />
+        </button>
+      </td>
+    </tr>
   );
 }

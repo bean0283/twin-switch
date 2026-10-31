@@ -412,11 +412,17 @@ pub fn list_source(client_key: &str) -> Result<Value, String> {
     let sessions: Vec<Value> = rows
         .into_iter()
         .map(|(id, title, created, updated, cwd, owner_uid, turns)| {
+            // 展示名与路径走**共用的** `workspace_of()`（与会话管理 / 导入页同源）；
+            // `workspace_key` 仍然是落盘目录名（`projects/{key}/`），不能拿它当展示名，
+            // 否则界面上是一串 `c-users-11970-desktop-111`。
+            let (_, ws_label) = crate::modules::workspace::workspace_of(&cwd);
             json!({
                 "id": id,
                 "title": if title.trim().is_empty() { "（无标题）".to_string() } else { title.trim().to_string() },
                 "cwd": cwd,
                 "workspace_key": if cwd.trim().is_empty() { String::new() } else { workspace_key(&cwd) },
+                "workspace": ws_label,
+                "workspace_path": cwd.replace('\\', "/"),
                 "created_ms": ts_to_ms(&created),
                 "updated_ms": ts_to_ms(&updated),
                 "turns": turns,

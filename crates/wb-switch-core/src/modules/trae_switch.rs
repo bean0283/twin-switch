@@ -547,6 +547,51 @@ pub struct SwitchResult {
     pub entries: usize,
     pub uid: Option<String>,
     pub message: String,
+    /// 切号时顺带复制的会话数（0 = 没勾 / 没复制）。
+    pub copied_sessions: usize,
+    /// 会话复制失败的原因（成功或没复制时为 None）。
+    ///
+    /// ⚠️ 与 `message` 分开：切号本身可能成功而会话复制失败，两件事必须各自说清，
+    /// 不许把「会话没复制」塌缩成「切换失败」，也不许反过来。
+    pub copy_error: Option<String>,
+}
+
+/// 切号时要处理的单个会话。
+///
+/// ⚠️⚠️ **「同步」与「复制」不是一回事**，这里必须分开：
+/// - 已关联的会话（`linked` / `twin`）要**就地同步**（`sync_groups`，原会话 id 不变）；
+/// - 未关联的（`unlinked`）才**新建副本**（`import_sessions`，生成新 id）。
+///
+/// 2026-10-31 用户实测：之前对已关联的会话也走「复制」，于是每切一次号
+/// 就多出一份同名副本（客户端里看到「新对话」越来越多），而不是更新原来那条。
+#[derive(Debug, Clone)]
+pub struct SwitchCopyItem {
+    /// 源会话 id（源账号里的那条）。
+    pub session_id: String,
+    /// `sync` = 就地同步已有副本；`copy` = 新建副本。
+    pub mode: SwitchItemMode,
+    /// `mode == Sync` 时必填：要同步的关联组 id（来自 `switch_plan` 的 `groupId`）。
+    pub group_id: Option<String>,
+    /// `mode == Sync` 时必填：同步方向（`to_target` / `to_source`）。
+    pub direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchItemMode {
+    /// 就地同步（原会话 id 不变，客户端里的位置与归属不变）。
+    Sync,
+    /// 新建副本（未关联的会话才这么做）。
+    Copy,
+}
+
+/// 切号时顺带处理的会话（当前账号 → 目标账号）。
+///
+/// 由界面按「会话清单里用户勾中的那些」传入；`None` / 空 = 本次什么都不做。
+#[derive(Debug, Clone, Default)]
+pub struct SwitchCopyPlan {
+    /// 源账号 uid（当前登录的那个）。
+    pub source_uid: String,
+    pub items: Vec<SwitchCopyItem>,
 }
 
 fn make_rollback_dir() -> PathBuf {
@@ -590,6 +635,27 @@ pub fn switch_to(
     account_id: &str,
     on_progress: Option<&dyn Fn(&str)>,
 ) -> Result<SwitchResult, String> {
+    switch_to_with(client_key, account_id, on_progress, None)
+}
+
+/// 带「顺带复制会话」的切号。
+///
+/// ## 为什么复制放在这里而不是切完再调 `import_sessions`
+///
+/// 1. **进程已经停了**：`switch_to` 第 0 步本来就要结束客户端才能写登录态，
+///    那正是写会话库的唯一安全时机（库空闲、无 WAL 争用）。切完再复制，
+///    就得再结束一次、再拉起一次 ⇒ 用户看到「切个号重启两次」。
+/// 2. **不能先写登录态再复制**：写完登录态后目标账号的 uid 已经生效，
+///    再读「源账号的会话」会读错账号（`project.user_id` 已是新的）。
+/// 3. **不能让 `import_sessions` 自己 launch**：它会用**旧登录态**起一个实例，
+///    把刚写好的登录态盖掉。所以走 `import_sessions_ex(already_stopped = true)`，
+///    由本函数在写完登录态之后统一拉起（只拉一次）。
+pub fn switch_to_with(
+    client_key: &str,
+    account_id: &str,
+    on_progress: Option<&dyn Fn(&str)>,
+    copy: Option<&SwitchCopyPlan>,
+) -> Result<SwitchResult, String> {
     let cfg = load_config();
     let client = get_client(client_key).ok_or("未知客户端")?;
     ensure_switchable(client)?;
@@ -607,6 +673,37 @@ pub fn switch_to(
     };
 
     // 0) 结束进程
+    //
+    // ⚠️⚠️ **先确保库密钥已存盘，再结束进程**。
+    //
+    // 为什么：会话复制要解密整库，密钥来自 `load_saved_key`；没存过就得
+    // `scan_for_key` 从**进程内存**里扫。而这里下一步就把进程全杀了 ——
+    // 进程一没，内存扫不到，复制必然失败（「未在目标客户端进程中找到有效密钥」）。
+    // 所以这一步必须在 quit 之前做，且失败**不阻断**切号（不复制而已）。
+    let mut key_ready = true;
+    if copy.is_some_and(|p| !p.items.is_empty()) {
+        if crate::modules::trae_memory_scan::load_saved_key(client_key).is_none() {
+            log("目标库密钥尚未存盘，先从运行中的客户端扫一次（复制会话需要它）…");
+            let db = crate::modules::trae_discover::database_path(client);
+            match crate::modules::trae_memory_scan::scan_for_key(client_key, &db, Some(&log)) {
+                Ok(r) => match r.key {
+                    Some(k) => {
+                        let _ = crate::modules::trae_memory_scan::save_key(client_key, &k);
+                        log("已扫到密钥并保存");
+                    }
+                    None => {
+                        key_ready = false;
+                        log("未扫到密钥，本次无法复制会话（切号继续）");
+                    }
+                },
+                Err(e) => {
+                    key_ready = false;
+                    log(&format!("扫密钥失败，本次无法复制会话（切号继续）：{e}"));
+                }
+            }
+        }
+    }
+
     log("结束 Trae 进程…");
     let quit = quit_client(client, 20000);
     if !quit.ok {
@@ -618,6 +715,116 @@ pub fn switch_to(
             quit.attempts,
             quit.hint("Trae")
         ));
+    }
+
+    // 0b) 顺带复制会话（**必须在写登录态之前**：写完 uid 就变成目标账号了，
+    //     再读「源账号的会话」会读错人）。
+    //
+    // ⚠️ 复制失败**不中止切号**：登录态才是用户点这一下的主要目的；
+    // 会话没复制上属于「少做了附件」，该照实报出来（`copy_error`），
+    // 而不是把整个切号判成失败 —— 那会让用户以为号也没切过去。
+    let mut copied_sessions = 0usize;
+    let mut copy_error: Option<String> = None;
+    if let Some(plan) = copy {
+        if !plan.items.is_empty() {
+            if !key_ready {
+                copy_error = Some("没拿到库密钥（客户端未运行且从未存过密钥），本次未处理会话".into());
+            } else if plan.source_uid.trim().is_empty() {
+                copy_error = Some("读不到源账号，本次未处理会话".into());
+            } else {
+                // ⚠️⚠️ **目标账号的「库内真实 uid」不能直接用 `account_id`**。
+                //
+                // `account_id` 是本工具账号库的内部 id（形如 `oauth_882023`），而库里
+                // `project.user_id` 存的是**客户端真正认的 uid**（形如 `925158341882023`）。
+                // 两者不是一回事：2026-10-31 实测把 `oauth_882023` 写进 `project.user_id`，
+                // 结果会话在客户端里**一条都看不到**（客户端按真实 uid 取会话）。
+                //
+                // 唯一出口 `trae_vault::uid_of_account`：优先读载体 storage.json
+                // （客户端真正认的那个），其次 oauth.json 的 `uid`。
+                // 解析不出来就**不处理**并如实报错 —— 宁可少做一步，也不要写错归属。
+                let dst_uid = match crate::modules::trae_vault::uid_of_account(client_key, account_id) {
+                    Some(u) if !u.trim().is_empty() => u,
+                    _ => {
+                        copy_error = Some(format!(
+                            "读不到账号 {account_id} 的库内 uid，为避免写错归属，本次未处理会话"
+                        ));
+                        String::new()
+                    }
+                };
+                if !dst_uid.is_empty() {
+                    // ── 先做「就地同步」：已关联的会话必须在**原会话 id** 上更新，
+                    //    绝不能再新建一份（用户 2026-10-31 实测：每切一次号就多出一个
+                    //    「新对话」，就是这里走了复制而不是同步）。
+                    let syncs: Vec<(String, String)> = plan
+                        .items
+                        .iter()
+                        .filter(|it| it.mode == SwitchItemMode::Sync)
+                        .filter_map(|it| match (&it.group_id, &it.direction) {
+                            (Some(g), Some(d)) if !g.is_empty() && !d.is_empty() => {
+                                Some((g.clone(), d.clone()))
+                            }
+                            // 缺 group/direction 的「同步」**绝不下发**：那是覆盖数据的操作，
+                            // 猜方向 = 拿旧内容盖掉新内容。
+                            _ => None,
+                        })
+                        .collect();
+                    let mut synced = 0usize;
+                    if !syncs.is_empty() {
+                        log(&format!("切号前就地同步 {} 个已关联会话（原 id 不变）…", syncs.len()));
+                        match crate::modules::trae_import::sync_groups_after_stop(
+                            client_key,
+                            &syncs,
+                            Some(&|m| log(m)),
+                        ) {
+                            Ok(v) => {
+                                synced = v.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                log(&format!("已就地同步 {synced} 个会话"));
+                            }
+                            Err(e) => {
+                                log(&format!("就地同步失败（切号继续）：{e}"));
+                                copy_error = Some(format!("同步失败：{e}"));
+                            }
+                        }
+                    }
+
+                    // ── 再做「新建副本」：只有未关联的会话才需要新 id。
+                    let copies: Vec<String> = plan
+                        .items
+                        .iter()
+                        .filter(|it| it.mode == SwitchItemMode::Copy)
+                        .map(|it| it.session_id.clone())
+                        .collect();
+                    let mut copied = 0usize;
+                    if !copies.is_empty() {
+                        log(&format!("切号前新建 {} 个未关联会话的副本…", copies.len()));
+                        match crate::modules::trae_import::import_sessions_ex(
+                            client_key,
+                            client_key,
+                            Some(&dst_uid),
+                            &copies,
+                            Some(&|m| log(m)),
+                            true, // 进程已停，别让它再 stop/launch 一遍
+                        ) {
+                            Ok(v) => {
+                                copied = v
+                                    .get("verified_sessions")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0) as usize;
+                                log(&format!("已新建 {copied} 个会话副本并登记关联"));
+                            }
+                            Err(e) => {
+                                log(&format!("新建副本失败（切号继续）：{e}"));
+                                copy_error = Some(match copy_error {
+                                    Some(prev) => format!("{prev}；复制失败：{e}"),
+                                    None => format!("复制失败：{e}"),
+                                });
+                            }
+                        }
+                    }
+                    copied_sessions = synced + copied;
+                }
+            }
+        }
     }
 
     // 1) 当前 live 快照（回滚用）
@@ -745,6 +952,8 @@ pub fn switch_to(
         entries: entries.len(),
         uid,
         message,
+        copied_sessions,
+        copy_error,
     })
 }
 
@@ -765,6 +974,24 @@ mod tests {
     /// 出现了就意味着「删几条 SOLO 的旧会话」会把用户**正在用的 `Trae CN`** 一起杀掉。
     ///
     /// 反证：把 `own_kill_names` 的实现换回 `kill_names`（回退版），在「本机已合并」的机器上
+    /// 真机探针（`#[ignore]`）：确认账号库的「内部 id」与「库内真实 uid」确实是两回事，
+    /// 且 `uid_of_account` 取到的是客户端认的那个。
+    ///
+    /// 这是 2026-10-31「切号复制了会话但客户端看不到」的根因判据：
+    /// 复制时把 `account_id`（`oauth_882023`）当成了 uid，写进 `project.user_id`，
+    /// 而客户端按 `925158341882023` 取会话 ⇒ 一条都看不到。
+    ///
+    /// 跑法：`cargo test -p wb-switch-core --lib uid_mapping_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn uid_mapping_probe_shows_internal_id_vs_real_uid() {
+        let key = "trae-cn";
+        for id in crate::modules::trae_vault::list_vault_accounts(key) {
+            let uid = crate::modules::trae_vault::uid_of_account(key, &id);
+            println!("内部 id = {id} | 真实 uid = {uid:?}");
+        }
+    }
+
     /// 这条立刻变红（`Trae CN` / `Trae` 会出现在结果里）。
     #[test]
     fn own_kill_names_excludes_the_merged_host() {
@@ -813,5 +1040,59 @@ mod tests {
                 "影子客户端必须直接跳过，不碰任何进程"
             );
         }
+    }
+
+    /// 切号时顺带处理会话：`SwitchCopyPlan` 为空时后端必须把它当成「本次什么都不做」，
+    /// **不许**因为「有 plan 对象但 items 空」就去跑一遍写库流程。
+    ///
+    /// 为什么值得钉：空列表跑一遍 import 会结束一次客户端、备份一次整库、
+    /// 写一次库 —— 什么都没处理，却让用户多等十几秒、多一份备份。
+    #[test]
+    fn empty_copy_plan_is_a_no_op() {
+        let empty = SwitchCopyPlan::default();
+        assert!(empty.items.is_empty());
+        // 判据在 `switch_to_with` 里是 `!plan.items.is_empty()`，
+        // 这里钉住「默认构造 = 不处理」这个语义。
+        assert!(!(!empty.items.is_empty()), "空 plan 必须被前置条件挡掉");
+
+        let with_ids = SwitchCopyPlan {
+            source_uid: "u1".into(),
+            items: vec![SwitchCopyItem {
+                session_id: "abc".into(),
+                mode: SwitchItemMode::Copy,
+                group_id: None,
+                direction: None,
+            }],
+        };
+        assert!(!with_ids.items.is_empty(), "有 item 才允许进入处理流程");
+    }
+
+    /// ⚠️⚠️ 已关联的会话必须走 `Sync`（就地更新），**不能**走 `Copy`（新建副本）。
+    ///
+    /// 这是 2026-10-31 用户实测的坑：「每次复制都出现新对话，并没有按同步关联的思路再走」。
+    /// 判据在 `trae_session_links::switch_plan` 里：`linked → sync`、`unlinked → copy`、
+    /// `twin → link`。这里钉住「Sync 必须带 group + direction」这条前置条件：
+    /// 缺任一项就不许下发（覆盖数据的操作，猜方向 = 拿旧内容盖新内容）。
+    #[test]
+    fn sync_item_requires_group_and_direction() {
+        let ok = SwitchCopyItem {
+            session_id: "s1".into(),
+            mode: SwitchItemMode::Sync,
+            group_id: Some("g1".into()),
+            direction: Some("to_target".into()),
+        };
+        let usable = ok.mode == SwitchItemMode::Sync
+            && ok.group_id.as_deref().is_some_and(|s| !s.is_empty())
+            && ok.direction.as_deref().is_some_and(|s| !s.is_empty());
+        assert!(usable, "带全 group + direction 的 Sync 才能下发");
+
+        let missing_dir = SwitchCopyItem {
+            direction: None,
+            ..ok.clone()
+        };
+        let usable2 = missing_dir.mode == SwitchItemMode::Sync
+            && missing_dir.group_id.as_deref().is_some_and(|s| !s.is_empty())
+            && missing_dir.direction.as_deref().is_some_and(|s| !s.is_empty());
+        assert!(!usable2, "缺方向的 Sync 必须被挡掉（不许猜方向）");
     }
 }

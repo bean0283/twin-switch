@@ -420,10 +420,19 @@ pub const MODELS_REMOTE_MIRRORS: [&str; 2] = [
 /// `models.json` 的结构版本。
 ///
 /// v1 是扁平的 `{ 作用域: [模型…] }`（老机器上就是它）；
-/// v2 拆成 `defaults`（GitHub / 本机扫描给的，**会被覆盖**）与 `user`（用户手动加的，**永不覆盖**）。
-pub const MODELS_VERSION: u32 = 2;
+/// v2 拆成 `defaults`（GitHub 给的，**会被覆盖**）与 `user`（用户手动加的，**永不覆盖**）。
+/// v3 再加一段 `local`（本机识别到的，**只补充、不覆盖**）—— 见 `ModelsCatalog::local`。
+pub const MODELS_VERSION: u32 = 3;
 
-/// 模型清单（v2）。
+/// 模型清单（v3）。
+///
+/// 三段的分工必须背下来，写错任何一条都会造成「用户的模型莫名消失」：
+///
+/// | 段 | 谁写 | 会不会被覆盖 |
+/// |---|---|---|
+/// | `defaults` | **只有** GitHub 同步（`replace_defaults(_, "github")`） | 会，整段换掉 |
+/// | `local` | 本机识别（`merge_local`） | 不会，只做并集 |
+/// | `user` | 用户手动添加 | 不会，任何自动更新都不碰 |
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelsCatalog {
     #[serde(default)]
@@ -434,9 +443,21 @@ pub struct ModelsCatalog {
     /// 上次同步时间（RFC3339 本地时间，界面原样展示）。
     #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
-    /// 默认清单：会被 GitHub / 本机扫描**整体覆盖**。
+    /// 默认清单：**只有** GitHub 同步会整段覆盖。
     #[serde(default)]
     pub defaults: BTreeMap<String, Vec<String>>,
+    /// 本机识别到的模型：**只做并集，永不整段覆盖**。
+    ///
+    /// ⚠️⚠️ 为什么不能塞进 `defaults`（2026-10-30 的修复）：
+    /// 本机识别读的是**这台机器上三个产品实际能用的模型**，里面必然有 GitHub 清单里
+    /// 没有的东西（内部实验代号 `codewise-*` / `refactor_*`，或者作者还没收录的新模型）。
+    /// 早期两者都写 `defaults`，于是「点重新识别」会把 GitHub 的权威清单当场冲掉，
+    /// 后台每 6 小时还会再冲一次 —— 用户看到的就是「来源明明写着 GitHub，内容却是本机的」。
+    ///
+    /// 单独一段的好处：GitHub 同步只管 `defaults`，本机独有的模型安静地留在 `local`，
+    /// 两者互不覆盖，`effective()` 再把它们并起来。
+    #[serde(default)]
+    pub local: BTreeMap<String, Vec<String>>,
     /// 用户手动添加的清单：与 `defaults` 合并，**任何自动更新都不许动它**。
     #[serde(default)]
     pub user: BTreeMap<String, Vec<String>>,
@@ -463,12 +484,19 @@ fn tidy(list: &[String]) -> Vec<String> {
 }
 
 impl ModelsCatalog {
-    /// 合并后的「作用域 → 模型」：`defaults` 打头，`user` 追加（去重）。
+    /// 合并后的「作用域 → 模型」：`defaults` 打头，`local` 次之，`user` 最后（去重）。
     ///
-    /// 顺序有意义：网关 `/v1/models` 与界面的列表都按它显示，用户自己加的排在后面。
+    /// 顺序有意义：网关 `/v1/models` 与界面的列表都按它显示。
+    /// 本机独有的模型排在 GitHub 清单之后，用户自己加的排在最后 ——
+    /// 这样「官方推荐」的排序不会被本机噪音打乱。
     pub fn effective(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (scope, list) in self.defaults.iter().chain(self.user.iter()) {
+        for (scope, list) in self
+            .defaults
+            .iter()
+            .chain(self.local.iter())
+            .chain(self.user.iter())
+        {
             let entry = out.entry(scope.clone()).or_default();
             for m in tidy(list) {
                 if !entry.contains(&m) {
@@ -484,6 +512,25 @@ impl ModelsCatalog {
     /// 某个模型是否来自用户手动添加（界面据此决定「能不能删」）。
     pub fn is_user(&self, scope: &str, model: &str) -> bool {
         self.user
+            .get(scope)
+            .map(|l| l.iter().any(|m| m == model))
+            .unwrap_or(false)
+    }
+
+    /// 某个模型是否只来自本机识别（GitHub 清单里没有）。
+    ///
+    /// 界面据此打「仅本机」标签：用户换一台电脑就不该再看到它，
+    /// 也不该把它当成「官方支持的模型」。
+    pub fn is_local_only(&self, scope: &str, model: &str) -> bool {
+        let in_defaults = self
+            .defaults
+            .get(scope)
+            .map(|l| l.iter().any(|m| m == model))
+            .unwrap_or(false);
+        if in_defaults {
+            return false;
+        }
+        self.local
             .get(scope)
             .map(|l| l.iter().any(|m| m == model))
             .unwrap_or(false)
@@ -504,8 +551,8 @@ pub fn load_catalog() -> ModelsCatalog {
         Some(o) => o,
         None => return ModelsCatalog::default(),
     };
-    // v2：明确带 defaults / user 两个键之一
-    if obj.contains_key("defaults") || obj.contains_key("user") {
+    // v2/v3：明确带 defaults / local / user 键之一
+    if obj.contains_key("defaults") || obj.contains_key("local") || obj.contains_key("user") {
         let mut cat: ModelsCatalog = serde_json::from_value(v).unwrap_or_default();
         cat.version = MODELS_VERSION;
         return cat;
@@ -528,6 +575,7 @@ pub fn load_catalog() -> ModelsCatalog {
         source: "migrated".into(),
         updated_at: String::new(),
         defaults,
+        local: BTreeMap::new(),
         user: BTreeMap::new(),
     }
 }
@@ -595,9 +643,9 @@ pub fn remove_user_model(scope: &str, model: &str) -> Result<ModelsCatalog, Stri
     Ok(cat)
 }
 
-/// 把一份「作用域 → 模型」整体写进 `defaults`（覆盖），**保留 `user` 不动**。
+/// 把一份「作用域 → 模型」整体写进 `defaults`（覆盖），**保留 `local` / `user` 不动**。
 ///
-/// `source` 说明来源（`github` / `discover`），界面据此告诉用户「这份是哪来的」。
+/// ⚠️ 只有 GitHub 同步（`source = "github"`）该走这里。本机识别走 [`merge_local`]。
 pub fn replace_defaults(
     map: BTreeMap<String, Vec<String>>,
     source: &str,
@@ -613,6 +661,102 @@ pub fn replace_defaults(
     cat.defaults = defaults;
     cat.version = MODELS_VERSION;
     cat.source = source.to_string();
+    cat.updated_at = now_stamp();
+    save_catalog(&cat)?;
+    Ok(cat)
+}
+
+/// 把本机识别到的模型并进 `local` 段（**只做并集，永不整段覆盖**）。
+///
+/// 这就是用户 2026-10-30 定的口径：「本机识别只做补充、不覆盖，`defaults` 为空时兜底」。
+///
+/// 三条规则：
+///
+/// 1. **`defaults` 已有内容**（GitHub 同步过 / 旧机器迁移过）⇒ 只把 GitHub 清单里
+///    **没有**的模型写进 `local`；GitHub 有的一个字都不动，避免本机的旧版本覆盖官方新清单。
+/// 2. **`defaults` 是空的**（新电脑、首次启动、还没联上网）⇒ 本机识别结果**兜底**
+///    写进 `defaults`，否则界面会是空的、网关 `/v1/models` 也列不出东西。
+/// 3. 两种情况下 `user` 段都**一个字都不动**。
+///
+/// ⚠️ 本机识别结果可能**变少**（某个产品没登录 / 没装）：这时绝不能把 `local` 里
+/// 原来的条目删掉 —— 那等于「你今天没开 Trae，Trae 的模型就从清单里消失了」。
+/// 所以 `local` 只增不减；要清理只能靠用户手动删（`remove_local_model`）。
+pub fn merge_local(map: BTreeMap<String, Vec<String>>) -> Result<ModelsCatalog, String> {
+    let mut cat = load_catalog();
+
+    let defaults_empty = cat.defaults.values().all(|v| v.is_empty());
+
+    if defaults_empty {
+        // 兜底：本机识别直接当默认清单（只在这一种情况下写 defaults）
+        let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (scope, list) in &map {
+            let models = tidy(list);
+            if !models.is_empty() {
+                defaults.insert(scope.clone(), models);
+            }
+        }
+        if !defaults.is_empty() {
+            cat.defaults = defaults;
+            cat.version = MODELS_VERSION;
+            cat.source = "discover".to_string();
+            cat.updated_at = now_stamp();
+            save_catalog(&cat)?;
+            return Ok(cat);
+        }
+        return Ok(cat);
+    }
+
+    // 正常路径：GitHub 清单已存在 ⇒ 本机独有的模型进 `local`
+    let mut changed = false;
+    for (scope, list) in map {
+        let known: Vec<String> = cat
+            .defaults
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .chain(cat.user.get(&scope).cloned().unwrap_or_default())
+            .collect();
+        let entry = cat.local.entry(scope.clone()).or_default();
+        for m in tidy(&list) {
+            if known.iter().any(|k| k == &m) {
+                continue;
+            }
+            if !entry.iter().any(|e| e == &m) {
+                entry.push(m);
+                changed = true;
+            }
+        }
+    }
+    // 清掉空的（本机一个都没识别到的作用域）
+    cat.local.retain(|_, v| !v.is_empty());
+
+    if changed {
+        cat.version = MODELS_VERSION;
+        cat.updated_at = now_stamp();
+        // ⚠️ `source` 保持原值（github）：它描述的是 `defaults` 的来源，
+        // 本机补充不该把「来源：GitHub」改成「本机识别」—— 那会让用户以为权威清单被换了。
+        save_catalog(&cat)?;
+    }
+    Ok(cat)
+}
+
+/// 删掉一个「仅本机」的模型（`local` 段；GitHub 与用户段都删不了）。
+pub fn remove_local_model(scope: &str, model: &str) -> Result<ModelsCatalog, String> {
+    let mut cat = load_catalog();
+    let mut changed = false;
+    if let Some(list) = cat.local.get_mut(scope) {
+        let before = list.len();
+        list.retain(|m| m != model);
+        changed = list.len() != before;
+        if list.is_empty() {
+            cat.local.remove(scope);
+        }
+    }
+    if !changed {
+        return Err("这个模型不在「仅本机」段里（GitHub 清单与手动添加的要到对应入口删）".into());
+    }
+    cat.version = MODELS_VERSION;
     cat.updated_at = now_stamp();
     save_catalog(&cat)?;
     Ok(cat)
@@ -762,12 +906,23 @@ fn parse_remote_body(v: &Value) -> Result<BTreeMap<String, Vec<String>>, (Failur
     Ok(map)
 }
 
-/// 清单概览（界面用）：两份分开给，前端才知道哪些能删。
+/// 清单概览（界面用）：三段分开给，前端才知道哪些能删、哪些是「仅本机」。
 pub fn catalog_overview() -> Value {
     let cat = load_catalog();
     let effective = cat.effective();
     let user_count: usize = cat.user.values().map(|v| v.len()).sum();
     let default_count: usize = cat.defaults.values().map(|v| v.len()).sum();
+    // 「仅本机」= local 里那些 GitHub 清单没有的（同作用域同名不算）。
+    let local_only_count: usize = cat
+        .local
+        .iter()
+        .map(|(scope, list)| {
+            let d = cat.defaults.get(scope);
+            list.iter()
+                .filter(|m| !d.map(|x| x.iter().any(|y| y == *m)).unwrap_or(false))
+                .count()
+        })
+        .sum();
     serde_json::json!({
         "ok": true,
         "version": cat.version.max(MODELS_VERSION),
@@ -778,9 +933,11 @@ pub fn catalog_overview() -> Value {
         "remoteMirrors": MODELS_REMOTE_MIRRORS,
         "path": models_file().to_string_lossy(),
         "defaults": cat.defaults,
+        "local": cat.local,
         "user": cat.user,
         "effective": effective,
         "defaultCount": default_count,
+        "localCount": local_only_count,
         "userCount": user_count,
     })
 }
@@ -1024,13 +1181,15 @@ pub async fn discover_and_save() -> (Vec<DiscoveredModel>, Vec<SourceReport>) {
     if models.is_empty() {
         return (models, reports);
     }
-    // ⚠️ 只覆盖 `defaults`：本机扫描是「默认清单」的来源之一，绝不能顺手把用户手动添加的
-    //    模型冲掉（旧实现读整个文件再整份写回，user 段会被丢）。见 `replace_defaults`。
+    // ⚠️⚠️ 走 `merge_local` 而不是 `replace_defaults`：本机识别**只做补充、不覆盖**，
+    //    并且只在 `defaults` 为空时兜底（用户 2026-10-30 定的口径）。
+    //    早期这里直接覆盖 `defaults`，于是「点重新识别」会把 GitHub 的权威清单当场冲掉，
+    //    后台每 6 小时还会再冲一次 —— 界面写着「来源：GitHub」，内容却是本机的。
     let mut by_scope: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in &models {
         by_scope.entry(m.scope.clone()).or_default().push(m.model.clone());
     }
-    let _ = replace_defaults(by_scope, "discover");
+    let _ = merge_local(by_scope);
 
     // 显示名表：增量写入（识别失败的作用域保留旧值，与 models.json 同一策略）。
     // 只收「显示名 ≠ 代号」的条目 —— Trae / WorkBuddy 两边同名，存进去只是噪音。
@@ -1097,9 +1256,10 @@ mod sync_tests {
     /// 这是「让某个产品的积分可以被别的程序用」的关键一步：`models.json` 决定了
     /// 网关 `/v1/models` 能列什么、以及裸模型名路由到哪个作用域。
     ///
-    /// ⚠️ 必须走 [`replace_defaults`]（v2 出口）：早期这里直接 `serde_json::to_string`
-    /// 写 `{作用域:[…]}`，一跑就把用户的 v2 文件**降级成 v1 扁平格式** —— 虽然能被
-    /// 自动迁移回来，但 `user` 段（用户手动添加的模型）会在这一步被整份抹掉。
+    /// ⚠️⚠️ 必须走 [`merge_local`]，**绝不能**用 `replace_defaults`：
+    /// 本机识别只做补充、不覆盖（用户 2026-10-30 定的口径）。早期这里用
+    /// `replace_defaults(map, "discover")`，一跑就把 GitHub 的 143 个权威清单
+    /// 冲成这台机器的 45 个 —— 实测已踩过一次（`defaults` 143 → 45，`source` github → discover）。
     #[tokio::test]
     #[ignore]
     async fn sync_models_json() {
@@ -1114,14 +1274,14 @@ mod sync_tests {
         for r in &reports {
             eprintln!("  {}", r.note.chars().take(90).collect::<String>());
         }
-        let cat = replace_defaults(map, "discover").expect("写清单失败");
-        let total: usize = cat.defaults.values().map(|v| v.len()).sum();
+        let cat = merge_local(map).expect("写清单失败");
         eprintln!(
-            "已写 {}（{} 个作用域 / {} 个模型，user 段保留 {} 个）",
+            "已写 {}（defaults {} 个 / local 仅本机 {} 个 / user {} 个，source={}）",
             models_file().display(),
-            cat.defaults.len(),
-            total,
-            cat.user.values().map(|v| v.len()).sum::<usize>()
+            cat.defaults.values().map(|v| v.len()).sum::<usize>(),
+            cat.local.values().map(|v| v.len()).sum::<usize>(),
+            cat.user.values().map(|v| v.len()).sum::<usize>(),
+            cat.source
         );
     }
 }
@@ -1156,6 +1316,7 @@ mod tests {
             source: "migrated".into(),
             updated_at: String::new(),
             defaults,
+            local: BTreeMap::new(),
             user: BTreeMap::new(),
         };
         let eff = cat.effective();
@@ -1261,5 +1422,185 @@ mod tests {
             assert!(u.starts_with("https://"), "只允许 https：{u}");
         }
         assert_eq!(MODELS_REMOTE_MIRRORS[0], MODELS_REMOTE_URL, "主源必须排第一");
+    }
+
+    // ---------------------------------------------------------------
+    // 本机识别：只补充、不覆盖；defaults 为空时兜底
+    // （用户 2026-10-30 定的口径）
+    // ---------------------------------------------------------------
+
+    /// 造一份清单并直接算 `merge_local` 的**纯逻辑**（不落盘），便于钉住判据。
+    ///
+    /// 这里复制的是 [`merge_local`] 的核心分支 —— 一旦两者走岔，下面的测试会先红。
+    fn merge_local_pure(
+        mut cat: ModelsCatalog,
+        map: BTreeMap<String, Vec<String>>,
+    ) -> ModelsCatalog {
+        let defaults_empty = cat.defaults.values().all(|v| v.is_empty());
+        if defaults_empty {
+            let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (scope, list) in &map {
+                let models = tidy(list);
+                if !models.is_empty() {
+                    defaults.insert(scope.clone(), models);
+                }
+            }
+            if !defaults.is_empty() {
+                cat.defaults = defaults;
+                cat.source = "discover".to_string();
+            }
+            return cat;
+        }
+        for (scope, list) in map {
+            let known: Vec<String> = cat
+                .defaults
+                .get(&scope)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(cat.user.get(&scope).cloned().unwrap_or_default())
+                .collect();
+            let entry = cat.local.entry(scope.clone()).or_default();
+            for m in tidy(&list) {
+                if known.iter().any(|k| k == &m) {
+                    continue;
+                }
+                if !entry.iter().any(|e| e == &m) {
+                    entry.push(m);
+                }
+            }
+        }
+        cat.local.retain(|_, v| !v.is_empty());
+        cat
+    }
+
+    /// ① GitHub 清单已存在 ⇒ 本机识别**不许改 `defaults`**，多出来的进 `local`。
+    #[test]
+    fn local_discovery_never_overwrites_github_defaults() {
+        let mut cat = ModelsCatalog {
+            version: MODELS_VERSION,
+            source: "github".into(),
+            defaults: BTreeMap::from([(
+                "trae-cn".to_string(),
+                vec!["glm-5.3".to_string(), "kimi-k3".to_string()],
+            )]),
+            user: BTreeMap::from([("wb-cn".to_string(), vec!["my-model".to_string()])]),
+            ..Default::default()
+        };
+        let discovered = BTreeMap::from([(
+            "trae-cn".to_string(),
+            vec![
+                "glm-5.3".to_string(),      // GitHub 有 → 不进 local
+                "kimi-k3".to_string(),      // GitHub 有 → 不进 local
+                "codewise-rewrite".to_string(), // 仅本机 → 进 local
+                "refactor_planner".to_string(), // 仅本机 → 进 local
+            ],
+        )]);
+        let out = merge_local_pure(cat.clone(), discovered);
+        assert_eq!(
+            out.defaults.get("trae-cn").unwrap(),
+            &vec!["glm-5.3".to_string(), "kimi-k3".to_string()],
+            "GitHub 的清单一个字都不许动"
+        );
+        assert_eq!(
+            out.local.get("trae-cn").unwrap(),
+            &vec!["codewise-rewrite".to_string(), "refactor_planner".to_string()],
+            "只有 GitHub 没有的才进 local"
+        );
+        assert_eq!(out.source, "github", "本机补充不许把来源改成 discover");
+        assert_eq!(
+            out.user.get("wb-cn").unwrap(),
+            &vec!["my-model".to_string()],
+            "user 段一个字都不许动"
+        );
+        cat.defaults.clear();
+    }
+
+    /// ② `defaults` 为空 ⇒ 本机识别**兜底**写进 defaults（新电脑/没联上网时不至于一片空白）。
+    #[test]
+    fn local_discovery_backfills_when_defaults_are_empty() {
+        let cat = ModelsCatalog::default();
+        let discovered = BTreeMap::from([(
+            "trae-cn".to_string(),
+            vec!["glm-5.3".to_string(), "kimi-k3".to_string()],
+        )]);
+        let out = merge_local_pure(cat, discovered);
+        assert_eq!(
+            out.defaults.get("trae-cn").unwrap(),
+            &vec!["glm-5.3".to_string(), "kimi-k3".to_string()],
+            "没有 GitHub 清单时必须兜底，否则界面/网关都是空的"
+        );
+        assert!(out.local.is_empty(), "兜底时不该同时写两份");
+        assert_eq!(out.source, "discover");
+    }
+
+    /// ③ 本机这次识别得少了（某产品没登录）⇒ `local` 里旧条目**不许被删**。
+    ///
+    /// 否则会出现「你今天没开 Trae，Trae 的模型就从清单里消失了」——
+    /// 用户会以为工具把模型弄丢了。
+    #[test]
+    fn local_discovery_never_drops_previously_seen_models() {
+        let cat = ModelsCatalog {
+            defaults: BTreeMap::from([("trae-cn".to_string(), vec!["glm-5.3".to_string()])]),
+            local: BTreeMap::from([(
+                "trae-cn".to_string(),
+                vec!["old-local-only".to_string()],
+            )]),
+            ..Default::default()
+        };
+        // 这次只识别到一个 GitHub 已有的模型（old-local-only 没出现）
+        let out = merge_local_pure(
+            cat,
+            BTreeMap::from([("trae-cn".to_string(), vec!["glm-5.3".to_string()])]),
+        );
+        assert_eq!(
+            out.local.get("trae-cn").unwrap(),
+            &vec!["old-local-only".to_string()],
+            "以前识别到的本机独有模型不许因为这次没扫到就被删"
+        );
+    }
+
+    /// ④ `effective()` 必须把三段并起来，且 GitHub 的排在本机的前面。
+    #[test]
+    fn effective_merges_all_three_segments_in_order() {
+        let cat = ModelsCatalog {
+            defaults: BTreeMap::from([("trae-cn".to_string(), vec!["a".to_string()])]),
+            local: BTreeMap::from([("trae-cn".to_string(), vec!["b".to_string()])]),
+            user: BTreeMap::from([("trae-cn".to_string(), vec!["c".to_string()])]),
+            ..Default::default()
+        };
+        let eff = cat.effective();
+        assert_eq!(
+            eff.get("trae-cn").unwrap(),
+            &vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "顺序必须是 defaults → local → user"
+        );
+        // 同一模型在三段都有 ⇒ 只留一份
+        let cat2 = ModelsCatalog {
+            defaults: BTreeMap::from([("x".to_string(), vec!["m".to_string()])]),
+            local: BTreeMap::from([("x".to_string(), vec!["m".to_string()])]),
+            user: BTreeMap::from([("x".to_string(), vec!["m".to_string()])]),
+            ..Default::default()
+        };
+        assert_eq!(cat2.effective().get("x").unwrap(), &vec!["m".to_string()]);
+    }
+
+    /// ⑤ 「仅本机」判据：GitHub 清单里有的不算仅本机（哪怕 local 里也存了一份）。
+    #[test]
+    fn is_local_only_excludes_github_known_models() {
+        let cat = ModelsCatalog {
+            defaults: BTreeMap::from([(
+                "trae-cn".to_string(),
+                vec!["glm-5.3".to_string()],
+            )]),
+            local: BTreeMap::from([(
+                "trae-cn".to_string(),
+                vec!["glm-5.3".to_string(), "codewise-rewrite".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert!(!cat.is_local_only("trae-cn", "glm-5.3"), "GitHub 也有的不许标成仅本机");
+        assert!(cat.is_local_only("trae-cn", "codewise-rewrite"));
+        assert!(!cat.is_local_only("wb-cn", "whatever"), "没出现过的不算");
     }
 }

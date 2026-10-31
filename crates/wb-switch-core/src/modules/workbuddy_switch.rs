@@ -182,10 +182,26 @@ fn save_last_switch(v: &Value) {
     );
 }
 
+/// 切号时用户勾选的会话同步范围（界面传过来，`None` = 老行为：只看看设置）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSelection {
+    /// `selected` = 只同步 `session_ids`；`none` = 这次不同步；其余按设置。
+    pub mode: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
 /// 切换到指定账号。
 ///
 /// `relaunch = true` 时写成功后重新启动客户端。返回切换报告。
-pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
+///
+/// `sessions` 是界面上那张会话勾选表的结果（`None` = 用户没走勾选流程，按设置来）。
+pub fn switch_to(
+    id: &str,
+    relaunch: bool,
+    sessions: Option<SessionSelection>,
+) -> Result<Value, String> {
     let acc = workbuddy_vault::find_account(id)
         .ok_or_else(|| format!("账号不存在：{id}"))?;
     if crate::modules::workbuddy_auth::secret_value(&acc, "access_token").is_none() {
@@ -263,15 +279,43 @@ pub fn switch_to(id: &str, relaunch: bool) -> Result<Value, String> {
     //    切号只搬 `wb_link_since` 之后新建的会话，首次（起点为 0）连复制都不做、
     //    只登记已有副本（0 字节）。
     // ⚠️ 失败**不阻断**切号：切号本身已经成功，会话同步是附属动作，照实带回去。
-    let session_link = if settings::auto_link_workbuddy_sessions() {
+    // 勾选模式优先于设置：用户在切号弹窗里明确点过，就照他的选择来。
+    let selected: Option<Vec<String>> = sessions.as_ref().and_then(|s| {
+        if s.mode == "selected" {
+            Some(s.session_ids.clone())
+        } else {
+            None
+        }
+    });
+    let skip_all = sessions.as_ref().map(|s| s.mode == "none").unwrap_or(false);
+
+    let session_link = if let Some(ids) = selected {
+        // ⚠️ 勾了但一条都没勾上 = 用户就是不想同步，不是「同步失败」。
+        if ids.is_empty() {
+            json!({ "ok": true, "notNeeded": true, "reason": "本次切换没有勾选任何会话" })
+        } else {
+            match crate::modules::workbuddy_sessions::link_all(
+                crate::modules::workbuddy_sessions::LinkOptions {
+                    require_closed: false,
+                    copy_missing: true,
+                    since: 0,
+                    only_sessions: Some(ids.clone()),
+                    target_uid: Some(target_uid.clone()),
+                    // 勾选的「已关联」会话要把内容同步过去 —— 这正是「切号自动同步」。
+                    refresh_linked: true,
+                },
+            ) {
+                Ok(v) => v,
+                Err(e) => json!({ "ok": false, "error": e, "selectedCount": ids.len() }),
+            }
+        }
+    } else if skip_all {
+        json!({ "ok": true, "notNeeded": true, "reason": "本次切换未勾选会话同步" })
+    } else if settings::auto_link_workbuddy_sessions() {
         let since = settings::wb_link_since();
         let first = since <= 0;
         match crate::modules::workbuddy_sessions::link_all(
-            crate::modules::workbuddy_sessions::LinkOptions {
-                require_closed: false,
-                copy_missing: !first,
-                since,
-            },
+            crate::modules::workbuddy_sessions::LinkOptions::new(false, !first, since),
         ) {
             Ok(mut v) => {
                 // 成功才推进起点（失败时下次还会重试这批，不会漏）。
@@ -394,7 +438,7 @@ mod tests {
     #[test]
     fn switch_to_unknown_account_is_rejected_without_touching_auth_file() {
         // 用一个不可能存在的 id：必须在写登录态之前就失败
-        let err = switch_to("__no_such_account__", false).unwrap_err();
+        let err = switch_to("__no_such_account__", false, None).unwrap_err();
         assert!(err.contains("账号不存在"), "错误应说明账号不存在: {err}");
     }
 

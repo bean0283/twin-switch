@@ -392,16 +392,52 @@ pub async fn trae_backup_account(client_key: String, account_id: String) -> Resu
 }
 
 /// 切换到账号库中的某账号（冷切换：终止进程 → 还原载体 → 重启 → daemon 判定）。
+///
+/// `copy_sessions`：切号时顺带处理的会话。每项形如
+/// `{ sessionId, mode: "sync" | "copy" | "link", groupId?, direction? }`：
+/// - `sync` = **就地同步**已关联的副本（原会话 id 不变，客户端里位置与归属不变）；
+/// - `copy` = 新建副本（只有未关联的会话才这么做）；
+/// - `link` = 只登记关联（目标已有同内容副本时不重复写）。
+///
+/// 处理在**写登录态之前**完成（那时进程已停、库空闲），所以整个流程只重启一次客户端。
 #[tauri::command]
-pub async fn trae_switch_to(client_key: String, account_id: String) -> Result<Value, String> {
+pub async fn trae_switch_to(
+    client_key: String,
+    account_id: String,
+    copy_sessions: Option<Value>,
+) -> Result<Value, String> {
     if trae_discover::get_client(&client_key).is_none() {
         return Err(format!("未知客户端：{client_key}"));
     }
+    let plan = copy_sessions.and_then(|v| {
+        let source_uid = v.get("sourceUid")?.as_str()?.to_string();
+        let mut items: Vec<trae_switch::SwitchCopyItem> = Vec::new();
+        for x in v.get("items")?.as_array()? {
+            let Some(sid) = x.get("sessionId").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let mode = match x.get("mode").and_then(|s| s.as_str()).unwrap_or("copy") {
+                "sync" => trae_switch::SwitchItemMode::Sync,
+                _ => trae_switch::SwitchItemMode::Copy,
+            };
+            items.push(trae_switch::SwitchCopyItem {
+                session_id: sid.to_string(),
+                mode,
+                group_id: x.get("groupId").and_then(|s| s.as_str()).map(String::from),
+                direction: x.get("direction").and_then(|s| s.as_str()).map(String::from),
+            });
+        }
+        if items.is_empty() {
+            None
+        } else {
+            Some(trae_switch::SwitchCopyPlan { source_uid, items })
+        }
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let progress: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let r = trae_switch::switch_to(&client_key, &account_id, Some(&|m| {
+        let r = trae_switch::switch_to_with(&client_key, &account_id, Some(&|m| {
             progress.lock().unwrap().push(m.to_string());
-        }));
+        }), plan.as_ref());
         let progress = progress.into_inner().unwrap_or_default();
         match r {
             Ok(sr) => {
@@ -546,6 +582,40 @@ pub async fn workbuddy_account_token_refresh(
 #[tauri::command]
 pub fn trae_saved_key(client_key: String) -> Value {
     json!({ "clientKey": client_key, "key": trae_memory_scan::load_saved_key(&client_key) })
+}
+
+/// 「重置 Trae 登录态」预览（只读）：会动哪些文件、多大、当前登录是谁。
+/// 这是**删客户端登录态**的操作，界面必须先拿这份清单让用户确认。
+#[tauri::command]
+pub async fn trae_reset_login_preview(client_key: String) -> Value {
+    off_main(move || wb_switch_core::modules::trae_reset::preview(&client_key))
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// 重置 Trae 客户端登录态：停客户端 → 备份 → 删 `storage.json` 的 `iCubeAuthInfo*` 键
+/// （可选连 `Local Storage/leveldb` 一起清）→ 需要时重新打开。
+///
+/// ⚠️ 只清客户端侧登录载体：账号档案与会话数据一条不动。
+#[tauri::command]
+pub async fn trae_reset_login_state(
+    app: tauri::AppHandle,
+    client_key: String,
+    include_leveldb: bool,
+    relaunch: bool,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::trae_reset::reset_login_state(
+            &client_key,
+            include_leveldb,
+            relaunch,
+            Some(&|m| {
+                let _ = app.emit("trae-reset-progress", json!({ "line": m }));
+            }),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 一键：扫描进程内存提密钥 → 校验 HMAC → 解密整库到明文 SQLite。
@@ -720,6 +790,15 @@ pub async fn trae_session_detail(client_key: String, session_id: String) -> Resu
 #[tauri::command]
 pub async fn trae_session_edit_doc(client_key: String, session_id: String) -> Result<Value, String> {
     off_main(move || trae_session_edit::edit_doc(&client_key, &session_id)).await?
+}
+
+/// 「关联会话」页的「查看内容」：按会话 id 取角色 + 正文的回合列表。**只读，不写库。**
+///
+/// 不需要先切到目标账号 —— Trae 多账号共用一个库，只要库能解，任何账号的副本都读得到。
+#[tauri::command]
+pub async fn trae_session_turns(client_key: String, session_id: String) -> Result<Value, String> {
+    off_main(move || wb_switch_core::modules::trae_export::session_turns(&client_key, &session_id))
+        .await?
 }
 
 /// 会话编辑器：可写入的目标账号清单（**只读**）。
@@ -917,6 +996,41 @@ pub async fn trae_heal_session_projects(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 自愈：把写成「本工具内部 id」的 `project.user_id` 改回真实 uid。
+///
+/// 背景：切号顺带复制会话时误把 `account_id`（如 `oauth_882023`）当成了库内 uid，
+/// 结果会话在库里存在、客户端里**一条都看不到**（客户端按真实 uid 取会话）。
+/// 重活（解密整库 + 增量加密回写），走阻塞线程池。
+#[tauri::command]
+pub async fn trae_heal_project_uid(
+    app: tauri::AppHandle,
+    client_key: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = trae_import::heal_project_uid(&client_key, Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))?;
+        Ok(json!(result))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 自愈：把关联表里写成「本工具内部 id」的成员 uid 规范化成真实 uid，
+/// 并合并「同一组里同一账号被拆成两条」的脏数据。
+///
+/// 只改关联表（`~/.twin-switch/trae-session-links.json`），**不碰任何会话数据**，
+/// 因此不需要结束客户端、也不需要备份整库。
+#[tauri::command]
+pub async fn trae_normalize_link_store(
+    client_key: String,
+) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::normalize_link_store(&client_key, None)
+    })
+    .await?
 }
 
 /// WorkBuddy 会话来源列表（供勾选导入）。只读，不触碰 WorkBuddy 任何文件。
@@ -1887,13 +2001,31 @@ pub async fn workbuddy_switch_precheck(account_id: String) -> Value {
 }
 
 /// 切换到指定账号（会结束 WorkBuddy 进程；失败自动回滚登录态）。
+///
+/// `sessions` 来自切号弹窗的会话勾选表：`{ mode: "selected", sessionIds: [...] }`
+/// 只同步这些会话；`{ mode: "none" }` 本次不同步；不传 = 按设置（老行为）。
 #[tauri::command]
-pub async fn workbuddy_switch_to(account_id: String, relaunch: Option<bool>) -> Result<Value, String> {
+pub async fn workbuddy_switch_to(
+    account_id: String,
+    relaunch: Option<bool>,
+    sessions: Option<workbuddy_switch::SessionSelection>,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        workbuddy_switch::switch_to(&account_id, relaunch.unwrap_or(true))
+        workbuddy_switch::switch_to(&account_id, relaunch.unwrap_or(true), sessions)
     })
     .await
     .map_err(|e| format!("切换任务失败: {e}"))?
+}
+
+/// 切号弹窗用：列出**当前账号**的全部会话，以及每一条与目标账号的关联状态。
+///
+/// 只读（不写库、不写关联记录）。已关联的会话 `defaultChecked = true`，
+/// 界面据此默认勾选；没关联的默认空着，让用户主动新增。
+#[tauri::command]
+pub async fn workbuddy_switch_session_plan(target_uid: String) -> Value {
+    off_main(move || workbuddy_sessions::switch_plan(&target_uid))
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
 }
 
 /// 回滚到上一次切换前的登录态。
@@ -2130,11 +2262,7 @@ pub async fn workbuddy_session_copy_multi(
 pub async fn workbuddy_session_link_all() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         wb_switch_core::modules::workbuddy_sessions::link_all(
-            wb_switch_core::modules::workbuddy_sessions::LinkOptions {
-                require_closed: true,
-                copy_missing: true,
-                since: 0,
-            },
+            wb_switch_core::modules::workbuddy_sessions::LinkOptions::new(true, true, 0),
         )
     })
     .await
@@ -2148,11 +2276,7 @@ pub async fn workbuddy_session_link_all() -> Result<Value, String> {
 pub async fn workbuddy_session_link_existing() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         wb_switch_core::modules::workbuddy_sessions::link_all(
-            wb_switch_core::modules::workbuddy_sessions::LinkOptions {
-                require_closed: false,
-                copy_missing: false,
-                since: 0,
-            },
+            wb_switch_core::modules::workbuddy_sessions::LinkOptions::new(false, false, 0),
         )
     })
     .await
@@ -2315,10 +2439,58 @@ pub async fn trae_session_links_preview(
     .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
 }
 
+/// 「关联会话」页签：该客户端下**全部账号**的副本矩阵（含哪些账号还缺这份副本）。
+///
+/// 与 `trae_session_links_preview` 的区别：那个固定一对账号、只回两端；这个把组里
+/// 所有成员摆出来，界面才能画成 WorkBuddy 那样的矩阵并给「补齐到某账号」。
+#[tauri::command]
+pub async fn trae_session_links_overview(client_key: String) -> Value {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::overview(&client_key)
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// 切号弹窗用：列出**当前账号**的全部会话，以及每一条与目标账号的关联状态。
+///
+/// 与 WorkBuddy 的 `workbuddy_switch_session_plan` 同名同义（四态口径一致）。
+/// 只读：不写库、不写关联记录。
+#[tauri::command]
+pub async fn trae_switch_session_plan(
+    client_key: String,
+    source_uid: String,
+    target_uid: String,
+) -> Value {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::switch_plan(
+            &client_key, &source_uid, &target_uid,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
 /// Trae：删除一个关联组（只删本工具的关联记录，不动任何会话数据）。
 #[tauri::command]
 pub async fn trae_session_unlink(group_id: String) -> Result<Value, String> {
     off_main(move || wb_switch_core::modules::trae_session_links::unlink_group(&group_id)).await?
+}
+
+/// Trae：「取消关联」单个账号 —— 把它从「同一段对话」里拆出去。
+///
+/// 与 WorkBuddy 的 `workbuddy_session_group_unlink_members` 同名同义：
+/// 只删关联记录，**会话数据一个字不动**；组里剩不到 2 份时整组一并删掉。
+#[tauri::command]
+pub async fn trae_session_unlink_member(
+    group_id: String,
+    uid: String,
+    client_key: String,
+) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::trae_session_links::unlink_member(&group_id, &uid, &client_key)
+    })
+    .await?
 }
 
 /// Trae：「同步差异」——把关联组里较新一端的内容，就地覆盖到较旧一端
@@ -2491,6 +2663,8 @@ pub async fn workbuddy_session_edit_save(
     ops: Value,
     row_patch: Value,
     target_uid: Option<String>,
+    // 用户确认过「可以退出 WorkBuddy 再写入」：由后端退出客户端，写完自动重新打开。
+    close_client: Option<bool>,
 ) -> Result<Value, String> {
     let progress: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2503,6 +2677,7 @@ pub async fn workbuddy_session_edit_save(
             &ops,
             &row_patch,
             target_uid.as_deref(),
+            close_client.unwrap_or(false),
             Some(&|m| {
                 buf.lock().unwrap().push(m.to_string());
             }),
@@ -2714,6 +2889,9 @@ mod main_thread_guard {
         "trae_oauth_open_url", // 拉起浏览器
         "workbuddy_oauth_stop",
         "workbuddy_open_url", // 拉起浏览器
+        // 建一个目录 + 拉起系统打开器后立即返回（不读大文件、不做扫描）。
+        // 与 `reveal_path` / `reveal_error_log` 同一类。
+        "diag_log_open",
         // 读 `config::store_dir()` 的**进程内缓存** + 一个静态提示字符串。
         // 真正的路径解析（含一次性的旧目录搬迁）已经在 `lib.rs::run()` 里、
         // 任何命令可能被调用之前跑完了，所以这里不会碰磁盘。
@@ -2862,7 +3040,49 @@ pub async fn gateway_pricing() -> Result<Value, String> {
 /// 模型目录（`models.json`）。空对象表示还没登记。
 #[tauri::command]
 pub async fn gateway_models_get() -> Result<Value, String> {
-    read_store_json("models.json")
+    // ⚠️ 返回**合并后**的扁平清单（`defaults ∪ user`），与升级前的形状一致，
+    //    老调用方（把结果当 `Record<string, string[]>` 用）不会被 v2 结构弄坏。
+    //    要看「哪些是用户手动加的」请用 `gateway_models_catalog`。
+    Ok(json!(gateway_models::load_effective()))
+}
+
+/// 模型清单概览：`defaults`（GitHub / 本机扫描）与 `user`（手动添加）分开给。
+#[tauri::command]
+pub async fn gateway_models_catalog() -> Value {
+    gateway_models::catalog_overview()
+}
+
+/// 用户手动添加一个模型（写进 `user` 段，之后的任何同步都不会覆盖它）。
+#[tauri::command]
+pub async fn gateway_models_add_user(scope: String, model: String) -> Result<Value, String> {
+    gateway_models::add_user_model(&scope, &model)?;
+    Ok(gateway_models::catalog_overview())
+}
+
+/// 删除用户手动添加的模型（默认段的条目由 GitHub 同步管，这里删不了）。
+#[tauri::command]
+pub async fn gateway_models_remove_user(scope: String, model: String) -> Result<Value, String> {
+    gateway_models::remove_user_model(&scope, &model)?;
+    Ok(gateway_models::catalog_overview())
+}
+
+/// 删除一个「仅本机」的模型（`local` 段）。
+///
+/// 为什么需要这个入口：本机识别**只增不减**（某个产品今天没登录，它的模型不该
+/// 因此消失），所以清理只能靠用户手动点。删掉之后下次识别如果又扫到，会再加回来 ——
+/// 那是正确行为（它确实还在这台机器上可用）。
+#[tauri::command]
+pub async fn gateway_models_remove_local(scope: String, model: String) -> Result<Value, String> {
+    gateway_models::remove_local_model(&scope, &model)?;
+    Ok(gateway_models::catalog_overview())
+}
+
+/// 从 GitHub 拉模型清单并覆盖 `defaults`（`user` 段原样保留）。
+///
+/// 失败时**不写任何东西**：界面拿到原因，本地清单继续可用。
+#[tauri::command]
+pub async fn gateway_models_sync_remote() -> Result<Value, String> {
+    gateway_models::sync_from_remote().await
 }
 
 #[tauri::command]

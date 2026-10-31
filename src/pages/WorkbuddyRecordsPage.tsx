@@ -47,6 +47,7 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { groupSizes, isOlderDup, newestIdByGroup } from "@/lib/wb-dup";
 import type {
   WbLinkGroup,
   WbLinksPreview,
@@ -139,6 +140,16 @@ export default function WorkbuddyRecordsPage() {
   const [query, setQuery] = useState("");
   const [wsFilter, setWsFilter] = useState("");
   const [byWorkspace, setByWorkspace] = useState(true);
+  /**
+   * 同标题折叠（默认开）。
+   *
+   * 定时任务（「每日 AI 新闻推送」）**每次运行都新建一个同名会话**，一个号里很快堆到十几条，
+   * 列表会被它们占满（用户 2026-10-30 反馈）。折叠后每组只显示最新的那条，
+   * 下面一行写清「另有 N 条较旧副本」，点开才展开 —— 数据一条不少，只是先不吵你。
+   */
+  const [collapseDup, setCollapseDup] = useState(true);
+  /** 已手动展开的重复组（键 = `dupGroup`）。 */
+  const [expandedDup, setExpandedDup] = useState<Set<string>>(new Set());
 
   // 复制与关联
   const [srcUid, setSrcUid] = useState("");
@@ -401,17 +412,59 @@ export default function WorkbuddyRecordsPage() {
   };
 
   /**
+   * 同标题重复：组大小 / 组数 / 当前筛选范围内被折叠的「较旧副本」。
+   *
+   * ⚠️ 组大小按**全账号**统计（`sessions`），不是按筛选结果 —— 否则搜索一下就会
+   *    把「共 5 条」说成「共 1 条」，两处数字对不上。
+   */
+  /**
+   * 每个重复组里**本账号内**最新的一条会话 id。
+   *
+   * 判据在 `@/lib/wb-dup`（有单测）：**不能用后端的 `isNewest`** —— 它是跨账号的全局标记，
+   * 真机实测账号 e925618e / fbd4139a 的「每日 AI 新闻推送」组内全是 false，
+   * 拿它折叠会把整组折叠掉，列表一条不剩（看起来像数据没了）。
+   */
+  const newestByGroup = useMemo(() => newestIdByGroup(sessions), [sessions]);
+
+  /** 组内最新（本账号口径）。无重复组时恒为 true。 */
+  const isGroupNewest = (s: WbSessionItem) => !isOlderDup(s, newestByGroup);
+
+  /** 同标题重复的统计（组大小 / 组数 / 当前筛选范围内可清理的旧副本）。 */
+  const dupInfo = useMemo(() => {
+    const size = groupSizes(sessions);
+    const groupCount = [...size.values()].filter((n) => n > 1).length;
+    const olders = filtered.filter((s) => isOlderDup(s, newestByGroup));
+    return { size, groupCount, olders };
+  }, [sessions, filtered, newestByGroup]);
+
+  /** 这一条是不是「同标题较旧副本」且当前被折叠起来了。 */
+  const isCollapsedDup = (s: WbSessionItem) =>
+    collapseDup && Boolean(s.dupGroup) && !isGroupNewest(s) && !expandedDup.has(s.dupGroup);
+
+  /**
+   * 真正画在表里的行（折叠掉较旧副本）。
+   *
+   * ⚠️ 全选 / 半选必须只算这些行：否则「看不见的副本」也会被勾上，
+   *    用户点删除就在自己看不见的情况下删了数据。
+   */
+  const visibleRows = useMemo(
+    () => filtered.filter((s) => !isCollapsedDup(s)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtered, collapseDup, expandedDup],
+  );
+
+  /**
    * 全选：只作用于**当前可见**的行（搜索 / 空间筛选之后）。
    *
    * ⚠️ 勾选与「可见行」是两件事（Trae 会话页踩过的坑）：筛选会把一部分勾中的行藏起来，
    *    所以①表头全选只覆盖可见行；②改搜索词 / 换空间 / 换账号时清空勾选 ——
    *    否则用户会在看不见那些行的情况下把它们删掉。
    */
-  const allSelected = filtered.length > 0 && filtered.every((s) => selected.has(s.id));
+  const allSelected = visibleRows.length > 0 && visibleRows.every((s) => selected.has(s.id));
   /** 可见行里被勾中的数量（表头复选框的「半选」只看这个，不看被筛掉的勾选）。 */
-  const pickedVisible = filtered.filter((s) => selected.has(s.id)).length;
+  const pickedVisible = visibleRows.filter((s) => selected.has(s.id)).length;
   const toggleAll = () => {
-    setSelected(allSelected ? new Set() : new Set(filtered.map((s) => s.id)));
+    setSelected(allSelected ? new Set() : new Set(visibleRows.map((s) => s.id)));
   };
 
   /** 表格要渲染的「块」：分组视图按空间分块；平铺视图合成一块（表头行不渲染）。 */
@@ -821,6 +874,42 @@ export default function WorkbuddyRecordsPage() {
                   ))}
                 </select>
 
+                {/* 同标题折叠 + 批量选中旧副本：定时任务每次运行都建同名会话，
+                    不折叠列表会被「每日 AI 推送」这类记录占满。 */}
+                {dupInfo.groupCount > 0 && (
+                  <>
+                    <label
+                      className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground"
+                      title="定时任务（如「每日 AI 推送」）每次运行都会新建一个同名会话，可以把它们先折叠起来"
+                    >
+                      <input
+                        type="checkbox"
+                        className="size-3.5 cursor-pointer"
+                        checked={collapseDup}
+                        onChange={(e) => {
+                          setCollapseDup(e.target.checked);
+                          setExpandedDup(new Set());
+                        }}
+                      />
+                      合并同标题（{dupInfo.groupCount} 组）
+                    </label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-xs"
+                      disabled={dupInfo.olders.length === 0}
+                      title={
+                        dupInfo.olders.length === 0
+                          ? "当前筛选范围内没有较旧副本"
+                          : "把当前列表里的「同标题较旧副本」全部勾上，再点下方「删除所选」即可清理"
+                      }
+                      onClick={() => setSelected(new Set(dupInfo.olders.map((s) => s.id)))}
+                    >
+                      选中较旧副本（{dupInfo.olders.length}）
+                    </Button>
+                  </>
+                )}
+
                 {/* 视图切换：按空间分组 / 平铺 */}
                 <div className="ml-auto flex items-center gap-0.5 rounded-md border p-0.5">
                   <button
@@ -855,6 +944,11 @@ export default function WorkbuddyRecordsPage() {
                     ? `${sessions.length} 条`
                     : `${filtered.length} / ${sessions.length} 条`}
                 </Badge>
+                {collapseDup && visibleRows.length !== filtered.length && (
+                  <Badge variant="outline" title="同标题较旧副本已折叠">
+                    显示 {visibleRows.length} 条
+                  </Badge>
+                )}
                 {wsOptions.length > 0 && (
                   <Badge variant="outline">{wsOptions.length} 个空间</Badge>
                 )}
@@ -942,8 +1036,18 @@ export default function WorkbuddyRecordsPage() {
                               </td>
                             </tr>
                           )}
-                          {g.items.map((s) => (
-                            <tr key={s.id} className="border-b last:border-0 hover:bg-muted/30">
+                          {g.items.map((s) => {
+                            // 同标题较旧副本：折叠状态下不画（数量在下面那行提示里说清）
+                            if (isCollapsedDup(s)) return null;
+                            const groupSize = s.dupGroup
+                              ? (dupInfo.size.get(s.dupGroup) ?? 1)
+                              : 0;
+                            const groupNewest = isGroupNewest(s);
+                            const showDupHint =
+                              groupSize > 1 && groupNewest && collapseDup;
+                            return (
+                              <Fragment key={s.id}>
+                            <tr className="border-b last:border-0 hover:bg-muted/30">
                               <td className="px-3 py-2">
                                 <input
                                   type="checkbox"
@@ -953,7 +1057,18 @@ export default function WorkbuddyRecordsPage() {
                                 />
                               </td>
                               <td className="max-w-[420px] px-3 py-2">
-                                <div className="truncate font-medium">{s.title}</div>
+                                <div className="flex min-w-0 items-center gap-1.5">
+                                  <span className="truncate font-medium">{s.title}</span>
+                                  {groupSize > 1 && (
+                                    <Badge
+                                      variant={groupNewest ? "default" : "secondary"}
+                                      className="shrink-0 text-[10px]"
+                                      title={s.dupNote || undefined}
+                                    >
+                                      {groupNewest ? `同名 ${groupSize} 条 · 最新` : "较旧副本"}
+                                    </Badge>
+                                  )}
+                                </div>
                                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                   {!byWorkspace && (
                                     <span className="inline-flex shrink-0 items-center gap-1 rounded border px-1 py-0.5">
@@ -965,6 +1080,11 @@ export default function WorkbuddyRecordsPage() {
                                     {s.workspacePath || "（没有工作目录）"}
                                   </span>
                                 </div>
+                                {s.dupNote && groupSize > 1 && !groupNewest ? (
+                                  <div className="truncate text-[11px] text-amber-600">
+                                    {s.dupNote}
+                                  </div>
+                                ) : null}
                               </td>
                               <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
                                 {timeLabel(s.updatedAt)}
@@ -1018,7 +1138,32 @@ export default function WorkbuddyRecordsPage() {
                                 </div>
                               </td>
                             </tr>
-                          ))}
+                                {/* 折叠提示：说清「还有几条、怎么展开」，
+                                    不能让用户以为数据被删了。 */}
+                                {showDupHint && groupSize > 1 ? (
+                                  <tr className="border-b bg-muted/20 last:border-0">
+                                    <td />
+                                    <td colSpan={4} className="px-3 py-1.5">
+                                      <button
+                                        type="button"
+                                        className="flex items-center gap-1.5 text-left text-[11px] text-muted-foreground hover:text-foreground"
+                                        onClick={() =>
+                                          setExpandedDup((prev) => {
+                                            const n = new Set(prev);
+                                            n.add(s.dupGroup);
+                                            return n;
+                                          })
+                                        }
+                                      >
+                                        <Layers className="size-3" />
+                                        同标题另有 {groupSize - 1} 条较旧副本（共 {groupSize} 条），点此展开
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ) : null}
+                              </Fragment>
+                            );
+                          })}
                         </Fragment>
                       ))}
                     </tbody>

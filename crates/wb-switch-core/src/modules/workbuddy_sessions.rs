@@ -721,6 +721,7 @@ fn write_copies(
     target_uid: &str,
     plan: &[CopyItem],
     now: i64,
+    alive: &std::collections::HashSet<(String, String)>,
     done_rows: &mut Vec<String>,
     done_files: &mut Vec<PathBuf>,
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
@@ -730,19 +731,24 @@ fn write_copies(
         let cid = &item.cid;
         let src_row = read_source_row(conn, cid)?
             .ok_or_else(|| format!("会话 {cid} 在库里没有对应行"))?;
-        // 已建立过关联（目标账号已有副本）→ 跳过，不制造第二个副本。
+        // 已建立过关联、且那份副本**还在** → 跳过，不制造第二个副本。
         //
-        // ⚠️ **不看副本存活与否**：那个副本被用户在目标账号里删掉了，也是「有成员」。
-        //    自动补回来等于「删除等于没删」（与自动导入的墓碑是同一个教训）。
+        // ⚠️⚠️ 判据是「成员记录 + 会话存活」，不是只看成员记录：
+        //    只按记录判的话，副本被客户端清掉之后关联组里永远留着一条死成员，
+        //    于是这一组**再也不会被补回来** —— 用户看到的就是「会话关联经常断开」。
+        //    反过来，会话行还在、只是被软删（用户自己在客户端删的），仍然算「有成员」，
+        //    不复活（否则「删除等于没删」，与自动导入的墓碑是同一个教训）。
         if let Some(existing) = find_group_for(store, source_uid, cid)
             .and_then(|g| member_for(g, target_uid))
             .map(|m| m.session_id.clone())
         {
-            skipped.push(json!({
-                "id": cid, "title": item.title, "reason": "目标账号已有副本",
-                "targetSessionId": existing,
-            }));
-            continue;
+            if alive.contains(&(target_uid.to_string(), existing.clone())) {
+                skipped.push(json!({
+                    "id": cid, "title": item.title, "reason": "目标账号已有副本",
+                    "targetSessionId": existing,
+                }));
+                continue;
+            }
         }
         let new_cid = uuid::Uuid::new_v4().to_string();
         let dest = target_body_path(&item.src_path, &new_cid);
@@ -779,6 +785,208 @@ fn write_copies(
         }));
     }
     Ok((copied, skipped))
+}
+
+// ---------------------------------------------------------------------------
+// 三·三、已关联副本的内容同步（纯追加，零覆盖）
+// ---------------------------------------------------------------------------
+
+/// 比对时替代「本副本自己的会话 id」的标记 —— 与内容摘要用的是同一套归一化思路。
+const SELF_ID_MARK: &str = "__wb_copy_self_id__";
+
+/// 一份正文相对另一份的关系。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRelation {
+    /// 逐行相同（归一化后）。
+    Identical,
+    /// 目标正文是源正文的**有序前缀** —— 纯追加，可以安全覆盖成源那份。
+    Prefix,
+    /// 有分歧（目标有源没有的内容，或中途不同）—— 一律不动。
+    Diverge,
+}
+
+/// 逐行比对两份正文（把各自的会话 id 归一化后再比），**流式读，不整份进内存**。
+fn body_relation(
+    src: &Path,
+    src_id: &str,
+    tgt: &Path,
+    tgt_id: &str,
+) -> Result<BodyRelation, String> {
+    use std::io::{BufRead, BufReader};
+    let sf = std::fs::File::open(src).map_err(|e| format!("读源正文失败：{e}"))?;
+    let tf = std::fs::File::open(tgt).map_err(|e| format!("读目标正文失败：{e}"))?;
+    let mut s_lines = BufReader::new(sf).lines();
+    let mut t_lines = BufReader::new(tf).lines();
+    loop {
+        let s = s_lines.next();
+        let t = t_lines.next();
+        match (s, t) {
+            // 两边同时到底 → 完全一致。
+            (None, None) => return Ok(BodyRelation::Identical),
+            // 目标还没到底、源先没了 → 目标更长（有多余内容），不能覆盖。
+            (None, Some(_)) => return Ok(BodyRelation::Diverge),
+            // 目标到底了、源还有 → 目标是被源包含的前缀。
+            (Some(_), None) => return Ok(BodyRelation::Prefix),
+            (Some(s), Some(t)) => {
+                let s = s.map_err(|e| format!("读源正文失败：{e}"))?;
+                let t = t.map_err(|e| format!("读目标正文失败：{e}"))?;
+                if s.replace(src_id, SELF_ID_MARK) != t.replace(tgt_id, SELF_ID_MARK) {
+                    return Ok(BodyRelation::Diverge);
+                }
+            }
+        }
+    }
+}
+
+/// 把源正文按「脚本 id 换成目标 id」写到目标位置（先写临时文件再原子替换）。
+fn overwrite_body_from(src: &Path, src_id: &str, tgt: &Path, tgt_id: &str) -> Result<u64, String> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+    let tmp = tgt.with_extension("jsonl.wbtmp");
+    let mut out =
+        BufWriter::new(std::fs::File::create(&tmp).map_err(|e| format!("创建临时正文失败：{e}"))?);
+    let mut lines = 0u64;
+    for line in BufReader::new(
+        std::fs::File::open(src).map_err(|e| format!("读源正文失败：{e}"))?,
+    )
+    .lines()
+    {
+        let line = line.map_err(|e| format!("读源正文失败：{e}"))?;
+        out.write_all(line.replace(src_id, tgt_id).as_bytes())
+            .map_err(|e| format!("写入临时正文失败：{e}"))?;
+        out.write_all(b"\n")
+            .map_err(|e| format!("写入临时正文失败：{e}"))?;
+        lines += 1;
+    }
+    out.flush().map_err(|e| format!("写入临时正文失败：{e}"))?;
+    drop(out);
+    std::fs::rename(&tmp, tgt).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换目标正文失败：{e}")
+    })?;
+    Ok(lines)
+}
+
+/// 把源行的可变字段刷到目标副本行上（**不动 id / user_id / deleted_at**）。
+fn update_copy_row(
+    conn: &Connection,
+    source: &[(String, SqlValue)],
+    target_cid: &str,
+    target_uid: &str,
+    now: i64,
+) -> Result<(), String> {
+    // 只刷「内容相关」的字段：标题跟着内容走，时间是这次写入的时间。
+    // ⚠️ 不刷 cwd —— 目标副本的正文就放在它自己的工作区目录里，改 cwd 会让它找不到正文。
+    let mut sets: Vec<String> = vec!["updated_at = ?1".to_string()];
+    let mut vals: Vec<SqlValue> = vec![SqlValue::Integer(now)];
+    for col in ["title", "custom_title", "model"] {
+        if let Some((_, v)) = source.iter().find(|(name, _)| name == col) {
+            sets.push(format!("{col} = ?{}", vals.len() + 1));
+            vals.push(v.clone());
+        }
+    }
+    let id_at = vals.len() + 1;
+    let uid_at = vals.len() + 2;
+    vals.push(SqlValue::Text(target_cid.to_string()));
+    vals.push(SqlValue::Text(target_uid.to_string()));
+    let sql = format!(
+        "UPDATE sessions SET {} WHERE id = ?{id_at} AND user_id = ?{uid_at}",
+        sets.join(", ")
+    );
+    let params: Vec<&SqlValue> = vals.iter().collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params))
+        .map_err(|e| format!("更新副本行失败：{e}"))?;
+    Ok(())
+}
+
+/// 对**已经关联**的副本做内容同步：只在「目标正文是源正文前缀」时整份改写。
+///
+/// 返回 `(已同步, 跳过)`；跳过项都带 `reason`，界面照实显示「为什么没动」——
+/// 分歧、正文缺失、读失败都不许静默咽掉。
+#[allow(clippy::type_complexity)]
+fn refresh_linked_copies(
+    conn: &Connection,
+    pairs: &[(String, String, PathBuf, String)],
+    target_uid: &str,
+    now: i64,
+    backup_dir: &Path,
+    done: &mut Vec<(PathBuf, PathBuf)>,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut refreshed: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for (src_cid, src_title, src_path, tgt_cid) in pairs {
+        let tgt_path = target_body_path(src_path, tgt_cid);
+        if !tgt_path.is_file() {
+            skipped.push(json!({
+                "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
+                "reason": "目标副本正文不在磁盘上，未做内容同步",
+            }));
+            continue;
+        }
+        let relation = match body_relation(src_path, src_cid, &tgt_path, tgt_cid) {
+            Ok(r) => r,
+            Err(e) => {
+                skipped.push(json!({
+                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid, "reason": e,
+                }));
+                continue;
+            }
+        };
+        match relation {
+            BodyRelation::Identical => {
+                skipped.push(json!({
+                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
+                    "reason": "两边内容已经一致",
+                }));
+            }
+            BodyRelation::Diverge => {
+                skipped.push(json!({
+                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
+                    "reason": "内容有分歧（目标账号里也有新内容），未自动覆盖",
+                }));
+            }
+            BodyRelation::Prefix => {
+                // 覆盖前先留一份旧正文，回滚时按 (目标, 备份) 还原。
+                let backup = backup_dir.join(format!("{tgt_cid}.jsonl"));
+                if let Err(e) = std::fs::create_dir_all(backup_dir)
+                    .and_then(|_| std::fs::copy(&tgt_path, &backup))
+                {
+                    skipped.push(json!({
+                        "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
+                        "reason": format!("备份目标正文失败，未做同步：{e}"),
+                    }));
+                    continue;
+                }
+                match overwrite_body_from(src_path, src_cid, &tgt_path, tgt_cid) {
+                    Ok(lines) => {
+                        done.push((tgt_path.clone(), backup.clone()));
+                        let src_row = read_source_row(conn, src_cid).ok().flatten();
+                        if let Some(row) = src_row {
+                            if let Err(e) =
+                                update_copy_row(conn, &row, tgt_cid, target_uid, now)
+                            {
+                                skipped.push(json!({
+                                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
+                                    "reason": e,
+                                }));
+                                continue;
+                            }
+                        }
+                        refreshed.push(json!({
+                            "id": src_cid,
+                            "targetSessionId": tgt_cid,
+                            "title": src_title,
+                            "lines": lines,
+                            "backup": backup.to_string_lossy(),
+                        }));
+                    }
+                    Err(e) => skipped.push(json!({
+                        "id": src_cid, "title": src_title, "targetSessionId": tgt_cid, "reason": e,
+                    })),
+                }
+            }
+        }
+    }
+    (refreshed, skipped)
 }
 
 pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Result<Value, String> {
@@ -852,6 +1060,13 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
     let conn = open_rw(&db)?;
     let mut done_rows: Vec<String> = Vec::new();
     let mut done_files: Vec<PathBuf> = Vec::new();
+    // 手动复制沿用老语义：只要目标账号那一行还在（哪怕是软删），就当作「已有副本」跳过。
+    // 与 `link_all` 的「死成员允许重建」不同步是故意的 —— 手动点“复制”不该悄悄复活
+    // 用户自己删掉的会话。
+    let alive_keys: std::collections::HashSet<(String, String)> = all
+        .iter()
+        .map(|s| (s.user_id.clone(), s.id.clone()))
+        .collect();
     let result = (|| -> Result<(Vec<Value>, Vec<Value>), String> {
         let mut store = load_links().unwrap_or_default();
         let out = write_copies(
@@ -861,6 +1076,7 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
             target_uid,
             &plan,
             now,
+            &alive_keys,
             &mut done_rows,
             &mut done_files,
         )?;
@@ -1196,8 +1412,255 @@ pub fn links_preview(source_uid: &str, target_uid: &str) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 三·二、切号时的会话勾选（列出当前账号全部会话 + 与目标账号的关联状态）
+// ---------------------------------------------------------------------------
+
+/// 一条候选会话在「切到目标账号」时的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchLinkState {
+    /// 目标账号有存活副本 → 默认勾选（勾上 = 把内容同步过去）。
+    Linked,
+    /// 关联组里记着目标成员，但那份副本已经不在了 → 默认勾选（勾上 = 补一份回来）。
+    Missing,
+    /// 没有关联记录，但目标账号里已有一份同内容副本 → 默认勾选（勾上 = 只登记关联，0 字节）。
+    Twin,
+    /// 完全没有关联 → 默认不勾（勾上才新建副本 + 关联）。
+    Unlinked,
+}
+
+impl SwitchLinkState {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Missing => "missing",
+            Self::Twin => "twin",
+            Self::Unlinked => "unlinked",
+        }
+    }
+    /// 「已有关联」的三种都默认勾上；只有完全没关联的留给用户主动新增。
+    pub fn default_checked(self) -> bool {
+        !matches!(self, Self::Unlinked)
+    }
+}
+
+/// 默认勾选的**唯一出口**。
+///
+/// 三条同时成立才默认勾上：① 状态本身默认勾（已关联）；② 有正文（没正文复制不了）；
+/// ③ **不是同标题的较旧副本**。
+///
+/// 第 ③ 条是「切号后会话重复出现多次」的根因修复：WorkBuddy 的定时任务（「每日 AI 推送」）
+/// 每次运行都新建一个同名会话，一个账号里能有 5 份。以前这些全被默认勾上，切一次号就把
+/// 5 份副本一起搬过去，目标账号里越积越多。现在只勾最新那份，旧的标出来、想同步可手动勾。
+fn default_checked(state: SwitchLinkState, has_body: bool, dup_older: bool) -> bool {
+    state.default_checked() && has_body && !dup_older
+}
+
+/// 每个重复组里**本账号内**最新的一条（组键 → 会话 id），按 `updated_at` 取最大。
+///
+/// ⚠️ 不能用 [`workbuddy_source::WbSession::is_newest`]：它是**跨账号的全局标记**
+///    （同一段对话在多账号各有一份，全局只有一份最新）。真机实测账号 e925618e /
+///    fbd4139a 的「每日 AI 新闻推送」组内全局标记全为 false —— 直接拿它判「较旧」，
+///    会导致整组都不默认勾选，用户以为关联失效。这里按本账号时间取代表，保证每组留一条。
+///
+/// 时间相同时取**先出现**的那条（列表本身已按更新时间倒序，语义稳定、不抖动）。
+fn newest_by_group(items: &[(&str, &str, i64)]) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, (i64, String)> =
+        std::collections::HashMap::new();
+    for (group, id, at) in items {
+        if group.is_empty() {
+            continue;
+        }
+        match out.get(*group) {
+            Some((prev, _)) if *at <= *prev => {}
+            _ => {
+                out.insert((*group).to_string(), (*at, (*id).to_string()));
+            }
+        }
+    }
+    out.into_iter().map(|(k, (_, v))| (k, v)).collect()
+}
+
+/// 切号前给界面用的会话清单（只读）。
+///
+/// 每一行是**当前账号**的一个会话，带上「与目标账号的关联状态」。界面据此决定默认勾选：
+/// 已关联的默认勾上（可取消 = 这次不同步），没关联的默认空着（勾上 = 新增关联）。
+///
+/// ⚠️ 关联状态的判据与 [`plan_links`] 完全一致：**成员记录 + 会话存活**。
+/// 两边不一致会出现「界面说已关联、实际却补了一份副本」这种自相矛盾。
+pub fn switch_plan(target_uid: &str) -> Value {
+    let source_uid = workbuddy_auth::current_uid().unwrap_or_default();
+    if source_uid.trim().is_empty() {
+        return json!({ "ok": false, "error": "读不到当前登录账号，无法列出会话" });
+    }
+    if target_uid.trim().is_empty() || target_uid == source_uid {
+        return json!({ "ok": false, "error": "目标账号无效（为空或与当前账号相同）" });
+    }
+    let all = match workbuddy_source::list_sessions() {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let store = match load_links() {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "storeStatus": "unavailable", "error": e }),
+    };
+    let is_alive = |uid: &str, cid: &str| -> bool {
+        all.iter()
+            .any(|t| t.id == cid && !t.deleted && t.user_id == uid)
+    };
+
+    // 同标题重复组在**源账号范围内**的份数与组内最新。
+    //
+    // 为什么需要：WorkBuddy 的定时任务每次运行都新建一个会话、标题相同（「每日 AI 推送」），
+    // 于是一个号里会出现好几条同名会话。早前这里把每条都平铺出来并默认勾选，
+    // 切一次号就把同一段对话的 N 份副本全搬过去 —— 用户看到的就是「复制后重复出现多次」。
+    // 现在把重复组信息一并给界面：默认只勾最新那一份，旧的标出来但不勾（想同步可手动勾）。
+    //
+    // ⚠️ 「最新」必须按**源账号内**的更新时间判断。`WbSession::is_newest` 是全局标记
+    //    （同一段对话在多账号各有一份，全局只有一份最新）；真机实测账号 e925618e /
+    //    fbd4139a 的「每日 AI 新闻推送」组内 `is_newest` 全为 false —— 直接用它会导致
+    //    **整组都不默认勾选**，用户以为关联失效了。
+    let source_rows: Vec<&workbuddy_source::WbSession> = all
+        .iter()
+        .filter(|s| s.user_id == source_uid && !s.deleted)
+        .collect();
+    let mut group_size: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for s in &source_rows {
+        if !s.dup_group.is_empty() {
+            *group_size.entry(s.dup_group.as_str()).or_insert(0) += 1;
+        }
+    }
+    let newest_here = newest_by_group(
+        &source_rows
+            .iter()
+            .map(|s| (s.dup_group.as_str(), s.id.as_str(), s.updated_at))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut rows: Vec<Value> = Vec::new();
+    let mut linked = 0usize;
+    let mut missing = 0usize;
+    let mut twin_n = 0usize;
+    let mut unlinked = 0usize;
+    let mut dup_olders = 0usize;
+    let mut dup_skipped = 0usize;
+    for s in all
+        .iter()
+        .filter(|s| s.user_id == source_uid && !s.deleted)
+    {
+        let member_cid = find_group_for(&store, &source_uid, &s.id)
+            .and_then(|g| member_for(g, target_uid))
+            .map(|m| m.session_id.clone());
+        let target_alive = member_cid
+            .as_deref()
+            .map(|cid| is_alive(target_uid, cid))
+            .unwrap_or(false);
+        // 没有关联记录时，看目标账号里有没有「同一段对话」的副本（摘要 + 标题都相同）。
+        let twin_cid = if member_cid.is_none() && !s.content_digest.is_empty() {
+            all.iter()
+                .find(|t| {
+                    t.user_id == target_uid
+                        && !t.deleted
+                        && t.title == s.title
+                        && t.content_digest == s.content_digest
+                })
+                .map(|t| t.id.clone())
+        } else {
+            None
+        };
+        let state = match (member_cid.is_some(), target_alive, twin_cid.is_some()) {
+            (true, true, _) => SwitchLinkState::Linked,
+            (true, false, _) => SwitchLinkState::Missing,
+            (false, _, true) => SwitchLinkState::Twin,
+            _ => SwitchLinkState::Unlinked,
+        };
+        match state {
+            SwitchLinkState::Linked => linked += 1,
+            SwitchLinkState::Missing => missing += 1,
+            SwitchLinkState::Twin => twin_n += 1,
+            SwitchLinkState::Unlinked => unlinked += 1,
+        }
+        let peers = if s.dup_group.is_empty() {
+            1
+        } else {
+            group_size.get(s.dup_group.as_str()).copied().unwrap_or(1)
+        };
+        // 「本账号内的组内最新」：只有同组确实有多份时才有意义（唯一标题恒 true）。
+        let is_newest_here = if peers <= 1 {
+            true
+        } else {
+            newest_here
+                .get(s.dup_group.as_str())
+                .map(|id| id == &s.id)
+                .unwrap_or(true)
+        };
+        let dup_older = peers > 1 && !is_newest_here;
+        if dup_older {
+            dup_olders += 1;
+        }
+        let default_checked_row = default_checked(state, s.has_body, dup_older);
+        // 记下「本来会被默认勾上、因为重复被去掉」的条数：界面要能说清少勾了几条，
+        // 不能让用户以为是我们算漏了。
+        if dup_older && s.has_body && state.default_checked() {
+            dup_skipped += 1;
+        }
+        rows.push(json!({
+            "sessionId": s.id,
+            "title": s.title,
+            "updatedAt": s.updated_at,
+            "hasBody": s.has_body,
+            "bodyBytes": s.body_bytes,
+            "cwd": s.cwd,
+            "state": state.key(),
+            "defaultChecked": default_checked_row,
+            // 没有正文的会话复制不了（复制只搬正文 + 库行），如实告诉界面，别让它勾了没反应。
+            "disabled": !s.has_body,
+            "targetSessionId": member_cid.clone().or(twin_cid),
+            // 同标题重复组（`dupGroup` 为空 = 标题唯一）。`dupRelation`：
+            // `latest` 组内最新；`equal` 与最新内容逐行一致；`diverged` 内容不同。
+            "dupGroup": s.dup_group,
+            "dupGroupSize": peers,
+            // 本账号口径的「组内最新」，界面据此折叠/画徽标（不要用全局 is_newest）。
+            "isNewest": is_newest_here,
+            "dupRelation": s.dup_relation,
+            "dupNote": s.dup_note,
+        }));
+    }
+
+    // `checked` 必须与逐行的 `defaultChecked` 同源（不是 `linked+missing+twin`）：
+    // 排除同标题较旧副本之后，这两个数会不一样，写死了就会出现「说 4 条、实际只勾 3 条」。
+    let checked = rows
+        .iter()
+        .filter(|r| r["defaultChecked"].as_bool().unwrap_or(false))
+        .count();
+    let dup_groups = group_size.values().filter(|&&n| n > 1).count();
+
+    json!({
+        "ok": true,
+        "storeStatus": "ready",
+        "sourceUid": source_uid,
+        "targetUid": target_uid,
+        "counts": {
+            "total": rows.len(),
+            "linked": linked,
+            "missing": missing,
+            "twin": twin_n,
+            "unlinked": unlinked,
+            "checked": checked,
+            // 同标题重复：组数 / 较旧副本条数 / 其中「本来会勾、因重复被跳过」的条数。
+            "dupGroups": dup_groups,
+            "dupOlders": dup_olders,
+            "dupSkipped": dup_skipped,
+        },
+        "sessions": rows,
+        "storePath": links_file().to_string_lossy(),
+    })
+}
+
 /// 一键互通的参数。
-#[derive(Debug, Clone, Copy)]
+///
+/// ⚠️ 不再 `Copy`：勾选同步要带一串会话 id，`Vec` 不是 `Copy`。
+#[derive(Debug, Clone)]
 pub struct LinkOptions {
     /// 客户端正在运行就拒绝（界面入口 `true`；切号流程 `false`，那时已确认退出）。
     pub require_closed: bool,
@@ -1205,6 +1668,31 @@ pub struct LinkOptions {
     pub copy_missing: bool,
     /// 只复制这个时刻之后**创建**的会话（`0` = 不限制）。切号自动同步用它做增量。
     pub since: i64,
+    /// 只处理这些**源会话 id**（切号时用户勾选的那批）。`None` = 不限制。
+    ///
+    /// 未列出的源会话完全不参与：不复制、不改写、不登记 —— 这就是「取消勾选 = 不同步」。
+    pub only_sessions: Option<Vec<String>>,
+    /// 只同步到这个账号。`None` = 所有可用账号（一键互通的语义）。
+    pub target_uid: Option<String>,
+    /// 对**已经关联**的副本做内容同步（切号勾选时为 `true`）。
+    ///
+    /// 只做「目标正文是源正文的归一化前缀」这一种安全情形（纯追加，零覆盖）；
+    /// 有分歧的一律不动，如实回报「内容有分歧，未自动覆盖」。
+    pub refresh_linked: bool,
+}
+
+impl LinkOptions {
+    /// 只带三件必需参数的老用法（其余取默认）。
+    pub fn new(require_closed: bool, copy_missing: bool, since: i64) -> Self {
+        Self {
+            require_closed,
+            copy_missing,
+            since,
+            only_sessions: None,
+            target_uid: None,
+            refresh_linked: false,
+        }
+    }
 }
 
 /// 关联组成员登记：目标账号**已有同一段对话的副本**，只需登记，不必复制。
@@ -1252,12 +1740,20 @@ pub(crate) type LinkPlan = std::collections::BTreeMap<(String, String), Vec<Copy
 /// `alive` 必须是**按 `updated_at` 倒序**的：同一段对话有多份副本时让最新的先当锚点，
 /// 由它去 adopt 旧副本。顺序反了，关联组就会挂到旧副本上。
 ///
+/// `only` 非空时只处理这些源会话（切号勾选）；其余源会话既不复制也不登记。
+///
+/// ⚠️⚠️ **组员是否「还在」按存活判定，不按记录判定**：`session_links` 里还留着的成员，
+/// 如果对应的会话行已经没了（客户端清理 / 用户删库 / 换机），就不算「已有副本」，
+/// 否则那一组会**永远**停在「关联断开」——没人会再去补，用户只能手动干预。
+/// 反过来，会话行还在、只是被软删（用户在客户端删掉），仍然算「有成员」，不复活。
+///
 /// 返回 `(复制计划, 只登记项, 无正文数, 已有同内容副本而跳过数)`。
 fn plan_links(
     alive: &[&workbuddy_source::WbSession],
     uids: &[String],
     store: &LinkStore,
     since: i64,
+    only: Option<&std::collections::HashSet<String>>,
     body_of: impl Fn(&str) -> Option<PathBuf>,
 ) -> (LinkPlan, Vec<LinkAdopt>, usize, usize) {
     let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1266,8 +1762,19 @@ fn plan_links(
     let mut adopts: Vec<LinkAdopt> = Vec::new();
     let mut no_body = 0usize;
     let mut already_there = 0usize;
+    // 存活副本的键集合：成员记录 + 这个集合才是「真的还有副本」。
+    let alive_keys: std::collections::HashSet<(String, String)> = alive
+        .iter()
+        .map(|s| (s.user_id.clone(), s.id.clone()))
+        .collect();
 
     for s in alive {
+        // 勾选模式下，没勾的源会话一律不碰。
+        if let Some(sel) = only {
+            if !sel.contains(&s.id) {
+                continue;
+            }
+        }
         // 已经被别的副本 adopt 掉 → 它已经是组员，不再当源（否则会互相复制一轮）。
         if consumed.contains(&(s.user_id.clone(), s.id.clone())) {
             continue;
@@ -1276,7 +1783,11 @@ fn plan_links(
             find_group_for(store, &s.user_id, &s.id).map(|g| {
                 (
                     g.id.clone(),
-                    g.members.iter().map(|m| m.uid.clone()).collect(),
+                    g.members
+                        .iter()
+                        .filter(|m| alive_keys.contains(&(m.uid.clone(), m.session_id.clone())))
+                        .map(|m| m.uid.clone())
+                        .collect(),
                 )
             });
         // 没正文的会话复制不了（复制只搬正文 + 库行）：跳过，但要如实计数。
@@ -1378,8 +1889,20 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
 
     let all = workbuddy_source::list_sessions()?;
 
-    let uids = link_target_uids(&all);
-    if uids.len() < 2 {
+    let mut uids = link_target_uids(&all);
+    // 指定了目标账号（切号勾选）就只对它一个同步 —— 别的账号一个字节都不碰。
+    if let Some(t) = &opt.target_uid {
+        uids.retain(|u| u == t);
+        if uids.is_empty() {
+            return Ok(json!({
+                "ok": true,
+                "notNeeded": true,
+                "reason": "目标账号不在可用账号列表里（可能已禁用）",
+                "accounts": uids,
+            }));
+        }
+    }
+    if uids.len() < 2 && opt.target_uid.is_none() {
         return Ok(json!({
             "ok": true,
             "notNeeded": true,
@@ -1394,10 +1917,25 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
         .filter(|s| !s.deleted && !s.user_id.is_empty())
         .collect();
     alive.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let alive_keys: std::collections::HashSet<(String, String)> = alive
+        .iter()
+        .map(|s| (s.user_id.clone(), s.id.clone()))
+        .collect();
+
+    let only: Option<std::collections::HashSet<String>> = opt
+        .only_sessions
+        .as_ref()
+        .map(|v| v.iter().cloned().collect());
 
     let mut store = load_links()?;
-    let (mut plan, adopts, no_body, already_there) =
-        plan_links(&alive, &uids, &store, opt.since, workbuddy_source::find_jsonl);
+    let (mut plan, adopts, no_body, already_there) = plan_links(
+        &alive,
+        &uids,
+        &store,
+        opt.since,
+        only.as_ref(),
+        workbuddy_source::find_jsonl,
+    );
     // 「只登记已有副本」模式：计划出来的复制项一律丢掉（0 字节、不碰会话库）。
     if !opt.copy_missing {
         plan.clear();
@@ -1411,7 +1949,42 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
     };
 
     let planned: usize = plan.values().map(|v| v.len()).sum();
-    if planned == 0 {
+
+    // 已关联副本的内容同步：**只对勾选的会话**做，且必须在此之前算出配对
+    // （`store` 后面要在事务里改，新复制出来的副本不需要「刷新」）。
+    //
+    // 配对条件：源会话在勾选里 + 关联组里有目标成员 + 那份成员**存活**。
+    let refresh_pairs: Vec<(String, String, PathBuf, String)> = if opt.refresh_linked {
+        let mut pairs = Vec::new();
+        for s in &alive {
+            if let Some(sel) = &only {
+                if !sel.contains(&s.id) {
+                    continue;
+                }
+            }
+            let Some(tgt_cid) = find_group_for(&store, &s.user_id, &s.id)
+                .and_then(|g| member_for(g, opt.target_uid.as_deref().unwrap_or("")))
+                .map(|m| m.session_id.clone())
+            else {
+                continue;
+            };
+            if !alive_keys.contains(&(
+                opt.target_uid.as_deref().unwrap_or("").to_string(),
+                tgt_cid.clone(),
+            )) {
+                continue;
+            }
+            let Some(path) = workbuddy_source::find_jsonl(&s.id) else {
+                continue;
+            };
+            pairs.push((s.id.clone(), s.title.clone(), path, tgt_cid));
+        }
+        pairs
+    } else {
+        Vec::new()
+    };
+
+    if planned == 0 && refresh_pairs.is_empty() {
         // 只有「登记组关系」，没有复制 → 完全不碰会话库，也不需要备份。
         if !adopts.is_empty() {
             for a in &adopts {
@@ -1458,6 +2031,10 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
     let mut done_files: Vec<PathBuf> = Vec::new();
     let mut copied: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
+    // 被内容同步覆盖过的正文 (目标正文, 覆盖前备份)，失败时逐份还原。
+    let mut done_bodies: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut refreshed: Vec<Value> = Vec::new();
+    let mut refresh_skipped: Vec<Value> = Vec::new();
     let mut per_target: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     let result = (|| -> Result<(), String> {
@@ -1481,6 +2058,7 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
                 dst,
                 items,
                 now,
+                &alive_keys,
                 &mut done_rows,
                 &mut done_files,
             )?;
@@ -1488,6 +2066,24 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
             *per_target.entry(dst.clone()).or_insert(0) += c.len();
             copied.extend(c);
             skipped.extend(s);
+        }
+        // 已关联副本的内容同步（纯追加）。
+        if !refresh_pairs.is_empty() {
+            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let dir = store_dir()
+                .join("backup")
+                .join(format!("wb_bodies_link_{stamp}"));
+            let target_uid = opt.target_uid.clone().unwrap_or_default();
+            let (r, rs) = refresh_linked_copies(
+                &conn,
+                &refresh_pairs,
+                &target_uid,
+                now,
+                &dir,
+                &mut done_bodies,
+            );
+            refreshed = r;
+            refresh_skipped = rs;
         }
         save_links(&store)?;
         Ok(())
@@ -1502,9 +2098,17 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
         for f in &done_files {
             let _ = std::fs::remove_file(f);
         }
+        // 内容同步也要回滚：把覆盖前的正文拷回去，否则「事务回滚了但文件已经变了」。
+        let mut restored = 0usize;
+        for (target, backup_body) in &done_bodies {
+            if std::fs::copy(backup_body, target).is_ok() {
+                restored += 1;
+            }
+        }
         return Err(format!(
-            "{e}（已回滚本次互通的 {} 条新记录，备份保留在 {}）",
+            "{e}（已回滚本次互通的 {} 条新记录、{} 份正文，备份保留在 {}）",
             rolled,
+            restored,
             backup.display()
         ));
     }
@@ -1522,9 +2126,15 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
         "copied": copied.len(),
         "adopted": adopts.len(),
         "planned": planned,
+        // 内容同步的两个数字：改了几份 / 为什么没改。界面必须分开报，
+        // 「0 份已同步」不能同时代表「本来就是最新」和「全都失败了」。
+        "refreshed": refreshed.len(),
+        "refreshRows": refreshed,
+        "refreshSkipped": refresh_skipped,
         "accounts": uids,
         "byTarget": by_target,
         "skipped": skipped.len(),
+        "skippedRows": skipped,
         "noBody": no_body,
         "alreadyThere": already_there,
         "backup": backup.to_string_lossy(),
@@ -1564,7 +2174,7 @@ pub fn link_all_preview() -> Value {
         Err(e) => return json!({ "ok": false, "error": e }),
     };
     let (plan, adopts, no_body, already_there) =
-        plan_links(&alive, &uids, &store, 0, workbuddy_source::find_jsonl);
+        plan_links(&alive, &uids, &store, 0, None, workbuddy_source::find_jsonl);
 
     let mut per_target: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
@@ -1842,7 +2452,7 @@ mod tests {
 
         let store = LinkStore::default();
         let (plan, adopts, no_body, already) =
-            plan_links(&alive, &uids, &store, 0, |_| Some(PathBuf::from("x.jsonl")));
+            plan_links(&alive, &uids, &store, 0, None, |_| Some(PathBuf::from("x.jsonl")));
 
         assert_eq!(no_body, 0);
         assert_eq!(already, 0);
@@ -1890,7 +2500,7 @@ mod tests {
             }],
         };
         let (plan, adopts, _, _) =
-            plan_links(&[&a1, &b1], &uids, &store, 0, |_| Some(PathBuf::from("x.jsonl")));
+            plan_links(&[&a1, &b1], &uids, &store, 0, None, |_| Some(PathBuf::from("x.jsonl")));
         assert!(plan.is_empty(), "两个账号都已在组里，不该再复制");
         assert!(adopts.is_empty());
     }
@@ -1900,8 +2510,183 @@ mod tests {
     fn link_plan_counts_sessions_without_body() {
         let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
         let a1 = ws("s-a1", "A", "t", "", 100);
-        let (plan, _, no_body, _) = plan_links(&[&a1], &uids, &LinkStore::default(), 0, |_| None);
+        let (plan, _, no_body, _) = plan_links(&[&a1], &uids, &LinkStore::default(), 0, None, |_| None);
         assert_eq!(no_body, 1);
         assert!(plan.is_empty());
+    }
+
+    // ── 切号勾选的默认值：同标题较旧副本不许默认勾 ──────────────────────────
+
+    /// 「组内最新」必须按**本账号**的更新时间判，不能用全局 `is_newest`。
+    ///
+    /// 真机场景：账号 e925618e / fbd4139a 的「每日 AI 新闻推送」一组 2～6 条，
+    /// 全局最新那份在别的账号里 ⇒ 组内全局标记全 false。若拿全局标记判「较旧」，
+    /// 整组都不默认勾选，用户会以为关联同步失效。
+    #[test]
+    fn newest_by_group_uses_local_time_not_global_flag() {
+        let rows = [
+            ("每日 ai 新闻推送", "a", 100),
+            ("每日 ai 新闻推送", "b", 300),
+            ("每日 ai 新闻推送", "c", 200),
+            ("", "x", 999), // 标题唯一：不参与分组
+        ];
+        let m = newest_by_group(&rows);
+        assert_eq!(m.get("每日 ai 新闻推送").map(String::as_str), Some("b"));
+        assert!(!m.contains_key(""), "空组键不是真实分组");
+        // 时间相同取先出现的（不抖动）
+        let tie = [("t", "first", 5), ("t", "second", 5)];
+        assert_eq!(newest_by_group(&tie).get("t").map(String::as_str), Some("first"));
+    }
+
+    /// 定时任务每次运行都建同名会话，一个号里能有 5 份「每日 AI 推送」。
+    ///
+    /// 判据必须落在 `default_checked()` 这一个出口上，否则「界面默认勾了 5 份」与
+    /// 「后端只同步 1 份」会各说一套 —— 用户看到的就是「切完号会话重复出现多次」。
+    #[test]
+    fn dup_older_copy_is_not_checked_by_default() {
+        // 已关联 + 有正文 + 最新 → 勾
+        assert!(default_checked(SwitchLinkState::Linked, true, false));
+        assert!(default_checked(SwitchLinkState::Missing, true, false));
+        assert!(default_checked(SwitchLinkState::Twin, true, false));
+        // 同组较旧 → 一律不勾（即使已关联），想同步由用户手动勾
+        assert!(!default_checked(SwitchLinkState::Linked, true, true));
+        assert!(!default_checked(SwitchLinkState::Twin, true, true));
+        // 没关联 / 没正文 → 本来就不勾
+        assert!(!default_checked(SwitchLinkState::Unlinked, true, false));
+        assert!(!default_checked(SwitchLinkState::Linked, false, false));
+    }
+
+    // ── 关联「断开」的两条判据 ───────────────────────────────────────────────
+
+    /// 组员的会话已经不在了（客户端清理 / 删库）⇒ 必须允许**重建**，否则这一组
+    /// 会永远卡在「关联断开」，谁也不会再去补。
+    #[test]
+    fn dead_member_allows_rebuild() {
+        let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let a1 = ws("s-a1", "A", "方案讨论", "aaa", 300);
+        let alive = vec![&a1];
+        // 关联组里记着 A→B，但那份副本 s-gone 已经不在库里了。
+        let store = LinkStore {
+            version: LINK_STORE_VERSION,
+            groups: vec![LinkGroup {
+                id: "g1".into(),
+                created_at: 1,
+                members: vec![
+                    LinkMember { uid: "A".into(), session_id: "s-a1".into(), linked_at: 1 },
+                    LinkMember { uid: "B".into(), session_id: "s-gone".into(), linked_at: 1 },
+                ],
+            }],
+        };
+        let (plan, adopts, _, _) =
+            plan_links(&alive, &uids, &store, 0, None, |_| Some(PathBuf::from("x.jsonl")));
+        assert!(adopts.is_empty());
+        assert_eq!(
+            plan.get(&("A".to_string(), "B".to_string())).map(|v| v.len()),
+            Some(1),
+            "死掉的成员不该挡住重建"
+        );
+    }
+
+    /// 成员还在（哪怕软删）：不复活，保持老语义「删除等于没删」。
+    #[test]
+    fn deleted_member_is_not_revived() {
+        let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let a1 = ws("s-a1", "A", "方案讨论", "aaa", 300);
+        let b1 = ws("s-b1", "B", "方案讨论", "aaa", 200);
+        let alive = vec![&a1, &b1];
+        let store = LinkStore {
+            version: LINK_STORE_VERSION,
+            groups: vec![LinkGroup {
+                id: "g1".into(),
+                created_at: 1,
+                members: vec![
+                    LinkMember { uid: "A".into(), session_id: "s-a1".into(), linked_at: 1 },
+                    LinkMember { uid: "B".into(), session_id: "s-b1".into(), linked_at: 1 },
+                ],
+            }],
+        };
+        let (plan, adopts, _, _) =
+            plan_links(&alive, &uids, &store, 0, None, |_| Some(PathBuf::from("x.jsonl")));
+        assert!(plan.is_empty() && adopts.is_empty(), "已有关联的组不该再动");
+    }
+
+    /// 勾选模式：只有被勾中的源会话参与，其余一个字节都不碰。
+    #[test]
+    fn only_sessions_limits_sources() {
+        let uids: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let a1 = ws("s-a1", "A", "勾中的", "aaa", 300);
+        let a2 = ws("s-a2", "A", "没勾的", "bbb", 200);
+        let alive = vec![&a1, &a2];
+        let mut sel = std::collections::HashSet::new();
+        sel.insert("s-a1".to_string());
+        let (plan, _, _, _) = plan_links(
+            &alive,
+            &uids,
+            &LinkStore::default(),
+            0,
+            Some(&sel),
+            |_| Some(PathBuf::from("x.jsonl")),
+        );
+        let items: Vec<&CopyItem> = plan.values().flatten().collect();
+        assert_eq!(items.len(), 1, "只有勾中的那一条");
+        assert_eq!(items[0].cid, "s-a1");
+    }
+
+    // ── 内容同步：只在「纯追加」时改写 ──────────────────────────────────────
+
+    fn write_lines(path: &Path, lines: &[&str]) {
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn body_relation_tells_identical_prefix_and_diverge() {
+        let dir = temp_dir("rel");
+        let src = dir.join("src.jsonl");
+        let tgt = dir.join("tgt.jsonl");
+
+        // 两份内容相同，但各自带自己的会话 id → 归一化后应当判 Identical。
+        write_lines(&src, &["{\"id\":\"SID-SRC\",\"t\":\"a\"}", "{\"t\":\"b\"}"]);
+        write_lines(&tgt, &["{\"id\":\"SID-TGT\",\"t\":\"a\"}", "{\"t\":\"b\"}"]);
+        assert_eq!(
+            body_relation(&src, "SID-SRC", &tgt, "SID-TGT").unwrap(),
+            BodyRelation::Identical
+        );
+
+        // 源多一行 → 目标是前缀，可安全追加。
+        write_lines(&src, &["l1", "l2", "l3"]);
+        write_lines(&tgt, &["l1", "l2"]);
+        assert_eq!(
+            body_relation(&src, "SID-SRC", &tgt, "SID-TGT").unwrap(),
+            BodyRelation::Prefix
+        );
+
+        // 目标里也有源没有的内容 → 有分歧，绝不能覆盖。
+        write_lines(&tgt, &["l1", "l2", "目标独有的"]);
+        assert_eq!(
+            body_relation(&src, "SID-SRC", &tgt, "SID-TGT").unwrap(),
+            BodyRelation::Diverge
+        );
+
+        // 中途不同也算分歧。
+        write_lines(&tgt, &["l1", "改了"]);
+        assert_eq!(
+            body_relation(&src, "SID-SRC", &tgt, "SID-TGT").unwrap(),
+            BodyRelation::Diverge
+        );
+    }
+
+    /// 改写后正文里的会话 id 必须换成目标 id（否则目标账号打开会串到源会话）。
+    #[test]
+    fn overwrite_body_rewrites_session_id() {
+        let dir = temp_dir("ovr");
+        let src = dir.join("src.jsonl");
+        let tgt = dir.join("tgt.jsonl");
+        write_lines(&src, &["{\"id\":\"SRC\"}", "{\"t\":\"next\"}"]);
+        write_lines(&tgt, &["{\"id\":\"TGT\"}"]);
+        let n = overwrite_body_from(&src, "SRC", &tgt, "TGT").unwrap();
+        assert_eq!(n, 2);
+        let text = std::fs::read_to_string(&tgt).unwrap();
+        assert!(text.contains("TGT") && !text.contains("SRC"), "{text}");
+        assert!(text.contains("next"));
     }
 }

@@ -349,6 +349,11 @@ fn status_of(g: &Group, _account_total: usize) -> &'static str {
     {
         return "diverged";
     }
+    // 「上次比对之后又有新内容」：结论只对那一份失效，全组算「待同步」（有待确认的改动），
+    // 不能因此退化成「无法确认」—— 用户刚比完、某账号说了句话就全组变灰，是 2026-10-30 的反馈。
+    if g.members.iter().any(|m| m.relation() == "stale") {
+        return "pending";
+    }
     // 追溯不到摘要 ⇒ 没做过逐行比对（标题被改 / 体积超限），只能说「不知道」。
     let comparable = !g.members.is_empty() && g.members.iter().all(|m| !m.digest().is_empty());
     if !comparable {
@@ -393,6 +398,7 @@ fn member_payload(m: &Member) -> Value {
                 "behind" => "落后于最新副本，可安全同步".to_string(),
                 "ahead" => "比其它副本多出内容（未包含关系）".to_string(),
                 "diverged" => "内容分叉，需要人工选择来源".to_string(),
+                "stale" => "上次比对之后这份有新内容，未重新比对".to_string(),
                 "no-body" => "正文文件不存在".to_string(),
                 "unknown" => "未做逐行比对".to_string(),
                 _ => String::new(),
@@ -415,8 +421,14 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
     // 不再进状态位，只作为 `missingAccounts` / `missingCount` 供「关联新账号」用。
     let missing_count = missing_accounts.len();
     let behind = g.members.iter().filter(|m| m.relation() == "behind").count();
+    // 「上次比对之后又有新内容」的成员数。⚠️ 它跟 `behind` 是两回事：
+    // 前者是「曾经比过、现在这份待重新确认」，后者是「确认过确实落后、可安全快进」。
+    // 界面必须分开说，否则会出现「有 0 个副本落后了，可以安全同步」这种自相矛盾的文案。
+    let stale = g.members.iter().filter(|m| m.relation() == "stale").count();
     let status_reason = if status == "pending" && behind > 0 {
         "behind"
+    } else if status == "pending" && stale > 0 {
+        "stale"
     } else {
         ""
     };
@@ -433,6 +445,7 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
         "statusText": status_text(status),
         "statusReason": status_reason,
         "behindCount": behind,
+        "staleCount": stale,
         "sourceSessionId": src,
         "canUnify": g.members.len() >= 2 && g.members.iter().filter(|m| m.has_body()).count() >= 1,
         "missingAccounts": missing_accounts,
@@ -1303,6 +1316,33 @@ mod tests {
         assert_eq!(p2["status"], "pending");
         assert_eq!(p2["statusReason"], "behind");
         assert_eq!(p2["behindCount"], 1);
+    }
+
+    /// 一份「上次比对之后又有新内容」⇒ 全组「待同步」，但**原因必须是 `stale`**。
+    ///
+    /// 锁的是 2026-10-30 的修复：以前任一份文件一变，整组结论全废（退回「无法确认」），
+    /// 用户只能再等一次十几秒的强制比对。现在只作废那一份。
+    /// `statusReason` 不能写成 `behind` —— 那会让界面冒出「有 0 个副本落后了」这种话。
+    #[test]
+    fn stale_member_is_pending_with_its_own_reason() {
+        let accounts = vec![
+            ("u1".to_string(), "甲".to_string()),
+            ("u2".to_string(), "乙".to_string()),
+            ("u3".to_string(), "丙".to_string()),
+        ];
+        let g = group(vec![
+            member("u1", "aaaa", "latest", true),
+            member("u2", "aaaa", "equal", true),
+            member("u3", "", "stale", true),
+        ]);
+        let p = group_payload(&g, &accounts);
+        assert_eq!(p["status"], "pending", "有副本待重新确认 ⇒ 不是「内容一致」");
+        assert_eq!(p["statusReason"], "stale");
+        assert_eq!(p["staleCount"], 1);
+        assert_eq!(p["behindCount"], 0, "不能把它说成「有副本落后」");
+        assert_eq!(p["statusText"], "待同步");
+        let re = p["members"][2]["reason"].as_str().unwrap_or("");
+        assert!(re.contains("新内容"), "成员备注要说明为什么：{re}");
     }
 
     #[test]

@@ -918,14 +918,62 @@ impl Report {
     }
 }
 
-/// 单行内容校验（前端每次改动都跑；**不读文件、不开库**）。
+/// 单行校验的完整结论（除错误/提醒外，还带着「两类历史形态」的标记）。
+///
+/// 为什么要这两个标记：全量校验里 90+ 行都缺 `sessionId`，逐条写 warning 会把界面刷成
+/// 一片红字；真正有用的是「共 N 行」这一句汇总。所以由调用方决定怎么聚合。
+#[derive(Debug, Default)]
+struct LineCheck {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    /// 该行**整行没有** `sessionId`（不是不匹配）。
+    missing_sid: bool,
+    /// 该行 `id` 不是 UUID 形态（如 `cmp_…`）。
+    odd_id: bool,
+}
+
+/// 单行内容校验（**严格版**：用户新增/改动的行必须完全合规）。
 ///
 /// `expect_session_id`：该行 `sessionId` 必须等于它（客户端按这个字段过滤事件）。
 pub fn check_line(line: &Value, expect_session_id: &str) -> (Vec<String>, Vec<String>) {
+    let c = check_line_detail(line, expect_session_id, true);
+    (c.errors, c.warnings)
+}
+
+/// 单行校验的实现，`strict` 决定两处「真实数据里本来就存在」的形态算不算错。
+///
+/// ⚠️ 为什么要分严格/宽松（2026-10-30 实测）：
+/// 某条真实会话的正文里有 90+ 行**本来就缺 `sessionId`**，还有 `id: "cmp_793f78ae-…"`
+/// 这种不是 UUID 的 id（WorkBuddy 自己的压缩/检查点事件）。早前写入前的全量校验拿严格
+/// 判据逐行卡，于是这条会话**永远存不了盘** —— 用户只是想改个标题，也被挡在
+/// 「必须修好才能写入（97）」上，等于编辑器对这批会话完全不可用。
+///
+/// 两类错误的性质完全不同：
+/// - `sessionId` **存在但不等于本会话** ⇒ 真危险（会把别的会话事件混进来）⇒ 永远 error；
+/// - `sessionId` **整行缺失** / `id` 非 UUID ⇒ 既有事实，客户端本来就这么存 ⇒ 宽松时只提醒。
+///
+/// 严格版仍用于「用户新增的行」与「前端改动校验」：新增行必须带齐字段，
+/// 否则就是我们把不合规的数据写进库。
+///
+/// ⚠️ 上面那几行**不要缩进超过 3 个空格**：Rust 会把 doc 注释里缩进 4+ 的行当成
+/// **Rust 代码块**去做 doctest 编译，中文自然编译不过（2026-10-31 `cargo test --workspace`
+/// 的 doc-test 就是这样失败的）。要展示缩进文本请用 ```text 包裹。
+fn check_line_with(
+    line: &Value,
+    expect_session_id: &str,
+    strict: bool,
+) -> (Vec<String>, Vec<String>) {
+    let c = check_line_detail(line, expect_session_id, strict);
+    (c.errors, c.warnings)
+}
+
+/// 校验实现本体；`strict` 只影响两类「历史形态」的定级（见上）。
+fn check_line_detail(line: &Value, expect_session_id: &str, strict: bool) -> LineCheck {
     let mut r = Report::default();
+    let mut out = LineCheck::default();
     let Some(o) = line.as_object() else {
-        r.err("该行必须是一个 JSON 对象");
-        return (r.errors, r.warnings);
+        out.errors.push("该行必须是一个 JSON 对象".to_string());
+        return out;
     };
     let ty = o.get("type").and_then(Value::as_str).unwrap_or("");
     if ty.is_empty() {
@@ -935,7 +983,14 @@ pub fn check_line(line: &Value, expect_session_id: &str) -> (Vec<String>, Vec<St
     }
     if let Some(id) = o.get("id").and_then(Value::as_str) {
         if !is_uuid_like(id) {
-            r.err(format!("id 不是 UUID 形态：{id}"));
+            out.odd_id = true;
+            let m = format!("id 不是 UUID 形态：{id}");
+            if strict {
+                r.err(m);
+            } else {
+                // 客户端自己能读（`cmp_` 开头的压缩事件就是这样），原样保留即可。
+                r.warn(format!("{m}（WorkBuddy 自己的事件 id，原样保留）"));
+            }
         }
     }
     match ty {
@@ -971,13 +1026,24 @@ pub fn check_line(line: &Value, expect_session_id: &str) -> (Vec<String>, Vec<St
         _ => {}
     }
     match o.get("sessionId").and_then(Value::as_str) {
-        None => r.err("该行缺少 sessionId（客户端靠它筛选本会话的事件）"),
+        None => {
+            out.missing_sid = true;
+            let m = "该行缺少 sessionId（客户端靠它筛选本会话的事件）";
+            if strict {
+                r.err(m);
+            } else {
+                r.warn(format!("{m}（WorkBuddy 原有事件本来就没带，原样保留）"));
+            }
+        }
+        // ⚠️ 这一条永远是 error：带着**别的**会话 id 的行混进来，客户端会把事件挂错会话。
         Some(s) if s != expect_session_id => r.err(format!(
             "该行的 sessionId 是 {s}，必须等于本会话 {expect_session_id}"
         )),
         _ => {}
     }
-    (r.errors, r.warnings)
+    out.errors = r.errors;
+    out.warnings = r.warnings;
+    out
 }
 
 /// 前端每次改动调用的分级校验（毫秒级）。
@@ -1018,7 +1084,10 @@ pub fn validate_submit(
                                 continue;
                             }
                         };
-                        let (e, w) = check_line(json, session_id);
+                        // `replace` 改的是**既有行**（字段来自原行，可能本来就缺 sessionId），
+                        // 用宽松判据；`insert` / `append` 是我们凭空加的新行，必须严格合规。
+                        let strict = kind != "replace";
+                        let (e, w) = check_line_with(json, session_id, strict);
                         for m in e {
                             r.err(m);
                         }
@@ -1179,6 +1248,9 @@ fn validate_full(lines: &[String], expect_session_id: &str) -> Report {
     let mut results: HashSet<String> = HashSet::new();
     let mut users = 0usize;
     let mut bad = 0usize;
+    // 两类「WorkBuddy 自己就这么存」的形态，只计数、最后汇总提醒（逐条刷屏没人看）。
+    let mut no_sid = 0usize;
+    let mut odd_id = 0usize;
 
     for (i, raw) in lines.iter().enumerate() {
         if raw.trim().is_empty() {
@@ -1191,9 +1263,24 @@ fn validate_full(lines: &[String], expect_session_id: &str) -> Report {
             bad += 1;
             continue;
         };
-        let (e, _) = check_line(&v, expect_session_id);
-        for m in e {
+        // ⚠️ 这里**必须用宽松判据**：既有行原样带回时不能因为「WorkBuddy 自己就没写
+        //    sessionId / id 不是 UUID」而拒绝整份写入 —— 那等于这类会话永远存不了盘。
+        //    用户新增行的合规性由 `validate_submit`（严格版）在改动时就卡住。
+        let c = check_line_detail(&v, expect_session_id, false);
+        for m in c.errors {
             r.err(format!("第 {i} 行：{m}"));
+        }
+        if c.missing_sid {
+            no_sid += 1;
+        }
+        if c.odd_id {
+            odd_id += 1;
+        }
+        for m in c.warnings {
+            // 这两类已在上面计数汇总，不再逐行重复。
+            if !m.contains("缺少 sessionId") && !m.contains("不是 UUID 形态") {
+                r.warn(format!("第 {i} 行：{m}"));
+            }
         }
         let kind = classify_line(raw).map(|c| c.kind).unwrap_or_default();
         if kind == "user" {
@@ -1221,6 +1308,17 @@ fn validate_full(lines: &[String], expect_session_id: &str) -> Report {
 
     if users == 0 {
         r.err("整份正文里没有任何用户提问，客户端会显示成空白会话");
+    }
+    // 两类历史形态汇总成两句 —— 让用户知道「这 97 条不是我们的错，也不影响保存」。
+    if no_sid > 0 {
+        r.warn(format!(
+            "有 {no_sid} 行本来就没有 sessionId（WorkBuddy 自己写的；客户端按会话过滤时会跳过它们，原样保留即可）"
+        ));
+    }
+    if odd_id > 0 {
+        r.warn(format!(
+            "有 {odd_id} 行的事件 id 不是 UUID 形态（如 cmp_… 的压缩/检查点事件，客户端认，原样保留即可）"
+        ));
     }
     for (i, p) in &parents {
         if !ids.contains(p) {
@@ -1360,7 +1458,73 @@ fn update_row(
 /// - `ops`：行改动（见 [`apply_ops`]）
 /// - `row_patch`：`sessions` 列改动
 /// - `target_uid`：只在 `insert` 时可用；写入另一个账号
+/// 写入目标账号（`insert` 可指定别的账号；覆写恒等于源账号）。
+fn dest_uid_of(uid: &str, mode: &str, target_uid: Option<&str>) -> String {
+    match (mode, target_uid) {
+        ("insert", Some(t)) if !t.is_empty() => t.to_string(),
+        _ => uid.to_string(),
+    }
+}
+
+/// 写回会话（**外层**：占用门禁 + 自动退出客户端 + 写完自动拉回来）。
+///
+/// `close_client` 来自界面确认框里用户点的那一下：
+/// - `false` 且客户端正占着这个号 ⇒ 返回 `{ok:false, code:"clientRunning"}`（**正常返回**，
+///   让界面弹「要不要我来退出它再写」，而不是让用户自己去关）；
+/// - `true` ⇒ 由本工具退出 WorkBuddy → 写入 → **无论成败都重新打开**（谁关的谁负责开）。
+///
+/// ⚠️ 关客户端属于破坏性动作，只走用户点过确认的这条路；`copy_sessions` 也是同样的口径。
 pub fn edit_save(
+    uid: &str,
+    cid: &str,
+    mode: &str,
+    ops: &Value,
+    row_patch: &Value,
+    target_uid: Option<&str>,
+    close_client: bool,
+    progress: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let say = |m: &str| {
+        if let Some(f) = progress {
+            f(m);
+        }
+    };
+    let dest_uid = dest_uid_of(uid, mode, target_uid);
+    // 客户端在跑、且它登录的正是要写的这个号 ⇒ 它内存里有一份会话，写盘会被它覆盖回去。
+    let occupied = workbuddy_switch::is_running()
+        && workbuddy_auth::current_uid().as_deref() == Some(dest_uid.as_str());
+    if occupied && !close_client {
+        return Ok(json!({
+            "ok": false,
+            "code": "clientRunning",
+            "stage": wbs::TARGET_IN_USE,
+        }));
+    }
+    let stopped = if occupied {
+        say("WorkBuddy 正在使用这个账号，先退出它再写入（写完自动重新打开）…");
+        crate::modules::workbuddy_session_groups::ensure_closed(true)?
+    } else {
+        false
+    };
+
+    let outcome = edit_save_inner(uid, cid, mode, ops, row_patch, target_uid, progress);
+
+    // ⚠️ 重启必须放在 `?` **之前**：中途任何一处失败都不能把客户端关在外面没人管。
+    let (relaunched, restart_err) =
+        crate::modules::workbuddy_session_groups::restart_client(stopped);
+    let mut out = outcome?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("clientStopped".into(), json!(stopped));
+        o.insert("clientRelaunched".into(), json!(relaunched));
+        if let Some(e) = restart_err {
+            o.insert("restartError".into(), json!(e));
+        }
+    }
+    Ok(out)
+}
+
+/// 真正的写入流程（不碰客户端进程）。
+fn edit_save_inner(
     uid: &str,
     cid: &str,
     mode: &str,
@@ -1386,10 +1550,7 @@ pub fn edit_save(
                 .to_string(),
         );
     }
-    let dest_uid = match (mode, target_uid) {
-        ("insert", Some(t)) if !t.is_empty() => t.to_string(),
-        _ => uid.to_string(),
-    };
+    let dest_uid = dest_uid_of(uid, mode, target_uid);
 
     // 1) 只读校验归属
     let all = workbuddy_source::list_sessions()?;
@@ -1419,12 +1580,8 @@ pub fn edit_save(
         }
     }
 
-    // 2) 占用门禁（同 `copy_sessions`）
-    if workbuddy_switch::is_running()
-        && workbuddy_auth::current_uid().as_deref() == Some(dest_uid.as_str())
-    {
-        return Err(wbs::TARGET_IN_USE.to_string());
-    }
+    // 2) 占用门禁在外层 [`edit_save`] 处理（那里才能安全地「关客户端 → 写完再开回来」），
+    //    内层假设调用方已经把客户端退出。
 
     // 3) 读原文 + 应用 ops
     let (src_path, lines) = read_body_lines(cid)?;
@@ -1581,6 +1738,39 @@ mod tests {
             r#"{"type":"b","n":1}"#.to_string(),
             r#"{"type":"c"}"#.to_string(),
         ]
+    }
+
+    /// 既有行原样保留时不能被「缺 sessionId / id 非 UUID」卡住（否则整条会话永远存不了盘）。
+    ///
+    /// 用户 2026-10-30 的实际场景：某会话里有 90+ 行 WorkBuddy 自己就没写 `sessionId`，
+    /// 还有 `id: cmp_793f78ae-…` 这种压缩事件 id，于是「必须修好才能写入（97）」，
+    /// 连只改标题都保存不了。
+    #[test]
+    fn legacy_session_lines_pass_lenient_but_not_strict() {
+        let legacy = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}],
+            "id": "cmp_793f78ae-0b94-4545-9991-963fc2b8abbf",
+        });
+        // 宽松（写入前全量兜底 / replace 既有行）：放行，但两条都记成提醒
+        let (e, w) = check_line_with(&legacy, "sid-1", false);
+        assert!(e.is_empty(), "既有行不该拦：{e:?}");
+        assert!(w.iter().any(|m| m.contains("缺少 sessionId")), "要提醒：{w:?}");
+        assert!(w.iter().any(|m| m.contains("不是 UUID")), "要提醒：{w:?}");
+        // 严格（用户新增/追加的行）：必须挡住
+        let (e2, _) = check_line(&legacy, "sid-1");
+        assert_eq!(e2.len(), 2, "新增行缺字段必须报错：{e2:?}");
+        // 带着**别的**会话 id：宽松也一律 error（会把事件挂错会话）
+        let other = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [],
+            "sessionId": "sid-other",
+        });
+        let (e3, _) = check_line_with(&other, "sid-1", false);
+        assert_eq!(e3.len(), 1);
+        assert!(e3[0].contains("必须等于本会话"), "{e3:?}");
     }
 
     #[test]
@@ -1887,6 +2077,12 @@ mod tests {
         assert!(!r.errors.is_empty());
     }
 
+    /// 缺 `sessionId` 的既有行：**只提醒、不拦写入**。
+    ///
+    /// 这条断言在 2026-10-30 反转过：原来是「必须报错」。实测 WorkBuddy 自己的正文里就有
+    /// 大量不带 `sessionId` 的事件行，一旦计入 error，这类会话连「只改标题」都存不了盘
+    /// （界面：「必须修好才能写入（97）」）。所以全量校验降级为 warning，
+    /// 严格拦截只留给「用户新增的行」与「带着别的会话 id 的行」。
     #[test]
     fn full_validation_reports_missing_session_id() {
         let ls = vec![
@@ -1894,7 +2090,12 @@ mod tests {
             r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}"#.to_string(),
         ];
         let r = validate_full(&ls, "s");
-        assert!(r.errors.iter().any(|e| e.contains("sessionId")));
+        assert!(
+            r.errors.is_empty(),
+            "既有行缺 sessionId 不该阻断保存：{:?}",
+            r.errors
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("sessionId")), "{:?}", r.warnings);
     }
 
     #[test]

@@ -48,6 +48,7 @@ import type {
   TraeEditTargets,
   TraeSwitchResult,
   TraeLinksPreview,
+  TraeLinkOverview,
   TraeDivergedLinks,
   TraeVaultMeta,
   TraeWbCleanupReport,
@@ -60,6 +61,8 @@ import type {
   WorkbuddyAccountList,
   WorkbuddySwitchPrecheck,
   WorkbuddySwitchResult,
+  WorkbuddySwitchSessionPlan,
+  WorkbuddySwitchSessionSelection,
   WorkbuddyOAuthStart,
   WorkbuddyOAuthPoll,
   WorkbuddyImportPreview,
@@ -169,9 +172,30 @@ export function traeBackupAccount(
   return call("trae_backup_account", { clientKey, accountId });
 }
 
-/** 切换到账号库中的某账号（冷切换：终止进程 → 还原载体 → 重启 → daemon 判定）。 */
-export function traeSwitchTo(clientKey: string, accountId: string): Promise<TraeSwitchResult> {
-  return call("trae_switch_to", { clientKey, accountId });
+/**
+ * 切换到账号库中的某账号（冷切换：终止进程 → 还原载体 → 重启 → daemon 判定）。
+ *
+ * `copySessions.items`：切号时**顺带处理**的会话，每项带处理方式：
+ * - `sync` = **就地同步**已关联副本（原会话 id 不变，客户端里不会多出新对话）；
+ * - `copy` = 新建副本（只有未关联的会话才这么做）；
+ * - `link` = 只登记关联（目标已有同内容副本，不重复写）。
+ *
+ * 处理在写登录态之前完成（那时进程已停、库空闲），所以全程只重启一次客户端。
+ */
+export function traeSwitchTo(
+  clientKey: string,
+  accountId: string,
+  copySessions?: {
+    sourceUid: string;
+    items: {
+      sessionId: string;
+      mode: "sync" | "copy" | "link";
+      groupId?: string | null;
+      direction?: string | null;
+    }[];
+  },
+): Promise<TraeSwitchResult> {
+  return call("trae_switch_to", { clientKey, accountId, copySessions });
 }
 
 /** 回滚到某账号（本质是切回它，用于切换异常后的恢复）。 */
@@ -321,6 +345,26 @@ export function traeSessionEditDoc(
   sessionId: string,
 ): Promise<TraeEditDoc> {
   return call("trae_session_edit_doc", { clientKey, sessionId });
+}
+
+/**
+ * 「关联会话」页的「查看内容」：按会话 id 取角色 + 正文的回合列表（**只读**）。
+ *
+ * 不需要先切到目标账号 —— Trae 多账号共用一个库，只要库能解，
+ * 任何账号（包括当前没登录的）副本都能读到。
+ */
+export function traeSessionTurns(
+  clientKey: string,
+  sessionId: string,
+): Promise<{
+  ok: boolean;
+  sessionId: string;
+  title: string;
+  updated: string;
+  count: number;
+  turns: { role: string; text: string; tools: string[] }[];
+}> {
+  return call("trae_session_turns", { clientKey, sessionId });
 }
 
 /**
@@ -557,6 +601,91 @@ export function traeHealSessionProjects(clientKey: string): Promise<{
 }
 
 /**
+ * 自愈：把关联表里写成「本工具内部 id」的成员 uid 规范化成真实 uid，
+ * 并合并「同一组里同一账号被拆成两条」的脏数据。
+ *
+ * 只改关联表，**不碰会话数据**，不需要结束客户端。修完之后「关联状态」
+ * 才能按真实 uid 正确匹配（否则已关联的会话会被判成「未关联」，
+ * 界面就只会提示「新建副本」——表现为「每切一次号多一个新对话」）。
+ */
+export function traeNormalizeLinkStore(clientKey: string): Promise<{
+  ok: boolean;
+  renamed: number;
+  merged: number;
+  droppedGroups: number;
+  groups: number;
+}> {
+  return call("trae_normalize_link_store", { clientKey });
+}
+
+/**
+ * 自愈：把写成「本工具内部 id」的 `project.user_id` 改回真实 uid。
+ *
+ * 修的是「会话在库里存在、客户端里一条都看不到」这个症状：
+ * 客户端按**真实 uid**（如 `925158341882023`）取会话，而错位数据里写的是
+ * 本工具账号库的内部 id（如 `oauth_882023`）。
+ *
+ * ⚠️ 会写库（结束客户端 → 备份 → 增量回写 → 重启），耗时几十秒。
+ */
+export function traeHealProjectUid(clientKey: string): Promise<{
+  checked: boolean;
+  fixed: number;
+  sessions: string[];
+  backup?: string | null;
+  backup_mode?: string;
+  relaunched?: boolean;
+  note: string;
+}> {
+  return call("trae_heal_project_uid", { clientKey });
+}
+
+/**
+ * 切号弹窗用：列出**当前账号**的全部会话 + 每一条与目标账号的关联状态（只读）。
+ *
+ * 与 WorkBuddy 的 `workbuddySwitchSessionPlan` 同名同义、同一套四态口径：
+ * `linked` 已关联 / `missing` 关联断开 / `twin` 目标已有同内容副本 / `unlinked` 未关联。
+ */
+export function traeSwitchSessionPlan(
+  clientKey: string,
+  sourceUid: string,
+  targetUid: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  counts?: {
+    total: number;
+    linked: number;
+    missing: number;
+    twin: number;
+    unlinked: number;
+    checked: number;
+  };
+  sessions?: {
+    sessionId: string;
+    title: string;
+    workspace: string;
+    workspacePath: string;
+    messages: number;
+    updated: string;
+    state: "linked" | "missing" | "twin" | "unlinked";
+    stateText: string;
+    defaultChecked: boolean;
+    targetSessionId: string | null;
+    /** 关联组 id（`syncMode == "sync"` 时后端要用它）。 */
+    groupId: string | null;
+    /** 处理方式：`sync` 就地同步 / `copy` 新建副本 / `link` 只登记关联。 */
+    syncMode: "sync" | "copy" | "link";
+    /** 同步方向（`syncMode == "sync"` 时给出，目前恒为 `to_target`）。 */
+    direction: string | null;
+    /** 目标那份比源新（同步会覆盖用户可能更想留的那一份）。 */
+    targetAhead: boolean;
+    disabled: boolean;
+  }[];
+}> {
+  return call("trae_switch_session_plan", { clientKey, sourceUid, targetUid });
+}
+
+/**
  * 同客户端下两个账号之间的会话副本关联（只读）。
  *
  * 会读一次已解密库判定副本存活；`client_key` 是 Trae 客户端键（如 `trae-cn`）。
@@ -569,11 +698,40 @@ export function traeSessionLinksPreview(
   return call("trae_session_links_preview", { clientKey, sourceUid, targetUid });
 }
 
+/**
+ * 「关联会话」页签：该客户端下**全部账号**的副本矩阵（含哪些账号还缺这份副本）。
+ *
+ * 与 `traeSessionLinksPreview` 的区别：那个固定一对账号、只回两端；这个把组里所有成员
+ * 摆出来，界面才能画成矩阵并给「补齐到某账号」。只读。
+ */
+export function traeSessionLinksOverview(clientKey: string): Promise<TraeLinkOverview> {
+  return call("trae_session_links_overview", { clientKey });
+}
+
 /** 解除一个关联组（只删本工具的关联记录，不动任何会话数据）。 */
 export function traeSessionUnlink(
   groupId: string,
 ): Promise<{ ok: boolean; remaining: number }> {
   return call("trae_session_unlink", { groupId });
+}
+
+/**
+ * 把一个账号从关联组里拆出去（只删这条关联记录，会话数据一个字不动）。
+ *
+ * 与 WorkBuddy 的 `workbuddySessionGroupUnlinkMembers` 同名同义。
+ * 组里剩不到 2 份时后端会**整组删掉**（只剩一份的「关联组」没有意义），
+ * 返回值里的 `groupRemoved` 就是这件事，界面据此说清「整组已解散」。
+ */
+export function traeSessionUnlinkMember(
+  groupId: string,
+  uid: string,
+  clientKey: string,
+): Promise<{
+  ok: boolean;
+  remainingMembers: number;
+  groupRemoved: boolean;
+}> {
+  return call("trae_session_unlink_member", { groupId, uid, clientKey });
 }
 
 /**
@@ -1021,6 +1179,55 @@ export function traeCleanupScan(force = false): Promise<TraeCleanupScan> {
 }
 
 /**
+ * 「重置 Trae 登录态」预览（只读）：会动哪些文件、多大、当前登录是谁。
+ *
+ * 用于**动手前列清单**给用户确认 —— 这是删客户端登录态的操作，不能点一下就执行。
+ */
+export function traeResetLoginPreview(clientKey: string): Promise<{
+  ok: boolean;
+  error?: string;
+  clientKey?: string;
+  clientLabel?: string;
+  rootDir?: string;
+  running?: boolean;
+  storagePath?: string;
+  authKeys?: string[];
+  liveUid?: string | null;
+  liveLabel?: string | null;
+  entries?: { rel: string; kind: string; bytes: number; files: number; leveldb: boolean; action: string }[];
+  totalBytes?: number;
+  backupRoot?: string;
+}> {
+  return call("trae_reset_login_preview", { clientKey });
+}
+
+/**
+ * 重置 Trae 客户端登录态：停客户端 → 备份 → 删 `storage.json` 里的 `iCubeAuthInfo*` 键
+ * （可选连 `Local Storage/leveldb` 一起清）→ 需要时重新打开。
+ *
+ * ⚠️ 只清**客户端侧**登录载体：本工具的账号档案、会话数据一条不动，清完照样能切回原账号。
+ */
+export function traeResetLoginState(
+  clientKey: string,
+  includeLeveldb: boolean,
+  relaunch: boolean,
+): Promise<{
+  ok: boolean;
+  clientKey?: string;
+  clientLabel?: string;
+  removedKeys?: string[];
+  removedDirs?: string[];
+  backupDir?: string;
+  backedFiles?: number;
+  clientStopped?: boolean;
+  clientRelaunched?: boolean;
+  relaunchError?: string | null;
+  note?: string;
+}> {
+  return call("trae_reset_login_state", { clientKey, includeLeveldb, relaunch });
+}
+
+/**
  * 账号库积分的**离线快照**：只读各账号的 profile.json，不联网、毫秒级。
  * 首屏先拿它渲染。
  */
@@ -1108,8 +1315,22 @@ export function workbuddySwitchPrecheck(accountId: string): Promise<WorkbuddySwi
   return call("workbuddy_switch_precheck", { accountId });
 }
 
-export function workbuddySwitchTo(accountId: string, relaunch: boolean): Promise<WorkbuddySwitchResult> {
-  return call("workbuddy_switch_to", { accountId, relaunch });
+export function workbuddySwitchTo(
+  accountId: string,
+  relaunch: boolean,
+  sessions?: WorkbuddySwitchSessionSelection,
+): Promise<WorkbuddySwitchResult> {
+  return call("workbuddy_switch_to", { accountId, relaunch, sessions });
+}
+
+/**
+ * 切号弹窗用：列出**当前账号**的全部会话 + 每一条与目标账号的关联状态。
+ *
+ * 只读。已关联的 `defaultChecked = true`（默认勾选），没关联的默认不勾，
+ * 由用户主动新增 —— 这就是「勾选决定同步什么」的唯一数据源。
+ */
+export function workbuddySwitchSessionPlan(targetUid: string): Promise<WorkbuddySwitchSessionPlan> {
+  return call("workbuddy_switch_session_plan", { targetUid });
 }
 
 export function workbuddyRollback(): Promise<{ ok: boolean; uid: string | null; restoredFrom: string }> {
@@ -1474,6 +1695,9 @@ export function workbuddySessionEditValidate(
  *
  * ⚠️ 后端把「写入前的全量校验」错误以 `ok=false` + `errors` **正常返回**（不是抛错），
  * 所以这里能拿到明细并展示。
+ *
+ * `closeClient`：用户点了「退出并保存」才传 `true` —— 后端会先退出 WorkBuddy、写完
+ * **自动重新打开**。不传时若客户端正占着这个号，后端只回 `code: "clientRunning"` 不写盘。
  */
 export function workbuddySessionEditSave(
   uid: string,
@@ -1482,8 +1706,17 @@ export function workbuddySessionEditSave(
   ops: WbEditOp[],
   rowPatch: Record<string, unknown>,
   targetUid?: string,
+  closeClient?: boolean,
 ): Promise<WbEditSaveResult> {
-  return call("workbuddy_session_edit_save", { uid, cid, mode, ops, rowPatch, targetUid });
+  return call("workbuddy_session_edit_save", {
+    uid,
+    cid,
+    mode,
+    ops,
+    rowPatch,
+    targetUid,
+    closeClient,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,6 +1856,82 @@ export async function gatewayPricing(): Promise<{
 
 export async function gatewayModelsGet(): Promise<unknown> {
   return invoke("gateway_models_get");
+}
+
+/**
+ * 模型清单概览。三段的分工**不能搞混**（搞混就会「模型莫名消失」）：
+ *
+ * - `defaults`：**只有** GitHub 同步会整段覆盖（权威清单）
+ * - `local`：本机识别到的，只做并集、**永不整段覆盖**（GitHub 没有的模型放这里）
+ * - `user`：手动添加的，任何自动更新都不碰
+ */
+export function gatewayModelsCatalog(): Promise<{
+  ok: boolean;
+  version: number;
+  source: string;
+  updatedAt: string;
+  remoteUrl: string;
+  /** 备用镜像源（主源不通时自动退到这里，第一个是主源本身）。 */
+  remoteMirrors?: string[];
+  path: string;
+  defaults: Record<string, string[]>;
+  local: Record<string, string[]>;
+  user: Record<string, string[]>;
+  effective: Record<string, string[]>;
+  defaultCount: number;
+  /** 「仅本机」的模型数（GitHub 清单里没有的）。 */
+  localCount?: number;
+  userCount: number;
+}> {
+  return invoke("gateway_models_catalog");
+}
+
+/** 手动添加一个模型（写进 `user` 段）。 */
+export function gatewayModelsAddUser(
+  scope: string,
+  model: string,
+): Promise<Awaited<ReturnType<typeof gatewayModelsCatalog>>> {
+  return invoke("gateway_models_add_user", { scope, model });
+}
+
+/** 删除手动添加的模型（默认段由 GitHub 同步管，这里删不了）。 */
+export function gatewayModelsRemoveUser(
+  scope: string,
+  model: string,
+): Promise<Awaited<ReturnType<typeof gatewayModelsCatalog>>> {
+  return invoke("gateway_models_remove_user", { scope, model });
+}
+
+/**
+ * 删除一个「仅本机」的模型（`local` 段）。
+ *
+ * 本机识别只增不减（某个产品今天没登录，它的模型不该因此消失），
+ * 所以清理只能靠用户手动点。下次识别若又扫到，会再加回来 —— 那是正确行为。
+ */
+export function gatewayModelsRemoveLocal(
+  scope: string,
+  model: string,
+): Promise<Awaited<ReturnType<typeof gatewayModelsCatalog>>> {
+  return invoke("gateway_models_remove_local", { scope, model });
+}
+
+/**
+ * 从 GitHub 拉模型清单，覆盖 `defaults`（`user` 段原样保留）。
+ *
+ * 失败时不写任何东西 —— 本地清单继续可用，界面把原因照实说出来。
+ */
+export function gatewayModelsSyncRemote(): Promise<{
+  ok: boolean;
+  source?: string;
+  url?: string;
+  scopes?: number;
+  models?: number;
+  updatedAt?: string;
+  userKept?: number;
+  /** 主源不通、退到镜像源时为 true（界面要说明，别让用户以为主源也通了）。 */
+  mirrored?: boolean;
+}> {
+  return invoke("gateway_models_sync_remote");
 }
 
 export async function gatewayModelsSet(value: unknown): Promise<void> {

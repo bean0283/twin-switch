@@ -418,6 +418,45 @@ pub async fn restart(port: u16) -> Result<(), String> {
     serve(port).await
 }
 
+/// 启动时的 `serve`：**端口暂时被占就退避重试**，直到起来或预算用完。
+///
+/// ⚠️⚠️ 2026-10-30 用户反馈「更新软件后网关经常没自动重启，要再重启一次软件才行」。
+/// 根因：自动更新是「装新版本 → 拉起新进程 → 旧进程才退出」，端口 57892 在这几秒里
+/// 仍被**旧进程**占着（Windows 上即使旧进程已退出，TIME_WAIT/句柄释放也可能滞后）。
+/// 原来启动只 `serve` 一次，绑不上就只打一行日志、**永不重试** —— 界面就一直显示「未启动」。
+///
+/// 退避序列约 21 秒（0.2/0.5/1/2/4/6/8 秒累加）。只在启动路径用：用户手动开关走
+/// [`restart`]，那是「立刻要给结果」的交互，不适合静默等 20 秒。
+pub async fn serve_with_retry(port: u16) -> Result<(), String> {
+    const BACKOFF_MS: [u64; 7] = [200, 500, 1000, 2000, 4000, 6000, 8000];
+    let mut last = String::new();
+    for (i, wait) in BACKOFF_MS.iter().enumerate() {
+        match serve(port).await {
+            Ok(()) => {
+                if i > 0 {
+                    eprintln!("[gateway] 第 {} 次尝试绑定成功（前 {} 次被占用）", i + 1, i);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last = e;
+                // 已经有人在监听（`serve` 幂等返回 Ok）不算失败，上面那个分支已处理。
+                // 这里只可能是「端口被别人占着 / 被安全软件拦」，值得等一会儿再试。
+                eprintln!(
+                    "[gateway] 绑定失败（第 {} 次，{} ms 后重试）：{}",
+                    i + 1,
+                    wait,
+                    last
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(*wait)).await;
+            }
+        }
+    }
+    let msg = format!("{last}（已重试 {} 次仍未成功，可在页面上点刷新或重新开关积分共享）", BACKOFF_MS.len());
+    set_last_error(Some(msg.clone()));
+    Err(msg)
+}
+
 /// 绑定地址：**局域网开关关着就只绑回环**（默认），开着才绑全网卡。
 ///
 /// 单独抽成函数是为了能被单测钉住 —— 这条判据错了，等于把额度借给整个局域网。
@@ -3301,6 +3340,30 @@ fn token_of(scope: &str) -> Option<String> {
     }
 }
 
+/// 网关测试的**全局串行锁**（跨 `mod tests` / `mod selftest_probe` 共用）。
+///
+/// ⚠️⚠️ 为什么必须是 crate 级、而不是某个测试模块里的私有锁：
+///
+/// 网关有若干个**进程级全局静态**（`STARTED_AT` / `LAN_ACTIVE` / `LAST_ERROR`），
+/// 会写它们的测试散在不同模块里：
+/// - `startup_retry_survives_a_temporarily_taken_port`（会把 `STARTED_AT` 置起来）
+/// - `status_reports_not_running_before_start`（断言 `STARTED_AT == 0`）
+/// - `lan_guard_lets_loopback_through`（临时改 `LAN_ACTIVE`）
+///
+/// 这些用例**并行跑必然互相干扰**：前者绑上端口后 `STARTED_AT > 0`，
+/// 后者就断言失败（2026-10-31 实测：`cargo test --workspace` 连跑 5 轮稳定失败，
+/// 单独跑 `-p wb-switch-core --lib` 却全绿 —— 就是并行调度把两条撞在一起）。
+///
+/// 锁放模块私有的时候，另一个模块的测试**根本拿不到它**（编译期 `E0425`），
+/// 所以必须提到 crate 级。
+#[cfg(test)]
+fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3448,10 +3511,7 @@ mod tests {
 
     /// 会改全局 `LAN_ACTIVE` 的测试必须串行（否则并行跑 `status()` 的用例会看到中间态）。
     fn lan_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        L.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        global_test_lock()
     }
 
     /// 局域网模式下**本机来源必须放行**：这条一旦坏了，本机所有客户端都会被 401 打死。
@@ -3710,6 +3770,69 @@ mod tool_call_tests {
         assert_eq!(finish_with_calls(None, true), "tool_calls");
         assert_eq!(finish_with_calls(Some("stop".into()), false), "stop");
         assert_eq!(finish_with_calls(Some("length".into()), true), "length");
+    }
+
+    /// 启动重试：端口被占时 `serve_with_retry` 必须真的**再试**，不能试一次就放弃。
+    ///
+    /// 锁的是 2026-10-30 的反馈「更新后网关经常没自动重启，要再重启一次软件」：
+    /// 自动更新时旧进程还占着 57892，只试一次的 `serve` 必然失败，之后没人再拉它。
+    ///
+    /// ⚠️ 判据只能是「端口最终被自己人监听」：`serve` 绑上之后就**永久阻塞**（等 shutdown），
+    /// 所以任务永远不会「完成」，不能靠 `timeout(task)` 判成功。
+    #[tokio::test]
+    async fn startup_retry_survives_a_temporarily_taken_port() {
+        // ⚠️ 与 `status_reports_not_running_before_start` 串行：两者都读/写进程内的
+        // `STARTED_AT` 全局静态。这条测试会把 `STARTED_AT` 置起来，如果并行跑，
+        // 「启动前不该是 running」那条就会偶发失败（2026-10-31 实测 5 轮稳定复现）。
+        let _guard = super::global_test_lock();
+        // 拿一个空闲端口（绑定到 0 让系统给），然后**立刻释放**，再自己占住它。
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 占住（模拟「旧进程还没退出」）
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(async move { serve_with_retry(port).await });
+
+        // 让它先撞几次墙（前两次退避合计 700ms）
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        assert!(
+            !task.is_finished(),
+            "端口被占时不许立刻放弃 —— 那正是用户看到「未启动」的原因"
+        );
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "占位者还在，此时连上的应该是它（说明端口确实被占）"
+        );
+
+        // 旧进程退出
+        drop(squatter);
+
+        // 后面还有 1s/2s/4s 的退避，够它绑上（不 await 任务，只探端口）
+        let mut waited = 0u64;
+        let mut bound = false;
+        while waited < 9000 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited += 100;
+            // 能连上 ⇒ 有人监听。占位者已 drop，所以连上的只能是网关自己。
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                bound = true;
+                break;
+            }
+        }
+        assert!(bound, "释放端口后必须退避重试并绑成功（等了 {waited} ms）");
+        assert!(
+            STARTED_AT.load(Ordering::Relaxed) > 0,
+            "绑上之后必须把 STARTED_AT 置起来，否则界面永远显示未启动"
+        );
+
+        // 收尾：别把监听留在测试进程里（后面还有别的测试可能用端口）
+        request_stop();
+        let _ = wait_stopped(3000).await;
+        let _ = task.await;
     }
 }
 

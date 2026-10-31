@@ -1383,6 +1383,61 @@ pub struct ExportMeta {
     pub chars: usize,
 }
 
+/// 只读预览：按会话 id 取「角色 + 正文」的回合列表（**不写库、不改任何东西**）。
+///
+/// 用途是「关联会话」页的「查看内容」—— 用户要确认某个账号的副本到底聊了什么，
+/// 才好决定「以此为准」拿哪一份。
+///
+/// 为什么按会话 id 就够、不需要先切到那个账号：**Trae 的多账号共用一个库**，
+/// 归属只体现在 `project.user_id` 上。所以只要这个库能解密，任何账号（包括当前
+/// 没登录的）的副本都能读出来 —— 这正是用户 2026-10-31 要求的「没登录的账号也应当
+/// 可以后台尝试解密」。
+///
+/// ⚠️ 读之前先 `ensure_decrypted`：刚复制完的会话如果快照还是旧的，这里会读到
+/// 空列表，界面就会误报「没有内容」（与关联页那个「内容缺失」是同一个根因）。
+pub fn session_turns(client_key: &str, session_id: &str) -> Result<Value, String> {
+    if !is_session_id(session_id) {
+        return Err("会话 ID 格式不正确，应为 20~24 位十六进制".into());
+    }
+    // 快照过期时先刷新（失败不阻断：没存密钥/库被占用时照旧读旧快照，
+    // 读不到就是空列表，由界面照实说「读不到」，不猜）。
+    let _ = ensure_decrypted(client_key, None);
+    let conn = open_decrypted(client_key)?;
+    let meta = conn
+        .query_row(
+            "SELECT session_title, ifnull(updated_at, created_at) FROM chat_session \
+             WHERE session_id=?",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, rusqlite::types::Value>(1)?,
+                ))
+            },
+        )
+        .ok();
+    let turns = fetch_conversation(&conn, session_id)?;
+    let (title, updated) = match meta {
+        Some((t, u)) => (t, format_ts(&u)),
+        None => (String::new(), String::new()),
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "sessionId": session_id,
+        "title": title,
+        "updated": updated,
+        "count": turns.len(),
+        "turns": turns
+            .iter()
+            .map(|t| serde_json::json!({
+                "role": t.role,
+                "text": t.text,
+                "tools": t.tools,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 /// 生成对话记录 MD，返回 (md 文本, 统计)。
 pub fn build_chat_md(client_key: &str, session_id: &str) -> Result<(String, ExportMeta), String> {
     if !is_session_id(session_id) {
@@ -1706,6 +1761,38 @@ pub fn remove_file_quiet(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真机探针（`#[ignore]`）：确认「查看内容」能读到真实会话的正文。
+    ///
+    /// 只读，不改任何数据。跑法：
+    /// `cargo test -p wb-switch-core --lib turns_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn turns_probe_reads_real_conversation() {
+        let key = "trae-cn";
+        let list = list_sessions(key).expect("读会话列表失败");
+        println!("会话总数 {}", list.len());
+        let s = list
+            .iter()
+            .find(|s| s.messages > 0)
+            .expect("没有带正文的会话");
+        println!("取会话 {} | owner={} | msgs={}", s.id, s.owner_uid, s.messages);
+        let v = session_turns(key, &s.id).expect("读回合失败");
+        println!("title = {}", v["title"]);
+        println!("count = {}", v["count"]);
+        if let Some(t) = v["turns"].as_array().and_then(|a| a.first()) {
+            let text = t["text"].as_str().unwrap_or("");
+            println!(
+                "第一轮 role={} text[:120]={}",
+                t["role"],
+                text.chars().take(120).collect::<String>()
+            );
+        }
+        assert!(
+            v["count"].as_u64().unwrap_or(0) > 0,
+            "能读到的会话必须至少有 1 轮"
+        );
+    }
 
     fn turn(role: &str, text: &str, tools: &[&str]) -> Turn {
         Turn {

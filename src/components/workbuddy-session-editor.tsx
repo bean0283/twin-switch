@@ -764,12 +764,13 @@ export function WorkbuddySessionEditor({
    * 跨客户端搬迁也复用它，只是固定按 `overwrite` 走 —— 导入链路读的是 WorkBuddy 库里的内容，
    * 绕不过去，必须先把改动落到库里。
    */
-  const saveToSource = async (m: "overwrite" | "insert"): Promise<boolean> => {
+  const saveToSource = async (m: "overwrite" | "insert", closeClient = false): Promise<boolean> => {
     if (!doc || !uid) return false;
     setSaving(true);
     setSaveLog([`写入方式：${m === "overwrite" ? "就地改写" : "新增会话"}`,
       `改动：${editCount(edit)} 处行改动 / ${Object.keys(rowPatch).length} 个字段`,
-    ]);
+      closeClient ? "已确认：需要时由本工具退出 WorkBuddy，写完自动重新打开" : "",
+    ].filter(Boolean));
     try {
       const r = await api.workbuddySessionEditSave(
         uid,
@@ -778,7 +779,25 @@ export function WorkbuddySessionEditor({
         ops,
         rowPatch,
         m === "insert" && targetUid !== "" ? targetUid : undefined,
+        closeClient,
       );
+      // 客户端正占着这个号：后端**没写盘**，等用户点一下「退出并保存」。
+      // 关客户端是破坏性动作，不能替用户决定（同复制 / 导入页的口径）。
+      if (!r.ok && r.code === "clientRunning") {
+        setSaveLog((prev) => [...prev, r.stage ?? "WorkBuddy 正在使用这个账号"]);
+        toast.warning("WorkBuddy 正在使用这个账号", {
+          description:
+            "写入会话库前需要先退出它（客户端运行时会用内存里的会话覆盖我们写的内容）。点「退出并保存」后我会关掉它、写完自动重新打开。",
+          duration: 20000,
+          action: {
+            label: "退出并保存",
+            // 重新走一遍**完整**的保存入口：跨客户端搬迁时不能只补「写回源会话」这一步，
+            // 否则用户确认退出后搬迁就断在第一阶段了。
+            onClick: () => void save({ closeClient: true }),
+          },
+        });
+        return false;
+      }
       if (!r.ok) {
         // ⚠️ 写入前的**全量校验**没过：这是正常返回（不是异常），明细必须原样展示。
         setReport({
@@ -798,10 +817,25 @@ export function WorkbuddySessionEditor({
         `正文本体：${r.bodyPath ?? ""}`,
         `正文备份：${r.bodyBackup ?? ""}`,
         `库备份：${r.dbBackup ?? ""}`,
-      ]);
+        // 是我们关的，就必须说清「开回来了没有」——失败也要照实说。
+        r.clientStopped
+          ? r.clientRelaunched
+            ? "已重新打开 WorkBuddy"
+            : `WorkBuddy 没能自动打开：${r.restartError ?? "原因未知"}`
+          : "",
+      ].filter(Boolean));
       for (const w of r.warnings ?? []) setSaveLog((prev) => [...prev, `提醒：${w}`]);
       toast.success(m === "overwrite" ? "已改写这条会话" : "已新增一条会话", {
-        description: `会话 id ${r.sessionId ?? ""}`,
+        description: [
+          `会话 id ${r.sessionId ?? ""}`,
+          r.clientStopped
+            ? r.clientRelaunched
+              ? "已重新打开 WorkBuddy"
+              : `WorkBuddy 未能自动打开：${r.restartError ?? "原因未知"}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" · "),
       });
       if (m === "insert" && r.sessionId) {
         await loadDoc(r.sessionId, r.ownerUid ?? uid);
@@ -824,7 +858,7 @@ export function WorkbuddySessionEditor({
    *
    * ⚠️ 顺序不能反：② 读的是 WorkBuddy 库里的内容，不先落 ① 就等于把**没改过的**版本搬过去。
    */
-  const pushCross = async () => {
+  const pushCross = async (closeClient = false) => {
     if (!doc || !uid || !cross) return;
     // ⚠️ 按**复合键**取账号：同一 uid 在两个客户端下各有一份，只比 uid 会挑错客户端。
     const acc = crossAccount;
@@ -838,7 +872,7 @@ export function WorkbuddySessionEditor({
     try {
       if (hasEdits(edit) || Object.keys(rowPatch).length > 0) {
         setSaveLog((prev) => [...prev, "① 先把改动写回这条 WorkBuddy 会话（导入读的是库里的内容）…"]);
-        const ok = await saveToSource("overwrite");
+        const ok = await saveToSource("overwrite", closeClient);
         if (!ok) {
           setSaveLog((prev) => [...prev, "改动没写成功，已中止搬迁（源会话保持原样）"]);
           return;
@@ -860,9 +894,9 @@ export function WorkbuddySessionEditor({
     }
   };
 
-  const save = async () => {
-    if (cross) return pushCross();
-    return saveToSource(mode);
+  const save = async (opts?: { closeClient?: boolean }) => {
+    if (cross) return pushCross(opts?.closeClient ?? false);
+    return saveToSource(mode, opts?.closeClient ?? false);
   };
 
   // -------------------------------------------------------------------------
@@ -1416,7 +1450,7 @@ export function WorkbuddySessionEditor({
               <AlertDescription className="text-xs">
                 新会话归属到「{targets.find((a) => a.uid === targetUid)?.label ?? targetUid}」，
                 以新 UUID 插入 `sessions` 表并把正文里的会话 id 一并换掉。源会话一行都不动。
-                该账号正在 WorkBuddy 中使用时会被拒绝写入。
+                该账号正被 WorkBuddy 使用时，点保存会让你确认一次：确认后自动退出客户端、写完自动重新打开。
               </AlertDescription>
             </Alert>
           ) : null}

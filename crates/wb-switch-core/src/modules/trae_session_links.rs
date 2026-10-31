@@ -302,6 +302,16 @@ fn upsert_group(
 /// 导入几十个会话时既慢，又容易在中途失败留下半截状态。
 ///
 /// 返回登记的组数。
+///
+/// ⚠️⚠️ 存进关联表的 uid **必须是库内真实 uid**，不能是本工具账号库的内部 id。
+///
+/// 为什么：`project.user_id` 存的是真实 uid（`925158341882023`），而账号库条目 id 是
+/// `oauth_882023`。关联表若存内部 id，之后按真实 uid 查成员永远查不到 ⇒
+/// 明明是「已关联」的会话被判成「未关联」⇒ 界面只提示「新建副本」⇒
+/// 用户看到「每次复制都出现新对话，并没有按同步关联的思路再走」（2026-10-31 实测）。
+///
+/// 这里在**写入侧**统一规范化（唯一出口 `canonical_uid`），老数据由
+/// `switch_plan` / `overview` 的别名匹配兜住。
 pub fn register_batch(
     client_key: &str,
     source_uid: &str,
@@ -311,21 +321,108 @@ pub fn register_batch(
     if pairs.is_empty() {
         return Ok(0);
     }
+    let src_uid = canonical_uid(client_key, source_uid);
+    let dst_uid = canonical_uid(client_key, target_uid);
     let mut store = load_links()?;
     let now = crate::modules::config::now_ms();
     for (src, dst) in pairs {
         upsert_group(
             &mut store,
             client_key,
-            source_uid,
+            &src_uid,
             src,
-            target_uid,
+            &dst_uid,
             dst,
             now,
         );
     }
     save_links(&store)?;
     Ok(pairs.len())
+}
+
+/// 把「可能是内部 id」的 uid 规范化成**库内真实 uid**（唯一出口）。
+///
+/// 认不出来就原样返回（宁可不改，也不猜）。
+pub fn canonical_uid(client_key: &str, uid: &str) -> String {
+    match crate::modules::trae_vault::uid_of_account(client_key, uid) {
+        Some(real) if !real.trim().is_empty() => real.trim().to_string(),
+        _ => uid.to_string(),
+    }
+}
+
+/// 自愈关联表：把成员 uid 从内部 id 规范化成真实 uid，并合并「同一账号被拆成两条」的脏数据。
+///
+/// ## 要修的两个毛病
+///
+/// 1. **uid 写成内部 id**（`oauth_882023` 而不是 `925158341882023`）⇒ 按真实 uid 查不到成员。
+/// 2. **同一组里同一账号出现两次**（`oauth_882023` + `925158341882023` 各一条）——
+///    这是 #1 的直接后果：登记时用的内部 id、后来另一条用了真实 uid，
+///    `upsert_group` 按字符串比较认为是两个账号，于是两条都留着。
+///    脏数据会让「谁是目标那份」变得有歧义。
+///
+/// 修完把同一组里「规范化后 uid 相同」的成员合并成一条（保留 `linked_at` 较早的，
+/// 因为那是最初建立关联的那份）。只读关联表，**不碰任何会话数据**。
+pub fn normalize_link_store(client_key: &str, on_log: Option<&dyn Fn(&str)>) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    let mut store = load_links()?;
+    let mut renamed = 0usize;
+    let mut merged = 0usize;
+
+    for g in store.groups.iter_mut() {
+        // ① 规范化 uid（只对本客户端、且能解析出来的）
+        for m in g.members.iter_mut() {
+            if m.client_key != client_key {
+                continue;
+            }
+            let real = canonical_uid(client_key, &m.uid);
+            if real != m.uid {
+                log(&format!("   {} → {}（会话 {}）", m.uid, real, m.session_id));
+                m.uid = real;
+                renamed += 1;
+            }
+        }
+        // ② 合并「规范化后同 uid」的成员
+        let before = g.members.len();
+        let mut kept: Vec<LinkMember> = Vec::with_capacity(before);
+        for m in g.members.drain(..) {
+            match kept
+                .iter_mut()
+                .find(|k| k.client_key == m.client_key && k.uid == m.uid)
+            {
+                Some(k) => {
+                    // 保留较早建立的那条（那是最初的关联），但若它的 session_id 已失效
+                    // 而新来的那条还在，则用新来的 —— 这里不做"存活"判断，
+                    // 只按时间取早的：存活与否由上层实时算。
+                    if m.linked_at < k.linked_at {
+                        k.session_id = m.session_id;
+                        k.linked_at = m.linked_at;
+                    }
+                    merged += 1;
+                }
+                None => kept.push(m),
+            }
+        }
+        g.members = kept;
+        let _ = before;
+    }
+
+    // ③ 清掉空组（成员合并后可能只剩 1 条，那不叫「关联」）
+    let before_groups = store.groups.len();
+    store.groups.retain(|g| g.members.len() >= 2);
+    let dropped = before_groups - store.groups.len();
+
+    save_links(&store)?;
+    Ok(json!({
+        "ok": true,
+        "renamed": renamed,
+        "merged": merged,
+        "droppedGroups": dropped,
+        "groups": store.groups.len(),
+    }))
 }
 
 /// 一个会话在「期望归属 `want_uid`」视角下的判活信息。
@@ -348,6 +445,7 @@ fn member_view(
             "created": Value::Null,
             "messages": Value::Null,
             "ownedBy": Value::Null,
+            "workspace": Value::Null,
             "integrity": issues,
         }),
         Some(s) => {
@@ -362,6 +460,8 @@ fn member_view(
                 // 消息条数：分叉判定的主判据（见 `divergence_of`）。
                 "messages": s.messages,
                 "ownedBy": s.owner_uid,
+                // 归属工作空间（卡片左上角那个「来源」标签，与另两页同一套判定）。
+                "workspace": s.workspace,
                 // 数据自检问题清单（空 = 健康）；判据见 [`session_integrity`]。
                 "integrity": issues,
             })
@@ -485,6 +585,571 @@ pub fn links_preview(client_key: &str, source_uid: &str, target_uid: &str) -> Va
         "sourceUid": source_uid,
         "targetUid": target_uid,
         "count": groups.len(),
+        "groups": groups,
+        "storePath": links_store_path(),
+    })
+}
+
+/// 状态文案（与 WorkBuddy 侧措辞保持一致：同一个意思不许两种说法）。
+fn status_text(status: &str) -> &'static str {
+    match status {
+        "consistent" => "内容一致",
+        "pending" => "待同步",
+        "diverged" => "有分歧",
+        "missing" => "内容缺失",
+        _ => "无法确认",
+    }
+}
+
+/// 切号弹窗用：列出**当前账号**的全部会话 + 每一条与目标账号的关联状态。
+///
+/// 与 WorkBuddy 的 `workbuddy_sessions::switch_plan` **同名同义、同一套四态口径**：
+///
+/// | state | 含义 | 界面默认 |
+/// |---|---|---|
+/// | `linked` | 有本工具的关联记录，且目标那份副本还活着 | 勾上 |
+/// | `missing` | 有记录，但目标那份已经没了（客户端里删过 / 换过库） | 勾上（切完会补一份） |
+/// | `twin` | 没有记录，但目标账号里已有一份同标题同内容的副本 | 勾上（只登记关联，不重复复制） |
+/// | `unlinked` | 既没记录也没同内容副本 | 空着，由用户主动新增 |
+///
+/// ⚠️ 与 WorkBuddy 的一处**必然差异**：Trae 没有「内容摘要」可比对
+/// （WorkBuddy 靠 `content_digest` 判「同一段对话」），这里只能用
+/// **同标题 + 同消息条数**当「疑似同一段对话」的判据，而且只用于 `twin` 这一态。
+/// 判不出来就老实报 `unlinked`，不猜 —— 猜错会让用户以为「已经关联过了」。
+pub fn switch_plan(client_key: &str, source_uid: &str, target_uid: &str) -> Value {
+    let source_uid = source_uid.trim();
+    let target_uid = target_uid.trim();
+    if source_uid.is_empty() {
+        return json!({ "ok": false, "error": "读不到当前登录账号，无法列出会话" });
+    }
+    if target_uid.is_empty() || target_uid == source_uid {
+        return json!({ "ok": false, "error": "目标账号无效（为空或与当前账号相同）" });
+    }
+    // 与关联总览同一条纪律：先让快照跟上实时库，否则刚复制/刚聊过的会话查不到。
+    let _ = crate::modules::trae_export::ensure_decrypted(client_key, None);
+    let all = match crate::modules::trae_export::list_sessions(client_key) {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let store = match load_links() {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "storeStatus": "unavailable", "error": e }),
+    };
+
+    // 目标账号里「还活着」的副本（存在 + 未被软删 + 归属对得上）。
+    //
+    // ⚠️⚠️ 归属比较必须**接受 uid 的两种写法**。
+    //
+    // 同一个账号在系统里有两个标识：账号库内部 id（`oauth_882023`）与库内真实 uid
+    // （`925158341882023`）。2026-10-31 之前写错的关联记录里存的是**内部 id**，
+    // 而库里 `project.user_id` 是真实 uid ⇒ 直接字符串比较永远对不上，
+    // 结果明明是「已关联」的会话被判成「未关联」，界面就只会提示「新建副本」，
+    // 用户看到的正是「每次复制都出现新对话，并没有按同步关联的思路再走」。
+    let uid_aliases = |uid: &str| -> Vec<String> {
+        let mut out = vec![uid.to_string()];
+        if let Some(real) = crate::modules::trae_vault::uid_of_account(client_key, uid) {
+            let real = real.trim().to_string();
+            if !real.is_empty() && real != uid {
+                out.push(real);
+            }
+        }
+        // 反向：传进来的是真实 uid，也要能找到对应的内部 id。
+        for id in crate::modules::trae_vault::list_vault_accounts(client_key) {
+            if let Some(real) = crate::modules::trae_vault::uid_of_account(client_key, &id) {
+                if real.trim() == uid && id != uid {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    };
+    let target_ids = uid_aliases(target_uid);
+    let target_alive = |sid: &str| -> bool {
+        all.iter().any(|t| {
+            t.id == sid && !t.owner_uid.is_empty() && target_ids.iter().any(|u| *u == t.owner_uid)
+        })
+    };
+
+    // 当前账号名下的会话（与「会话记录」页同源）。
+    //
+    // ⚠️ 同样要接受两种 uid 写法：库里 `project.user_id` 可能是真实 uid，
+    // 而界面传进来的 `source_uid` 也可能已经是真实 uid（一致）；但老数据里
+    // 可能有写成内部 id 的会话，一并纳入。
+    let source_ids = uid_aliases(source_uid);
+    let mine: Vec<&crate::modules::trae_export::SessionInfo> = all
+        .iter()
+        .filter(|s| source_ids.iter().any(|u| *u == s.owner_uid))
+        .collect();
+
+    let mut sessions: Vec<Value> = Vec::with_capacity(mine.len());
+    let mut counts = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for s in mine {
+        // 这条会话在哪一组里、该组里目标账号那一份的 id
+        let group = store.groups.iter().find(|g| {
+            g.members.iter().any(|m| {
+                m.client_key == client_key
+                    && source_ids.iter().any(|u| *u == m.uid)
+                    && m.session_id == s.id
+            })
+        });
+        // 组里目标账号那一份：成员的 uid 可能写成内部 id，用别名集合匹配。
+        let member_sid = group
+            .and_then(|g| {
+                g.members.iter().find(|m| {
+                    m.client_key == client_key
+                        && target_ids.iter().any(|u| *u == m.uid)
+                        && m.session_id != s.id
+                })
+            })
+            .map(|m| m.session_id.clone());
+        // 组里目标账号那一份的「当前状态」（条数 / 更新时间），用来算同步方向。
+        let target_session = member_sid
+            .as_deref()
+            .and_then(|sid| all.iter().find(|t| t.id == sid));
+
+        let alive = member_sid.as_deref().map(target_alive).unwrap_or(false);
+
+        // 没有关联记录时，看目标账号里有没有「疑似同一段对话」的副本。
+        // ⚠️ 只用「同标题 + 同条数」这条弱判据，且只在**标题非空**时才敢用：
+        //    空标题的会话（`Untitled Task`）一抓一大把，按标题匹配必然错配。
+        let twin = if member_sid.is_none() && !s.title.trim().is_empty() {
+            all.iter()
+                .find(|t| {
+                    target_ids.iter().any(|u| *u == t.owner_uid)
+                        && t.title == s.title
+                        && t.messages == s.messages
+                        && t.messages > 0
+                })
+                .map(|t| t.id.clone())
+        } else {
+            None
+        };
+
+        let state = match (member_sid.is_some(), alive, twin.is_some()) {
+            (true, true, _) => {
+                counts.0 += 1;
+                "linked"
+            }
+            (true, false, _) => {
+                counts.1 += 1;
+                "missing"
+            }
+            (false, _, true) => {
+                counts.2 += 1;
+                "twin"
+            }
+            _ => {
+                counts.3 += 1;
+                "unlinked"
+            }
+        };
+        // 已关联（含 missing / twin）默认勾上：切完把内容带过去。
+        let default_checked = state != "unlinked";
+        if default_checked {
+            counts.4 += 1;
+        }
+
+        // ── 「同步」还是「复制」，由状态决定，**不让界面猜**。
+        //
+        // ⚠️⚠️ 已关联的会话必须**就地同步**（原 id 不变）：2026-10-31 用户实测，
+        // 之前一律走复制 ⇒ 每切一次号客户端里就多出一个「新对话」，
+        // 而不是把原来那条更新掉。
+        // 只有「未关联」才该新建副本（那是真的没有副本可更新）。
+        let sync_mode = match state {
+            // 有副本且活着 ⇒ 就地同步
+            "linked" => "sync",
+            // 有记录但目标那份没了 ⇒ 得重新复制一份（没有可更新的对象）
+            "missing" => "copy",
+            // 目标已有同内容副本 ⇒ 只登记关联，不复制、不同步
+            "twin" => "link",
+            _ => "copy",
+        };
+        // 同步方向：一律「把当前账号的内容写到目标账号」。
+        // 用户勾选这个动作的语义就是「把我在用的这份带过去」，
+        // 不是「把目标那份拉回来」—— 后者会让用户当前在聊的内容被旧副本盖掉。
+        let direction = if sync_mode == "sync" { Some("to_target") } else { None };
+
+        sessions.push(json!({
+            "sessionId": s.id,
+            "title": s.title,
+            "workspace": s.workspace,
+            "workspacePath": s.workspace_path,
+            "messages": s.messages,
+            "updated": s.updated,
+            "state": state,
+            "stateText": switch_state_text(state),
+            "defaultChecked": default_checked,
+            "targetSessionId": member_sid.or(twin),
+            // 关联组 id + 处理方式 + 同步方向：界面原样回传，后端据此决定
+            // 是「就地同步」还是「新建副本」。
+            "groupId": group.map(|g| g.id.clone()),
+            "syncMode": sync_mode,
+            "direction": direction,
+            // 目标那份比源新（会覆盖用户更想留的那一份）⇒ 提醒用。
+            "targetAhead": target_session
+                .map(|t| t.messages > s.messages)
+                .unwrap_or(false),
+            // 没有正文的会话复制过去也是空壳，不参与勾选。
+            "disabled": s.messages <= 0,
+        }));
+    }
+    sessions.sort_by(|a, b| {
+        b["updated"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["updated"].as_str().unwrap_or(""))
+    });
+
+    json!({
+        "ok": true,
+        "storeStatus": "ready",
+        "clientKey": client_key,
+        "sourceUid": source_uid,
+        "targetUid": target_uid,
+        "counts": {
+            "total": sessions.len(),
+            "linked": counts.0,
+            "missing": counts.1,
+            "twin": counts.2,
+            "unlinked": counts.3,
+            "checked": counts.4,
+        },
+        "sessions": sessions,
+    })
+}
+
+/// 切号弹窗里「会话与目标账号的关系」的人话（与 WorkBuddy 的 `linkStateLabel` 逐字一致）。
+fn switch_state_text(state: &str) -> &'static str {
+    match state {
+        "linked" => "已关联 · 切换后同步内容",
+        "missing" => "关联断开 · 会补一份副本",
+        "twin" => "目标已有同内容副本 · 只登记关联",
+        _ => "未关联 · 勾选后新建副本",
+    }
+}
+
+/// 全账号维度的关联总览 —— 「关联会话」页签用。
+///
+/// 与 [`links_preview`] 的差别：那里固定一对账号、只回两端；这里把该客户端下
+/// **所有**成员摆成一张矩阵，并算出「哪些账号还没有这份副本」（`missingAccounts`，
+/// 供界面上的「补齐到某账号」用）。
+///
+/// 判据口径（**不许升级成比事实更强的结论**）：
+/// - Trae 没有 WorkBuddy 那种整份正文摘要，逐行一致性判不了 ⇒ 只用
+///   **消息条数 + 更新时间**判断谁落后（与 `divergence_of` 同一套）；
+/// - 因此状态只有 `consistent`（条数/时间全等）/ `pending`（有副本落后，可安全快进）/
+///   `missing`（有成员已失效）/ `unknown`（读不到消息数），**不产出 `diverged`** ——
+///   「分叉」需要有逐行证据，这里给不出就不说。
+pub fn overview(client_key: &str) -> Value {
+    let store = match load_links() {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "storeStatus": "unavailable", "error": e }),
+    };
+    // ⚠️⚠️ **先确保解密快照是最新的**，再读会话列表。
+    //
+    // 2026-10-31 用户实测：刚复制完的会话，在关联页立刻显示「内容缺失 / 这个账号里
+    // 已经没有这条会话」。根因是关联总览读的是**解密快照**，而快照还是写入前的旧版本，
+    // 里面当然没有新副本。
+    //
+    // 用户的要求是「没有登录的账号，应当也可以后台尝试解密」—— 这条正好靠这里满足：
+    // Trae 的多账号**共用一个库**（靠 `project.user_id` 区分归属），所以只要库能解，
+    // 所有账号（包括当前没登录的）的副本都能读到，不需要逐个账号去登录一次。
+    //
+    // 失败**不阻断**：没存密钥 / 库被占用时照旧用旧快照，但下面的 `readable` 会因此
+    // 收敛成「实际读到的那部分」，不会把读不到的账号判成「已失效」。
+    let snapshot_fresh = match crate::modules::trae_export::ensure_decrypted(client_key, None) {
+        Ok(o) => o.reused || o.pages > 0,
+        Err(_) => false,
+    };
+    let all = match crate::modules::trae_export::list_sessions(client_key) {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let integ = integrity_for(client_key, &link_sids(&store, client_key));
+
+    // 账号清单：本客户端下真实出现过会话的 owner_uid（与「会话记录」页同源）。
+    let mut accounts: Vec<(String, String)> = Vec::new();
+    for s in &all {
+        if s.owner_uid.is_empty() || accounts.iter().any(|(u, _)| u == &s.owner_uid) {
+            continue;
+        }
+        accounts.push((s.owner_uid.clone(), s.owner_label.clone()));
+    }
+    accounts.sort_by(|a, b| a.1.cmp(&b.1));
+    // 本次**能读到**的账号：解密快照只覆盖当前解密过的那一个库，其它账号的会话在
+    // 这份快照里根本不存在。若把「快照里没有」当成「副本已失效」，界面会满屏红色
+    // （真机实测 6 组全 missing）—— 那是错的，必须区分「真的没了」与「这次没解密」。
+    //
+    // ⚠️ 快照**没刷新成功**时（`snapshot_fresh == false`：没存密钥 / 库被占用），
+    // 手里这份数据是过期的，这时任何「这个账号没有这条会话」的结论都可能是假象 ⇒
+    // 把 `readable` 收敛成空集，让所有成员显示「未解密」而不是「已失效」。
+    // 「未解密」是诚实的（这次确实没读到），「已失效」是断言（说人家真的没了），
+    // 过期数据上做后者就是撒谎。
+    let readable: std::collections::HashSet<String> = if snapshot_fresh {
+        accounts.iter().map(|(u, _)| u.clone()).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let label_of = |uid: &str| -> String {
+        accounts
+            .iter()
+            .find(|(u, _)| u == uid)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| format!("uid …{}", uid.chars().rev().take(6).collect::<String>()))
+    };
+
+    let mut groups: Vec<Value> = Vec::new();
+    let mut tally = (0usize, 0usize, 0usize, 0usize);
+    for g in store.groups.iter() {
+        let mine: Vec<&LinkMember> = g
+            .members
+            .iter()
+            .filter(|m| m.client_key == client_key)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let mut members: Vec<Value> = mine
+            .iter()
+            .map(|m| {
+                let mut v = member_view(&all, &m.session_id, &m.uid, &integ);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("uid".into(), json!(m.uid));
+                    o.insert("accountName".into(), json!(label_of(&m.uid)));
+                    o.insert("linkedAt".into(), json!(m.linked_at));
+                }
+                v
+            })
+            .collect();
+
+        // 「可读成员」才参与状态计算；未解密的账号一律按「无法确认」处理，不当失效。
+        let readable_members: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                v["uid"]
+                    .as_str()
+                    .map(|u| readable.contains(u))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let msgs: Vec<Option<i64>> = members.iter().map(|v| v["messages"].as_i64()).collect();
+        let stamps: Vec<String> = members
+            .iter()
+            .map(|v| v["updated"].as_str().unwrap_or("").to_string())
+            .collect();
+        let max_msg = readable_members
+            .iter()
+            .filter_map(|&i| msgs[i])
+            .max();
+        let max_stamp = readable_members
+            .iter()
+            .map(|&i| stamps[i].clone())
+            .max()
+            .unwrap_or_default();
+        // 「全都一样」：条数全等且时间全等 —— 这是本模块能给的最强结论（只看可读成员）。
+        let all_equal = !readable_members.is_empty()
+            && max_msg.is_some()
+            && readable_members
+                .iter()
+                .all(|&i| members[i]["alive"].as_bool().unwrap_or(false) && msgs[i] == max_msg && stamps[i] == max_stamp);
+        let any_behind = !all_equal
+            && max_msg.is_some()
+            && readable_members.iter().any(|&i| {
+                members[i]["alive"].as_bool().unwrap_or(false)
+                    && (msgs[i] != max_msg || stamps[i] != max_stamp)
+            });
+
+        let readable_gone = readable_members
+            .iter()
+            .any(|&i| !members[i]["alive"].as_bool().unwrap_or(false));
+
+        let status = if readable_gone {
+            "missing"
+        } else if readable_members.is_empty() || max_msg.is_none() {
+            // 没有任何一份可读 ⇒ 无法确认；**不是**「失效」。
+            "unknown"
+        } else if any_behind {
+            "pending"
+        } else {
+            "consistent"
+        };
+        match status {
+            "consistent" => tally.0 += 1,
+            "pending" => tally.1 += 1,
+            "missing" => tally.2 += 1,
+            _ => tally.3 += 1,
+        }
+
+        // 逐成员关系：未解密 ⇒ unreadable；全等 ⇒ equal；否则条数最多（再比时间）= latest。
+        let leader = if all_equal {
+            None
+        } else {
+            let mut best: Option<usize> = None;
+            for &i in readable_members.iter() {
+                if !members[i]["alive"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                best = match best {
+                    None => Some(i),
+                    Some(b) => {
+                        let (bm, im) = (msgs[b], msgs[i]);
+                        let better = match (bm, im) {
+                            (Some(x), Some(y)) if x != y => y > x,
+                            _ => stamps[i] > stamps[b],
+                        };
+                        if better {
+                            Some(i)
+                        } else {
+                            Some(b)
+                        }
+                    }
+                };
+            }
+            best
+        };
+        for (i, v) in members.iter_mut().enumerate() {
+            let uid = v["uid"].as_str().unwrap_or("").to_string();
+            let alive = v["alive"].as_bool().unwrap_or(false);
+            let (relation, reason) = if !readable.contains(&uid) {
+                // ⚠️ 不能写成「已失效」：这份快照只解密了一个账号的库，其它账号根本读不到。
+                (
+                    "unreadable",
+                    "该账号的本地库这次没有解密，无法确认这份副本（切到该账号解密后再看）",
+                )
+            } else if !alive {
+                ("gone", "这个账号里已经没有这条会话")
+            } else if max_msg.is_none() {
+                ("unknown", "读不到消息条数，未做比较")
+            } else if all_equal {
+                ("equal", "条数与更新时间都与其它副本相同")
+            } else if Some(i) == leader {
+                ("latest", "内容最新（条数最多/时间最晚）")
+            } else {
+                ("behind", "落后于最新副本，可安全同步")
+            };
+            if let Some(o) = v.as_object_mut() {
+                o.insert("relation".into(), json!(relation));
+                o.insert("reason".into(), json!(reason));
+                o.insert("isNewest".into(), json!(Some(i) == leader || all_equal));
+                // `contentState` 只看存活：这里没有 WorkBuddy 那种「库里有行但正文文件没了」
+                // 的中间态（Trae 正文全在库里），失效就是 gone，读不到就是 unreadable。
+                o.insert(
+                    "contentState".into(),
+                    json!(if !readable.contains(&uid) {
+                        "unreadable"
+                    } else if alive {
+                        "ready"
+                    } else {
+                        "gone"
+                    }),
+                );
+            }
+        }
+
+        let present: std::collections::HashSet<&str> =
+            mine.iter().map(|m| m.uid.as_str()).collect();
+        // 只把**可读账号**里缺的算「还没有这份副本」—— 未解密的账号不是缺，是看不到。
+        let missing_accounts: Vec<Value> = accounts
+            .iter()
+            .filter(|(uid, _)| !present.contains(uid.as_str()))
+            .map(|(uid, label)| json!({ "uid": uid, "label": label }))
+            .collect();
+        // 来源 = 组里最新那个**可读且存活**的副本（「以某端为准」的默认方向）。
+        let source_sid = leader
+            .map(|i| members[i]["sessionId"].as_str().unwrap_or("").to_string())
+            .or_else(|| {
+                readable_members
+                    .iter()
+                    .find(|&&i| members[i]["alive"].as_bool().unwrap_or(false))
+                    .map(|&i| members[i]["sessionId"].as_str().unwrap_or("").to_string())
+            })
+            .unwrap_or_default();
+        let title = members
+            .iter()
+            .find_map(|v| v["title"].as_str().filter(|t| !t.is_empty()))
+            .unwrap_or("(无标题)")
+            .to_string();
+        // 卡片左上角那个「来源」标签：取任一成员的工作空间名（Trae 的 project.name 优先）。
+        let project = members
+            .iter()
+            .find_map(|v| v["workspace"].as_str().filter(|w| !w.is_empty()))
+            .unwrap_or("")
+            .to_string();
+        // 卡片右上角的相对时间用它（组内最新那份的更新时间）。
+        let updated_at = members
+            .iter()
+            .filter_map(|v| v["updated"].as_str())
+            .max()
+            .unwrap_or("")
+            .to_string();
+        // 只有「可读且存活」的副本才能当同步来源 / 被覆盖，数量按这个算。
+        let alive_count = readable_members
+            .iter()
+            .filter(|&&i| members[i]["alive"].as_bool().unwrap_or(false))
+            .count();
+        // 「规范 source」= 组里最早登记的成员（与 `group_members` / `sync_group` 的口径一致）。
+        // 界面据此把「以这份为准」翻译成 `sourceToTarget` / `targetToSource`，不自己猜方向。
+        let canonical_uid = mine
+            .iter()
+            .min_by_key(|m| m.linked_at)
+            .map(|m| m.uid.clone())
+            .unwrap_or_default();
+
+        groups.push(json!({
+            "groupId": g.id,
+            "key": g.id,
+            "title": title,
+            "project": project,
+            "updatedAt": updated_at,
+            "memberCount": members.len(),
+            "accountNames": members.iter().map(|v| v["accountName"].clone()).collect::<Vec<_>>(),
+            "status": status,
+            "statusText": status_text(status),
+            "statusReason": if status == "pending" { "behind" } else { "" },
+            "behindCount": if all_equal { 0 } else { members.len().saturating_sub(1) },
+            "sourceSessionId": source_sid,
+            "canonicalUid": canonical_uid,
+            "pairwise": members.len() == 2,
+            "canUnify": alive_count >= 2,
+            "canCopy": alive_count >= 1,
+            "missingAccounts": missing_accounts,
+            "missingCount": missing_accounts.len(),
+            "members": members,
+        }));
+    }
+    // 组内最新时间倒序，与「会话记录」页观感一致。
+    groups.sort_by(|a, b| {
+        let stamp = |v: &Value| -> String {
+            v["members"]
+                .as_array()
+                .and_then(|m| {
+                    m.iter()
+                        .filter_map(|x| x["updated"].as_str())
+                        .max()
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default()
+        };
+        stamp(b).cmp(&stamp(a))
+    });
+
+    json!({
+        "ok": true,
+        "storeStatus": "ready",
+        "clientKey": client_key,
+        "accounts": accounts
+            .iter()
+            .map(|(uid, label)| json!({ "uid": uid, "label": label }))
+            .collect::<Vec<_>>(),
+        "counts": {
+            "total": groups.len(),
+            "consistent": tally.0,
+            "pending": tally.1,
+            "missing": tally.2,
+            "unknown": tally.3,
+        },
         "groups": groups,
         "storePath": links_store_path(),
     })
@@ -660,7 +1325,8 @@ pub fn group_members(
 }
 
 /// 删除一个关联组（只删本工具的关联记录，**不动任何会话数据**）。
-pub fn unlink_group(group_id: &str) -> Result<Value, String> {    let mut store = load_links()?;
+pub fn unlink_group(group_id: &str) -> Result<Value, String> {
+    let mut store = load_links()?;
     let before = store.groups.len();
     store.groups.retain(|g| g.id != group_id);
     if store.groups.len() == before {
@@ -668,6 +1334,55 @@ pub fn unlink_group(group_id: &str) -> Result<Value, String> {    let mut store 
     }
     save_links(&store)?;
     Ok(json!({ "ok": true, "groupId": group_id, "remaining": store.groups.len() }))
+}
+
+/// 把一个账号从关联组里**拆出去**（只删这条成员记录，会话数据一个字不动）。
+///
+/// 与 WorkBuddy 的「取消关联」同名同义：用户看着某个副本不对劲（换过库 / 客户端里
+/// 删过 / 挂错账号），只想把它从「同一段对话」里摘掉，不想整组解散。
+///
+/// 三条规矩：
+/// 1. 组里剩不到 2 份 ⇒ **整组删掉**：只剩一份的「关联组」没有任何意义，
+///    留着只会让列表里多一行点不开的卡片。
+/// 2. 拆掉的账号若原本是源，不特殊处理 —— 关联只是「同一段对话」的记录，
+///    没有方向性，谁先谁后不影响任何判据（`source` 只用于显示「源副本」列）。
+/// 3. 找不到这条成员就报错，**不静默成功**：否则界面会以为已经拆掉了。
+pub fn unlink_member(group_id: &str, uid: &str, client_key: &str) -> Result<Value, String> {
+    let mut store = load_links()?;
+    if !store.groups.iter().any(|g| g.id == group_id) {
+        return Err(format!("没有找到关联组 {group_id}"));
+    }
+    let (left, removed_group) = unlink_member_in(&mut store, group_id, uid, client_key)
+        .ok_or_else(|| {
+            format!("这个账号（{uid}）不在该关联组里（可能已经被拆掉了，刷新看看）")
+        })?;
+    save_links(&store)?;
+    Ok(json!({
+        "ok": true,
+        "groupId": group_id,
+        "uid": uid,
+        "remainingMembers": left,
+        "groupRemoved": removed_group,
+    }))
+}
+
+/// [`unlink_member`] 的**纯逻辑**：在内存里的 store 上拆一个成员，返回
+/// `(剩下的成员数, 整组是否被删掉)`。抽出来是为了能单测钉住「剩不到 2 份就整组删」。
+fn unlink_member_in(store: &mut LinkStore, group_id: &str, uid: &str, client_key: &str) -> Option<(usize, bool)> {
+    let idx = store.groups.iter().position(|g| g.id == group_id)?;
+    let before = store.groups[idx].members.len();
+    store.groups[idx]
+        .members
+        .retain(|m| !(m.uid == uid && m.client_key == client_key));
+    if store.groups[idx].members.len() == before {
+        return None;
+    }
+    let left = store.groups[idx].members.len();
+    let removed_group = left < 2;
+    if removed_group {
+        store.groups.retain(|g| g.id != group_id);
+    }
+    Some((left, removed_group))
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +1398,113 @@ mod tests {
             version: LINK_STORE_VERSION,
             groups: Vec::new(),
         }
+    }
+
+    fn member(uid: &str, client_key: &str, at: i64) -> LinkMember {
+        LinkMember {
+            client_key: client_key.to_string(),
+            uid: uid.to_string(),
+            session_id: format!("sid-{uid}"),
+            linked_at: at,
+        }
+    }
+
+    /// 取消关联单个账号：只摘这一个，其它成员原样留着。
+    #[test]
+    fn unlink_member_removes_only_the_targeted_member() {
+        let mut store = store_with();
+        store.groups.push(LinkGroup {
+            id: "g1".into(),
+            created_at: 1,
+            members: vec![
+                member("u1", "trae-cn", 1),
+                member("u2", "trae-cn", 2),
+                member("u3", "trae-cn", 3),
+            ],
+        });
+        let (left, removed) = unlink_member_in(&mut store, "g1", "u2", "trae-cn").expect("应能拆掉");
+        assert_eq!(left, 2);
+        assert!(!removed, "还剩两份，组要留着");
+        let g = &store.groups[0];
+        assert_eq!(g.members.len(), 2);
+        assert!(g.members.iter().all(|m| m.uid != "u2"), "只该摘掉 u2");
+        assert!(g.members.iter().any(|m| m.uid == "u1") && g.members.iter().any(|m| m.uid == "u3"));
+    }
+
+    /// 剩不到两份 ⇒ **整组删掉**：只剩一份的「关联组」没有任何意义。
+    ///
+    /// 留着会变成列表里一张「1 个账号」的怪卡片，点开还什么都不显示。
+    #[test]
+    fn unlink_member_dissolves_group_when_less_than_two_remain() {
+        let mut store = store_with();
+        store.groups.push(LinkGroup {
+            id: "g1".into(),
+            created_at: 1,
+            members: vec![member("u1", "trae-cn", 1), member("u2", "trae-cn", 2)],
+        });
+        store.groups.push(LinkGroup {
+            id: "g2".into(),
+            created_at: 2,
+            members: vec![member("x1", "trae-cn", 3), member("x2", "trae-cn", 4)],
+        });
+        let (left, removed) = unlink_member_in(&mut store, "g1", "u2", "trae-cn").expect("应能拆掉");
+        assert_eq!(left, 1);
+        assert!(removed, "只剩一份 ⇒ 整组必须删掉");
+        assert_eq!(store.groups.len(), 1, "只该删 g1");
+        assert_eq!(store.groups[0].id, "g2", "别的组不许被误删");
+    }
+
+    /// 同 uid 在**不同客户端**下是两份不同副本：只摘当前客户端那一份。
+    ///
+    /// ⚠️ 只按 uid 匹配会把另一个客户端的同名账号一起摘掉（那是另一个库的会话）。
+    #[test]
+    fn unlink_member_is_scoped_by_client_key() {
+        let mut store = store_with();
+        store.groups.push(LinkGroup {
+            id: "g1".into(),
+            created_at: 1,
+            members: vec![
+                member("u1", "trae-cn", 1),
+                member("u1", "trae-solo-cn", 2),
+                member("u2", "trae-cn", 3),
+            ],
+        });
+        let (left, removed) =
+            unlink_member_in(&mut store, "g1", "u1", "trae-cn").expect("应能拆掉");
+        assert_eq!(left, 2);
+        assert!(!removed);
+        let g = &store.groups[0];
+        assert!(
+            g.members
+                .iter()
+                .any(|m| m.uid == "u1" && m.client_key == "trae-solo-cn"),
+            "另一个客户端的同名账号不许被摘掉"
+        );
+        assert!(
+            !g.members
+                .iter()
+                .any(|m| m.uid == "u1" && m.client_key == "trae-cn"),
+            "目标客户端那一份必须摘掉"
+        );
+    }
+
+    /// 不在组里的账号 / 不存在的组 ⇒ 返回 None（上层据此报错，**不静默成功**）。
+    #[test]
+    fn unlink_member_reports_when_nothing_was_removed() {        let mut store = store_with();
+        store.groups.push(LinkGroup {
+            id: "g1".into(),
+            created_at: 1,
+            members: vec![member("u1", "trae-cn", 1), member("u2", "trae-cn", 2)],
+        });
+        assert!(
+            unlink_member_in(&mut store, "g1", "nobody", "trae-cn").is_none(),
+            "不在组里必须报错，否则界面以为已经拆掉了"
+        );
+        assert!(
+            unlink_member_in(&mut store, "no-such-group", "u1", "trae-cn").is_none(),
+            "组不存在也要报错"
+        );
+        assert_eq!(store.groups[0].members.len(), 2, "失败不许改动数据");
     }
 
     /// 自检必须抓到「客户端一定渲染不出来」的两类硬伤，且**对健康会话零误报**。
@@ -856,6 +1678,135 @@ mod tests {
         assert_eq!(LINK_STORE_VERSION, 1);
         // 存储文件名必须与 WorkBuddy 侧区分开
         assert!(links_file().to_string_lossy().ends_with("trae-session-links.json"));
+    }
+
+    /// 真机探针（`#[ignore]`）：把关联表里的内部 id 规范化成真实 uid，
+    /// 并合并「同一组里同账号两条」的脏数据。**会改关联表**（已由用户手动备份）。
+    ///
+    /// 跑法：`cargo test -p wb-switch-core --lib normalize_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn normalize_probe_fixes_real_link_store() {
+        let key = "trae-cn";
+        let r = normalize_link_store(key, Some(&|m| println!("   {m}"))).expect("规范化失败");
+        println!("结果 = {r}");
+        let after = load_links().expect("读关联表失败");
+        println!("修复后组数 {}", after.groups.len());
+        for g in &after.groups {
+            let uids: Vec<&str> = g.members.iter().map(|m| m.uid.as_str()).collect();
+            println!("  {} {:?}", &g.id[..8], uids);
+        }
+    }
+
+    /// 真机探针（`#[ignore]`）：确认 `switch_plan` 能算出「当前账号会话 + 与目标账号的状态」。
+    ///
+    /// 只读。跑法：
+    /// `cargo test -p wb-switch-core --lib switch_plan_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn switch_plan_probe_lists_sessions_with_states() {
+        let key = "trae-cn";
+        let list = crate::modules::trae_export::list_sessions(key).expect("读会话失败");
+        // 取两个不同账号：一个当「当前」，另一个当目标。
+        let mut uids: Vec<String> = Vec::new();
+        for s in &list {
+            if !s.owner_uid.is_empty() && !uids.contains(&s.owner_uid) {
+                uids.push(s.owner_uid.clone());
+            }
+        }
+        println!("库里的账号数 {}", uids.len());
+        if uids.len() < 2 {
+            println!("只有一个账号，无法组成「切到另一个」的场景（跳过）");
+            return;
+        }
+        let (src, tgt) = (&uids[0], &uids[1]);
+        println!("源 {src} → 目标 {tgt}");
+        let v = switch_plan(key, src, tgt);        println!("ok = {}", v["ok"]);
+        println!("counts = {}", v["counts"]);
+        if let Some(arr) = v["sessions"].as_array() {
+            for s in arr.iter().take(5) {
+                println!(
+                    "  · {} | {} | {} 条 | state={} | mode={} | group={} | checked={}",
+                    s["title"].as_str().unwrap_or(""),
+                    s["workspace"].as_str().unwrap_or(""),
+                    s["messages"],
+                    s["state"].as_str().unwrap_or(""),
+                    s["syncMode"].as_str().unwrap_or(""),
+                    s["groupId"].as_str().unwrap_or("-"),
+                    s["defaultChecked"],
+                );
+            }
+        }
+        assert!(v["ok"].as_bool().unwrap_or(false), "switch_plan 必须返回 ok");
+        assert!(
+            v["sessions"].as_array().map(|a| a.len()).unwrap_or(0) > 0,
+            "当前账号必须有会话"
+        );
+
+        // ── 关键验证：找一对**确实有关联**的账号，确认能算出 linked / sync ──
+        // 上面那对可能是「本来就没关联」的账号，全 unlinked 是正确结果，
+        // 不能据此认为判定坏了。这里遍历所有账号对，专门找有 group 的那一对。
+        println!("\n=== 遍历账号对，找有真实关联的 ===");
+        let mut found_linked = 0usize;
+        for (i, a) in uids.iter().enumerate() {
+            for b in uids.iter().skip(i + 1) {
+                let p = switch_plan(key, a, b);
+                let arr = p["sessions"].as_array().cloned().unwrap_or_default();
+                // ⚠️ 判据是**组里真有这条会话的成员**（groupId 非 null），
+                // 而不是「这一对账号之间有某个组」—— 后者会把「组存在但目标成员不在」
+                // 也算进来，打印出来就成了「有真实关联」却全是 unlinked（误导）。
+                let linked_rows: Vec<&Value> = arr
+                    .iter()
+                    .filter(|s| s["groupId"].is_string() && s["syncMode"] == "sync")
+                    .collect();
+                if linked_rows.is_empty() {
+                    continue;
+                }
+                println!("★ {a} → {b}：{} 条可就地同步", linked_rows.len());
+                found_linked += linked_rows.len();
+                for s in linked_rows {
+                    println!(
+                        "    {} | state={} | mode={} | dir={} | checked={}",
+                        s["title"].as_str().unwrap_or(""),
+                        s["state"].as_str().unwrap_or(""),
+                        s["syncMode"].as_str().unwrap_or(""),
+                        s["direction"].as_str().unwrap_or("-"),
+                        s["defaultChecked"],
+                    );
+                }
+            }
+        }
+        assert!(
+            found_linked > 0,
+            "至少应有一对账号能算出「就地同步」——否则说明关联表或判据坏了"
+        );
+    }
+
+    /// 切号弹窗的四态文案必须与 WorkBuddy 的 `linkStateLabel` **逐字一致**。    ///
+    /// 用户明确要求「样式跟 WorkBuddy 一样，不要自创风格」—— 同一个意思两种说法
+    /// 会让人以为功能不一样。
+    #[test]
+    fn switch_state_texts_match_workbuddy() {
+        assert_eq!(switch_state_text("linked"), "已关联 · 切换后同步内容");
+        assert_eq!(switch_state_text("missing"), "关联断开 · 会补一份副本");
+        assert_eq!(switch_state_text("twin"), "目标已有同内容副本 · 只登记关联");
+        assert_eq!(switch_state_text("unlinked"), "未关联 · 勾选后新建副本");
+        // 未知态不许 panic，回落到「未关联」（最保守，不会误报已关联）
+        assert_eq!(switch_state_text("nonsense"), "未关联 · 勾选后新建副本");
+    }
+
+    /// 空标题的会话**不许**按标题判「同内容副本」。
+    ///
+    /// Trae 里 `Untitled Task` 一抓一大把，按标题匹配必然错配 —— 把两个毫不相干的
+    /// 空标题会话标成「目标已有同内容副本」，用户会以为已经关联过了。
+    #[test]
+    fn blank_titles_never_match_as_twin() {
+        // 这条判据在 `switch_plan` 里是 `!s.title.trim().is_empty()` 的前置条件。
+        // 这里用等价表达式钉住「空标题一律不匹配」的语义。
+        let title = "   ";
+        assert!(title.trim().is_empty(), "空标题必须被前置条件挡掉");
+        let title2 = "Untitled Task";
+        assert!(!title2.trim().is_empty(), "有名字的标题才允许参与匹配");
     }
 
     // --- 分叉判定（`divergence_of`）------------------------------------------

@@ -2238,6 +2238,220 @@ pub fn heal_session_projects(client_key: &str, on_log: Option<&dyn Fn(&str)>) ->
     }))
 }
 
+/// 修复「`project.user_id` 写成了本工具账号库的内部 id」的错位。
+///
+/// ## 这个 bug 是怎么来的
+///
+/// 账号库里的条目 id 是 `oauth_882023`（本工具内部标识），而 Trae 客户端在
+/// `project.user_id` 里认的是**真实 uid** `925158341882023`。两者不是一回事。
+///
+/// 2026-10-31：切号顺带复制会话时，`dst_uid` 误用了 `account_id`（内部 id），
+/// 于是新 project 的 `user_id` 写成 `oauth_882023`。后果很直观：
+/// **会话在库里明明存在，客户端里一条都看不到** —— 客户端按真实 uid 取会话，
+/// `oauth_882023` 这个"账号"在它眼里根本不存在。
+///
+/// ## 修复口径
+///
+/// 只改 `project.user_id`（把内部 id 换成该账号的真实 uid），**不动任何会话内容**。
+/// 真实 uid 的唯一出口是 `trae_vault::uid_of_account`（优先载体 storage.json）。
+///
+/// ⚠️ 认不出来的账号**一律不改**：宁可留着错位（用户能看见「归属不对」这个事实），
+/// 也不要猜一个 uid 上去 —— 猜错就是把会话挂到别人名下。
+pub fn heal_project_uid(client_key: &str, on_log: Option<&dyn Fn(&str)>) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    let Some(client) = get_client(client_key) else {
+        return Err(format!("未知客户端: {client_key}"));
+    };
+    let live = database_path(client);
+
+    // 1) 先算出「哪些内部 id 能映射到真实 uid」。这一步纯读账号库，不碰客户端。
+    let mut mapping: Vec<(String, String)> = Vec::new();
+    for id in crate::modules::trae_vault::list_vault_accounts(client_key) {
+        if let Some(uid) = crate::modules::trae_vault::uid_of_account(client_key, &id) {
+            let uid = uid.trim().to_string();
+            // 只有「内部 id 与真实 uid 不同」才需要映射；相同就没有错位可言。
+            if !uid.is_empty() && uid != id {
+                mapping.push((id, uid));
+            }
+        }
+    }
+    if mapping.is_empty() {
+        return Ok(json!({
+            "checked": true,
+            "fixed": 0,
+            "sessions": Vec::<String>::new(),
+            "note": "没有发现需要修复的工程归属",
+        }));
+    }
+
+    // 2) 密钥 + 结束客户端（文件替换前提）
+    let enc_key_hex = resolve_live_key_for_heal(client_key, &live)?;
+    log("结束客户端进程（文件替换前提）…");
+    let was_running;
+    match stop_for_maintenance(client, 20_000) {
+        Ok(MaintenanceStop::NotRunning) => was_running = false,
+        Ok(MaintenanceStop::NoOwnProgram) => {
+            was_running = false;
+            log(&format!(
+                "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+                client.label
+            ));
+        }
+        Ok(MaintenanceStop::Stopped(n)) => {
+            was_running = true;
+            if n > 0 {
+                log(&format!("已结束 {n} 个进程"));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    // 3) 实时库 → 明文副本（合并 WAL，别丢掉客户端刚写的内容）
+    let work = store_dir()
+        .join("trae")
+        .join("heal_uid_tmp")
+        .join(format!("{client_key}-{}", chrono::Local::now().timestamp()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("创建工作目录失败: {e}"))?;
+    let orig_plain = work.join("live-orig.db");
+    log("解密实时库为明文副本…");
+    let rep = decrypt_database(&live, &enc_key_hex, &orig_plain, Some(&|m| log(&format!("   {m}"))))?;
+    log(&format!("实时库 {} 页", rep.pages));
+    patch_reserved_field(&orig_plain)?;
+    let plain = work.join("live-plain.db");
+    std::fs::copy(&orig_plain, &plain).map_err(|e| format!("复制明文副本失败: {e}"))?;
+    patch_reserved_field(&plain)?;
+    merge_live_wal_into(&plain, &live, &enc_key_hex, &|m| log(m))?;
+
+    // 4) 改明文：只动 project.user_id
+    let (fixed, sessions) = {
+        let conn = Connection::open(&plain).map_err(|e| format!("打开明文副本失败: {e}"))?;
+        let mut fixed = 0usize;
+        let mut sids: Vec<String> = Vec::new();
+        for (internal_id, real_uid) in &mapping {
+            // 先把受影响的会话 id 记下来（给界面展示「修了哪几条」）
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT s.session_id FROM chat_session s JOIN project p ON s.project_id=p.project_id \
+                 WHERE p.user_id=?",
+            ) {
+                if let Ok(rows) = stmt.query_map([internal_id], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        sids.push(r);
+                    }
+                }
+            }
+            let n = conn
+                .execute("UPDATE project SET user_id=? WHERE user_id=?", params![real_uid, internal_id])
+                .map_err(|e| format!("改写 project.user_id 失败: {e}"))?;
+            if n > 0 {
+                fixed += n;
+                log(&format!("   {internal_id} → {real_uid}：{n} 个工程"));
+            }
+        }
+        conn.close().map_err(|(_, e)| format!("关闭明文副本失败: {e}"))?;
+        (fixed, sids)
+    };
+    if fixed == 0 {
+        let _ = std::fs::remove_dir_all(&work);
+        if was_running {
+            let _ = launch(client_key);
+        }
+        return Ok(json!({
+            "checked": true,
+            "fixed": 0,
+            "sessions": Vec::<String>::new(),
+            "note": "库里没有写成内部 id 的工程归属（无需修复）",
+        }));
+    }
+
+    // 5) 备份 → 增量加密回写 → 自检 → 原子替换
+    let bdir = crate::modules::trae_export::import_backup_dir();
+    let backup_dir = bdir.join(crate::modules::trae_backup::entry_name(
+        client_key,
+        "heal-uid",
+        &crate::modules::trae_backup::new_stamp(),
+    ));
+    let backup_mode = {
+        let out = match crate::modules::trae_backup::snapshot_before_write(
+            &live,
+            &plain,
+            &backup_dir,
+            client_key,
+            "heal-uid",
+            "修复工程归属前的整库备份",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("备份原库失败，已中止：{e}"));
+            }
+        };
+        log(&format!("   {}", crate::modules::trae_backup::describe(&out)));
+        out.get("mode").and_then(Value::as_str).unwrap_or("?").to_string()
+    };
+    let new_db = work.join("target-new.db");
+    log("增量加密回写…");
+    let stats = write_db_incremental_with(
+        &enc_key_hex,
+        &live,
+        Some(&orig_plain),
+        &plain,
+        &new_db,
+        Some(&|m| log(&format!("   {m}"))),
+    )?;
+    log(&format!(
+        "增量回写完成：全库 {} 页，重写 {} 页",
+        stats.pages, stats.changed_pages
+    ));
+    if let Err(e) = crate::modules::trae_backup::swap_in_place(&new_db, &live) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(format!("替换实时库失败（原库未被改动）：{e}"));
+    }
+    let _ = std::fs::remove_file(format!("{}-shm", live.to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&work);
+
+    // 6) 让解密快照跟上（否则列表还显示旧归属）
+    match crate::modules::trae_export::promote_snapshot(client_key, &plain) {
+        Ok(()) => {}
+        Err(_) => {
+            crate::modules::trae_export::drop_snapshot_meta(client_key);
+        }
+    }
+
+    // 7) 重启客户端
+    let mut relaunched = false;
+    if was_running {
+        match launch(client_key) {
+            Ok(_) => relaunched = true,
+            Err(e) => log(&format!("重启客户端失败（请手动启动）：{e}")),
+        }
+    }
+
+    match backup_mode.as_str() {
+        "skipped" => log(&format!(
+            "已修复 {fixed} 个工程的账号归属、涉及 {} 条会话（未备份：设置里已关闭「写库前整库备份」）",
+            sessions.len()
+        )),
+        _ => log(&format!(
+            "已修复 {fixed} 个工程的账号归属、涉及 {} 条会话（备份在 {}）",
+            sessions.len(),
+            backup_dir.display()
+        )),
+    }
+    Ok(json!({
+        "checked": true,
+        "fixed": fixed,
+        "sessions": sessions,
+        "backup": if backup_mode == "skipped" { Value::Null } else { json!(backup_dir.to_string_lossy()) },
+        "backup_mode": backup_mode,
+        "relaunched": relaunched,
+        "note": "已把写成内部 id 的工程归属改回真实 uid，客户端里现在应当能看到这些会话了",
+    }))
+}
+
 /// 用模板补齐 `ours` 里缺失的键（递归）。
 ///
 /// 用途：lite 把这些 JSON 解析成**固定结构体**，缺字段会整条反序列化失败。
@@ -3601,6 +3815,33 @@ pub fn import_sessions(
     session_ids: &[String],
     on_log: Option<&dyn Fn(&str)>,
 ) -> Result<Value, String> {
+    import_sessions_ex(
+        src_client_key,
+        dst_client_key,
+        dst_uid,
+        session_ids,
+        on_log,
+        false,
+    )
+}
+
+/// [`import_sessions`] 的可控版本：`already_stopped` = **调用方已经结束了客户端**，
+/// 并且**由调用方负责重新拉起**。
+///
+/// 为什么需要它：切号流程（`trae_switch::switch_to`）在写登录态之前本来就要结束客户端，
+/// 那正是写会话库的最佳时机 —— 进程已退、库空闲。如果这时还让 `import_sessions`
+/// 自己再 `stop` 一遍、写完再 `launch` 一遍，用户就会看到「切个号重启两次客户端」
+/// （而且第二次拉起用的还是旧登录态，直接把刚写好的登录态盖掉）。
+///
+/// 所以切号里走 `already_stopped = true`：本函数只负责**写库**，不碰进程。
+pub fn import_sessions_ex(
+    src_client_key: &str,
+    dst_client_key: &str,
+    dst_uid: Option<&str>,
+    session_ids: &[String],
+    on_log: Option<&dyn Fn(&str)>,
+    already_stopped: bool,
+) -> Result<Value, String> {
     let same_db = src_client_key == dst_client_key;
     let Some(dst_client) = get_client(dst_client_key) else {
         return Err(format!("未知目标客户端: {dst_client_key}"));
@@ -3686,16 +3927,39 @@ pub fn import_sessions(
         return Err(format!("目标账号 {} 在本机没有会话库，请先用它登录一次 Trae", dst_client.label));
     }
     // ⚠️⚠️ T61：走 `stop_for_maintenance`（只碰目标客户端自己的程序），别用 `kill_all`。
-    match stop_for_maintenance(&dst_client, 10_000) {
-        Ok(MaintenanceStop::NotRunning) => {}
-        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
-            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
-            dst_client.label
-        )),
-        Ok(MaintenanceStop::Stopped(n)) => {
-            log(&format!("目标客户端 {} 正在运行，已结束 {n} 个进程，等待退出…", dst_client.label));
+    //
+    // 超时给 20 秒（原 10 秒）：Trae 光主程序就有十几个进程（实测 15+），
+    // 10 秒经常不够 —— 关不干净就 `launch`，结果是**旧窗口残留 + 新窗口**，
+    // 用户看到「复制会话时自动重启了两个客户端」（2026-10-31 反馈）。
+    //
+    // `already_stopped` 时整段跳过：切号流程已经结束过客户端了，由它负责拉起。
+    if already_stopped {
+        log("客户端已由调用方结束（切号流程），本次只写库、不碰进程");
+    } else {
+        match stop_for_maintenance(&dst_client, 20_000) {
+            Ok(MaintenanceStop::NotRunning) => {}
+            Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+                "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+                dst_client.label
+            )),
+            Ok(MaintenanceStop::Stopped(n)) => {
+                log(&format!("目标客户端 {} 正在运行，已结束 {n} 个进程，等待退出…", dst_client.label));
+            }
+            Err(_) => return Err("目标客户端未能退出，无法写入数据库".into()),
         }
-        Err(_) => return Err("目标客户端未能退出，无法写入数据库".into()),
+        // ⚠️ 关完再确认一次：`stop_for_maintenance` 返回 Stopped 也可能还有子进程在收尾。
+        // 这里留一个短暂等待，让「退出中」的进程真正消失 —— 否则下面 launch 会撞上
+        // 单实例锁、或让用户看到两个窗口。
+        {
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_millis(3000);
+            while Instant::now() < deadline && crate::modules::trae_switch::is_running_own(&dst_client) {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            if crate::modules::trae_switch::is_running_own(&dst_client) {
+                log("警告：目标客户端仍有进程在收尾，重启后可能出现两个窗口（不影响写入结果）");
+            }
+        }
     }
     let enc_key_hex = match load_saved_key(dst_client_key) {
         Some(k) => k,
@@ -3917,6 +4181,25 @@ pub fn import_sessions(
             return Err("自检失败：新库首页 HMAC 校验不通过（已保留备份）".into());
         }
     }
+    // 6a) ⚠️⚠️ **让解密快照跟上新库** —— 否则刚复制完的会话在「关联会话」里会显示
+    //     「内容缺失 / 这个账号里已经没有这条会话」（2026-10-31 用户实测）。
+    //
+    // 根因：关联总览读的是**解密快照**（`decrypted_db_path`），而快照还是写入前的旧版本，
+    // 里面当然没有新副本 ⇒ 判成「已失效」。
+    //
+    // 这里用 `promote_snapshot`（把刚写好的明文直接提升为新快照）而不是重新解密一遍：
+    // `plain` 就是新库的完整明文（`write_db_incremental` 保证逐页一致），
+    // 提升后元信息立即与新库对齐，后续读取无需再解密。**必须在删 work 目录之前调用。**
+    //
+    // 提升失败**不影响导入结果**（库已经替换成功），只丢元信息让下次重新解密 ——
+    // 反过来把成功的导入判成失败，会让用户以为白干了。
+    match crate::modules::trae_export::promote_snapshot(dst_client_key, &plain) {
+        Ok(()) => log("解密快照已更新到新库（关联页立即可见新副本）"),
+        Err(e) => {
+            log(&format!("导入成功，但快照提升失败（下次读取会重新解密）：{e}"));
+            crate::modules::trae_export::drop_snapshot_meta(dst_client_key);
+        }
+    }
     let _ = std::fs::remove_dir_all(&work);
     log(&format!(
         "自检通过：新库 {pages} 页 / {:.1} MB，会话 {plain_sessions} 个",
@@ -3978,14 +4261,23 @@ pub fn import_sessions(
     let verified_sessions = sid_pairs.len();
 
     // 7) 导入期间结束过目标客户端进程，成功后自动重启，保证导入的会话立即可用
-    let relaunched = match launch(dst_client_key) {
-        Ok(_) => {
-            log("导入成功，已自动重启目标客户端");
-            true
-        }
-        Err(e) => {
-            log(&format!("导入成功，但自动重启目标客户端失败：{e}"));
-            false
+    //
+    // ⚠️ `already_stopped` 时**不重启**：切号流程在写登录态之后才拉起客户端，
+    // 这里若抢先 `launch`，会用**旧登录态**启动一个实例，把刚写好的登录态盖掉 ——
+    // 那才是「切了号又变回去」的真正原因。
+    let relaunched = if already_stopped {
+        log("已写入会话；客户端由切号流程统一拉起（本次不重启）");
+        false
+    } else {
+        match launch(dst_client_key) {
+            Ok(_) => {
+                log("导入成功，已自动重启目标客户端");
+                true
+            }
+            Err(e) => {
+                log(&format!("导入成功，但自动重启目标客户端失败：{e}"));
+                false
+            }
         }
     };
 
@@ -4065,13 +4357,31 @@ pub fn sync_group(
 /// **批量**同步：`requests` 每项为 `(group_id, direction)`，`direction` 同 [`sync_group`]。
 ///
 /// 所有组合用一个写库周期（一次退客户端 / 一次备份 / 一次重启），返回 `groups[]` 逐组结果。
+/// 切号流程专用：在**进程已停**的前提下同步若干关联组（不 stop、不 launch）。
+///
+/// 与 [`sync_groups`] 的差别只有进程管理：这里假定调用方已经结束了客户端，
+/// 且由调用方在写完登录态之后统一拉起（否则会用旧登录态起实例、盖掉新登录态）。
+pub fn sync_groups_after_stop(
+    client_key: &str,
+    requests: &[(String, String)],
+    on_log: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let r = sync_groups_inner_ex(client_key, requests, on_log, true)?;
+    Ok(json!({
+        "ok": true,
+        "count": r.outcomes.len(),
+        "pages": r.pages,
+        "relaunched": r.relaunched,
+        "backupMode": r.backup_mode,
+    }))
+}
+
 pub fn sync_groups(
     client_key: &str,
     requests: &[(String, String)],
     on_log: Option<&dyn Fn(&str)>,
 ) -> Result<Value, String> {
-    let r = sync_groups_inner(client_key, requests, on_log)?;
-    Ok(json!({
+    let r = sync_groups_inner(client_key, requests, on_log)?;    Ok(json!({
         "ok": true,
         "count": r.outcomes.len(),
         "groups": r.outcomes.iter().map(|g| json!({
@@ -4146,6 +4456,17 @@ fn sync_groups_inner(
     client_key: &str,
     requests: &[(String, String)],
     on_log: Option<&dyn Fn(&str)>,
+) -> Result<BatchSyncResult, String> {
+    sync_groups_inner_ex(client_key, requests, on_log, false)
+}
+
+/// [`sync_groups_inner`] 的可控版本：`already_stopped` = 调用方已结束客户端、
+/// 并由调用方负责拉起（切号流程用，避免「切个号重启两次」）。
+fn sync_groups_inner_ex(
+    client_key: &str,
+    requests: &[(String, String)],
+    on_log: Option<&dyn Fn(&str)>,
+    already_stopped: bool,
 ) -> Result<BatchSyncResult, String> {
     let log = |m: &str| {
         if let Some(cb) = on_log {
@@ -4248,16 +4569,22 @@ fn sync_groups_inner(
     }
 
     // 2) 结束客户端（写库前提）—— ⚠️⚠️ T61：只碰它自己的程序，绝不碰承载方。
-    match stop_for_maintenance(&client, 20_000) {
-        Ok(MaintenanceStop::NotRunning) => {}
-        Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
-            "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
-            client.label
-        )),
-        Ok(MaintenanceStop::Stopped(n)) => {
-            log(&format!("{} 正在运行，已结束 {n} 个进程，等待退出…", client.label));
+    //
+    // `already_stopped` 时跳过：切号流程已经结束过客户端了，由它负责拉起。
+    if already_stopped {
+        log("客户端已由调用方结束（切号流程），本次只写库、不碰进程");
+    } else {
+        match stop_for_maintenance(&client, 20_000) {
+            Ok(MaintenanceStop::NotRunning) => {}
+            Ok(MaintenanceStop::NoOwnProgram) => log(&format!(
+                "{} 已并入其他客户端、本机没有它自己的程序：不结束任何进程。",
+                client.label
+            )),
+            Ok(MaintenanceStop::Stopped(n)) => {
+                log(&format!("{} 正在运行，已结束 {n} 个进程，等待退出…", client.label));
+            }
+            Err(_) => return Err("客户端未能退出，无法写入数据库".into()),
         }
-        Err(_) => return Err("客户端未能退出，无法写入数据库".into()),
     }
 
     // 3) 密钥
@@ -4462,20 +4789,31 @@ fn sync_groups_inner(
     }
 
     // 9) 重启客户端
-    let relaunched = match launch(client_key) {
-        Ok(_) => {
-            log(&format!(
-                "同步完成（{} 个关联组），已自动重启客户端",
-                outcomes.len()
-            ));
-            true
-        }
-        Err(e) => {
-            log(&format!(
-                "同步完成（{} 个关联组），但自动重启客户端失败：{e}",
-                outcomes.len()
-            ));
-            false
+    //
+    // ⚠️ `already_stopped` 时**不重启**：切号流程在写登录态之后才拉起客户端，
+    // 这里若抢先 launch，会用**旧登录态**起实例，把刚写好的登录态盖掉。
+    let relaunched = if already_stopped {
+        log(&format!(
+            "同步完成（{} 个关联组）；客户端由切号流程统一拉起（本次不重启）",
+            outcomes.len()
+        ));
+        false
+    } else {
+        match launch(client_key) {
+            Ok(_) => {
+                log(&format!(
+                    "同步完成（{} 个关联组），已自动重启客户端",
+                    outcomes.len()
+                ));
+                true
+            }
+            Err(e) => {
+                log(&format!(
+                    "同步完成（{} 个关联组），但自动重启客户端失败：{e}",
+                    outcomes.len()
+                ));
+                false
+            }
         }
     };
 
@@ -4589,10 +4927,11 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 9,
-            "护栏失效或写路径数量变了：只扫到 {checked} 处「会毁掉 WAL」的写路径，预期 9 处\
+            checked, 10,
+            "护栏失效或写路径数量变了：只扫到 {checked} 处「会毁掉 WAL」的写路径，预期 10 处\
              （删除 / 会话编辑 / WorkBuddy 导入 / Trae 导入 / 会话复制 / 分组同步 / \
-               项目修复 heal_session_projects / token 修复 heal_zero_token_usage / 通用写 apply_sql）。\
+               项目修复 heal_session_projects / token 修复 heal_zero_token_usage / 通用写 apply_sql / \
+               账号归属修复 heal_project_uid）。\
              新增写路径请一起加进来，别让护栏悄悄漏掉它。"
         );
     }
