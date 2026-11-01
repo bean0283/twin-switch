@@ -186,6 +186,105 @@ pub fn status() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 跨机器迁移
+//
+// ## 为什么需要导出/导入
+//
+// 这六个头是「这台机器装了官方客户端」的证明。服务端按它决定下发不下发
+// 「每天领 100 Credits」：**只带 clienttype/version/UA 时只有 VIEW_DETAILS**，
+// 带全套才有 `CLAIM_BENEFIT`（真机对照见模块头）。
+//
+// 其中 `machinecode` / `machinetype` / `machinetoken` 客户端**运行时才生成、不落盘**
+// （2026-11-01 实测：把 `%APPDATA%\com.qoder.app.stable` 与 `~/.qoder` 共 1 万多个文件
+// 全扫过，三个值一处明文都没有），所以**没法在新电脑上自动读出来**。
+//
+// 结论：换机器时只能把这份身份**带过去**。本模块提供导出/导入，
+// 就是让"能签到的那台"把身份交给"签不了的那台"。
+// ---------------------------------------------------------------------------
+
+/// 导出格式标识（与别的导出物区分，导入时先校验）。
+pub const EXPORT_FORMAT: &str = "twinswitch.qoder-machine";
+/// 导出格式版本。
+pub const EXPORT_VERSION: u32 = 1;
+
+/// 导出机器身份（整份可迁移，含 machineid / hostname）。
+///
+/// ⚠️ 为什么要连 `machineId` / `machineHostname` 一起导：服务端看到的是一整套身份，
+/// 只搬 token 而让新机器用自己的 machineid，等于"token 属于 A 机器、请求来自 B 机器"，
+/// 比不发更容易被判成异常客户端。整份照搬才是自洽的。
+pub fn export_identity() -> Result<Value, String> {
+    let cfg = load();
+    let get = |k: &str| {
+        cfg.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let code = get("machineCode")
+        .ok_or("本机还没有机器身份（缺 machineCode）——请先在有官方客户端的机器上抓包配置")?;
+    let token = get("machineToken").ok_or("本机还没有机器身份（缺 machineToken）")?;
+    let mtype = get("machineType").ok_or("本机还没有机器身份（缺 machineType）")?;
+    // machineid 允许来自客户端文件（自动读），导出时固化下来，免得新机器读到不同的值。
+    let mid = get("machineId")
+        .or_else(|| machine_id_from_client(QoderRegion::Global))
+        .or_else(|| machine_id_from_client(QoderRegion::Cn))
+        .ok_or("读不到 machineId（客户端没安装或还没登录过）")?;
+
+    Ok(json!({
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "exportedAt": chrono::Local::now().to_rfc3339(),
+        "machineCode": code,
+        "machineType": mtype,
+        "machineToken": token,
+        "machineId": mid,
+        "machineHostname": get("machineHostname").unwrap_or_else(hostname),
+        "machineOs": get("machineOs").unwrap_or_else(machine_os),
+    }))
+}
+
+/// 导入机器身份（覆盖写入，字段逐个校验）。
+///
+/// 只接受 [`EXPORT_FORMAT`] 的导出物；三项关键字段缺一不可 ——
+/// 半套身份发出去会被服务端当成畸形客户端（比不发更糟），所以宁可直接拒绝。
+pub fn import_identity(raw: &Value) -> Result<Value, String> {
+    let obj = raw.as_object().ok_or("内容不是 JSON 对象")?;
+    if let Some(f) = obj.get("format").and_then(Value::as_str) {
+        if f != EXPORT_FORMAT {
+            return Err(format!("这不是 Qoder 机器身份文件（format = {f}）"));
+        }
+    }
+    let pick = |k: &str| {
+        obj.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let code = pick("machineCode").ok_or("缺少 machineCode")?;
+    let token = pick("machineToken").ok_or("缺少 machineToken")?;
+    let mtype = pick("machineType").ok_or("缺少 machineType")?;
+    let mid = pick("machineId").ok_or("缺少 machineId（只搬 token 不搬 machineId 会被判成异常设备）")?;
+
+    let patch = json!({
+        "machineCode": code,
+        "machineToken": token,
+        "machineType": mtype,
+        "machineId": mid,
+        "machineHostname": pick("machineHostname").unwrap_or_else(hostname),
+        "machineOs": pick("machineOs").unwrap_or_else(machine_os),
+        "source": format!("从另一台机器导入（{}）", chrono::Local::now().format("%Y-%m-%d %H:%M")),
+    });
+    save(&patch)?;
+    Ok(json!({
+        "ok": true,
+        "path": config_path().display().to_string(),
+        "status": status(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -643,6 +643,15 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> 
     Ok(cols)
 }
 
+/// 同 [`table_columns`]，但**表不存在时返回空**而不是报错。
+///
+/// 用途：可选辅助表（`agent_run` / `history_v2` 等）。它们可能因为
+/// 客户端版本差异、或会话包裁剪而缺失，缺了只是「这部分没有数据」，
+/// 不该让整条会话复制失败。
+fn optional_table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    table_columns(conn, table).unwrap_or_default()
+}
+
 /// 公共列交集，排除自增主键 `id`：源行的整型主键会与目标库已有行冲突，
 /// 复制时跳过该列，由 SQLite 自动分配新值。
 fn common_cols(src_cols: &[String], dst_cols: &[String]) -> Vec<String> {
@@ -1343,9 +1352,16 @@ fn copy_session(
 
     // agent_run：agent 执行记录。同库复制时重生成唯一键 agent_run_id，
     // 会话内 parent_run_id 同步映射，否则父子关系指向源会话的运行。
+    //
+    // ⚠️ 源库缺这张表时**跳过**（`optional_table_columns` 返回空），不当作错误：
+    // 会话包只带会话相关的表，老版本包可能干脆没带 `agent_run`；
+    // 用 `table_columns(...)?` 会直接把整条会话复制判失败
+    // （2026-11-01 实测：导入报「目标库没有表 agent_run」，一条都进不去）。
     {
         let table = "agent_run";
-        let cols = common_cols(&table_columns(src, table)?, &table_columns(dst, table)?);
+        let src_cols = optional_table_columns(src, table);
+        let dst_cols = optional_table_columns(dst, table);
+        let cols = common_cols(&src_cols, &dst_cols);
         if !cols.is_empty() {
             let col_list = cols
                 .iter()
@@ -3815,14 +3831,27 @@ pub fn import_sessions(
     session_ids: &[String],
     on_log: Option<&dyn Fn(&str)>,
 ) -> Result<Value, String> {
-    import_sessions_ex(
+    import_sessions_from(
         src_client_key,
         dst_client_key,
         dst_uid,
         session_ids,
         on_log,
         false,
+        None,
     )
+}
+
+/// 会话包导入的源：一个**解压出来的明文 SQLite**（不是本机某个客户端的解密快照）。
+///
+/// 与「本机客户端」的差别有三处，都体现在 [`import_sessions_from`] 里：
+/// 1. 源库路径由调用方给（包里那份），不走 `decrypted_db_path(client_key)`；
+/// 2. **不剔除「已属于目标账号」的会话** —— 跨机迁移时同一个账号在两台机器上
+///    uid 相同，如果沿用同库复制的剔除逻辑，结果会是一条都导不进去；
+/// 3. 仍然**生成新 session_id**（目标机可能已有同 id，用户已确认「新建一份副本」）。
+pub struct PackSrc<'a> {
+    /// 包里 `pack.db` 的路径（已解压、明文）。
+    pub db: &'a Path,
 }
 
 /// [`import_sessions`] 的可控版本：`already_stopped` = **调用方已经结束了客户端**，
@@ -3842,7 +3871,55 @@ pub fn import_sessions_ex(
     on_log: Option<&dyn Fn(&str)>,
     already_stopped: bool,
 ) -> Result<Value, String> {
-    let same_db = src_client_key == dst_client_key;
+    import_sessions_from(
+        src_client_key,
+        dst_client_key,
+        dst_uid,
+        session_ids,
+        on_log,
+        already_stopped,
+        None,
+    )
+}
+
+/// 会话包导入入口：源是**包里的库**，目标是本机目标账号。
+///
+/// `src_client_key` 与 `dst_client_key` 传同一个值（同一个客户端），
+/// 但内部 `same_db` 会因 `pack.is_some()` 判为 false —— 于是不会执行
+/// 「剔除已属目标账号的会话」那段（跨机迁移时源 uid 常与目标 uid 相同，
+/// 剔除的话一条都导不进去）。
+pub fn import_pack_source(
+    dst_client_key: &str,
+    dst_uid: &str,
+    session_ids: &[String],
+    on_log: Option<&dyn Fn(&str)>,
+    pack: Option<&PackSrc<'_>>,
+) -> Result<Value, String> {
+    import_sessions_from(
+        dst_client_key,
+        dst_client_key,
+        Some(dst_uid),
+        session_ids,
+        on_log,
+        false,
+        pack,
+    )
+}
+
+/// 通用实现。`pack` 有值时源库来自会话包，此时 `src_client_key` 只用于日志与关联登记。
+fn import_sessions_from(
+    src_client_key: &str,
+    dst_client_key: &str,
+    dst_uid: Option<&str>,
+    session_ids: &[String],
+    on_log: Option<&dyn Fn(&str)>,
+    already_stopped: bool,
+    pack: Option<&PackSrc<'_>>,
+) -> Result<Value, String> {
+    // 「源与目标是同一个库」——只在本机客户端之间成立；包导入永远算「非同库」。
+    let same_db = pack.is_none() && src_client_key == dst_client_key;
+    // 「要不要生成新 session_id」——同库复制与包导入都要新 id，跨客户端才保留原 id。
+    let fresh_ids = same_db || pack.is_some();
     let Some(dst_client) = get_client(dst_client_key) else {
         return Err(format!("未知目标客户端: {dst_client_key}"));
     };
@@ -3879,23 +3956,58 @@ pub fn import_sessions_ex(
         }
     }
 
-    // 0) 源库必须是已解密状态
-    let src_db = decrypted_db_path(src_client_key);
+    // 0) 源库必须是可读的明文
+    //
+    // `pack.is_some()` 时源是会话包里的 `pack.db`（调用方已解压、已校验），
+    // 不再是本机某个客户端的解密快照 —— 所以不能拿 `decrypted_db_path` 去判断存在性。
+    let src_db = match pack {
+        Some(p) => p.db.to_path_buf(),
+        None => decrypted_db_path(src_client_key),
+    };
     if !src_db.is_file() {
-        return Err(format!(
-            "未找到源账号解密库：{}\n请先在「Trae 记录」页对源账号运行「扫描密钥并解密」。",
-            src_db.display()
-        ));
+        return Err(match pack {
+            Some(p) => format!("会话包里的数据库不存在：{}", p.db.display()),
+            None => format!(
+                "未找到源账号解密库：{}\n请先在「Trae 记录」页对源账号运行「扫描密钥并解密」。",
+                src_db.display()
+            ),
+        });
     }
-    let src_conn = open_decrypted(src_client_key)?;
+    let src_conn = match pack {
+        Some(p) => Connection::open(p.db).map_err(|e| format!("打开会话包数据库失败: {e}"))?,
+        None => open_decrypted(src_client_key)?,
+    };
+    // 源会话的归属账号：包导入时**必须**从包里查（包里是另一台机器的库，
+    // 用本机的 `session_owner_uid(client_key, sid)` 会查错人）。
+    let src_owner_of = |sid: &str| -> Option<String> {
+        if pack.is_none() {
+            return session_owner_uid(src_client_key, sid);
+        }
+        let v: rusqlite::types::Value = src_conn
+            .query_row(
+                "SELECT p.user_id FROM chat_session s JOIN project p ON s.project_id = p.project_id \
+                 WHERE s.session_id = ?",
+                params![sid],
+                |r| r.get(0),
+            )
+            .ok()?;
+        match v {
+            rusqlite::types::Value::Text(s) => Some(s),
+            rusqlite::types::Value::Integer(i) => Some(i.to_string()),
+            _ => None,
+        }
+    };
 
     // 同客户端跨账号：必须给出目标 uid。源账号按「所选会话的归属账号」判定
     // （而非解密库中出现最多的账号），已属于目标账号的会话直接跳过。
+    //
+    // ⚠️ 包导入**不走这段剔除**：跨机迁移时同一个账号在两台机器上 uid 相同，
+    // 按「已属目标账号」剔掉的话一条都导不进去（见 `PackSrc` 的注释）。
     let session_ids: Vec<String> = if same_db {
         let uid = dst_uid.ok_or("同客户端导入必须指定目标账号 uid")?;
         let mut kept: Vec<String> = Vec::new();
         for sid in session_ids {
-            match session_owner_uid(src_client_key, sid) {
+            match src_owner_of(sid) {
                 Some(o) if o == uid => {
                     log(&format!("会话 {sid} 已属于目标账号（uid …{}），跳过（无需复制）", uid_suffix(&uid)));
                 }
@@ -3913,10 +4025,12 @@ pub fn import_sessions_ex(
 
     // 源账号 uid：登记关联时要用它作为「源」一侧。取所选会话的归属账号——
     // 同库跨账号场景下它们必然同属一个账号（上面已把属于目标账号的剔掉）。
-    let src_owner_uid: Option<String> = if same_db {
-        session_ids
-            .iter()
-            .find_map(|sid| session_owner_uid(src_client_key, sid))
+    //
+    // ⚠️ 包导入也要取（跨机迁到**另一个**账号时，登记关联才有意义）：
+    // 但源 uid 与目标 uid 相同时**不能**登记 —— `register_batch` 的 upsert 会
+    // 按 uid 把「目标成员」换成新的，同 uid 就会把源成员自己替换掉，组里只剩一条。
+    let src_owner_uid: Option<String> = if same_db || pack.is_some() {
+        session_ids.iter().find_map(|sid| src_owner_of(sid))
     } else {
         None
     };
@@ -4017,7 +4131,9 @@ pub fn import_sessions_ex(
 
     // 3) 复制会话（先复制无冲突的）
     let dst_conn = Connection::open(&plain).map_err(|e| format!("打开目标明文副本失败: {e}"))?;
-    let opts = if same_db {
+    // `fresh_ids` 而不是 `same_db`：包导入也要**生成新 id**（目标机可能已有同 id），
+    // 但它不属于「同库」——那个变量只用于剔除逻辑。
+    let opts = if fresh_ids {
         CopyOpts::same_db_for(dst_uid)
     } else {
         CopyOpts::cross_db_for(dst_uid)
@@ -4219,12 +4335,16 @@ pub fn import_sessions_ex(
 
     // 6c) 登记跨账号关联：把「源会话 → 目标副本」记进关联表，供「关联」页签展示。
     //
-    // 只有**同库跨账号**才有意义：跨客户端（Trae ↔ WorkBuddy）的两条记录分属不同产品线，
+    // 只有**跨账号**才有意义：跨客户端（Trae ↔ WorkBuddy）的两条记录分属不同产品线，
     // 会话 id 语义都不同，谈不上「同一段对话的两个副本」。
     // 登记失败**不影响导入结果**（库已经替换成功），只记一条日志——
     // 反过来把已经成功的导入判成失败，会让用户以为白干了。
     let mut linked = 0usize;
-    if same_db {
+    // ⚠️ 源 uid 与目标 uid 相同时**不登记**：那是「同一个账号换台机器」，
+    // 两条本就是同一份身份，登记只会产生「自己跟自己关联」的脏组
+    // （`register_batch` 的 upsert 按 uid 替换目标成员，同 uid 会把源成员挤掉）。
+    let need_link = src_owner_uid.as_deref() != dst_uid;
+    if (same_db || pack.is_some()) && need_link {
         if let (Some(src_uid), Some(tgt_uid)) = (src_owner_uid, dst_uid) {
             match crate::modules::trae_session_links::register_batch(
                 dst_client_key,

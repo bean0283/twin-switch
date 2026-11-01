@@ -615,11 +615,27 @@ pub fn delete_sessions(uid: &str, ids: &[String]) -> Result<Value, String> {
 /// 客户端按会话行的 `cwd` 推导工作区目录名，而 `cwd` 在复制时原样保留，
 /// 所以目录名必须保持一致，否则客户端找不到正文。
 pub(crate) fn target_body_path(source_path: &Path, new_cid: &str) -> PathBuf {
+    target_body_path_from(source_path, new_cid, &workbuddy_auth::projects_dir())
+}
+
+/// 同 [`target_body_path`]，但源正文的「根」可以指定。
+///
+/// 为什么需要：会话包导入时，正文来自**解压出来的 `chats/<工作区>/` 目录**，
+/// 不是本机的 `projects/<工作区>/`。如果仍拿 `projects` 去 `strip_prefix`，
+/// 相对路径算不出来 ⇒ 正文全落到 `projects/` 根下，工作区归类丢失。
+///
+/// 包内目录结构与 `projects/` 保持同形（`chats/<工作区>/<cid>.jsonl`），
+/// 所以只要把这里的根换成 `chats/`，其余逻辑原样可用。
+pub(crate) fn target_body_path_from(
+    source_path: &Path,
+    new_cid: &str,
+    src_root: &Path,
+) -> PathBuf {
     let file_name = format!("{new_cid}.jsonl");
     let projects = workbuddy_auth::projects_dir();
     let relative = source_path
         .parent()
-        .and_then(|p| p.strip_prefix(&projects).ok())
+        .and_then(|p| p.strip_prefix(src_root).ok())
         .filter(|r| !r.as_os_str().is_empty());
     match relative {
         Some(r) => projects.join(r).join(file_name),
@@ -700,7 +716,7 @@ pub fn copy_preview(source_uid: &str, target_uid: &str, ids: &[String]) -> Value
 /// 流程：只读校验 → 占用门禁 → 整份备份 → 逐个（新 UUID → 写正文 → INSERT 行 → 校验）
 /// → 登记关联 → 失败回滚本次写入。云端映射库始终不写。
 /// 复制计划里的一项：源会话 id / 标题 / 磁盘上的正文路径。
-pub(crate) struct CopyItem {
+pub struct CopyItem {
     pub cid: String,
     pub title: String,
     pub src_path: PathBuf,
@@ -724,6 +740,9 @@ fn write_copies(
     alive: &std::collections::HashSet<(String, String)>,
     done_rows: &mut Vec<String>,
     done_files: &mut Vec<PathBuf>,
+    // 源正文的根目录。`None` = 本机 `projects/`（手动复制 / 一键互通）；
+    // `Some(chats)` = 会话包解压出来的 `chats/`（跨机导入）。
+    body_root: Option<&Path>,
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
     let mut copied: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
@@ -751,7 +770,10 @@ fn write_copies(
             }
         }
         let new_cid = uuid::Uuid::new_v4().to_string();
-        let dest = target_body_path(&item.src_path, &new_cid);
+        let dest = match body_root {
+            Some(root) => target_body_path_from(&item.src_path, &new_cid, root),
+            None => target_body_path(&item.src_path, &new_cid),
+        };
         if dest.exists() {
             return Err(format!("目标正文已存在同名文件，已停止复制：{}", dest.display()));
         }
@@ -1079,6 +1101,7 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
             &alive_keys,
             &mut done_rows,
             &mut done_files,
+            None, // 本机复制：正文根就是 projects/
         )?;
         save_links(&store)?;
         Ok(out)
@@ -1117,8 +1140,111 @@ pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Resu
     }))
 }
 
-/// **多目标**复制：一次把源账号的若干会话复制到多个目标账号。
+/// 会话包导入：把包里的一批会话写进**目标账号**。
 ///
+/// 与 [`copy_sessions`] 的差别只有一个：源不是本机某个账号，而是**包**——
+/// 所以归属校验（`row.user_id != source_uid`）这里不适用，改成「包里读出来的就是源」。
+/// 写入仍然走同一套 [`write_copies`]：新 UUID、新行、正文 cid 替换、失败整体回滚。
+///
+/// `body_root`：包内正文的根（`chats/`）。传进 `write_copies` 用来算工作区子目录 ——
+/// 不传就会把正文全丢到 `projects/` 根下，工作区归类丢失。
+pub fn import_from_pack(
+    plan: &[CopyItem],
+    body_root: &Path,
+    source_uid: &str,
+    target_uid: &str,
+    on_log: Option<&dyn Fn(&str)>,
+) -> Result<Value, String> {
+    let log = |m: &str| {
+        if let Some(f) = on_log {
+            f(m);
+        }
+    };
+    if plan.is_empty() {
+        return Err("没有要导入的会话".to_string());
+    }
+    if target_uid.trim().is_empty() {
+        return Err("缺少目标账号 uid".to_string());
+    }
+    let db = db_path();
+    assert_not_edge_sync(&db)?;
+
+    // 目标账号正被客户端使用时禁止写（运行中的实例看不到写入，继续对话会让会话分叉）。
+    if workbuddy_switch::is_running() && workbuddy_auth::current_uid().as_deref() == Some(target_uid) {
+        return Err(TARGET_IN_USE.to_string());
+    }
+
+    log(&format!("目标账号 {}，准备写入 {} 个会话", target_uid, plan.len()));
+    let backup = backup_db("pack-import")?;
+    log(&format!("已备份会话库：{}", backup.display()));
+
+    let now = now_ms();
+    let conn = open_rw(&db)?;
+    let mut done_rows: Vec<String> = Vec::new();
+    let mut done_files: Vec<PathBuf> = Vec::new();
+    // 包里带过来的会话在本机目标账号下**必然没有副本**（跨机），
+    // 但仍要传 alive：同机重复导入时，关联表里记着的副本可以避免重复新建。
+    let alive_keys: std::collections::HashSet<(String, String)> = workbuddy_source::list_sessions()
+        .map(|all| {
+            all.iter()
+                .map(|s| (s.user_id.clone(), s.id.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 源 uid 由调用方从包里读出（仅用于关联登记；与目标相同时 `write_copies` 不会登记）。
+    let src_uid = source_uid.to_string();
+
+    let result = (|| -> Result<(Vec<Value>, Vec<Value>), String> {
+        let mut store = load_links().unwrap_or_default();
+        write_copies(
+            &conn,
+            &mut store,
+            &src_uid,
+            target_uid,
+            plan,
+            now,
+            &alive_keys,
+            &mut done_rows,
+            &mut done_files,
+            Some(body_root),
+        )?;
+        save_links(&store)?;
+        Ok((Vec::new(), Vec::new()))
+    })();
+
+    match result {
+        Ok(_) => {
+            // `write_copies` 没回传明细（它的返回被上层各自加工），这里按实际写入数报。
+            log(&format!("已写入 {} 个会话", done_rows.len()));
+            Ok(json!({
+                "ok": true,
+                "targetUid": target_uid,
+                "copied": done_rows,
+                "count": done_rows.len(),
+                "backup": backup.to_string_lossy(),
+                "edgeSyncSkipped": edge_sync_databases(),
+                "note": "云端映射库未做任何写入（写入会导致 edge-sync 跳过上传、云端缺会话）",
+            }))
+        }
+        Err(e) => {
+            // 回滚：只撤销本次写入（删新行 + 删新正文），备份保留供人工恢复。
+            for cid in &done_rows {
+                let _ = conn.execute("DELETE FROM sessions WHERE id = ?1", [cid]);
+            }
+            for f in &done_files {
+                let _ = std::fs::remove_file(f);
+            }
+            Err(format!(
+                "{e}（已回滚本次导入的 {} 条新记录，备份保留在 {}）",
+                done_rows.len(),
+                backup.display()
+            ))
+        }
+    }
+}
+
+/// **多目标**复制：一次把源账号的若干会话复制到多个目标账号。///
 /// 为什么不让前端循环调 `copy_sessions`：
 /// * 每个目标各备份一次整库、各开关一次写连接 —— N 个目标就 N 次，明显慢；
 /// * 任一个目标失败时，前端拿不到「哪些成了、哪些没成」的统一结论，只能拼字符串。
@@ -2061,6 +2187,7 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
                 &alive_keys,
                 &mut done_rows,
                 &mut done_files,
+                None, // 一键互通：正文根就是 projects/
             )?;
             // 先计数再 move（`extend` 会把 c 吃掉）。
             *per_target.entry(dst.clone()).or_insert(0) += c.len();

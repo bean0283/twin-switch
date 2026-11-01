@@ -275,28 +275,52 @@ fn campaign_headers(region: QoderRegion, account: &QoderAccount, token: &str) ->
     //    只带上面那 4 个 → claimable=false、只有 2 个 VIEW_DETAILS；
     //    带全套 6 个 → claimable=true、3 个活动含 CLAIM_BENEFIT/CLAIMABLE/100。
     //    （真机对照见 `qoder_machine` 模块文档）
-    if let Some(machine) = crate::modules::qoder_machine::identity(region) {
-        out.extend(machine.headers());
+    let machine = crate::modules::qoder_machine::identity(region);
+    if let Some(m) = &machine {
+        out.extend(m.headers());
     }
 
-    if let Some((mtok, mtype)) = native {
-        let id = crate::modules::qoder_realm::derive_id(&account.uid, "machine");
-        out.push(("cosy-machineid".into(), id.clone()));
-        out.push(("cosy-machinetoken".into(), mtok.to_string()));
-        out.push(("cosy-machinetype".into(), mtype.to_string()));
-        out.push(("cosy-machinecode".into(), id.chars().take(20).collect()));
-        out.push(("cosy-machineos".into(), "x86_64_win32".into()));
-        out.push((
-            "cosy-machinehostname".into(),
-            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into()),
-        ));
+    // 账号级抓包只在**机器级身份缺失**时兜底。
+    //
+    // ⚠️ 以前是无条件发，于是机器级那套真实头会被这里的派生值覆盖：
+    // `cosy-machineid` / `cosy-machinecode` 都是 `derive_id(uid, "machine")` 算出来的**假值**，
+    // 与 `cosy-machinetoken`（真实、服务端签发）对不上 —— 服务端看到「token 属于 A 设备、
+    // id 属于 B 设备」，正是模块头说的「比不发更糟」。
+    // 现在两者都齐全时，一律以机器级那套为准（它是完整自洽的一组）。
+    if machine.is_none() {
+        if let Some((mtok, mtype)) = native {
+            let id = crate::modules::qoder_realm::derive_id(&account.uid, "machine");
+            out.push(("cosy-machineid".into(), id.clone()));
+            out.push(("cosy-machinetoken".into(), mtok.to_string()));
+            out.push(("cosy-machinetype".into(), mtype.to_string()));
+            out.push(("cosy-machinecode".into(), id.chars().take(20).collect()));
+            out.push(("cosy-machineos".into(), "x86_64_win32".into()));
+            out.push((
+                "cosy-machinehostname".into(),
+                std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into()),
+            ));
+        }
     }
     let _ = region;
     out
 }
 
-fn token_of<'a>(account: &'a QoderAccount) -> Result<&'a str, String> {
-    account
+/// 这台机器有没有可用的 Qoder 机器身份（决定「签到拿不到积分」该怪谁）。
+///
+/// 判据与 [`campaign_headers`] 实际发出去的头**同源**：机器级配置齐全，
+/// 或账号里存了原始 `cosy-machinetoken` + `cosy-machinetype`。
+///
+/// ⚠️ 别在这里另立判据 —— 一旦两边不一致，就会出现「文案说官方没有签到、
+/// 实际是缺配置」这种把用户劝退的错话（2026-11-01 用户反馈就是这个）。
+fn has_machine_identity(region: QoderRegion, account: &QoderAccount) -> bool {
+    if crate::modules::qoder_machine::identity(region).is_some() {
+        return true;
+    }
+    let has = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).is_some();
+    has(account.cosy_machine_token.as_deref()) && has(account.cosy_machine_type.as_deref())
+}
+
+fn token_of<'a>(account: &'a QoderAccount) -> Result<&'a str, String> {    account
         .access_token
         .as_deref()
         .filter(|t| !t.trim().is_empty())
@@ -503,6 +527,19 @@ pub async fn checkin_claim_once(
         };
         let message: String = if camps.is_empty() {
             "上游没有给这个账号下发任何活动（新号或活动资格未开放；以客户端内实际显示为准）".to_string()
+        } else if !has_machine_identity(region, account) {
+            // ★★ 这里以前一律说「国际版没有每日签到积分，这是官方行为」——
+            // 那是**错误的归因**：同一台机器带上全套 `cosy-machine*` 头就能拿到
+            // `CLAIM_BENEFIT`（见 `qoder_machine` 模块头的真机对照）。
+            // 换一台电脑签不了，几乎都是**这台机器没有机器身份**，与官方无关。
+            // 说成「官方没有」会让用户以为无解，直接放弃。
+            format!(
+                "这台电脑没有 Qoder 机器身份（缺 cosy-machine* 头），服务端因此只下发了 {} 个社区活动、\
+                 不下发「每天领积分」。\n\
+                 请到**能正常签到的那台电脑**上，打开「设置 → Qoder 机器身份」点「导出」，\
+                 把内容粘到这里点「导入」，再重新签到。",
+                camps.len()
+            )
         } else {
             // 参考实现的三态语义：**有活动平台但没积分类活动** ≠ 失败，也 ≠ 已签。
             // 国际版目前只下发 VIEW_DETAILS 型社区活动（如「1024 创造力集结」），

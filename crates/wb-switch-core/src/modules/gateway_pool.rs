@@ -1522,10 +1522,24 @@ mod tests {
         .expect("11128 必须冷却这个号，否则下一个请求还会撞它");
         assert_eq!(kind, "auth_dead");
         assert!((until - now - 10 * 60_000).abs() < 2_000);
-        // 402 → 停到下一个重置窗口（必定 > 现在 + 1 小时）
+        // 402 → 停到下一个重置窗口。
+        //
+        // ⚠️⚠️ 这里**不能断言「至少停 1 小时」**：重置窗口固定是 UTC 02:00，
+        // 每天 UTC 01:00–02:00 那一小时里，下一个窗口只剩不到 60 分钟
+        // （2026-11-01 09:1x GMT+8 = UTC 01:1x 实测就是这条断言红的）。
+        // 断言要表达的是「停到下一个窗口」，那就直接和 `next_reset_window` 比。
         let (until, kind) = classify(402, "", now).unwrap();
         assert_eq!(kind, "balance_exhausted");
-        assert!(until > now + 3_600_000, "402 应停到每日重置窗口");
+        assert!(until > now, "402 必须停在未来，不能是过去时刻");
+        assert_eq!(
+            until,
+            next_reset_window(now),
+            "402 应精确停在每日重置窗口（UTC 02:00）"
+        );
+        assert!(
+            until <= now + 86_400_000,
+            "最多停一天：超过说明窗口算错了"
+        );
         // 额度不足但上游没说时间 → 1 小时兜底，不编精确时刻
         let (until, kind) = classify(403, "额度不足", now).unwrap();
         assert_eq!(kind, "balance_exhausted");

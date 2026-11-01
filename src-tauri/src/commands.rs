@@ -12,11 +12,13 @@ use wb_switch_core::modules::{
     app_overview, checkin, client_usage, config, error_log, settings, trae_backup, trae_cleanup,
     trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
-    trae_profile, trae_remote, trae_session_edit, trae_switch, trae_vault, workbuddy_cleanup,
+    trae_profile, trae_remote, trae_session_edit, trae_session_pack, trae_switch, trae_vault,
+    workbuddy_cleanup,
     workbuddy_auth, workbuddy_credits, workbuddy_export, workbuddy_import, workbuddy_oauth,
-    workbuddy_session_edit, workbuddy_sessions, workbuddy_switch, workbuddy_vault,
+    workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
+    workbuddy_vault,
 };
-use wb_switch_core::modules::{gateway_keys, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_realm, qoder_sessions, qoder_tools};
+use wb_switch_core::modules::{gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -955,6 +957,97 @@ pub async fn trae_import_run(
             let _ = app.emit("trae-import-progress", json!({ "line": m }));
         }))?;
         Ok(json!(result))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 会话包：跨机器迁移（导出 → 导入）
+// ---------------------------------------------------------------------------
+
+/// 导出 Trae 会话包（`.zip`：`pack.db` + `manifest.json`）。
+///
+/// `sessionIds` 省略 = 导出该客户端全部会话。
+/// 与「导出 md」不同：这是**可回灌的数据包**，导入侧能把内容写回客户端库。
+#[tauri::command]
+pub async fn trae_session_pack_export(
+    app: tauri::AppHandle,
+    sources: Vec<String>,
+    session_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        trae_session_pack::export_pack(&sources, session_ids.as_deref(), Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 预检 Trae 会话包（只读）：包内会话数、工作空间在本机是否存在、manifest。
+#[tauri::command]
+pub async fn trae_session_pack_preview(zip_path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || trae_session_pack::preview_pack(&zip_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 导入 Trae 会话包到指定账号。
+///
+/// `dstUid` 必须是**库内真实 uid**（不是账号库内部 id）。
+/// 写入走本机导入同一套流程：结束客户端 → 备份 → 解密 → 合并 WAL → 复制新 id →
+/// 自检 → 增量回写 → 替换 → 刷新快照 → 重启。
+#[tauri::command]
+pub async fn trae_session_pack_import(
+    app: tauri::AppHandle,
+    zip_path: String,
+    dst_client_key: String,
+    dst_uid: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        trae_session_pack::import_pack(&zip_path, &dst_client_key, &dst_uid, Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 导出 WorkBuddy 会话包（`sessions` 行 + `chats/<工作区>/<cid>.jsonl`）。
+#[tauri::command]
+pub async fn wb_session_pack_export(
+    app: tauri::AppHandle,
+    session_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workbuddy_session_pack::export_pack(session_ids.as_deref(), Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 预检 WorkBuddy 会话包（只读）。
+#[tauri::command]
+pub async fn wb_session_pack_preview(zip_path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || workbuddy_session_pack::preview_pack(&zip_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 导入 WorkBuddy 会话包到指定账号。
+#[tauri::command]
+pub async fn wb_session_pack_import(
+    app: tauri::AppHandle,
+    zip_path: String,
+    dst_uid: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workbuddy_session_pack::import_pack(&zip_path, &dst_uid, Some(&|m| {
+            let _ = app.emit("trae-import-progress", json!({ "line": m }));
+        }))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2965,6 +3058,34 @@ pub async fn gateway_pool() -> Result<Value, String> {
     Ok(json!(gateway_pool::snapshot()))
 }
 
+/// 积分共享的选号策略（严格按过期 / 会话粘住 / 只用指定账号）。
+#[tauri::command]
+pub async fn gateway_routing() -> Result<Value, String> {
+    Ok(gateway_routing::load_report())
+}
+
+/// 写选号策略（只改传进来的字段）。
+#[tauri::command]
+pub async fn gateway_routing_set(
+    policy: Option<String>,
+    pinned: Option<String>,
+) -> Result<Value, String> {
+    let p = match policy.as_deref() {
+        None => None,
+        Some(s) => Some(
+            gateway_routing::CreditPolicy::parse(s)
+                .ok_or_else(|| format!("未知策略：{s}（只能是 strict / sticky / pinned）"))?,
+        ),
+    };
+    let saved = gateway_routing::save(p, pinned)?;
+    Ok(json!({
+        "ok": true,
+        "policy": saved.policy.as_str(),
+        "pinned": saved.pinned,
+        "report": gateway_routing::load_report(),
+    }))
+}
+
 /// 选号预览：只算不发，不消耗额度。
 #[tauri::command]
 pub async fn gateway_preview(model: String) -> Result<Value, String> {
@@ -3718,10 +3839,38 @@ pub async fn qoder_session_duplicate(region: String, session_id: String) -> Resu
 /// 存该账号的 Cosy 设备身份（从抓包里复制 `cosy-machinetoken` / `cosy-machinetype`）。
 ///
 /// 活动下发（`/me/campaigns`）绑定登录时服务端签发的设备令牌；客户端只在内存里持有，
+// ---------------------------------------------------------------------------
+// Qoder 机器身份（cosy-machine* 头）：跨机器迁移
+//
+// 服务端按这组头决定下发不下发「每天领 100 Credits」。三个关键值客户端运行时生成、
+// 不落盘，所以**换机器时只能搬**（见 `qoder_machine` 模块文档）。
+// ---------------------------------------------------------------------------
+
+/// 当前机器的机器身份状态（只读）。
+#[tauri::command]
+pub async fn qoder_machine_status() -> Result<Value, String> {
+    Ok(qoder_machine::status())
+}
+
+/// 导出机器身份（一整份 JSON 文本，交给另一台机器导入）。
+///
+/// ⚠️ 内容含 `machinetoken`（服务端签发的设备凭据），界面上必须提示别外传。
+#[tauri::command]
+pub async fn qoder_machine_export() -> Result<Value, String> {
+    qoder_machine::export_identity()
+}
+
+/// 导入机器身份（覆盖本机配置）。
+#[tauri::command]
+pub async fn qoder_machine_import(raw: String) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("内容不是合法 JSON：{e}"))?;
+    qoder_machine::import_identity(&v)
+}
+
 /// 所以要用户粘贴一次。两个都给才算设置了；传空串表示清除、退回派生值。
 #[tauri::command]
-pub async fn qoder_account_set_cosy(
-    region: String,
+pub async fn qoder_account_set_cosy(    region: String,
     id: String,
     machine_token: String,
     machine_type: String,

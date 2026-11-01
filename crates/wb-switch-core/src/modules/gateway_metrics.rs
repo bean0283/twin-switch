@@ -12,8 +12,10 @@
 //! | `ttft_ms` | 首字延迟 —— 真流式改造后这个值会**远小于** `total_ms`，一眼看出有没有生效 |
 //! | `total_ms` | 整段耗时 |
 //! | `queued` | 是否撞上上游排队（10605 / isQueued） |
+//! | `queuedRetries` / `queuedWaitMs` | 排队重试次数 / 累计等待 —— **排队的细节都在这**，不往对话里推 |
 //! | `failovers` | 这条请求换了几个号（>0 说明上一个号失败了，总时长被放大） |
 //! | `prompt_tokens` / `completion_tokens` | 上游给的用量；缺就写 `null`，**绝不写 0 冒充** |
+//! | `cachedTokens` | 上下文缓存命中数；`null` = 上游根本没给这项统计（如 Trae 渠道） |
 //! | `msgs` / `tools` / `chars` / `folded` | 请求体规模 + 折叠掉的历史工具结果条数 |
 //!
 //! ⚠️ 纪律：`ok:false` 的行必须带 `error` 原文；用量没拿到就写 `null`。
@@ -43,7 +45,21 @@ pub struct Trace {
     /// 被折叠（截断）的历史工具结果条数。
     pub folded: usize,
     pub failovers: usize,
+    /// 是否撞上过上游排队。
     pub queued: bool,
+    /// 排队重试了几次（一次排队至少 1 次）。
+    ///
+    /// ⚠️ 客户端**只该看到一条**排队提示（流式文本只能追加，每重试一次就多一行，
+    /// 2026-11-01 用户截图里堆了 4 行「⏳ 上游排队中」）。所以排队的**过程细节**
+    /// 全部记在这里，由网关的指标去看，不再往对话里灌。
+    pub queued_retries: usize,
+    /// 排队累计等待毫秒（真实耗掉的时间，区别于 `total_ms` 里混着的上游生成时间）。
+    pub queued_wait_ms: i64,
+    /// 上游报的「上下文缓存命中 token 数」。
+    ///
+    /// `None` = **上游没给这个字段**（Trae 渠道实测就不给），不是「命中 0」。
+    /// 两者必须能分开：写成 0 会让人以为缓存失效了，而实际上可能只是没有这项统计。
+    pub cached_tokens: Option<i64>,
     /// 这次请求用的是哪把网关 Key（用于按 Key 记额度）。
     ///
     /// 由 `chat()` 在校验 Key 之后填。换号重试时 clone 出去的每份都带着它 ——
@@ -75,6 +91,9 @@ impl Trace {
             folded: 0,
             failovers: 0,
             queued: false,
+            queued_retries: 0,
+            queued_wait_ms: 0,
+            cached_tokens: None,
             key_id: None,
             logged: false,
         }
@@ -98,6 +117,15 @@ impl Trace {
         self.queued = true;
     }
 
+    /// 记一次「排队等了一轮」：次数 +1、累计等待加上 `wait_secs`。
+    ///
+    /// 与 [`Trace::note_queued`] 分开：那个只标「撞过排队」，这个记**过程**。
+    pub fn note_queue_wait(&mut self, wait_secs: u64) {
+        self.queued = true;
+        self.queued_retries += 1;
+        self.queued_wait_ms += (wait_secs as i64).saturating_mul(1000);
+    }
+
     /// 记首字（只记第一次）。
     pub fn first_byte(&mut self) {
         if self.first_byte_ms.is_none() {
@@ -113,6 +141,13 @@ impl Trace {
         if let Some(v) = u.get("completion_tokens").and_then(Value::as_i64) {
             self.completion_tokens = Some(v);
         }
+        // 缓存命中：三种叫法都认（OpenAI / DeepSeek / Anthropic）。
+        // 一个都没有就保持 None —— 不许写 0 冒充「命中了 0」。
+        self.cached_tokens = u
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_i64)
+            .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_i64))
+            .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64));
     }
 
     /// 收尾并落盘（同一份 Trace 只会写一次）。
@@ -148,6 +183,10 @@ impl Trace {
             "ttft_ms": self.first_byte_ms,
             "total_ms": self.elapsed_ms(),
             "queued": self.queued,
+            "queuedRetries": self.queued_retries,
+            "queuedWaitMs": self.queued_wait_ms,
+            // `null` = 上游没给这项统计；0 是明确的「命中了 0」。两者不可混淆。
+            "cachedTokens": self.cached_tokens,
             "failovers": self.failovers,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,

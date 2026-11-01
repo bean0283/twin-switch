@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 use crate::modules::gateway_keys::{self, GATEWAY_PORT};
 use crate::modules::gateway_metrics::Trace;
 use crate::modules::gateway_pool;
-use crate::modules::gateway_stream::{Delta, Emitter, Kind, StreamReader};
+use crate::modules::gateway_stream::{
+    respond_with_queue, Delta, Emitter, Kind, OpenFail, StreamReader,
+};
 
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
@@ -986,43 +988,105 @@ async fn chat(
         );
     }
 
-    // ④ 选号：**同一段对话锁定同一账号，新对话才按「积分最早过期」挑**。
+    // ④ 选号：规则**由用户在界面选**（见 `gateway_routing`），不再写死。
     //
-    // 为什么不是每次都按紧迫度挑：Trae 的上游会话 ID 由 `session_seed(model, uid, …)`
-    // 派生（uid 参与指纹），中途换号 ⇒ 上游当成新会话 ⇒ 前缀缓存全失效、观感上「会话断了」。
-    // 所以规则是：**对话第一次请求**按最早过期选（先用快过期的，省钱）；
-    // **后续请求**沿用同一个号，只有它不可用/冷却时才重新挑。
+    // 背景：以前固定是「同一段对话锁定同一账号、新对话按积分最早过期挑」。
+    // 界面「账号池」按最早过期排序，于是看起来像「明明该按过期挑，怎么一直用同一个号」。
+    // 两个行为都合理，只是**该让人自己选**，所以拆成三档策略。
     //
     // 会话指纹 = 模型 + 首条 user（不含 uid），见 `gateway_stream::session_seed`。
     // 用原始请求体算指纹（`upstream_req` 是后面才克隆并改写的，那时已经不含原始形态）。
     let conv = crate::modules::gateway_stream::conversation_key(&bare, &req);
-    let sticky_key = gateway_pool::sticky_lookup(&conv);
 
     let sel = match gateway_pool::preview(&model) {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
-    // 粘住的号仍然可用（在池子里、且没冷却）才继续用它；否则回落到紧迫度最高的那个。
-    let sticky_alive = sticky_key.as_ref().and_then(|k| {
-        gateway_pool::usable()
-            .into_iter()
-            .find(|e| &e.key == k && e.cooldown_until.unwrap_or(0) <= crate::modules::config::now_ms())
-    });
-    let picked = match sticky_alive {
-        Some(e) => e,
-        None => match sel.picked.clone() {
-            Some(p) => p,
-            None => {
+
+    // ★ 选号策略由用户选（见 `gateway_routing`）：严格按过期 / 会话粘住 / 只用指定号。
+    //
+    // 以前是写死的「粘住优先」，而界面「账号池」按最早过期排序 —— 两件事都对，
+    // 摆在一起就让人以为「明明该按过期挑，怎么一直用同一个号」（用户 2026-11-01 反馈）。
+    // 现在把选择权交出去，并且**优先级只由 `pick_key` 一处定义**。
+    let routing = crate::modules::gateway_routing::current();
+
+    // 三个来源都要求「此刻真的可用」：**在这个模型的作用域里** + 在池子里 + 没冷却。
+    //
+    // ⚠️⚠️ 作用域校验不能省。指定账号是用户随手选的，可能选了个 Qoder 号，
+    // 而这次请求的模型只有 Trae 作用域 —— 不校验就会把别家的号硬塞进来，
+    // 既是越权（Key 授权可能不含那个作用域），也必然请求失败。
+    // 所以这里复用 `preview` 算好的 `candidates`（允许的作用域列表），而不是只看「池子里有、没冷却」。
+    let pool_now = gateway_pool::usable();
+    let now_ms = crate::modules::config::now_ms();
+    let find_usable = |key: &str| {
+        pool_now
+            .iter()
+            .find(|e| {
+                e.key == key
+                    && sel.candidates.iter().any(|s| s == &e.scope)
+                    // ⚠️ 必须按**这个模型**算冷却，不能用 `usable()` 给的原始 `cooldown_until`：
+                    // 后者不含「只在这个模型上被限」的情况（见 `gateway_pool::with_cooldowns`）。
+                    // 用错就会把「此刻在这个模型上被限」的号当可用，白撞一次 429。
+                    && gateway_pool::cooling_until(&e.key, Some(&bare)).unwrap_or(0) <= now_ms
+            })
+            .cloned()
+    };
+
+    // ① 指定账号（仅 pinned 策略看它；空串 = 没指定，直接跳过）
+    let pinned_entry = if routing.policy == crate::modules::gateway_routing::CreditPolicy::Pinned
+        && !routing.pinned.trim().is_empty()
+    {
+        find_usable(routing.pinned.trim())
+    } else {
+        None
+    };
+
+    // ② 会话粘住的号（严格模式下**故意不查**：它每轮都要按过期重挑）
+    let sticky_entry = if routing.policy == crate::modules::gateway_routing::CreditPolicy::Strict {
+        None
+    } else {
+        gateway_pool::sticky_lookup(&conv).and_then(|k| find_usable(&k))
+    };
+
+    // ③ 按「积分最早过期」排出来的那个（preview 已算好）
+    let urgency_entry = sel.picked.clone();
+
+    let chosen_key = crate::modules::gateway_routing::pick_key(
+        routing.policy,
+        pinned_entry.as_ref().map(|e| e.key.clone()),
+        sticky_entry.as_ref().map(|e| e.key.clone()),
+        urgency_entry.as_ref().map(|e| e.key.clone()),
+    );
+    let picked = match chosen_key {
+        Some(k) => {
+            let found = pinned_entry
+                .clone()
+                .filter(|e| e.key == k)
+                .or_else(|| sticky_entry.clone().filter(|e| e.key == k))
+                .or_else(|| urgency_entry.clone().filter(|e| e.key == k))
+                .or_else(|| find_usable(&k));
+            let Some(p) = found else {
                 return api_err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no_account",
-                    sel.reason.unwrap_or_else(|| "没有可用账号".into()),
-                )
-            }
-        },
+                    "选中的账号刚刚变得不可用，请重试".to_string(),
+                );
+            };
+            p
+        }
+        None => {
+            return api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_account",
+                sel.reason.clone().unwrap_or_else(|| "没有可用账号".into()),
+            )
+        }
     };
-    // 记下这段对话用的是哪个号（下次接着用它）。换号时这里会被覆盖。
-    gateway_pool::sticky_bind(&conv, &picked.key);
+    // 记下这段对话用的是哪个号（严格模式不记，见 `should_bind` 的说明）。
+    if crate::modules::gateway_routing::should_bind(routing.policy) {
+        gateway_pool::sticky_bind(&conv, &picked.key);
+    }
+
     if !key.allows(&picked.scope) {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return api_err(
@@ -2340,7 +2404,25 @@ fn trae_cred(uid_hint: Option<&str>) -> Option<TraeCred> {
 }
 
 
-/// 模型名 → (config_name, model_name)。与参考实现的 [`model_config`] 同形。
+/// 模型名 → (config_name, model_name)。
+///
+/// `config_name` 是给人看的显示名，`model_name` 是**上游内部的模型代号**，
+/// 后者一律带 `__dev` 后缀（如 `deepseek_v4_flash__dev`）。
+///
+/// ## ⚠️⚠️ `__dev` 不能删（2026-11-01 事故）
+///
+/// 我一度以为它是「自造的假值」——依据是客户端 `state.vscdb` 里
+/// `AI.agent.model.model_list_map` 的条目 `name` 都不带这个后缀。删掉后上游立刻回：
+///
+/// ```text
+/// code 4023: We're sorry, the model is unknown.
+/// ```
+///
+/// 所有账号全挂。原因是那两个名字**不是一回事**：
+/// - 清单里的 `name`（`deepseek-v4.1-flash`）= 展示/选择用标识；
+/// - 请求体的 `model_name`（`deepseek-v4.1-flash__dev`）= 服务端内部代号。
+///
+/// 想改这里之前，先拿**真实请求**验证，别拿展示名去推内部代号。
 fn trae_model_config(model: &str) -> (String, String) {
     let name = model.trim();
     let name = if name.is_empty() { "deepseek-v4-flash" } else { name };
@@ -2362,6 +2444,12 @@ fn trae_model_config(model: &str) -> (String, String) {
     };
     match known {
         Some((c, m)) => (c.to_string(), m.to_string()),
+        // ⚠️⚠️ `__dev` 后缀是**服务端要求的内部代号**，不能去掉。
+        //
+        // 2026-11-01 我按客户端模型清单（`model_list_map` 里的 `name`）把这些后缀当成
+        // 「自造的假值」删掉了，结果上游直接回 **`code 4023: the model is unknown`**，
+        // 全部账号失败。清单里的 `name` 是**展示用标识**，请求体的 `model_name`
+        // 是另一套内部代号 —— 两者不是一个东西，别再拿前者去改后者。
         None => (name.to_string(), format!("{name}__dev")),
     }
 }
@@ -2480,7 +2568,7 @@ async fn qoder_stream(
     scope: &str,
     model: &str,
     req: &Value,
-    mut trace: Trace,
+    trace: Trace,
     acc_id: Option<String>,
 ) -> Result<Upstream, (StatusCode, String)> {
     use crate::modules::qoder_realm::QoderRegion;
@@ -2492,71 +2580,71 @@ async fn qoder_stream(
     };
     let accounts = crate::modules::qoder_accounts::list(region)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读 Qoder 账号失败：{e}")))?;
-    let acc = pick_qoder_account(&accounts, acc_id.as_deref(), region)?;
+    // 选号失败要**立刻**报错（那是配置问题，等再久也不会变），所以留在流外面。
+    let acc = pick_qoder_account(&accounts, acc_id.as_deref(), region)?.clone();
 
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
     let tools = req.get("tools").cloned().unwrap_or(Value::Null);
     let shown = crate::modules::gateway_models::display_of(scope, model);
-
+    let model_owned = model.to_string();
     let budget = qoder_queue_budget();
-    let started = std::time::Instant::now();
-    loop {
-        let resp = crate::modules::qoder_tools::chat_open(
-            region,
-            acc,
-            model,
-            &shown,
-            &messages,
-            Some(&tools),
-        )
-        .await
-        .map_err(|e| {
-            if let Some((_, msg)) = queue_parts(&e) {
-                trace.note_queued();
-                (StatusCode::TOO_MANY_REQUESTS, format!("Qoder 上游排队中：{msg}"))
-            } else {
-                (StatusCode::BAD_GATEWAY, format!("Qoder 上游：{e}"))
-            }
-        })?;
 
-        let mut reader = StreamReader::new(resp, Kind::Qoder);
-        match reader.next_batch().await {
-            Ok(Some(first)) => {
-                return Ok(Upstream::Sse(crate::modules::gateway_stream::respond(
-                    Emitter::new(model),
-                    reader,
-                    first,
-                    trace,
-                )))
-            }
-            Ok(None) => {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    "Qoder 返回了流，但既没有正文也没有工具调用".to_string(),
-                ));
-            }
-            Err(e) => {
-                if let Some((wait, msg)) = queue_parts(&e) {
-                    let spent = started.elapsed().as_secs();
-                    let nap = wait.clamp(1, 45);
-                    if spent + nap <= budget {
-                        // 上游说的 retryAfterSeconds 要**照等**：官方客户端就是这么等的。
-                        tokio::time::sleep(std::time::Duration::from_secs(nap)).await;
-                        continue;
-                    }
-                    trace.note_queued();
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        format!(
-                            "Qoder 上游排队中：{msg}（已等 {spent} 秒仍没排到 —— 换号没用，\
-                             队列是模型级的；可换冷门模型试试）"
-                        ),
-                    ));
+    // ★★ 排队等待从这里**搬进流内部**（`respond_with_queue`）。
+    //
+    // 以前是在这里 `sleep` 最多 240 秒，期间一个字节都没发给客户端 ——
+    // 调用方（WorkBuddy / Trae / 任何 OpenAI 兼容工具）界面就一直空着，
+    // 看起来像「工具卡死了」，而实际上只是 Qoder 上游在排队（2026-11-01 用户反馈）。
+    //
+    // 现在：立刻建立 SSE 响应 → 每次排队先推一条「⏳ 排队中」正文 → 再睡 → 重试。
+    // 用户在自己的工具里就能看到排队状态，和 Qoder 客户端的
+    // 「模型请求正在排队·预计等待不足 1 分钟」是同一个意思。
+    let open = move || {
+        let region = region;
+        let acc = acc.clone();
+        let model = model_owned.clone();
+        let shown = shown.clone();
+        let messages = messages.clone();
+        let tools = tools.clone();
+        async move {
+            let resp = crate::modules::qoder_tools::chat_open(
+                region,
+                &acc,
+                &model,
+                &shown,
+                &messages,
+                tools.as_object().map(|_| &tools),
+            )
+            .await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(match queue_parts(&e) {
+                        Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
+                        None => OpenFail::Fatal(format!("Qoder 上游：{e}")),
+                    })
                 }
-                return Err((StatusCode::BAD_GATEWAY, e));
+            };
+            let mut reader = StreamReader::new(resp, Kind::Qoder);
+            match reader.next_batch().await {
+                Ok(Some(first)) => Ok((reader, first)),
+                Ok(None) => Err(OpenFail::Fatal(
+                    "Qoder 返回了流，但既没有正文也没有工具调用".to_string(),
+                )),
+                Err(e) => Err(match queue_parts(&e) {
+                    Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
+                    None => OpenFail::Fatal(e),
+                }),
             }
         }
-    }
+    };
+
+    Ok(Upstream::Sse(respond_with_queue(
+        // 用原始 `model`（&str）而不是被闭包 move 走的 `model_owned`。
+        Emitter::new(model),
+        trace,
+        open,
+        budget,
+    )))
 }
 
 /// 流式路径的排队预算（与 `qoder_tools::queue_budget_secs` 同一口径）。
@@ -3836,3 +3924,36 @@ mod tool_call_tests {
     }
 }
 
+
+#[cfg(test)]
+mod trae_model_name_tests {
+    use super::trae_model_config;
+
+    /// ⚠️⚠️ `model_name` **必须带 `__dev` 后缀** —— 这是服务端要求的内部代号。
+    ///
+    /// 别再被客户端模型清单骗了：`state.vscdb` 的 `model_list_map` 里那些 `name`
+    /// （`deepseek-v4.1-flash` 之类）是**展示用标识**，与请求体的 `model_name`
+    /// 不是同一个东西。2026-11-01 我把两者当成一回事、删掉后缀，
+    /// 上游立刻回 `code 4023: We're sorry, the model is unknown.`，所有账号全挂。
+    #[test]
+    fn keeps_dev_suffix_because_server_requires_it() {
+        for m in ["deepseek-v4.1-flash", "glm-5.3", "minimax-m3", "kimi-k2.7-code"] {
+            let (_, mdl) = trae_model_config(m);
+            assert!(
+                mdl.ends_with("__dev"),
+                "{m} → {mdl}：model_name 必须以 __dev 结尾，否则上游回 4023"
+            );
+        }
+    }
+
+    /// 已知模型的映射不能丢（`config_name` 是显示名，`model_name` 才是上游代号）。
+    #[test]
+    fn known_models_keep_their_internal_codename() {
+        assert_eq!(trae_model_config("deepseek-v4-flash").1, "deepseek_v4_flash__dev");
+        assert_eq!(trae_model_config("glm-5.3").1, "glm-5.3__dev");
+        assert_eq!(
+            trae_model_config("doubao-seed-2.1-turbo").1,
+            "Doubao-Seed-2.1-Turbo__dev"
+        );
+    }
+}

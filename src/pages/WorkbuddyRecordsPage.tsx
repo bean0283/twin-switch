@@ -14,6 +14,8 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Archive,
+  PackageOpen,
   ScrollText,
   Search,
   Trash2,
@@ -39,6 +41,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ResizableDialogContent } from "@/components/ui/resizable-dialog-content";
+import { SessionPackImportDialog } from "@/components/session-pack-import-dialog";
 import { WorkbuddySessionEditor } from "@/components/workbuddy-session-editor";
 import { WorkbuddySessionGroups } from "@/components/workbuddy-session-groups";
 import { Separator } from "@/components/ui/separator";
@@ -126,6 +129,8 @@ export default function WorkbuddyRecordsPage() {
   const [staleNote, setStaleNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  /** 会话包导入弹窗（跨电脑迁移）。 */
+  const [packOpen, setPackOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<WbSessionDetail | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<WbSessionItem[] | null>(null);
@@ -485,6 +490,36 @@ export default function WorkbuddyRecordsPage() {
     }
   };
 
+  /**
+   * 导出会话包（可回灌）。
+   *
+   * 选中的会话优先；没选就导出全部未删除的。
+   * ⚠️ 与单条「导出 Markdown」不同：那个只能读，这个能导入回客户端。
+   */
+  const onExportPack = async () => {
+    setBusy("pack-export");
+    try {
+      const ids = selected.size > 0 ? Array.from(selected) : undefined;
+      const r = await api.wbSessionPackExport(ids);
+      const mb = (r.bytes / 1_048_576).toFixed(1);
+      const missing = r.missingBody?.length ?? 0;
+      toast.success(`已导出 ${r.sessions} 个会话`, {
+        description:
+          `${r.filename}（${mb} MB）` +
+          (missing > 0 ? ` · ${missing} 个会话没有正文` : "") +
+          " · 包内含明文对话内容，请妥善保管",
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const openPackDialog = () => {
+    setPackOpen(true);
+  };
+
   const exportOne = async (item: WbSessionItem) => {
     setBusy(item.id);
     try {
@@ -757,6 +792,28 @@ export default function WorkbuddyRecordsPage() {
             </CardDescription>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void onExportPack()}
+                disabled={loading || refreshing || busy !== null}
+                title="导出成可回灌的会话包（zip 内含会话行 + 正文 + 清单），用于跨电脑迁移"
+              >
+                <Archive className="size-4" />
+                导出会话包
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void openPackDialog()}
+                disabled={loading || busy !== null}
+                title="从会话包导入会话（跨电脑迁移用）"
+              >
+                <PackageOpen className="size-4" />
+                导入会话包
+              </Button>
+            </div>
             <Button
               variant="outline"
               size="sm"
@@ -2046,6 +2103,21 @@ export default function WorkbuddyRecordsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 会话包导入（跨电脑迁移）：选包 → 预检 → 选目标账号 → 写库。 */}
+      <SessionPackImportDialog
+        open={packOpen}
+        onOpenChange={setPackOpen}
+        kind="workbuddy"
+        targets={accounts.map((a) => ({
+          uid: a.uid,
+          name: accountLabel(a, a.uid),
+          // WorkBuddy 这边不区分「当前登录」：切号页才管登录态，
+          // 记录页只按 uid 列账号；默认选第一个即可。
+          isCurrent: false,
+        }))}
+        onImported={() => void load(true)}
+      />
     </div>
   );
 }
