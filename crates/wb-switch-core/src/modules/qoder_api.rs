@@ -181,8 +181,26 @@ pub fn parse_quota(payload: &Value) -> Result<QuotaView, String> {
         .get("isQuotaExceeded")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if is_exceeded && remaining == 0.0 && total == 0.0 {
-        return Err("额度响应为退化形态（exceeded 且全 0）—— 拒绝写入".into());
+    // 「退化形态」= 上游说已超额 + 数字全 0，但**连额度块的数字结构都没有**。
+    //
+    // ⚠️⚠️ 这条判据最初是为了防止「上游偶发降级、把有余额的账号写成 0」的谎报，
+    // 但它的第一版只看 `exceeded && 全 0`，于是把**真实的「没有额度」**也判成了异常：
+    // 免费版账号（`userType: personal_standard`）正常响应就是
+    // `{"isQuotaExceeded":true,"userQuota":{"total":0.0,"used":0.0,"remaining":0.0}}`，
+    // 一条 addOnQuota 都没有 —— 2026-11-01 用户截图里「1/2 个账号查到额度，失败：
+    // 额度响应为退化形态」就是它，账号本身好好的，只是没买额度。
+    //
+    // 现在按**结构**区分（这才是「响应本身坏了」与「数值就是 0」的分界）：
+    // - 块里 `total` 是合法数字（哪怕是 0）→ 响应结构完整，如实返回 0；
+    // - 块缺失、或 `total` 不是数字（null / 字符串 / 缺键）→ 才判定为退化，拒绝写 0。
+    let has_numeric_total = |src: Option<&Map<String, Value>>| {
+        src.and_then(|m| m.get("total"))
+            .map(|v| v.is_f64() || v.is_i64() || v.is_u64())
+            .unwrap_or(false)
+    };
+    if is_exceeded && remaining == 0.0 && total == 0.0 && !has_numeric_total(user) && !has_numeric_total(add_on)
+    {
+        return Err("额度响应为退化形态（exceeded 且全 0，且额度块没有数字结构）—— 拒绝写入".into());
     }
     if let Some(p) = org_part {
         parts.push(p);
@@ -419,6 +437,42 @@ mod tests {
         assert_eq!(get("Origin"), "https://qoder.com.cn");
     }
 
+    /// 免费版账号的**真实响应**（2026-11-01 真机抓的，国际版 `Re life`）：
+    /// 结构完整、数值全 0、`isQuotaExceeded=true`、没有 addOnQuota 块。
+    ///
+    /// 这必须解析成功并如实返回 0 —— 之前的「退化形态」判据只看 `exceeded && 全 0`，
+    /// 把它判成了异常，于是界面报「1/2 个账号查到额度」而实际账号只是没买额度。
+    #[test]
+    fn zero_quota_with_intact_shape_is_not_degenerate() {
+        let v = json!({
+            "userId": "01a19537-c880-706a-bd63-c21379643e3a",
+            "userType": "personal_standard",
+            "usageType": "credits",
+            "totalUsagePercentage": 0.0,
+            "isQuotaExceeded": true,
+            "expiresAt": 253402214400000i64,
+            "userQuota": {"total": 0.0, "used": 0.0, "remaining": 0.0, "percentage": 0.0, "unit": "credits"},
+            "isPlanQuotaProrated": false
+        });
+        let q = parse_quota(&v).expect("结构完整的全 0 响应必须能解析，不能当成异常");
+        assert_eq!(q.remaining, 0.0);
+        assert_eq!(q.total, 0.0);
+        assert!(q.is_exceeded);
+        // 「没有这块」不等于「这块是 0」：上游没给 addOnQuota，就只出一块。
+        assert_eq!(q.parts.len(), 1);
+        assert_eq!(q.parts[0].name, "用户额度");
+    }
+
+    /// 真正的退化响应（额度块里没有数字结构）仍然要拒绝，不能写 0。
+    #[test]
+    fn degenerate_quota_without_numeric_shape_is_rejected() {
+        let v = json!({
+            "isQuotaExceeded": true,
+            "userQuota": {"total": null, "used": null, "remaining": null}
+        });
+        assert!(parse_quota(&v).is_err(), "字段全 null 必须判退化，否则会把未知写成 0");
+    }
+
     #[test]
     fn quota_sums_user_and_addon() {
         let v = json!({
@@ -510,8 +564,16 @@ mod tests {
 
     #[test]
     fn degenerate_response_is_refused() {
+        // ⚠️ 这条以前断言「`isQuotaExceeded` + 全 0」必须报错。**2026-11-01 被真机证伪**：
+        // 免费版账号（`personal_standard`）的正常响应就是 userQuota 全 0、没有 addOnQuota，
+        // 报错会让用户以为账号坏了（截图里「1/2 个账号查到额度，失败：退化形态」）。
+        //
+        // 现在判据改成看**结构**：额度块里的 `total` 是合法数字 ⇒ 响应正常，如实返回 0；
+        // 不是数字（null / 字符串 / 缺键）⇒ 才判退化。所以这个 payload 必须能解析。
         let v = json!({"isQuotaExceeded": true, "userQuota": {"remaining": 0.0, "total": 0.0}});
-        assert!(parse_quota(&v).is_err());
+        let q = parse_quota(&v).expect("结构完整的全 0 响应必须能解析");
+        assert_eq!(q.remaining, 0.0);
+        assert!(q.is_exceeded);
     }
 
     #[test]

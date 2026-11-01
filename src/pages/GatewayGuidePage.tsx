@@ -378,10 +378,17 @@ export default function GatewayGuidePage() {
             ：热门免费模型可能在上游排队（如 <code className="font-mono">DeepSeek-Flash</code>），
             换 <code className="font-mono">Qwen3.8-Max</code> / <code className="font-mono">GLM-5.3</code> 之类。
             <span className="block pt-1">
+              Qoder 排队时，对话里会先出现<b>一条</b>「⏳ 模型请求正在排队」——那是上游的原话，
+              只提示一次，不会反复刷（流式文本只能追加，每重试一次就多一行，反而更乱）。
+              之后要么正常出字，要么给出超时说明。
+            </span>
+            <span className="block pt-1">
               想确认「慢在哪一步」看 <code className="font-mono">~/.twin-switch/gateway-metrics.jsonl</code>
               ：<code className="font-mono">ttft_ms</code> 是首字延迟（远小于{" "}
               <code className="font-mono">total_ms</code> 说明流式生效了）、
               <code className="font-mono">queued</code> 是撞上排队、
+              <code className="font-mono">queuedRetries</code> /{" "}
+              <code className="font-mono">queuedWaitMs</code> 是排队重试了几次、累计等了多久、
               <code className="font-mono">failovers</code> 是换了几个号（&gt;0 会把总时长放大）。
             </span>
           </p>

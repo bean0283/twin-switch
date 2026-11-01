@@ -442,6 +442,119 @@ export function traeExportAll(sources: string[]): Promise<TraeExportAllReport> {
   return call("trae_export_all", { sources });
 }
 
+// ---------------------------------------------------------------------------
+// 会话包：跨机器迁移（导出 → 导入）
+//
+// ⚠️ 与「导出 md」不是一回事：md 只能读，包能**导回客户端**。
+// 包里是明文会话内容（`pack.db` + `manifest.json`），界面上要提示妥善保管。
+// ---------------------------------------------------------------------------
+
+export interface SessionPackManifestSession {
+  sessionId: string;
+  title: string;
+  messages: number;
+  workspace: string;
+  workspacePath: string;
+  updated: string;
+  ownerUid: string;
+  hasBody: boolean;
+}
+
+export interface SessionPackManifest {
+  format: string;
+  format_version: number;
+  exported_at: string;
+  app_version: string;
+  source_client: string;
+  source_label: string;
+  source_uid: string | null;
+  sessions: SessionPackManifestSession[];
+  workspaces: string[];
+  tables: string[];
+  kind: string;
+}
+
+export interface SessionPackPreview {
+  ok: boolean;
+  manifest: SessionPackManifest;
+  sessionCount: number;
+  sessionIds: string[];
+  /** 包里没有正文的会话（导进去是空壳）。Trae 侧用 `hasBody` 推断，WB 侧由后端算。 */
+  missingBody?: string[];
+  /** 工作空间路径在本机不存在（只提示，仍按原路径写入）。 */
+  workspacesMissing: string[];
+}
+
+export interface SessionPackExportResult {
+  ok: boolean;
+  path: string;
+  filename: string;
+  sessions: number;
+  rows: number;
+  bytes: number;
+  missingBody?: string[];
+  manifest: SessionPackManifest;
+}
+
+/** 导出 Trae 会话包。`sessionIds` 省略 = 导出全部。 */
+export function traeSessionPackExport(
+  sources: string[],
+  sessionIds?: string[],
+): Promise<SessionPackExportResult> {
+  return call("trae_session_pack_export", { sources, sessionIds });
+}
+
+/** 预检 Trae 会话包（只读）。 */
+export function traeSessionPackPreview(zipPath: string): Promise<SessionPackPreview> {
+  return call("trae_session_pack_preview", { zipPath });
+}
+
+/**
+ * 导入 Trae 会话包到指定账号。
+ *
+ * `dstUid` 必须是**库内真实 uid**（不是账号库内部 id `oauth_xxx`）。
+ */
+export function traeSessionPackImport(
+  zipPath: string,
+  dstClientKey: string,
+  dstUid: string,
+): Promise<{
+  ok: boolean;
+  copied_rows: number;
+  skipped: unknown[];
+  verified_sessions: number;
+  target_uid: string | null;
+  backupDir: string | null;
+  backupMode: string;
+  relaunched: boolean;
+}> {
+  return call("trae_session_pack_import", { zipPath, dstClientKey, dstUid });
+}
+
+/** 导出 WorkBuddy 会话包。`sessionIds` 省略 = 导出全部未删除会话。 */
+export function wbSessionPackExport(sessionIds?: string[]): Promise<SessionPackExportResult> {
+  return call("wb_session_pack_export", { sessionIds });
+}
+
+/** 预检 WorkBuddy 会话包（只读）。 */
+export function wbSessionPackPreview(zipPath: string): Promise<SessionPackPreview> {
+  return call("wb_session_pack_preview", { zipPath });
+}
+
+/** 导入 WorkBuddy 会话包到指定账号。 */
+export function wbSessionPackImport(
+  zipPath: string,
+  dstUid: string,
+): Promise<{
+  ok: boolean;
+  imported: string[];
+  skipped: unknown[];
+  noBody: string[];
+  manifest: SessionPackManifest;
+}> {
+  return call("wb_session_pack_import", { zipPath, dstUid });
+}
+
 /** 导出目录绝对路径（提示 / 打开用）。 */
 export function traeExportDir(): Promise<string> {
   return call("trae_export_dir", {});
@@ -1803,6 +1916,33 @@ export async function gatewayPool(): Promise<unknown> {
   return invoke("gateway_pool");
 }
 
+/** 积分共享的选号策略。 */
+export type CreditPolicy = "strict" | "sticky" | "pinned";
+
+export interface RoutingReport {
+  path: string;
+  exists: boolean;
+  policy: CreditPolicy;
+  pinned: string;
+  parseError: string | null;
+}
+
+export async function gatewayRouting(): Promise<RoutingReport> {
+  return invoke("gateway_routing");
+}
+
+/**
+ * 写选号策略。只改传进来的字段（`undefined` 表示这次不动它）。
+ *
+ * `pinned` 是账号池里的 key（`产品:账号标识`），空串 = 没指定。
+ */
+export async function gatewayRoutingSet(
+  policy?: CreditPolicy,
+  pinned?: string,
+): Promise<{ ok: boolean; policy: CreditPolicy; pinned: string; report: RoutingReport }> {
+  return invoke("gateway_routing_set", { policy, pinned });
+}
+
 export async function gatewayPreview(model: string): Promise<unknown> {
   return invoke("gateway_preview", { model });
 }
@@ -2265,6 +2405,47 @@ export async function qoderSessionDuplicate(
   return invoke("qoder_session_duplicate", { region, sessionId });
 }
 
+
+/**
+ * Qoder 机器身份（`cosy-machine*` 头）状态。
+ *
+ * 服务端按这组头决定下发不下发「每天领积分」：缺了就只有社区活动（VIEW_DETAILS）。
+ * 三个关键值客户端运行时才生成、不落盘，所以**换电脑必须搬**。
+ */
+export interface QoderMachineStatus {
+  path: string;
+  machineCode: boolean;
+  machineToken: boolean;
+  machineType: boolean;
+  machineId: boolean;
+  autoMachineId: { cn: string | null; global: string | null };
+  hostname: string;
+  machineOs: string;
+  /** 三项关键字段齐了没有（齐了才可能拿到签到活动）。 */
+  ready: boolean;
+}
+
+export function qoderMachineStatus(): Promise<QoderMachineStatus> {
+  return invoke("qoder_machine_status");
+}
+
+/**
+ * 导出本机机器身份（一整份，交给另一台电脑导入）。
+ *
+ * ⚠️ 返回值含 `machineToken`（服务端签发的设备凭据），界面要提示别外传。
+ */
+export function qoderMachineExport(): Promise<Record<string, unknown> & { format?: string }> {
+  return invoke("qoder_machine_export");
+}
+
+/** 导入机器身份（覆盖本机配置）。`raw` 是导出的那份 JSON 文本。 */
+export function qoderMachineImport(raw: string): Promise<{
+  ok: boolean;
+  path: string;
+  status: QoderMachineStatus;
+}> {
+  return invoke("qoder_machine_import", { raw });
+}
 
 /// 存该账号的 Cosy 设备身份（抓包里 cosy-machinetoken / cosy-machinetype）。
 export async function qoderAccountSetCosy(

@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { QoderMachineCard } from "@/components/qoder-machine-card";
 import { Skeleton } from "@/components/ui/skeleton";
 import * as api from "@/lib/api";
 import {
@@ -1195,6 +1196,10 @@ export default function SettingsPage() {
           </Link>
         </CardContent>
       </Card>
+
+      {/* Qoder 机器身份：与 settings.json 无关，所以放在加载态外面 ——
+          设置读取失败时它照样能用（换电脑签不了正需要它）。 */}
+      <QoderMachineCard />
     </div>
   );
 }

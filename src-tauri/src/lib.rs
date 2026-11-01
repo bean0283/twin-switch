@@ -106,6 +106,9 @@ pub fn run() {
     }
 
     builder = builder.plugin(tauri_plugin_opener::init());
+    // 会话包导入需要选文件：zip 是二进制且可能几十 MB，前端只能拿到内存对象、
+    // 拿不到真实路径，所以必须走原生对话框。
+    builder = builder.plugin(tauri_plugin_dialog::init());
 
     // 自动更新：检查 / 下载 / 安装都走 `update_service`，签名校验由插件内部完成。
     // 只注册不自动装 —— 下载完的包暂存在内存里，等用户点「重启并安装」。
@@ -184,6 +187,10 @@ pub fn run() {
             commands::qoder_cleanup_run,
             commands::qoder_home_summary,
             commands::qoder_account_set_cosy,
+            // Qoder 机器身份（跨机器迁移：能签到的那台导出、签不了的那台导入）
+            commands::qoder_machine_status,
+            commands::qoder_machine_export,
+            commands::qoder_machine_import,
             commands::qoder_session_update_message,
             commands::qoder_session_delete_message,
             commands::qoder_session_rename,
@@ -210,6 +217,8 @@ pub fn run() {
             commands::gateway_set_enabled,
             commands::gateway_set_lan,
             commands::gateway_pool,
+            commands::gateway_routing,
+            commands::gateway_routing_set,
             commands::gateway_preview,
             commands::gateway_keys_list,
             commands::gateway_key_create,
@@ -278,6 +287,13 @@ pub fn run() {
             commands::trae_import_candidates,
             commands::trae_import_inspect,
             commands::trae_import_run,
+            // 会话包（跨机器迁移）
+            commands::trae_session_pack_export,
+            commands::trae_session_pack_preview,
+            commands::trae_session_pack_import,
+            commands::wb_session_pack_export,
+            commands::wb_session_pack_preview,
+            commands::wb_session_pack_import,
             commands::trae_find_misaligned_projects,
             commands::trae_heal_session_projects,
             commands::trae_heal_project_uid,

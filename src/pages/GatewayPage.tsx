@@ -28,6 +28,11 @@ import {
   gatewayStatus,
   gatewayUpstreamsGet,
   gatewayUpstreamsSet,
+  gatewayRouting,
+  gatewayRoutingSet,
+  asError,
+  type CreditPolicy,
+  type RoutingReport,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
@@ -162,6 +167,29 @@ type Preview = {
 };
 
 const PRODUCTS: Record<string, string> = { trae: "Trae", workbuddy: "WorkBuddy", qoder: "Qoder" };
+
+/**
+ * 选号策略三档（与后端 `gateway_routing::CreditPolicy` 一一对应）。
+ *
+ * 说明文案刻意写清**代价**：这三档不是「好坏」之别，而是「省钱」与「对话连续」的取舍。
+ */
+const ROUTING_OPTIONS: { value: CreditPolicy; title: string; desc: string }[] = [
+  {
+    value: "strict",
+    title: "严格按「积分最早过期」",
+    desc: "每一轮都重新挑积分最先到期的账号。⚠️ 中途可能换号 —— 上游会当成另一段对话，前缀缓存失效、观感上「接不上」，长任务尤其明显。",
+  },
+  {
+    value: "sticky",
+    title: "同一对话固定账号",
+    desc: "一段对话从头到尾花同一个账号的积分，只有它不可用（冷却/耗尽）才换。下面「账号池」的排序因此只决定**新对话**用谁。",
+  },
+  {
+    value: "pinned",
+    title: "只用指定账号",
+    desc: "只花选定账号的积分。它不可用时先按上一条走（同一对话固定），还不行再按第一条（最早过期）—— 不会因为指定账号挂了就失败。",
+  },
+];
 
 
 function fmtExpiry(ms: number | null): string {
@@ -376,6 +404,33 @@ export default function GatewayPage() {
 
   const [keyName, setKeyName] = useState("");
   const [plaintext, setPlaintext] = useState<string | null>(null);
+
+  /** 选号策略（严格按过期 / 会话粘住 / 只用指定账号）。 */
+  const [routing, setRouting] = useState<RoutingReport | null>(null);
+  const [routingBusy, setRoutingBusy] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    gatewayRouting()
+      .then((r: RoutingReport) => alive && setRouting(r))
+      .catch(() => {
+        // 读不到就保持 null（卡片会显示「读取失败」），不拿默认值假装读到了。
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const saveRouting = async (policy: CreditPolicy, pinned?: string) => {
+    setRoutingBusy(true);
+    try {
+      const r = await gatewayRoutingSet(policy, pinned);
+      setRouting(r.report);
+    } catch (cause) {
+      toast.error("保存选号策略失败", { description: asError(cause) });
+    } finally {
+      setRoutingBusy(false);
+    }
+  };
 
   const [model, setModel] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -1311,7 +1366,86 @@ export default function GatewayPage() {
         )}
       </Card>
 
-      <Card {...fold("pool")} title="账号池" desc="最紧迫（最早过期）的排在最前面">
+      <Card
+        {...fold("routing")}
+        title="积分使用策略"
+        desc="决定一段对话到底花哪个账号的积分"
+      >
+        {routing === null ? (
+          <p className="py-4 text-xs text-muted-foreground">
+            读取策略失败（不影响网关运行，网关自己会按默认「同一对话固定账号」走）。
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {ROUTING_OPTIONS.map((o) => {
+              const on = routing.policy === o.value;
+              return (
+                <label
+                  key={o.value}
+                  className={cn(
+                    "flex cursor-pointer gap-3 rounded-lg border p-3 transition-colors",
+                    on ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40",
+                    routingBusy && "pointer-events-none opacity-60",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    className="mt-1 size-4 shrink-0 cursor-pointer"
+                    name="routing-policy"
+                    checked={on}
+                    onChange={() => void saveRouting(o.value)}
+                  />
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">{o.title}</span>
+                      {o.value === "sticky" && (
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                          默认
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs leading-relaxed text-muted-foreground">{o.desc}</p>
+                    {/* 选中「只用指定账号」时才露出账号下拉 */}
+                    {o.value === "pinned" && on ? (
+                      <div className="pt-1">
+                        <select
+                          className="h-8 w-full max-w-sm rounded-md border border-input bg-background px-2 text-xs"
+                          value={routing.pinned}
+                          disabled={routingBusy}
+                          onChange={(e) => void saveRouting("pinned", e.target.value)}
+                        >
+                          <option value="">（未指定 —— 等同「同一对话固定账号」）</option>
+                          {pool.map((e) => (
+                            <option key={e.key} value={e.key}>
+                              {PRODUCTS[e.product] ?? e.product} · {e.label}
+                              {e.usable ? "" : `（当前不可用：${e.reason ?? "未知原因"}）`}
+                            </option>
+                          ))}
+                        </select>
+                        {!routing.pinned ? (
+                          <p className="pt-1 text-[11px] text-muted-foreground">
+                            还没选账号 —— 这一档现在等同于「同一对话固定账号」。选一个才会真正限定。
+                          </p>
+                        ) : !pool.some((e) => e.key === routing.pinned) ? (
+                          <p className="pt-1 text-[11px] text-amber-600">
+                            指定的账号已不在池子里（被删了？），当前会自动按「同一对话固定账号」走。
+                          </p>
+                        ) : (
+                          <p className="pt-1 text-[11px] text-muted-foreground">
+                            只花这个账号的积分；它不可用时依次退化为「同一对话固定账号」→「最早过期」。
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+      <Card {...fold("pool")} title="账号池" desc="按积分最早过期排序 —— 它决定「新对话」用谁；已在进行的对话是否沿用同一个号，看上面的策略">
         {pool.length === 0 ? (
           <p className="py-6 text-center text-xs text-muted-foreground">
             还没有账号。先去各产品的账号管理里添加。
@@ -1787,7 +1921,11 @@ export default function GatewayPage() {
         )}
       </Card>
 
-      <Card {...fold("preview")} title="选号预览" desc="只算不发，不消耗额度">
+      <Card
+        {...fold("preview")}
+        title="选号预览"
+        desc="只算不发，不消耗额度；这里算的是「按最早过期」的结果，实际选号还受上面的策略影响"
+      >
         <div className="flex flex-wrap items-center gap-2">
           <input
             value={model}

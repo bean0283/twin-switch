@@ -689,6 +689,22 @@ impl Emitter {
         self.frame(json!({}), None)
     }
 
+    /// 「上游在排队」的**可见**提示帧。
+    ///
+    /// ## 为什么用正文 delta 而不是 SSE 注释
+    ///
+    /// 标准做法是用注释行（`: queued`，客户端会忽略）来保活，但那样**用户什么也看不到**
+    /// —— 而这里的诉求恰恰是「在别的工具里也能看出在排队」：
+    /// Qoder 上游排队最长要等 4 分钟，期间客户端界面一直空着，看起来像卡死。
+    ///
+    /// 所以直接推一段正文。代价是这段文字会进入对话内容（客户端会把 assistant 回复存下来），
+    /// 这是有意的取舍：**看得见**比干净更重要。
+    pub fn notice(&mut self, text: &str) -> String {
+        // 标记「已经产出过内容」：否则排队提示之后若上游回空，收尾会误报「空流」。
+        self.content_seen = true;
+        self.frame(json!({ "content": text }), None)
+    }
+
     /// 吃一批增量，返回要立刻发给客户端的 SSE 文本（可能为空）。
     pub fn absorb(&mut self, ds: &[Delta]) -> String {
         let mut text = String::new();
@@ -738,7 +754,9 @@ impl Emitter {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": reason }],
         });
         if !usage.is_null() {
-            last["usage"] = usage.clone();
+            // 归一化后再给客户端：各家的缓存字段叫法不同，不统一就会出现
+            // 「明明命中了，界面显示 0%」（见 `normalize_usage`）。
+            last["usage"] = normalize_usage(usage);
         }
         out.push_str(&format!("data: {last}\n\n"));
         out.push_str("data: [DONE]\n\n");
@@ -799,54 +817,71 @@ pub fn respond(
                 }
             }
         }
-        let mut failure: Option<String> = None;
-        loop {
-            match reader.next_batch().await {
-                Ok(Some(ds)) => {
-                    if ds
-                        .iter()
-                        .any(|d| matches!(d, Delta::Content(_) | Delta::ToolCall(_)))
-                    {
-                        trace.first_byte();
-                    }
-                    let out = em.absorb(&ds);
-                    if !out.is_empty() {
-                        if tx.send(Ok(Bytes::from(out))).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            }
-        }
-        match failure {
-            Some(e) => {
-                let _ = tx.send(Ok(Bytes::from(em.error_frames(&e)))).await;
-                trace.finish(false, 502, &e);
-            }
-            None if !em.content_seen && em.calls.is_empty() => {
-                let _ = tx
-                    .send(Ok(Bytes::from(
-                        em.error_frames("上游返回了流，但既没有正文也没有工具调用"),
-                    )))
-                    .await;
-                trace.finish(false, 502, "空流：没有正文也没有工具调用");
-            }
-            None => {
-                let finish = reader.finish.clone();
-                let usage = reader.usage().clone();
-                trace.usage(&usage);
-                let tail = em.finish_frames(finish, &usage);
-                let _ = tx.send(Ok(Bytes::from(tail))).await;
-                trace.finish(true, 200, "");
-            }
-        }
+        pump_reader(&mut em, &mut reader, &tx, &mut trace).await;
     });
 
+    sse_response(rx)
+}
+
+/// 把 reader 读到结束，边读边发；收尾统一交给 `em`（错误帧 / 结束帧）。
+///
+/// 抽出来是为了让 [`respond`] 与 [`respond_with_queue`] 共用同一段循环 ——
+/// 两份拷贝迟早会分叉（一边加了 `first_byte` 记账、另一边忘了）。
+async fn pump_reader(
+    em: &mut Emitter,
+    reader: &mut StreamReader,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    trace: &mut Trace,
+) {
+    let mut failure: Option<String> = None;
+    loop {
+        match reader.next_batch().await {
+            Ok(Some(ds)) => {
+                if ds
+                    .iter()
+                    .any(|d| matches!(d, Delta::Content(_) | Delta::ToolCall(_)))
+                {
+                    trace.first_byte();
+                }
+                let out = em.absorb(&ds);
+                if !out.is_empty() {
+                    if tx.send(Ok(Bytes::from(out))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    match failure {
+        Some(e) => {
+            let _ = tx.send(Ok(Bytes::from(em.error_frames(&e)))).await;
+            trace.finish(false, 502, &e);
+        }
+        None if !em.content_seen && em.calls.is_empty() => {
+            let _ = tx
+                .send(Ok(Bytes::from(
+                    em.error_frames("上游返回了流，但既没有正文也没有工具调用"),
+                )))
+                .await;
+            trace.finish(false, 502, "空流：没有正文也没有工具调用");
+        }
+        None => {
+            let finish = reader.finish.clone();
+            let usage = reader.usage().clone();
+            trace.usage(&usage);
+            let tail = em.finish_frames(finish, &usage);
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+            trace.finish(true, 200, "");
+        }
+    }
+}
+
+fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Response {
     (
         StatusCode::OK,
         [
@@ -857,6 +892,168 @@ pub fn respond(
         Body::from_stream(RxStream { rx }),
     )
         .into_response()
+}
+
+/// 上游「还没拿到第一批数据」时的失败分类。
+pub enum OpenFail {
+    /// 上游在排队：等 `secs` 秒再来一次，期间**给客户端推一条可见提示**。
+    Queued { secs: u64, msg: String },
+    /// 真失败（凭据死、参数错、流为空……）：直接回错误帧。
+    Fatal(String),
+}
+
+/// 带「排队可见」的流式响应。
+///
+/// ## 与 [`respond`] 的区别
+///
+/// `respond` 是「reader 已经拿到手」才调用 —— 排队等待发生在它之前，
+/// 那段时间**一个字节都没发出去**，客户端界面就是空的（Qoder 排队最长 240 秒）。
+///
+/// 这里把「获取 reader」也搬进流内部：先立刻建立 SSE 响应，然后在流里循环
+/// `open()` —— 每次排队就推一条「⏳ 排队中」的正文，睡一会儿再试。
+/// 于是调用方（WorkBuddy / Trae / 其他任何 OpenAI 兼容工具）**能看见它在排队**，
+/// 而不是盯着一个不动的光标。
+pub fn respond_with_queue<F, Fut>(
+    mut em: Emitter,
+    mut trace: Trace,
+    mut open: F,
+    budget_secs: u64,
+) -> Response
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(StreamReader, Vec<Delta>), OpenFail>> + Send,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let head = em.opening_frame();
+        if tx.send(Ok(Bytes::from(head))).await.is_err() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        // ⚠️⚠️ 排队提示**只推一条**。
+        //
+        // 流式文本只能追加、不能改已发出去的内容：每重试一次推一条，界面上就会堆成
+        // 一列「⏳ 上游排队中（已等 4 秒）」「（已等 39 秒）」「（已等 74 秒）」……
+        // 越堆越长、还不断把最新状态顶上去（2026-11-01 用户截图，4 行全是同一件事）。
+        //
+        // 所以：首次排队时说一句（学 Qoder 客户端那句「模型请求正在排队·预计等待 N 秒」），
+        // 之后不再重复；**过程的真实情况**（重试几次、累计等了多少）全部记进
+        // `trace` 的 `queuedRetries` / `queuedWaitMs`，去网关指标里看。
+        let mut notice_sent = false;
+        let (mut reader, pending) = loop {
+            match open().await {
+                Ok(v) => break v,
+                Err(OpenFail::Queued { secs, msg }) => {
+                    let spent = started.elapsed().as_secs();
+                    // 上游给的 retryAfterSeconds 要照等，但别把客户端拖到它自己超时。
+                    let nap = secs.clamp(1, 45);
+                    trace.note_queue_wait(nap);
+                    if spent + nap > budget_secs {
+                        let e = format!(
+                            "上游排队超时：{msg}（已等 {spent} 秒仍没排到 —— 换号没用，\
+                             队列是模型级的；可换冷门模型试试）"
+                        );
+                        let _ = tx.send(Ok(Bytes::from(em.error_frames(&e)))).await;
+                        trace.finish(false, 429, &e);
+                        return;
+                    }
+                    if !notice_sent {
+                        // ★ 关键：先把「在排队」推给客户端，再睡。顺序反了就等于没做。
+                        let out = em.notice(&format!("⏳ {msg}\n\n"));
+                        if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
+                            return; // 客户端已经断开，别白等
+                        }
+                        notice_sent = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(nap)).await;
+                }
+                Err(OpenFail::Fatal(e)) => {
+                    let _ = tx.send(Ok(Bytes::from(em.error_frames(&e)))).await;
+                    trace.finish(false, 502, &e);
+                    return;
+                }
+            }
+        };
+        if !pending.is_empty() {
+            if pending
+                .iter()
+                .any(|d| matches!(d, Delta::Content(_) | Delta::ToolCall(_)))
+            {
+                trace.first_byte();
+            }
+            let out = em.absorb(&pending);
+            if !out.is_empty() {
+                if tx.send(Ok(Bytes::from(out))).await.is_err() {
+                    return;
+                }
+            }
+        }
+        pump_reader(&mut em, &mut reader, &tx, &mut trace).await;
+    });
+
+    sse_response(rx)
+}
+
+/// 把上游的「上下文缓存命中」字段归一化成各家客户端都认得的样子。
+///
+/// ## 为什么要归一化
+///
+/// 「缓存命中了多少 token」在不同厂商的 `usage` 里叫法完全不同，而客户端只认其中一两种。
+/// dsh 这类界面读的是 `prompt_tokens_details.cached_tokens`（OpenAI 口径）或
+/// `prompt_cache_hit_tokens`（DeepSeek 口径）；上游要是只给了另一种写法，
+/// 界面就一律显示 **0 命中 / 0 读取**——看起来像「缓存完全没生效」，
+/// 而实际上可能只是**名字对不上**（2026-11-01 用户反馈「缓存命中永远是 0」）。
+///
+/// ## 纪律：没有就**不补**
+///
+/// 三个来源一个都没有 ⇒ 原样返回，一个字段都不加。
+/// ⛔ 绝不凭空写 `cached_tokens: 0` —— 那与「上游说命中 0」长得一样，
+/// 而这两件事必须能区分（本项目反复强调的那条）。
+pub fn normalize_usage(u: &Value) -> Value {
+    if u.is_null() {
+        return Value::Null;
+    }
+    let mut out = u.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+
+    // 各家的写法，按优先级取第一个有值的。
+    let detail = obj
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_i64);
+    let ds_hit = obj.get("prompt_cache_hit_tokens").and_then(Value::as_i64);
+    let anth = obj.get("cache_read_input_tokens").and_then(Value::as_i64);
+
+    let cached = detail.or(ds_hit).or(anth);
+    let Some(cached) = cached else {
+        // 谁都没给 ⇒ 保持「没数据」，不加任何字段。
+        return out;
+    };
+
+    // 补 OpenAI 口径
+    if detail.is_none() {
+        let d = obj
+            .entry("prompt_tokens_details")
+            .or_insert_with(|| json!({}));
+        if let Some(d) = d.as_object_mut() {
+            d.insert("cached_tokens".into(), json!(cached));
+        }
+    }
+    // 补 DeepSeek 口径（含 miss，客户端要算命中率）
+    if ds_hit.is_none() {
+        obj.insert("prompt_cache_hit_tokens".into(), json!(cached));
+    }
+    if !obj.contains_key("prompt_cache_miss_tokens") {
+        if let Some(prompt) = obj.get("prompt_tokens").and_then(Value::as_i64) {
+            obj.insert(
+                "prompt_cache_miss_tokens".into(),
+                json!((prompt - cached).max(0)),
+            );
+        }
+    }
+    out
 }
 
 /// 上游本来就是标准 OpenAI SSE（WorkBuddy）⇒ 字节原样透传。
@@ -1011,6 +1208,99 @@ fn sse_usage(line: &str) -> Option<Value> {
 }
 
 #[cfg(test)]
+mod cache_norm_tests {
+    use super::normalize_usage;
+    use serde_json::json;
+
+    /// 三种叫法都能补成客户端认得的样子（dsh 读 OpenAI 口径）。
+    #[test]
+    fn fills_openai_shape_from_deepseek_field() {
+        let u = json!({"prompt_tokens": 1000, "completion_tokens": 10, "prompt_cache_hit_tokens": 800});
+        let n = normalize_usage(&u);
+        assert_eq!(
+            n.pointer("/prompt_tokens_details/cached_tokens").and_then(|v| v.as_i64()),
+            Some(800)
+        );
+        // miss 由 prompt - cached 推出来，客户端要它算命中率
+        assert_eq!(n.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64()), Some(200));
+    }
+
+    #[test]
+    fn fills_deepseek_shape_from_openai_field() {
+        let u = json!({"prompt_tokens": 500, "prompt_tokens_details": {"cached_tokens": 400}});
+        let n = normalize_usage(&u);
+        assert_eq!(n.get("prompt_cache_hit_tokens").and_then(|v| v.as_i64()), Some(400));
+        assert_eq!(n.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64()), Some(100));
+    }
+
+    /// 真实命中 0 时要保留 0，不能因为 `is_some` 判断写错而变成"没数据"。
+    #[test]
+    fn keeps_genuine_zero() {
+        let u = json!({"prompt_tokens": 500, "prompt_cache_hit_tokens": 0});
+        let n = normalize_usage(&u);
+        assert_eq!(
+            n.pointer("/prompt_tokens_details/cached_tokens").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+    }
+
+    /// ⚠️ 上游一个缓存字段都没给 ⇒ **一个都不加**。
+    ///
+    /// 这是本项目反复强调的纪律：`null`（没这项统计）和 `0`（命中 0）必须能区分。
+    /// 补一个 0 出去，用户就会以为「缓存完全没生效」，而真相可能只是上游不报这项。
+    #[test]
+    fn adds_nothing_when_upstream_reports_no_cache_field() {
+        let u = json!({"prompt_tokens": 1000, "completion_tokens": 10});
+        let n = normalize_usage(&u);
+        assert!(n.get("prompt_tokens_details").is_none(), "不许凭空造 cached_tokens");
+        assert!(n.get("prompt_cache_hit_tokens").is_none());
+        assert!(n.get("prompt_cache_miss_tokens").is_none());
+        assert_eq!(n.get("prompt_tokens").and_then(|v| v.as_i64()), Some(1000));
+    }
+
+    /// **真实样本**：Trae `deepseek-v4.1-flash` 的 usage 原文（2026-11-01 真机抄录）。
+    ///
+    /// 它用 Anthropic 的命名给了两个 `cache_*` 字段，**值都是 0**。
+    /// 归一化必须把它变成 `cached_tokens: 0`（明确的"没命中"），
+    /// 而不是什么都不补（那会让客户端显示"没数据"，和"命中 0"混为一谈）。
+    #[test]
+    fn real_trae_usage_reports_explicit_zero_cache() {
+        let u = json!({
+            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens_total": 0,
+            "cache_read_input_tokens": 0,
+            "cache_read_input_tokens_total": 0,
+            "cluster": "normal_context",
+            "completion_tokens": 186,
+            "name": "",
+            "prompt_tokens": 27074,
+            "reasoning_tokens": 100,
+            "total_tokens": 27260
+        });
+        let n = normalize_usage(&u);
+        assert_eq!(
+            n.pointer("/prompt_tokens_details/cached_tokens").and_then(|v| v.as_i64()),
+            Some(0),
+            "上游明确报了 cache_read_input_tokens=0，客户端就该看到 0"
+        );
+        assert_eq!(n.get("prompt_cache_hit_tokens").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            n.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64()),
+            Some(27074),
+            "全部未命中，miss 应等于 prompt_tokens"
+        );
+        // 其余字段一个都不能动
+        assert_eq!(n.get("total_tokens").and_then(|v| v.as_i64()), Some(27260));
+        assert_eq!(n.get("cluster").and_then(|v| v.as_str()), Some("normal_context"));
+    }
+
+    #[test]
+    fn null_stays_null() {
+        assert!(normalize_usage(&serde_json::Value::Null).is_null());
+    }
+}
+
+#[cfg(test)]
 mod usage_tests {
     use super::sse_usage;
 
@@ -1037,5 +1327,60 @@ mod usage_tests {
         let line = "data: {\"code\":0,\"data\":{\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}}";
         let u = sse_usage(line).expect("信封里的 usage 也要认");
         assert_eq!(u.get("completion_tokens").and_then(|v| v.as_i64()), Some(9));
+    }
+}
+
+#[cfg(test)]
+mod queue_notice_tests {
+    use super::Emitter;
+
+    /// 排队提示**只该出现一次**。
+    ///
+    /// 回归用：2026-11-01 用户截图里 WorkBuddy 对话中堆了 4 行「⏳ 上游排队中（已等 4/39/74/110 秒）」
+    /// ——因为每重试一次就推一条。流式文本只能追加，堆出来的是一列越来越长的噪音。
+    /// 这里把「推一次」的判据钉在代码结构上：`notice_sent` 标志只置一次。
+    #[test]
+    fn queue_notice_is_emitted_only_once() {
+        // 直接断言源码里的语义太重；改为验证 Emitter 层面：同一段提示推两次会产生两帧，
+        // 而调用方（respond_with_queue）用 `notice_sent` 拦住第二次。
+        // 这条测试锁的是「确实存在这个闸门」——用文本扫描，防止以后被误删。
+        let src = include_str!("gateway_stream.rs");
+        assert!(
+            src.contains("let mut notice_sent = false;"),
+            "必须保留 notice_sent 闸门，否则排队提示会每次重试都推一条"
+        );
+        assert!(
+            src.contains("if !notice_sent {"),
+            "推提示必须包在 if !notice_sent 里"
+        );
+        assert!(
+            src.contains("notice_sent = true;"),
+            "推完必须置位，否则每条都会推"
+        );
+    }
+
+    /// 排队提示必须是**客户端看得见的正文**。
+    ///
+    /// 用 SSE 注释（`: queued`）客户端会直接忽略 —— 那就等于没做，
+    /// 而这条功能的全部意义就是「让用户在别的工具里看见还在排队」。
+    #[test]
+    fn notice_is_visible_content_delta() {
+        let mut em = Emitter::new("test-model");
+        let head = em.opening_frame();
+        let n = em.notice("⏳ 上游排队中\n\n");
+        assert!(n.starts_with("data: "), "必须是 SSE data 行");
+        assert!(n.contains("\"content\""), "必须是 content delta，否则客户端不显示");
+        assert!(n.contains("排队中"));
+        // 角色只在开场帧带一次，后续帧不该重复带 role。
+        assert!(head.contains("\"assistant\""));
+        assert!(!n.contains("\"assistant\""));
+        // 必须是合法 JSON（拼错一个引号客户端就整条丢弃）。
+        let body = n.trim().strip_prefix("data: ").unwrap().trim();
+        let v: serde_json::Value = serde_json::from_str(body).expect("帧必须是合法 JSON");
+        assert_eq!(
+            v.pointer("/choices/0/delta/content")
+                .and_then(|x| x.as_str()),
+            Some("⏳ 上游排队中\n\n")
+        );
     }
 }
