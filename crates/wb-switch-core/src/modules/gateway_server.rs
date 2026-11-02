@@ -1198,7 +1198,13 @@ async fn chat(
             Err((code, msg)) => {
                 // 上游报错 → 反馈给池子（冷却/标记），下一个请求也不会再撞同一个。
                 // ⚠️ 按 **(账号, 模型)** 记账：429 只锁这个模型，别的模型还能用这个号。
-                if let Some((until, kind)) =
+                //
+                // ⚠️⚠️ 「上下文超长」**不能记账**：那是请求太大，账号完全健康。
+                // 记了就等于「用户发一次超长请求，三个好账号全被冷却」，
+                // 之后正常请求反而没号可用。
+                if gateway_pool::is_context_overflow(&msg) {
+                    // 跳过冷却，继续走下面的错误处理
+                } else if let Some((until, kind)) =
                     gateway_pool::apply_error(&cand.key, code.as_u16(), &msg, Some(&bare))
                 {
                     let left = (until - gateway_pool::now_ms_pub()).max(0) / 1000;
@@ -1229,6 +1235,20 @@ async fn chat(
         StatusCode::BAD_GATEWAY,
         "上游没有任何响应".to_string(),
     ));
+    // 上下文超长：**400 不是 502**。
+    //  - 语义上：请求本身太大，是客户端该修的事，不是「网关/上游坏了」；
+    //  - 实用上：多数客户端只对 5xx 自动重试。回 502 会让它把同一份巨长的 body
+    //    再发 5 遍（2026-11-02 实测「已重试模型请求 1/5」），每一遍都必然失败。
+    if gateway_pool::is_context_overflow(&msg) {
+        trace.finish(false, 400, &msg);
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "上下文超出该模型的上限（与账号无关，换号也没用）。请新建对话、减少附件或删掉部分历史后重试。上游原文：{msg}"
+            ),
+        );
+    }
     trace.finish(false, code.as_u16(), &msg);
     api_err(
         code,
@@ -1300,6 +1320,11 @@ fn should_failover(status: u16, msg: &str) -> bool {
     // 排队是**模型维度**的：换号只会再排一次，白等一轮还拖长客户端超时。
     // 判据与冷却归类同源（`gateway_pool::is_queued_hint`），别再各写一套。
     if crate::modules::gateway_pool::is_queued_hint(msg) {
+        return false;
+    }
+    // 上下文超长 = **请求本身**的问题，与账号无关：换号换不掉 token 数。
+    // 2026-11-02 实测：连换 3 个号全撞同一个 4026，客户端还当成可重试错误重试了 5 轮。
+    if crate::modules::gateway_pool::is_context_overflow(msg) {
         return false;
     }
     let m = msg.to_ascii_lowercase();
@@ -3826,6 +3851,21 @@ mod tests {
         assert!(!normalize_first_role(&mut empty));
         let mut not_array = json!({ "messages": "x" });
         assert!(!normalize_first_role(&mut not_array));
+    }
+
+    /// **上下文超长不换号**。
+    ///
+    /// 2026-11-02 用户实测：Trae 回 `code 4026: context length exceeded`，
+    /// 网关按 5xx 规则连换 3 个号全撞同一堵墙，还把三个健康账号全记了冷却；
+    /// 客户端又把 502 当可重试错误，自动重试了 5 轮（截图「已重试模型请求 1/5」）。
+    /// 换号换不掉 token 数 —— 这类错误必须在**第一个号**就停下。
+    #[test]
+    fn no_failover_on_context_overflow() {
+        let msg = "Trae 上游报错：code 4026: We're sorry, your context length has exceeded the maximum limit.";
+        // 502 本身是可换号的，但「上下文超长」必须压过它
+        assert!(!should_failover(502, msg));
+        assert!(!should_failover(400, "context_length_exceeded"));
+        assert!(!should_failover(413, "prompt is too long"));
     }
 
     /// 该换号的：限流 / 额度耗尽 / 凭据死 / 5xx / 传输失败。

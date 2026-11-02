@@ -925,17 +925,36 @@ fn update_copy_row(
 /// 返回 `(已同步, 跳过)`；跳过项都带 `reason`，界面照实显示「为什么没动」——
 /// 分歧、正文缺失、读失败都不许静默咽掉。
 #[allow(clippy::type_complexity)]
+/// 一对「已关联副本」的内容同步任务。
+///
+/// 比原来的四元组多了 `src_uid` / `group_key`：分歧时要能告诉界面
+/// **这是哪个关联组**，用户才能在弹窗里选「以哪边为准」（走 `session_groups::unify`）。
+struct RefreshPair {
+    src_cid: String,
+    src_title: String,
+    src_path: PathBuf,
+    tgt_cid: String,
+    src_uid: String,
+    group_key: String,
+}
+
 fn refresh_linked_copies(
     conn: &Connection,
-    pairs: &[(String, String, PathBuf, String)],
+    pairs: &[RefreshPair],
     target_uid: &str,
     now: i64,
     backup_dir: &Path,
     done: &mut Vec<(PathBuf, PathBuf)>,
-) -> (Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, Vec<Value>, usize) {
     let mut refreshed: Vec<Value> = Vec::new();
+    // ⚠️ `skipped` 只放**真问题**（分歧 / 正文缺失 / 读失败）。
+    // 「两边已经一致」以前也塞在这里，被界面一律读成「未同步（有分歧或缺正文）」——
+    // 用户看到「明明没有分歧」正是这个原因（2026-11-02 反馈）。现在单独计数。
     let mut skipped: Vec<Value> = Vec::new();
-    for (src_cid, src_title, src_path, tgt_cid) in pairs {
+    let mut diverged: Vec<Value> = Vec::new();
+    let mut same = 0usize;
+    for p in pairs {
+        let (src_cid, src_title, src_path, tgt_cid) = (&p.src_cid, &p.src_title, &p.src_path, &p.tgt_cid);
         let tgt_path = target_body_path(src_path, tgt_cid);
         if !tgt_path.is_file() {
             skipped.push(json!({
@@ -955,15 +974,19 @@ fn refresh_linked_copies(
         };
         match relation {
             BodyRelation::Identical => {
-                skipped.push(json!({
-                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
-                    "reason": "两边内容已经一致",
-                }));
+                // 已经一致 = 本来就是我们想要的状态，不是「跳过」，更不是问题。
+                same += 1;
             }
             BodyRelation::Diverge => {
-                skipped.push(json!({
-                    "id": src_cid, "title": src_title, "targetSessionId": tgt_cid,
-                    "reason": "内容有分歧（目标账号里也有新内容），未自动覆盖",
+                // 两边都往前走了 —— 不能替用户决定谁对。
+                // 记下关联组 key，界面据此弹窗让用户选「以哪边为准」（走 session_groups::unify）。
+                diverged.push(json!({
+                    "id": src_cid,
+                    "title": src_title,
+                    "targetSessionId": tgt_cid,
+                    "sourceUid": p.src_uid,
+                    "groupKey": p.group_key,
+                    "reason": "两边都有新内容（分歧），未自动覆盖",
                 }));
             }
             BodyRelation::Prefix => {
@@ -1008,7 +1031,7 @@ fn refresh_linked_copies(
             }
         }
     }
-    (refreshed, skipped)
+    (refreshed, skipped, diverged, same)
 }
 
 pub fn copy_sessions(source_uid: &str, target_uid: &str, ids: &[String]) -> Result<Value, String> {
@@ -2080,7 +2103,7 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
     // （`store` 后面要在事务里改，新复制出来的副本不需要「刷新」）。
     //
     // 配对条件：源会话在勾选里 + 关联组里有目标成员 + 那份成员**存活**。
-    let refresh_pairs: Vec<(String, String, PathBuf, String)> = if opt.refresh_linked {
+    let refresh_pairs: Vec<RefreshPair> = if opt.refresh_linked {
         let mut pairs = Vec::new();
         for s in &alive {
             if let Some(sel) = &only {
@@ -2088,8 +2111,13 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
                     continue;
                 }
             }
-            let Some(tgt_cid) = find_group_for(&store, &s.user_id, &s.id)
-                .and_then(|g| member_for(g, opt.target_uid.as_deref().unwrap_or("")))
+            // ⚠️ 组和成员都从**同一个** `find_group_for` 结果里取：
+            //    分歧时要带着 `group_key` 回给界面（用户点「以哪边为准」走 unify），
+            //    两次查找容易对不上（中间 `store` 还会被改）。
+            let Some(g) = find_group_for(&store, &s.user_id, &s.id) else {
+                continue;
+            };
+            let Some(tgt_cid) = member_for(g, opt.target_uid.as_deref().unwrap_or(""))
                 .map(|m| m.session_id.clone())
             else {
                 continue;
@@ -2103,7 +2131,15 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
             let Some(path) = workbuddy_source::find_jsonl(&s.id) else {
                 continue;
             };
-            pairs.push((s.id.clone(), s.title.clone(), path, tgt_cid));
+            pairs.push(RefreshPair {
+                src_cid: s.id.clone(),
+                src_title: s.title.clone(),
+                src_path: path,
+                tgt_cid,
+                src_uid: s.user_id.clone(),
+                // `session_groups` 认的键就是 `link:<组 id>`（见其 `collect`）。
+                group_key: format!("link:{}", g.id),
+            });
         }
         pairs
     } else {
@@ -2161,6 +2197,9 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
     let mut done_bodies: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut refreshed: Vec<Value> = Vec::new();
     let mut refresh_skipped: Vec<Value> = Vec::new();
+    // 两边都往前走了、需要用户裁决的；以及「本来就已经一致」的份数（不是问题）。
+    let mut diverged: Vec<Value> = Vec::new();
+    let mut refresh_same: usize = 0;
     let mut per_target: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     let result = (|| -> Result<(), String> {
@@ -2201,7 +2240,7 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
                 .join("backup")
                 .join(format!("wb_bodies_link_{stamp}"));
             let target_uid = opt.target_uid.clone().unwrap_or_default();
-            let (r, rs) = refresh_linked_copies(
+            let (r, rs, dv, sm) = refresh_linked_copies(
                 &conn,
                 &refresh_pairs,
                 &target_uid,
@@ -2211,6 +2250,8 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
             );
             refreshed = r;
             refresh_skipped = rs;
+            diverged = dv;
+            refresh_same = sm;
         }
         save_links(&store)?;
         Ok(())
@@ -2257,7 +2298,12 @@ pub fn link_all(opt: LinkOptions) -> Result<Value, String> {
         // 「0 份已同步」不能同时代表「本来就是最新」和「全都失败了」。
         "refreshed": refreshed.len(),
         "refreshRows": refreshed,
+        // 真问题（正文缺失 / 读失败 / 写失败）；**不含**「两边已经一致」。
         "refreshSkipped": refresh_skipped,
+        // 已经一致的份数：与 `refreshSkipped` 分开，否则「一致」会被读成「没同步成功」。
+        "refreshSame": refresh_same,
+        // 分歧：两边都有新内容，需要用户选以哪边为准（界面据此弹窗）。
+        "diverged": diverged,
         "accounts": uids,
         "byTarget": by_target,
         "skipped": skipped.len(),
@@ -2355,6 +2401,37 @@ pub fn unlink_group(group_id: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// 「两边已经一致」**不许**再被报成「未同步」。
+    ///
+    /// 回归用（2026-11-02 用户报「明明没有分歧，切换时却说有 1 份未同步」）：
+    /// 这条文案以前出现在 `BodyRelation::Identical` 分支里，被界面统一读成
+    /// 「有分歧或缺正文」，于是在完全一致时也会吓人一跳。
+    #[test]
+    fn identical_is_not_reported_as_unsynced() {
+        // ⚠️ 别用「文件里不含某句话」来断言：测试自身就在同一个文件里，
+        //    断言字符串会把自己算进去（第一次就踩了）。
+        //    直接检查分支体：已一致只能计数，不能进 skipped。
+        let src = include_str!("workbuddy_sessions.rs");
+        let i = src.find("BodyRelation::Identical => {").expect("找不到一致分支");
+        let arm = &src[i..i + 260];
+        assert!(
+            !arm.contains("skipped.push"),
+            "「已一致」是想要的状态，不是没同步成 —— 不能进 refreshSkipped"
+        );
+        assert!(arm.contains("same += 1"), "应当只累加「已一致」计数");
+    }
+
+    /// 分歧必须带着 `groupKey` 回给界面，否则用户没法选「以哪边为准」。
+    #[test]
+    fn diverged_rows_carry_group_key() {
+        let src = include_str!("workbuddy_sessions.rs");
+        let i = src.find("BodyRelation::Diverge => {").expect("找不到分歧分支");
+        let arm = &src[i..i + 900];
+        assert!(arm.contains("diverged.push"), "分歧应进 diverged，而不是 skipped");
+        assert!(arm.contains("\"groupKey\": p.group_key"), "分歧行必须带关联组 key");
+        assert!(!arm.contains("skipped.push"), "分歧不该再算作普通跳过");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wb-sessions-{tag}-{}", uuid::Uuid::new_v4().simple()));

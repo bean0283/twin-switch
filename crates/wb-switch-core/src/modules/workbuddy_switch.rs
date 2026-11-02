@@ -350,9 +350,34 @@ pub fn switch_to(
     }));
     workbuddy_vault::mark_used(id);
 
-    // 6) 可选重启
+    // 5.5) **有分歧就先别启动**，等用户裁决完再启。
+    //
+    // 为什么不能先启动再说：客户端一起来就会往会话库里写，
+    // 用户还没选完「以哪边为准」，这边已经换了内容 —— 实测就是这个体验
+    // （2026-11-02 用户反馈「我还没确认，WorkBuddy 就已经重启了」）。
+    //
+    // 返回整组明细（不止源/目标两方）：最新内容可能落在第三个账号上。
+    let diverged_keys = diverged_group_keys(&session_link);
+    let mut divergence: Vec<Value> = Vec::new();
+    let mut restart_deferred = false;
+    if relaunch && !diverged_keys.is_empty() {
+        // ⚠️ **不在切换路径上强制比对**：实测 4 份 × 288 MB 要 34 秒（2026-11-02 本机），
+        // 卡在这里用户只会以为程序挂了。改用「按修改时间给默认值（后端已算好
+        // `newestSessionId`）+ 界面后台再逐份比对刷新」。
+        match crate::modules::workbuddy_session_groups::groups_for(&diverged_keys) {
+            Ok(v) if !v.is_empty() => {
+                divergence = v;
+                restart_deferred = true;
+                // 记一笔：万一应用在这之后没了，下次启动靠它把客户端补拉起来。
+                mark_pending_restart(true);
+            }
+            _ => {} // 取不到明细就别拦着启动，照常重启（宁可少一次裁决，也别把客户端憋着）
+        }
+    }
+
+    // 6) 可选重启（被推迟时这里不启，由 `finish_deferred` 在用户裁决后启）
     let mut relaunched = false;
-    if relaunch {
+    if relaunch && !restart_deferred {
         relaunched = launch().is_ok();
     }
 
@@ -363,9 +388,127 @@ pub fn switch_to(
         "backup": backup,
         "killed": killed,
         "relaunched": relaunched,
+        // `true` = 客户端**还没**启动，等 `workbuddy_switch_finish` 裁决后再启。
+        "restartDeferred": restart_deferred,
+        // 有分歧的关联组（每组含全部成员与 `isNewest`）。
+        "divergence": divergence,
         "automationSync": automation_sync,
         "sessionLink": session_link,
     }))
+}
+
+/// 「客户端被故意留在关闭状态」的标记文件。
+///
+/// 为什么要它：推迟启动后，客户端要等用户在弹窗里选完才起来。
+/// 万一这中间应用崩了 / 被强退 / 用户直接杀进程，WorkBuddy 就一直是关的 ——
+/// 用户下次开本工具时，靠这个标记把它补拉起来。
+fn pending_restart_marker() -> PathBuf {
+    crate::modules::config::store_dir()
+        .join("workbuddy")
+        .join("pending-restart.json")
+}
+
+fn mark_pending_restart(on: bool) {
+    let p = pending_restart_marker();
+    if on {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, json!({"at": now_ms()}).to_string());
+    } else {
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// 上次是不是「推迟了启动但没走完收尾」——是就补拉起来并清理标记。
+///
+/// 返回 `Some(true)` = 这次补拉了客户端。
+pub fn resume_pending_restart() -> Option<bool> {
+    let p = pending_restart_marker();
+    if !p.is_file() {
+        return None;
+    }
+    // 用户可能自己已经把客户端开起来了：那就只清标记，不要重复拉一个。
+    let relaunched = if is_running() {
+        false
+    } else {
+        launch().is_ok()
+    };
+    let _ = std::fs::remove_file(&p);
+    Some(relaunched)
+}
+
+/// 从 `link_all` 的结果里取出「有分歧的关联组键」（去重 + 稳定顺序）。
+///
+/// 抽成独立函数是为了能单测：它决定「要不要把客户端启动推迟」，
+/// 判断错了要么拦不住（用户还没选就被重启），要么白拦（客户端干等）。
+pub fn diverged_group_keys(session_link: &Value) -> Vec<String> {
+    session_link
+        .get("diverged")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.get("groupKey").and_then(Value::as_str))
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 分歧裁决后收尾：按用户选择同步，然后启动客户端。
+///
+/// 只有 `switch_to` 返回 `restartDeferred: true` 时才该调用它 ——
+/// 那时客户端被**故意**留在关闭状态，等这里统一启动，避免「还没选完就起来了」。
+///
+/// - `resolutions`：每项 `{groupKey, sessionId}`，`sessionId` = 用户选定的标准副本
+/// - `relaunch`：裁决完是否启动客户端（正常是 true）
+///
+/// 每条独立成败：一份失败不影响其它份，也不影响启动 —— 用户至少能拿回客户端。
+pub fn finish_deferred(resolutions: &[SwitchResolution], relaunch: bool) -> Result<Value, String> {
+    let mut applied: Vec<Value> = Vec::new();
+    for r in resolutions {
+        if r.group_key.trim().is_empty() || r.session_id.trim().is_empty() {
+            continue;
+        }
+        // 客户端此时是关的（切号时被推迟），所以 `close_client = false` 不会被拒。
+        match crate::modules::workbuddy_session_groups::unify(&r.group_key, &r.session_id, false) {
+            Ok(v) => applied.push(json!({
+                "groupKey": r.group_key,
+                "ok": true,
+                "verified": v.get("verified").cloned().unwrap_or(Value::Null),
+                "backupDir": v.get("backupDir").cloned().unwrap_or(Value::Null),
+                // 真正写过几份 / 本来就一致几份：界面要能说清「这次其实没改东西」。
+                "synced": v.get("syncedCount").cloned().unwrap_or(json!(0)),
+                "unchanged": v.get("unchangedCount").cloned().unwrap_or(json!(0)),
+            })),
+            Err(e) => applied.push(json!({
+                "groupKey": r.group_key,
+                "ok": false,
+                "error": e,
+            })),
+        }
+    }
+    let relaunched = if relaunch { launch().is_ok() } else { false };
+    // 清标记：走到这里客户端已经（尝试）启动，标记的使命结束。
+    mark_pending_restart(false);
+    Ok(json!({
+        "ok": true,
+        "applied": applied,
+        "relaunched": relaunched,
+        // 一条都没裁决也要照实说，界面据此判断「是同步了还是直接启动」
+        "resolved": applied.iter().filter(|a| a["ok"] == json!(true)).count(),
+    }))
+}
+
+/// [`finish_deferred`] 的一条裁决。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchResolution {
+    pub group_key: String,
+    pub session_id: String,
 }
 
 /// 回滚到上一次切换前的登录态。
@@ -433,6 +576,30 @@ mod tests {
     fn image_names_covers_workbuddy() {
         let names = image_names();
         assert!(names.iter().any(|n| n == "WorkBuddy"), "{names:?}");
+    }
+
+    /// 分歧组键：去重、丢弃空值、没有 `diverged` 时为空。
+    #[test]
+    fn diverged_group_keys_dedupes_and_ignores_bad_rows() {
+        let link = json!({
+            "ok": true,
+            "diverged": [
+                { "id": "a", "groupKey": "link:g1" },
+                { "id": "b", "groupKey": "link:g1" }, // 同一组的两条会话 → 只算一次
+                { "id": "c", "groupKey": "link:g2" },
+                { "id": "d" },                        // 没有 groupKey
+                { "id": "e", "groupKey": "" },        // 空串
+            ],
+        });
+        let keys = diverged_group_keys(&link);
+        assert_eq!(keys, vec!["link:g1".to_string(), "link:g2".to_string()]);
+    }
+
+    #[test]
+    fn diverged_group_keys_empty_when_no_divergence() {
+        assert!(diverged_group_keys(&json!({ "ok": true })).is_empty());
+        assert!(diverged_group_keys(&json!({ "diverged": [] })).is_empty());
+        assert!(diverged_group_keys(&json!(null)).is_empty());
     }
 
     #[test]

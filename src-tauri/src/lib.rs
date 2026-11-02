@@ -159,6 +159,32 @@ pub fn run() {
                 }
             });
             }
+            // 上次「切号时推迟了客户端启动、但没走完收尾」→ 补拉起来。
+            // 不做的话，应用崩一次就能把 WorkBuddy 一直晾在关闭状态（用户不一定会想到去开）。
+            tauri::async_runtime::spawn(async move {
+                match wb_switch_core::modules::workbuddy_switch::resume_pending_restart() {
+                    Some(launched) => eprintln!(
+                        "[switch] 补拉上次推迟启动的 WorkBuddy：{}",
+                        if launched { "已启动" } else { "已在运行或启动失败" }
+                    ),
+                    None => {}
+                }
+            });
+            // 自动签到：启动 8 秒后问一次「今天还有哪些平台没签」。
+            //
+            // 为什么要等 8 秒：签到要连三个平台，启动瞬间和客户端探测、模型刷新
+            // 挤在一起会互相拖慢；而且用户可能马上就退出（托盘应用常见），
+            // 太早反而容易被打断。
+            //
+            // 只在用户**自己开了**自动签到时才发请求（模块内部先看开关）。
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                let r = wb_switch_core::modules::auto_checkin::maybe_run("auto").await;
+                let ran = r.get("ran").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                if ran > 0 {
+                    eprintln!("[auto-checkin] 本次自动签到执行了 {ran} 个平台");
+                }
+            });
             Ok(())
         })
         // 点窗口关闭按钮：隐藏到托盘，不退出程序
@@ -256,6 +282,9 @@ pub fn run() {
             commands::trae_credits_query,
             commands::trae_credits_one,
             commands::checkin_run,
+            commands::auto_checkin_state,
+            commands::auto_checkin_set,
+            commands::auto_checkin_maybe_run,
             commands::trae_identify_live,
             commands::trae_backup_account,
             commands::trae_switch_to,
@@ -350,6 +379,8 @@ pub fn run() {
             commands::workbuddy_account_add_token,
             commands::workbuddy_switch_precheck,
             commands::workbuddy_switch_to,
+            commands::workbuddy_switch_finish,
+            commands::workbuddy_session_group_compare,
             commands::workbuddy_switch_session_plan,
             commands::workbuddy_rollback,
             commands::workbuddy_import_local,

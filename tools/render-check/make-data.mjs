@@ -819,10 +819,40 @@ const data = {
     notes: [],
   },
 
+  // 自动签到（首页卡片）：给一份「已开启、今天 Trae 跑过 / 另两个还没跑」的样本。
+  // ⚠️ 三种状态各给一个，否则截图只能证明「有一行能渲染」：
+  //    已执行（Trae）/ 未执行（WB、Qoder）。
+  autoCheckin: {
+    enabled: true,
+    today: "2026-11-02",
+    scopes: [
+      {
+        scope: "trae",
+        done: true,
+        record: {
+          at: 1793692800000,
+          trigger: "auto",
+          summary: {
+            total: 3, success: 2, already: 1, skipped: 0, unavailable: 0,
+            inactive: 0, needClient: 0, failed: 0, gained: 200,
+          },
+          items: [],
+        },
+      },
+      { scope: "workbuddy", done: false, record: null },
+      { scope: "qoder", done: false, record: null },
+    ],
+    history: [
+      { date: "2026-11-02", scopes: ["trae"] },
+      { date: "2026-11-01", scopes: ["trae", "workbuddy"] },
+      { date: "2026-10-31", scopes: ["trae", "workbuddy", "qoder"] },
+    ],
+  },
+
   // 更新状态：给一份「已是最新」，免得更新入口卡在检查中。
   updateState: {
-    currentVersion: "0.4.8",
-    latestVersion: "0.4.8",
+    currentVersion: "0.4.9",
+    latestVersion: "0.4.9",
     hasUpdate: false,
     checking: false,
     downloading: false,

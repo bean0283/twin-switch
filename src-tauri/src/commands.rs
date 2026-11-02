@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    app_overview, checkin, client_usage, config, error_log, settings, trae_backup, trae_cleanup,
+    app_overview, auto_checkin, checkin, client_usage, config, error_log, settings, trae_backup, trae_cleanup,
     trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
     trae_profile, trae_remote, trae_session_edit, trae_session_pack, trae_switch, trae_vault,
@@ -18,7 +18,7 @@ use wb_switch_core::modules::{
     workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
     workbuddy_vault,
 };
-use wb_switch_core::modules::{gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
+use wb_switch_core::modules::{workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -356,6 +356,27 @@ pub async fn trae_credits_one(client_key: Option<String>, id: String) -> Result<
 #[tauri::command]
 pub async fn checkin_run(scope: Option<String>, client_key: Option<String>) -> Result<Value, String> {
     Ok(checkin::run(scope.as_deref(), client_key.as_deref()).await)
+}
+
+/// 自动签到的当前状态（开关 + 今天各平台跑了没有 + 最近几天的记录）。
+#[tauri::command]
+pub async fn auto_checkin_state() -> Result<Value, String> {
+    Ok(auto_checkin::state())
+}
+
+/// 开/关自动签到。关掉只是不再自动跑，**已签到的记录保留**（那是事实）。
+#[tauri::command]
+pub async fn auto_checkin_set(enabled: bool) -> Result<Value, String> {
+    auto_checkin::set_enabled(enabled)
+}
+
+/// 问一次「今天还有哪些平台没签」并执行。
+///
+/// 首页挂载时调用（覆盖「应用一直开着跨过零点」的情况）；
+/// 启动时另有一个后台任务调用它，两处靠模块内的闸门保证只跑一份。
+#[tauri::command]
+pub async fn auto_checkin_maybe_run() -> Result<Value, String> {
+    Ok(auto_checkin::maybe_run("auto").await)
 }
 
 /// 识别当前登录账号（写入账号库前调用，拿 uid 做归属）。
@@ -2108,6 +2129,44 @@ pub async fn workbuddy_switch_to(
     })
     .await
     .map_err(|e| format!("切换任务失败: {e}"))?
+}
+
+/// 对指定关联组**逐份重新比对**（真读盘），返回最新明细。
+///
+/// ⚠️ 慢是预期：4 份 × 288 MB 实测 34 秒（2026-11-02 本机）。所以界面是**后台**调用，
+/// 绝不放在切号路径上；结果回来后只刷新徽标与关系，不动用户已经点过的选择。
+#[tauri::command]
+pub async fn workbuddy_session_group_compare(
+    group_keys: Vec<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (compared, skipped) = workbuddy_session_groups::force_compare(&group_keys);
+        let groups = workbuddy_session_groups::groups_for(&group_keys)?;
+        Ok::<Value, String>(json!({
+            "ok": true,
+            "compared": compared,
+            "skippedBytes": skipped,
+            "groups": groups,
+        }))
+    })
+    .await
+    .map_err(|e| format!("比对任务失败: {e}"))?
+}
+
+/// 分歧裁决后的收尾：按选择同步，再启动客户端。
+///
+/// 只在 `workbuddy_switch_to` 返回 `restartDeferred: true` 时调用 —— 那时客户端
+/// 被故意留在关闭状态，等这里统一启动（用户反馈：还没确认就重启了）。
+#[tauri::command]
+pub async fn workbuddy_switch_finish(
+    resolutions: Vec<workbuddy_switch::SwitchResolution>,
+    relaunch: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workbuddy_switch::finish_deferred(&resolutions, relaunch.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("收尾任务失败: {e}"))?
 }
 
 /// 切号弹窗用：列出**当前账号**的全部会话，以及每一条与目标账号的关联状态。

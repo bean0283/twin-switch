@@ -424,6 +424,29 @@ pub fn is_queued_hint(text: &str) -> bool {
     m.contains("10605") || m.contains("isqueued") || m.contains("queued") || text.contains("排队")
 }
 
+/// 上游说「上下文太长」——**与账号无关**，换号 / 重试都不会变好。
+///
+/// 2026-11-02 用户实测：一段超长上下文被 Trae 回 `code 4026: your context length has
+/// exceeded the maximum limit`，网关按 5xx 规则连换 3 个号，全是同一个错；
+/// 客户端又把 502 当成可重试错误，自动重试了 5 轮。**换号换不掉 token 数。**
+///
+/// 判据包括各家说法：Trae `4026` / OpenAI `context_length_exceeded` /
+/// Anthropic `prompt is too long` / 通用 `context window`、`too many tokens`。
+pub fn is_context_overflow(text: &str) -> bool {
+    let m = text.to_ascii_lowercase();
+    m.contains("4026")
+        || m.contains("context length")
+        || m.contains("context_length_exceeded")
+        || m.contains("maximum context")
+        || m.contains("context window")
+        || m.contains("too many tokens")
+        || m.contains("prompt is too long")
+        || m.contains("input is too long")
+        || m.contains("max_tokens")
+            && m.contains("exceed")
+        || (text.contains("上下文") && (text.contains("超") || text.contains("过长")))
+}
+
 /// 纯判定：这次失败该冷却多久、算什么类型（不碰任何全局状态，便于单测）。
 fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'static str)> {
     // 排队（10605 / isQueued）通常裹在 401/403 信封里 —— 必须先查它，
@@ -1544,6 +1567,32 @@ mod tests {
         let (until, kind) = classify(403, "额度不足", now).unwrap();
         assert_eq!(kind, "balance_exhausted");
         assert!((until - now - 3_600_000).abs() < 2_000);
+    }
+
+    /// 「上下文超长」必须能被认出来：它决定要不要换号、要不要冷却账号。
+    #[test]
+    fn detects_context_overflow_across_vendors() {
+        let cases = [
+            "code 4026: We're sorry, your context length has exceeded the maximum limit.",
+            "context_length_exceeded",
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "too many tokens in request",
+            "上下文超出上限",
+        ];
+        for c in cases {
+            assert!(is_context_overflow(c), "应识别为上下文超长：{c}");
+        }
+        // 别把「额度」和「排队」误伤成上下文问题（那两类换号是有意义的）
+        for c in [
+            "quota exceeded",
+            "429 rate limit",
+            "code 10605 isQueued",
+            "余额不足",
+            "invalid api key",
+        ] {
+            assert!(!is_context_overflow(c), "不该误判：{c}");
+        }
     }
 
     #[test]

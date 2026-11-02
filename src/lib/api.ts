@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
+  AutoCheckinRunResult,
+  AutoCheckinState,
   BackupRetention,
   CheckinResult,
   DiagLogSettings,
@@ -1382,6 +1384,26 @@ export function traeCreditsOne(
  * 每个账号一条结果，`status` 六档（见 `CheckinStatus`）互不合并 ——
  * 单账号失败不会影响其它账号，也不会让整个调用抛错。
  */
+/** 自动签到的状态：开关 + 今天各平台跑了没有。 */
+export function autoCheckinState(): Promise<AutoCheckinState> {
+  return call("auto_checkin_state");
+}
+
+/** 开/关自动签到。关掉只是不再自动跑，已签到的记录保留。 */
+export function autoCheckinSet(enabled: boolean): Promise<AutoCheckinState> {
+  return call("auto_checkin_set", { enabled });
+}
+
+/**
+ * 让后端判断「今天还缺哪些平台」并执行。
+ *
+ * 首页挂载时调用一次（覆盖应用一直开着跨过零点的情况）；启动时也有一次后台调用，
+ * 两处靠后端闸门保证只跑一份。
+ */
+export function autoCheckinMaybeRun(): Promise<AutoCheckinRunResult> {
+  return call("auto_checkin_maybe_run");
+}
+
 export function checkinRun(
   scope: "all" | "trae" | "workbuddy" | "qoder" = "all",
   clientKey?: string | null,
@@ -1426,6 +1448,48 @@ export function workbuddyAccountList(): Promise<WorkbuddyAccountList> {
 
 export function workbuddySwitchPrecheck(accountId: string): Promise<WorkbuddySwitchPrecheck> {
   return call("workbuddy_switch_precheck", { accountId });
+}
+
+/**
+ * 对指定关联组逐份重新比对（真读盘）。
+ *
+ * ⚠️ 慢是预期：4 份 × 288 MB 实测约 34 秒。所以只在弹窗打开后**后台**调用，
+ * 结果回来只刷新徽标/关系，不动用户已经点过的选择。
+ */
+export function workbuddySessionGroupCompare(
+  groupKeys: string[],
+): Promise<{ ok: boolean; compared: number; skippedBytes: number; groups: WbSessionGroup[] }> {
+  return call("workbuddy_session_group_compare", { groupKeys });
+}
+
+/**
+ * 分歧裁决后的收尾：按选择同步，再启动客户端。
+ *
+ * 只在 `workbuddySwitchTo` 返回 `restartDeferred: true` 时调用 —— 那时客户端被
+ * 故意留在关闭状态（用户反馈：还没确认就重启了）。
+ *
+ * `resolutions` 为空 = 不做任何修改、只把客户端拉起来。
+ */
+export function workbuddySwitchFinish(
+  resolutions: { groupKey: string; sessionId: string }[],
+  relaunch = true,
+): Promise<{
+  ok: boolean;
+  applied: {
+    groupKey: string;
+    ok: boolean;
+    error?: string;
+    verified?: boolean | null;
+    backupDir?: string | null;
+    /** 这次真正写过的份数。 */
+    synced?: number;
+    /** 本来就一致、没有改动的份数。 */
+    unchanged?: number;
+  }[];
+  relaunched: boolean;
+  resolved: number;
+}> {
+  return call("workbuddy_switch_finish", { resolutions, relaunch });
 }
 
 export function workbuddySwitchTo(

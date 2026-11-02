@@ -121,6 +121,14 @@ export interface TraeCreditsState {
    * 所以点了哪个号就只等那一个号的接口。失败只提示，不动其它账号的数字。
    */
   refreshOne: (id: string) => Promise<void>;
+  /**
+   * 「过期才刷」：切完账号后调用。
+   *
+   * 走 `force = false`，由后端 15 分钟缓存决定要不要真的打接口 ——
+   * 窗口内一次请求都不发，窗口外才刷。**绝不用 `force = true`**：
+   * 那等于每次切号都把四个账号全打一遍（2026-11-02 用户反馈的频繁刷新）。
+   */
+  refreshIfStale: () => Promise<void>;
   /** 正在单独刷新的账号 id（该卡片的按钮转圈）。 */
   refreshingId: string | null;
   expand: TraeCreditEntry | null;
@@ -129,7 +137,7 @@ export interface TraeCreditsState {
 
 /**
  * 账号库积分状态：首屏读离线快照（各账号的 profile.json，毫秒级），
- * 随后自动查一次（未命中 5 分钟缓存才会真的打接口）。
+ * 随后自动查一次（未命中 15 分钟缓存才会真的打接口）。
  *
  * 换客户端 / 账号库变化时传新的 `clientKey` 会重新拉一遍。
  */
@@ -226,7 +234,32 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
     [clientKey, refreshingId],
   );
 
-  return { result, error, busy, refresh, refreshOne, refreshingId, expand, setExpand };
+  /**
+   * 「过期才刷」：交给后端缓存判断，窗口内不发请求。
+   *
+   * ⚠️ 必须复用 `traeCreditsQuery(key, false)`：缓存窗口只有一个出口（后端 `CACHE_TTL_MS`），
+   * 前端再自己算一遍时间就变成两套判据了。
+   */
+  const refreshIfStale = useCallback(async () => {
+    try {
+      const res = await api.traeCreditsQuery(clientKey, false);
+      setResult(res);
+    } catch {
+      // 静默：这是切号后的顺带动作，失败不该弹窗打断用户（手动刷新时才提示）。
+    }
+  }, [clientKey]);
+
+  return {
+    result,
+    error,
+    busy,
+    refresh,
+    refreshOne,
+    refreshIfStale,
+    refreshingId,
+    expand,
+    setExpand,
+  };
 }
 
 /** 顶部工具条（与 WorkBuddy 侧同一套）。 */

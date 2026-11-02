@@ -24,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { AutoCheckinCard } from "@/components/auto-checkin-card";
 import { CheckinButton } from "@/components/checkin-button";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
 import { creditResourceName } from "@/lib/credit-package-names";
@@ -608,6 +609,10 @@ export default function HomePage() {
           loading={!reclaim && reclaimBusy}
         />
       </div>
+
+      {/* 自动签到：每天首次时把还没签的平台各签一次（已签的不重复触发）。
+          放在概览数字下面 —— 它是「今天要不要做点什么」的入口，不适合沉到底部。 */}
+      <AutoCheckinCard onRan={() => void refreshOverview()} />
 
       {/* 双栏状态卡。
           ⚠️ `items-start`：Trae 侧是「每个客户端一块」，客户端多的时候会比 WorkBuddy

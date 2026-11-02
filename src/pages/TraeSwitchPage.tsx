@@ -877,6 +877,10 @@ export default function TraeSwitchPage() {
         });
       }
       await loadOverview(clientKey);
+      // 切完顺带看一眼积分：**过期才刷**（15 分钟窗口内一个请求都不发）。
+      // 不能写 `credits.refresh()` —— 那是 `force = true`，等于每次切号都把
+      // 四个账号全打一遍，正是用户反馈的「频繁刷新」（2026-11-02）。
+      void credits.refreshIfStale();
       // ⚠️ 切完**不再**弹同步确认：T35 起已经在切换之前问过了。
       //    再弹一次等于把同一个问题问两遍，而且是真的「切完才问」。
     } catch (cause) {

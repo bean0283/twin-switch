@@ -405,6 +405,16 @@ fn decide_group(ids: &[Option<ContentId>], updated_at: &[i64]) -> (usize, Vec<St
 // 同步后的回读校验 / 「已校验一致」记录
 // ---------------------------------------------------------------------------
 
+/// 读回**一份**正文的 `(行数, 摘要)`（16 位十六进制，与 `WbSession::content_digest` 同口径）。
+///
+/// 用途：切号前要判定「这一组里谁最新」时，必须拿到**每份**的摘要 ——
+/// `verify_same_content` 只回答「是否都跟第一份一样」，判不出谁更靠前。
+/// 读完会进缓存，紧接着的 `collect()` 不必再读一遍。
+pub fn content_stamp(path: &Path, ids: &[String]) -> Option<(usize, String)> {
+    let cid = content_id_cached(path, ids)?;
+    Some((cid.lines, cid.total.chars().take(16).collect()))
+}
+
 /// 一份文件的内容摘要（`digest` 为 16 位十六进制，与 `WbSession::content_digest` 同口径）。
 pub struct VerifyReport {
     /// 全部一致（且至少有一份）。
