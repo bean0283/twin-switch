@@ -333,6 +333,19 @@ pub fn queue_wait_of(raw: &str) -> (u64, Option<u64>) {
     (wait, int_after(raw, "queueCount"))
 }
 
+/// 排队提示的人话文案（流式与非流式共用）。
+///
+/// ⚠️ Qoder 的 `queueCount` 经常是 **0** 而 `serviceAvailable=false`（`RESOURCE_LIMIT`）：
+/// 那不是"排在 0 个人后面"，是**这个模型此刻没有可用资源**。原来一律写「前面约 0 人」，
+/// 用户会以为"马上就轮到了"，实际每次都干等 30 秒（2026-11-02 用户截图连刷 8 次）。
+pub fn queue_text(wait: u64, count: Option<u64>) -> String {
+    match count {
+        Some(0) => format!("上游资源受限（服务端暂不可用），预计等 {wait} 秒"),
+        Some(n) => format!("上游排队中（前面约 {n} 人，预计等 {wait} 秒）"),
+        None => format!("上游排队中，预计等 {wait} 秒"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 流式解析
 // ---------------------------------------------------------------------------
@@ -349,6 +362,8 @@ pub struct StreamReader {
     started: bool,
     usage: Value,
     finish: Option<String>,
+    /// 本次请求的工具定义：收尾时按 schema 校正参数类型（模型常把 number/bool 写成字符串）。
+    tools: Value,
 }
 
 impl StreamReader {
@@ -363,7 +378,14 @@ impl StreamReader {
             started: false,
             usage: Value::Null,
             finish: None,
+            tools: Value::Null,
         }
+    }
+
+    /// 带上工具定义：收尾时按 schema 把 `"30000"` / `"true"` 这类字符串纠回数字/布尔。
+    pub fn with_tools(mut self, tools: &Value) -> Self {
+        self.tools = tools.clone();
+        self
     }
 
     /// 离线构造：把一段**录下来的**流文本交给解析器（不连网）。
@@ -381,6 +403,7 @@ impl StreamReader {
             started: false,
             usage: Value::Null,
             finish: None,
+            tools: Value::Null,
         }
     }
 
@@ -557,8 +580,8 @@ impl StreamReader {
                     let (wait, count) = queue_wait_of(&raw);
                     // 约定：`QUEUED|<秒>|<可读文案>` —— 外层据此按 retryAfterSeconds 等。
                     return Err(format!(
-                        "QUEUED|{wait}|上游排队中（前面约 {} 人，预计等 {wait} 秒）",
-                        count.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+                        "QUEUED|{wait}|{}",
+                        queue_text(wait, count)
                     ));
                 }
                 return Err(format!(
@@ -650,6 +673,8 @@ pub struct Emitter {
     /// 工具调用在这里累积，**收尾时一次性发出去**（见 [`Emitter::finish_frames`]）。
     calls: Vec<ToolCallAcc>,
     content_seen: bool,
+    /// 本次请求的工具定义：收尾时按 schema 校正参数类型（模型常把 number/bool 写成字符串）。
+    tools: Value,
 }
 
 impl Emitter {
@@ -661,7 +686,14 @@ impl Emitter {
             role_sent: false,
             calls: Vec::new(),
             content_seen: false,
+            tools: Value::Null,
         }
+    }
+
+    /// 带上工具定义：收尾时按 schema 把 `"30000"` / `"true"` 这类字符串纠回数字/布尔。
+    pub fn with_tools(mut self, tools: &Value) -> Self {
+        self.tools = tools.clone();
+        self
     }
 
     fn frame(&mut self, mut delta: Value, finish: Option<Value>) -> String {
@@ -739,7 +771,10 @@ impl Emitter {
     /// 客户端拿到完整集合才能把多个调用**并发**执行。以前一个一个发、
     /// 甚至只发最后一个，客户端只能串行，串行就多叠几轮 TTFT（L2-2）。
     pub fn finish_frames(&mut self, finish: Option<String>, usage: &Value) -> String {
-        let calls = crate::modules::gateway_server::finalize_tool_calls(&self.calls);
+        let mut calls = crate::modules::gateway_server::finalize_tool_calls(&self.calls);
+        // 模型给的参数类型不一定合 schema（常见：`"wait": "true"` / `"timeoutMs": "30000"`）。
+        // 客户端是**按 schema 校验**的，类型不对直接报 invalid arguments —— 必须在交出前纠回。
+        crate::modules::gateway_server::coerce_tool_call_args(&mut calls, &self.tools);
         let has_calls = !calls.is_empty();
         let mut out = String::new();
         if has_calls {
