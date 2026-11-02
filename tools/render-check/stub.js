@@ -19,7 +19,7 @@
   const handlers = {
     // ⚠️ 每次发版都要跟着改 —— 截图页脚会照实显示桩里的版本，忘了改就会出现
     //    「代码是 vX、截图是 vY」的假证据。
-    "plugin:app|version": () => "0.4.8",
+    "plugin:app|version": () => "0.4.9",
     "plugin:event|listen": () => 1,
     "plugin:event|unlisten": () => null,
     "plugin:event|emit": () => null,
@@ -28,6 +28,16 @@
     app_overview_cached: () => ({ empty: true, overview: null }),
     // ⚠️ 这两个以前**没桩**，兜底返回 `null` ⇒ 启动编排里的 `refreshOverview()` 永远拿不到
     //    数据，页面骨架常驻（实测 `skeleton=3` 25 秒不动）。补齐后页面才真的画完。
+    // 自动签到：三档都要给。`maybe_run` 必须返回**已开启**时的形状，
+    // 否则首页卡片会显示「今日未执行」而截图看起来像功能没生效。
+    auto_checkin_state: () => D.autoCheckin,
+    auto_checkin_set: (args) => ({ ...D.autoCheckin, enabled: args?.enabled === true }),
+    auto_checkin_maybe_run: () => ({
+      ran: [],
+      skipped: ["trae", "workbuddy", "qoder"],
+      reason: "busy",
+      state: D.autoCheckin,
+    }),
     app_overview_snapshot: () => D.appOverview,
     update_state: () => D.updateState,
     workbuddy_import_reference_accounts: () => D.refAccounts,

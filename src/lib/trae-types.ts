@@ -1413,6 +1413,18 @@ export interface WorkbuddySwitchResult {
   backup: string | null;
   killed: string[];
   relaunched: boolean;
+  /**
+   * `true` = 客户端**还没启动**，因为会话语义有分歧，等用户裁决后再启。
+   *
+   * 界面必须弹窗让用户选，选完（或明确「不做改动」）调 `workbuddySwitchFinish`。
+   */
+  restartDeferred?: boolean;
+  /**
+   * 有分歧的关联组，**每组含全部成员**（不止源/目标两方）。
+   *
+   * 最新内容可能落在第三个账号上，所以让用户从整组里选标准，而不是二选一。
+   */
+  divergence?: WbSessionGroup[];
   /** 定时任务同步报告（`ok:false` 表示切号成功但同步失败，界面要照实说）。 */
   automationSync?: {
     ok: boolean;
@@ -1446,11 +1458,34 @@ export interface WorkbuddySwitchResult {
     noBody?: number;
     /** 已关联副本里真正被内容同步（纯追加）改写的份数。 */
     refreshed?: number;
-    /** 没能同步的逐条原因（分歧 / 正文缺失 / 读失败）—— 界面要能说清为什么没动。 */
+    /**
+     * 两边**本来就已经一致**的份数。
+     *
+     * ⚠️ 与 `refreshSkipped` 严格分开：它代表「已经是想要的状态」，
+     * 不是「没同步成功」。混在一起会让用户看到「明明没有分歧」（2026-11-02 反馈）。
+     */
+    refreshSame?: number;
+    /** 真问题（正文缺失 / 读失败 / 写失败）—— 界面要能说清为什么没动。 */
     refreshSkipped?: Array<{
       id: string;
       title?: string;
       targetSessionId?: string;
+      reason: string;
+    }>;
+    /**
+     * 分歧：两边都有新内容，网关不替用户决定谁对。
+     *
+     * 界面据此弹窗让用户选「以哪边为准」；选定后走
+     * `workbuddySessionGroupUnify(groupKey, 选定副本的 sessionId, true)`。
+     */
+    diverged?: Array<{
+      id: string;
+      title?: string;
+      targetSessionId?: string;
+      /** 源副本所属账号（刚切走的那个）。 */
+      sourceUid?: string;
+      /** 关联组键（`link:<组 id>`），交给 unify 用。 */
+      groupKey?: string;
       reason: string;
     }>;
   } | null;
@@ -1967,6 +2002,16 @@ export interface WbSessionGroup {
   staleCount?: number;
   /** 推荐来源副本（内容最新）。 */
   sourceSessionId: string;
+  /**
+   * 「内容最新」的那份：有比对结论时是权威结论，没有时退化为**按修改时间**。
+   *
+   * 切号时的分歧弹窗里，后端会**强制比对**这几组，所以它通常是可靠答案。
+   */
+  newestSessionId?: string;
+  /** 按文件修改时间最新的那份（永远给，供比对不可用时兜底）。 */
+  newestByTimeSessionId?: string;
+  /** `content` = 有逐行比对结论；`mtime` = 只能按修改时间判。 */
+  newestBasis?: "content" | "mtime";
   canUnify: boolean;
   missingAccounts: Array<{ uid: string; label: string }>;
   /** 还没有这份会话的账号数（仅用于「关联新账号」，不影响状态）。 */
@@ -2702,6 +2747,34 @@ export interface CheckinItem {
 }
 
 /** 汇总。⚠️ 分档计数与上面七档一一对应，禁止把 `skipped` 并进 `failed`。 */
+/** 自动签到：某个平台当日的记录。`record` 为 `null` = 今天还没跑过。 */
+export interface AutoCheckinScopeState {
+  scope: "trae" | "workbuddy" | "qoder";
+  done: boolean;
+  record: {
+    at: number;
+    trigger: string;
+    summary: CheckinSummary;
+    items: CheckinItem[];
+  } | null;
+}
+
+export interface AutoCheckinState {
+  enabled: boolean;
+  today: string;
+  scopes: AutoCheckinScopeState[];
+  history: { date: string; scopes: string[] }[];
+}
+
+/** `maybeRun` 的返回：这次真跑了哪些、跳过了哪些。 */
+export interface AutoCheckinRunResult {
+  ran: string[];
+  skipped: string[];
+  /** `disabled` = 没开；`busy` = 另一份正在跑；空串 = 正常跑完。 */
+  reason: "" | "disabled" | "busy";
+  state: AutoCheckinState;
+}
+
 export interface CheckinSummary {
   total: number;
   success: number;

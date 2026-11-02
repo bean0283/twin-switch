@@ -247,6 +247,82 @@ impl CmdResult {
     }
 }
 
+/// 解码一条**控制台命令**的输出。
+///
+/// ⚠️ 中文 Windows 上 `taskkill` / `kill` 的输出是 **GBK（OEM 代码页）**，不是 UTF-8。
+/// 以前一律 `from_utf8_lossy`：中文全变成 `\u{FFFD}`，用户看到的就是
+/// 「…（一串乱码）… PID 33104（乱码）…」（2026-11-02 用户截图）。
+///
+/// 而且更糟：代码里还用 `detail().contains("找不到")` 判「进程已经没了」——
+/// 乱码之后这个判断永远为假，于是「已经退出」被当成「拒绝访问」报给用户。
+///
+/// 这里不引编码库：**能按 UTF-8 解就解，解不了只保留 ASCII**（PID/英文关键字还在），
+/// 中文一律丢弃并标注。反正最终给用户的结论由 [`terminate_direct`] 的错误码给出，
+/// 不再依赖这些本地化文案。
+fn decode_console(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let ascii: String = bytes
+                .iter()
+                .map(|b| if b.is_ascii_graphic() || *b == b' ' || *b == b'\n' { *b as char } else { ' ' })
+                .collect();
+            let flat = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
+            // 全中文输出（ASCII 部分为空）也要留下这句说明 ——
+            // 返回空串会让用户以为「命令什么都没说」，实际是说了但我们解不了。
+            if flat.trim().is_empty() {
+                "（该命令输出非 UTF-8，中文已省略）".to_string()
+            } else {
+                format!("{flat}（该命令输出非 UTF-8，中文已省略）")
+            }
+        }
+    }
+}
+
+/// 直接 `TerminateProcess` 一个 PID，返回**结构化的失败原因**（不依赖本地化文案）。
+///
+/// 为什么需要它：`taskkill` 失败只说一句本地化的话，还分不清到底是
+/// 「进程已经没了」「拒绝访问（要管理员）」还是「受保护」。这些正是用户要采取
+/// 不同动作的地方，所以用错误码自己判。
+#[cfg(windows)]
+pub fn terminate_direct(pid: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    if pid == 0 {
+        return Err("PID 0 不是可结束的进程".to_string());
+    }
+    unsafe {
+        let h = match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) => h,
+            Err(_) => {
+                // 5 = ERROR_ACCESS_DENIED；87 = 参数错（进程已不在）；其余按码报。
+                return Err(match GetLastError().0 {
+                    5 => "拒绝访问（该进程权限更高，需要以管理员身份运行本工具）".to_string(),
+                    87 => "进程已退出".to_string(),
+                    c => format!("打开进程失败（Win32 错误码 {c}）"),
+                });
+            }
+        };
+        let r = TerminateProcess(h, 1);
+        let _ = CloseHandle(h);
+        if r.is_err() {
+            return Err(format!("终止进程失败（Win32 错误码 {}）", GetLastError().0));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn terminate_direct(pid: u32) -> Result<(), String> {
+    let args = vec!["-9".to_string(), pid.to_string()];
+    match run_cmd("kill", &args, std::time::Duration::from_secs(10)) {
+        Some(r) if r.ok() => Ok(()),
+        Some(r) => Err(format!("kill 返回 {:?}", r.code)),
+        None => Err("kill 未能启动或超时".to_string()),
+    }
+}
+
 /// 跑一条外部命令并带超时；起不来或超时返回 `None`（超时会顺手 `kill` 掉子进程）。
 pub fn run_cmd(program: &str, args: &[String], timeout: std::time::Duration) -> Option<CmdResult> {
     use std::process::{Command, Stdio};
@@ -277,8 +353,8 @@ pub fn run_cmd(program: &str, args: &[String], timeout: std::time::Duration) -> 
     let out = child.wait_with_output().ok()?;
     Some(CmdResult {
         code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        stdout: decode_console(&out.stdout),
+        stderr: decode_console(&out.stderr),
     })
 }
 
@@ -406,6 +482,11 @@ pub struct KillOutcome {
     pub restarted: bool,
     /// 每轮失败原因（taskkill 的 stderr 摘要等）。
     pub errors: Vec<String>,
+    /// 结束失败时**逐条原因**：`(映像名, PID, 原因)`。
+    ///
+    /// 与 `errors` 的区别：这里的原因是我们自己判的（`TerminateProcess` 错误码），
+    /// 不是 `taskkill` 的本地化文案 —— 后者在中文系统上既读不懂又容易被编码搞乱。
+    pub blockers: Vec<(String, u32, String)>,
 }
 
 impl KillOutcome {
@@ -424,7 +505,31 @@ impl KillOutcome {
             self.remaining.len(),
             pids.join(", ")
         );
-        if !self.errors.is_empty() {
+        if !self.blockers.is_empty() {
+            // 按原因归类：用户要看到的是「该怎么办」，不是一串 PID。
+            let mut by_reason: Vec<(String, Vec<u32>)> = Vec::new();
+            for (_, pid, why) in &self.blockers {
+                match by_reason.iter_mut().find(|(r, _)| r == why) {
+                    Some((_, v)) => v.push(*pid),
+                    None => by_reason.push((why.clone(), vec![*pid])),
+                }
+            }
+            s.push_str("。原因：");
+            s.push_str(
+                &by_reason
+                    .iter()
+                    .map(|(why, ps)| {
+                        format!(
+                            "{} 个{}",
+                            ps.len(),
+                            why
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            );
+            s.push_str("。可以：① 手动退出该客户端后重试；② 以管理员身份运行本工具再切；③ 若它刚自动更新过，等更新结束再试");
+        } else if !self.errors.is_empty() {
             s.push_str("；结束命令的返回：");
             s.push_str(&self.errors.join("；"));
         }
@@ -478,6 +583,8 @@ pub fn kill_tree_and_wait(
 
     let deadline = Instant::now() + timeout;
     let mut attempts = 0u32;
+    // 连续「全部都是拒绝访问」的轮数（确定性失败，早退用）。
+    let mut denied_rounds = 0u32;
     let mut killed: Vec<String> = Vec::new();
     // 每轮重新取；只保留最后一轮的错误（20 轮全留会把清单撑爆，且失败原因通常稳定）。
     let mut errors: Vec<String>;
@@ -503,17 +610,96 @@ pub fn kill_tree_and_wait(
                 remaining: Vec::new(),
                 restarted: false,
                 errors,
+                blockers: Vec::new(),
             };
         }
+
+        // 第二轮起换**直接终止**：`taskkill` 在中文系统上失败时只吐一句本地化的话，
+        // 既说不清原因（拒绝访问 / 已退出 / 受保护），也容易被编码搞成乱码。
+        // `TerminateProcess` 能拿到错误码，结论是我们自己判的（2026-11-02 用户反馈）。
+        if attempts >= 2 {
+            let mut ok_any = false;
+            let mut denied = 0usize;
+            for (_, pid) in &now {
+                match terminate_direct(*pid) {
+                    Ok(()) => ok_any = true,
+                    Err(e) if e.contains("拒绝访问") => denied += 1,
+                    Err(_) => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let after = snapshot();
+            if is_clear(&after) {
+                return KillOutcome {
+                    ok: true,
+                    attempts,
+                    killed,
+                    remaining: Vec::new(),
+                    restarted: false,
+                    errors,
+                    blockers: Vec::new(),
+                };
+            }
+            // 权限被拒是**确定性失败**：再来 14 轮也是同一个结果。
+            // 连拒 3 轮就直接收工，把「要管理员」这个结论早点给用户
+            // （不然他要盯着转 20 秒，还不知道卡在哪）。
+            if !ok_any && denied >= after.len() && denied > 0 {
+                denied_rounds += 1;
+                if denied_rounds >= 3 {
+                    let mut detailed = errors;
+                    let mut blockers: Vec<(String, u32, String)> = Vec::new();
+                    for (name, pid) in &after {
+                        let why = terminate_direct(*pid)
+                            .err()
+                            .unwrap_or_else(|| "仍然无法结束".to_string());
+                        if why.contains("已退出") {
+                            continue;
+                        }
+                        detailed.push(format!("{name}（PID {pid}）：{why}"));
+                        blockers.push((name.clone(), *pid, why));
+                    }
+                    return KillOutcome {
+                        ok: false,
+                        attempts,
+                        killed,
+                        remaining: after,
+                        restarted: false,
+                        errors: detailed,
+                        blockers,
+                    };
+                }
+            } else {
+                denied_rounds = 0;
+            }
+        }
+
         if Instant::now() >= deadline {
             let restarted = !now.is_empty() && !now.iter().any(|(_, pid)| first_pids.contains(pid));
+            // 最后一轮：把「还剩哪些、为什么」逐条问出来（不看 taskkill 的文案）。
+            let mut detailed = errors;
+            let mut blockers: Vec<(String, u32, String)> = Vec::new();
+            for (name, pid) in &now {
+                match terminate_direct(*pid) {
+                    Ok(()) => {}
+                    // 「进程已退出」说明这条只是快照过时，不算失败。
+                    Err(why) if why.contains("已退出") => {}
+                    Err(why) => {
+                        detailed.push(format!("{name}（PID {pid}）：{why}"));
+                        blockers.push((name.clone(), *pid, why));
+                    }
+                }
+            }
+            if detailed.is_empty() {
+                detailed.push("已发出结束命令，但系统还没回收这些进程".to_string());
+            }
             return KillOutcome {
                 ok: false,
                 attempts,
                 killed,
                 remaining: now,
                 restarted,
-                errors,
+                errors: detailed,
+                blockers,
             };
         }
     }
@@ -598,6 +784,48 @@ mod tests {
         let ok = CmdResult { code: Some(0), stdout: "成功".into(), stderr: String::new() };
         assert!(ok.ok());
         assert_eq!(ok.detail(), "成功");
+    }
+
+    /// 控制台输出解码：GBK 的中文**不许**变成一串 `\u{FFFD}`（用户截图里的乱码）。
+    #[test]
+    fn console_output_never_emits_mojibake() {
+        // UTF-8 正常放行
+        assert_eq!(decode_console("ERROR: The process 123 could not be terminated.".as_bytes()),
+                   "ERROR: The process 123 could not be terminated.");
+        assert_eq!(decode_console("中文原样".as_bytes()), "中文原样");
+
+        // GBK 的「拒绝访问。」= BE DC BE F8 B7 C3 CE CA A1 A3
+        let gbk = [0xBE, 0xDC, 0xBE, 0xF8, 0xB7, 0xC3, 0xCE, 0xCA, 0xA1, 0xA3];
+        let out = decode_console(&gbk);
+        assert!(!out.contains('\u{FFFD}'), "不许出现替换字符（那就是乱码）");
+        assert!(out.contains("非 UTF-8"), "要明确说中文被省略了: {out}");
+
+        // 纯 ASCII 混在 GBK 里时，ASCII 部分（PID / 关键字）要留住
+        let mixed = b"PID 33104 \xBE\xDC\xBE\xF8\xB7\xC3";
+        let out2 = decode_console(mixed);
+        assert!(out2.contains("33104"), "ASCII 信息必须保留: {out2}");
+        assert!(!out2.contains('\u{FFFD}'));
+    }
+
+    /// 失败提示必须说「怎么办」，而不是把一串 PID 堆给用户。
+    #[test]
+    fn hint_offers_actions_when_processes_refuse_to_die() {
+        let out = KillOutcome {
+            ok: false,
+            attempts: 16,
+            killed: vec!["WorkBuddy.exe".into()],
+            remaining: vec![("WorkBuddy.exe".into(), 33104), ("WorkBuddy.exe".into(), 33328)],
+            restarted: false,
+            errors: vec![],
+            blockers: vec![
+                ("WorkBuddy.exe".into(), 33104, "拒绝访问（该进程权限更高，需要以管理员身份运行本工具）".into()),
+                ("WorkBuddy.exe".into(), 33328, "拒绝访问（该进程权限更高，需要以管理员身份运行本工具）".into()),
+            ],
+        };
+        let h = out.hint("WorkBuddy");
+        assert!(h.contains("2 个"), "同类原因要合并计数: {h}");
+        assert!(h.contains("管理员"), "要给出可执行建议: {h}");
+        assert!(!h.contains('\u{FFFD}'));
     }
 
     #[test]

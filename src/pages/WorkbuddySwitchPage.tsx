@@ -44,7 +44,9 @@ import {
   CreditsHeader,
   useWorkbuddyCredits,
 } from "@/components/workbuddy-credits";
+import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
+import { pickDefaultStandard, sessionLinkNote } from "@/lib/wb-switch-note";
 import type {
   WbCreditItem,
   WorkbuddyAccount,
@@ -55,7 +57,9 @@ import type {
   WorkbuddySwitchResult,
   WorkbuddySwitchSessionPlan,
   WorkbuddySwitchSessionRow,
+  WbSessionGroup,
 } from "@/lib/trae-types";
+
 
 /**
  * 切换成功后确认窗自动关闭的延时（ms）。
@@ -199,6 +203,21 @@ export default function WorkbuddySwitchPage() {
   const [switchTarget, setSwitchTarget] = useState<WorkbuddyAccount | null>(null);
   const [precheck, setPrecheck] = useState<WorkbuddySwitchPrecheck | null>(null);
   const [switchResult, setSwitchResult] = useState<WorkbuddySwitchResult | null>(null);
+  /**
+   * 有分歧的关联组（切换后、客户端启动**之前**）。
+   *
+   * 有值就弹窗让用户从**整组成员**里选「以哪份为准」——最新内容可能落在
+   * 第三个账号上，所以不能只给源/目标两个选项。
+   */
+  const [divergence, setDivergence] = useState<WbSessionGroup[] | null>(null);
+  /** 每组选了哪个成员作标准：`groupKey → sessionId`。 */
+  const [divChoice, setDivChoice] = useState<Record<string, string>>({});
+  /** 正在收尾（同步 + 启动客户端）。 */
+  const [finishing, setFinishing] = useState(false);
+  /** 后台逐份比对的进度状态（慢，但能让「谁最新」有确定答案）。 */
+  const [comparing, setComparing] = useState(false);
+  /** 用户亲手点过的组：后台比对回来时**不许**改他选的那一项。 */
+  const touchedGroups = useRef<Set<string>>(new Set());
   // 会话同步勾选表：`plan` 是后端算的「当前账号全部会话 + 与目标账号的关联状态」。
   const [plan, setPlan] = useState<WorkbuddySwitchSessionPlan | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
@@ -365,6 +384,82 @@ export default function WorkbuddySwitchPage() {
     );
   }, [plan, sessionQuery, onlyNewest]);
 
+  /**
+   * 后台对这几组逐份重新比对（真读盘，慢）。
+   *
+   * 为什么要它：切号路径上不敢做（4 份 × 288 MB 要 34 秒，会像卡死），
+   * 但「谁最新」又必须有个确定答案 —— 于是放后台，回来只刷新徽标与关系，
+   * **用户已经点过的组一律不动**。
+   */
+  const runCompare = async (groups: WbSessionGroup[]) => {
+    if (groups.length === 0) return;
+    setComparing(true);
+    try {
+      const r = await api.workbuddySessionGroupCompare(groups.map((g) => g.key));
+      const byKey = new Map(r.groups.map((g) => [g.key, g]));
+      setDivergence((prev) => prev?.map((g) => byKey.get(g.key) ?? g) ?? null);
+      setDivChoice((prev) => {
+        const next = { ...prev };
+        for (const g of r.groups) {
+          if (touchedGroups.current.has(g.key)) continue;
+          const pick = pickDefaultStandard(g);
+          if (pick) next[g.key] = pick;
+        }
+        return next;
+      });
+    } catch {
+      // 比对失败就维持「按修改时间」的结论，不打扰用户（它多数时候是对的）。
+    } finally {
+      setComparing(false);
+    }
+  };
+
+  /**
+   * 裁决完分歧后收尾：按选择同步，再启动客户端。
+
+   *
+   * ⚠️ 这是客户端**唯一**的启动时机（切换时后端推迟了启动）。
+   * 所以无论用户是「确认」还是「不做改动」，都必须走到这里 ——
+   * 否则 WorkBuddy 会被一直晾在关闭状态。
+   *
+   * `resolutions` 为空 = 不改任何内容，只启动。
+   */
+  const finishDivergence = async (resolutions: { groupKey: string; sessionId: string }[]) => {
+    setFinishing(true);
+    try {
+      const r = await api.workbuddySwitchFinish(resolutions, true);
+      const bad = (r.applied ?? []).filter((a) => !a.ok);
+      const unchanged = (r.applied ?? []).reduce((n, a) => n + (a.unchanged ?? 0), 0);
+      const wrote = (r.applied ?? []).reduce((n, a) => n + (a.synced ?? 0), 0);
+      if (resolutions.length === 0) {
+        toast.success(r.relaunched ? "未做改动，WorkBuddy 已启动" : "未做改动");
+      } else if (bad.length === 0 && wrote === 0) {
+        // 一份都没写：说明内容本来就一致，别让用户以为「同步过了」。
+        toast.success(`内容本来就一致，未改动${unchanged > 0 ? `（${unchanged} 份）` : ""}`, {
+          description: r.relaunched ? "WorkBuddy 已启动" : undefined,
+        });
+      } else if (bad.length === 0) {
+        toast.success(`已按所选同步 ${wrote} 份，WorkBuddy 已启动`, {
+          description: unchanged > 0 ? `另有 ${unchanged} 份本来就一致，未改动` : undefined,
+        });
+      } else {
+        // 部分失败也必须说清：失败的组没同步，但客户端照样起来了。
+        toast.error(`有 ${bad.length} 段同步失败（其余已同步）`, {
+          description: `${bad[0]?.error ?? "未知原因"}${r.relaunched ? "；WorkBuddy 已启动" : ""}`,
+        });
+      }
+      setDivergence(null);
+      await load();
+    } catch (e) {
+      // 收尾失败 = 客户端可能还没起来，必须让用户知道怎么补救。
+      toast.error("收尾失败，WorkBuddy 可能还没启动", {
+        description: api.asError(e),
+      });
+    } finally {
+      setFinishing(false);
+    }
+  };
+
   const runSwitch = async () => {
     const acc = switchTarget;
     if (!acc) return;
@@ -377,6 +472,22 @@ export default function WorkbuddySwitchPage() {
         : undefined;
       const r = await api.workbuddySwitchTo(acc.id, true, selection);
       setSwitchResult(r);
+      // 有分歧：客户端此时**还没启动**（后端推迟了），先让用户裁决。
+      if (r.restartDeferred && (r.divergence?.length ?? 0) > 0) {
+        const groups = r.divergence ?? [];
+        // 默认选「内容最新」的那份；没有标记就退回后端给的 sourceSessionId，
+        // 再不行取第一个有正文的 —— 保证每组都有默认值，用户不选也能直接确认。
+        const init: Record<string, string> = {};
+        for (const g of groups) {
+          const pick = pickDefaultStandard(g);
+          if (pick) init[g.key] = pick;
+        }
+        touchedGroups.current = new Set();
+        setDivChoice(init);
+        setDivergence(groups);
+        // 后台再逐份比对一次：默认值先按修改时间给出来（快），确定结论随后补上。
+        void runCompare(groups);
+      }
       // 定时任务同步的结果要一起报：删/增都对用户有影响，不能只说「切换成功」。
       const sync = r.automationSync;
       const syncNote = (() => {
@@ -390,26 +501,7 @@ export default function WorkbuddySwitchPage() {
       })();
       // 会话互通的结果同样要报：它写的是会话库，失败必须让用户看见，不许只报「切换成功」。
       const link = r.sessionLink;
-      const linkNote = (() => {
-        if (!link) return "";
-        if (link.ok === false) return `会话未同步：${link.error ?? "未知原因"}`;
-        // 首次只登记、不搬历史（历史存量要人工确认后才搬，见会话页）。
-        if (link.firstRun)
-          return "会话自动同步已启用（首次只登记已有副本；历史会话请在「会话记录 → 复制与关联」点一键互通补齐）";
-        // 没开开关 / 只有一个账号 / 已全部同步 —— 都不值得占一行。
-        if (link.notNeeded) return "";
-        const n = link.copied ?? 0;
-        const ad = link.adopted ?? 0;
-        const rf = link.refreshed ?? 0;
-        const parts: string[] = [];
-        if (n > 0) parts.push(`新增 ${n} 个副本`);
-        if (rf > 0) parts.push(`同步 ${rf} 份内容`);
-        if (ad > 0) parts.push(`登记 ${ad} 组关联`);
-        // 没能同步的要照实说，不能只报成功的数字。
-        const bad = link.refreshSkipped?.length ?? 0;
-        if (bad > 0) parts.push(`${bad} 份未同步（有分歧或缺正文）`);
-        return parts.length ? `会话${parts.join("、")}` : "";
-      })();
+      const linkNote = link ? sessionLinkNote(link) : "";
       const notes = [syncNote.replace(/^；/, ""), linkNote]
         .filter((s) => s.length > 0)
         .join("；");
@@ -1116,6 +1208,130 @@ export default function WorkbuddySwitchPage() {
             </Button>
             <Button variant="destructive" onClick={() => void runRemove()}>
               删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 分歧裁决：客户端**还没启动**，等这里选完再启 */}
+      <Dialog
+        open={divergence !== null}
+        onOpenChange={(o) => {
+          // 关窗也要把客户端拉起来 —— 否则 WorkBuddy 一直被晾着。
+          if (!o && !finishing) void finishDivergence([]);
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="size-4 text-amber-600" />
+              有 {divergence?.length ?? 0} 段会话内容不一致
+            </DialogTitle>
+            {comparing ? (
+              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <Loader2 className="size-3 animate-spin" />
+                正在逐份重新比对内容（大文件可能要几十秒）—— 结论出来后会自动更新
+              </div>
+            ) : null}
+            <DialogDescription className="space-y-2">
+              <span className="block">
+                这些对话在各个账号里都往前走过，工具不替你决定谁对。
+                选一份作为标准，会把它的内容同步给同组的其它账号（覆盖前各自备份）。
+              </span>
+              <span className="block">
+                每段列出了整组的副本，并已逐份重新比对（不是拿上次的结论）；默认勾选内容最新的那份。
+              </span>
+              <span className="block text-amber-700 dark:text-amber-400">
+                WorkBuddy 现在还没启动 —— 选完（或点「不做改动」）才会启动。
+              </span>
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="max-h-[52vh] space-y-3 overflow-y-auto pr-1">
+            {(divergence ?? []).map((g) => (
+              <div key={g.key} className="rounded-lg border border-border px-3 py-2.5">
+                <div className="truncate text-sm font-medium">{g.title || g.key}</div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                  {g.memberCount} 个账号参与 · 选一份作为标准
+                </div>
+                <div className="mt-2 space-y-1">
+                  {g.members.map((m) => {
+                    const disabled = !m.sessionId || m.contentState === "gone";
+                    const checked = divChoice[g.key] === m.sessionId;
+                    // 「最新」按内容判定优先；没比对结论时按修改时间标，并写清楚依据。
+                    const newestId = g.newestSessionId || g.newestByTimeSessionId;
+                    const isNewest = !!m.sessionId && (m.sessionId === newestId || m.isNewest);
+                    const newestByTime = isNewest && g.newestBasis !== "content" && !m.isNewest;
+                    return (
+                      <label
+                        key={`${g.key}:${m.sessionId || m.uid}`}
+                        className={cn(
+                          "flex cursor-pointer items-start gap-2 rounded-md border px-2 py-1.5",
+                          checked ? "border-primary bg-primary/5" : "border-border",
+                          (disabled || finishing) && "pointer-events-none opacity-50",
+                        )}
+                      >
+                        <input
+                          type="radio"
+                          className="mt-1 size-3.5 shrink-0"
+                          name={`divergence-${g.key}`}
+                          checked={checked}
+                          disabled={disabled || finishing}
+                          onChange={() => {
+                            // 记下「这组是用户亲手选的」，后台比对回来不许覆盖。
+                            touchedGroups.current.add(g.key);
+                            setDivChoice((prev) => ({ ...prev, [g.key]: m.sessionId }));
+                          }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-xs font-medium">{m.accountName}</span>
+                            {isNewest ? (
+                              <span className="rounded bg-emerald-500/10 px-1 text-[10px] text-emerald-600">
+                                {newestByTime ? "最新（按修改时间）" : "最新"}
+                              </span>
+                            ) : null}
+                            <span className="text-[10px] text-muted-foreground">
+                              {m.recordCount != null ? `${m.recordCount} 条 · ` : ""}
+                              {m.updatedAt ? new Date(m.updatedAt).toLocaleString("zh-CN") : "—"}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            {m.contentState === "gone"
+                              ? "这份副本已不存在"
+                              : m.contentState === "missing"
+                                ? "正文文件缺失"
+                                : m.reason}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={finishing}
+              onClick={() => void finishDivergence([])}
+            >
+              不做改动，直接启动
+            </Button>
+            <Button
+              disabled={finishing}
+              onClick={() =>
+                void finishDivergence(
+                  Object.entries(divChoice)
+                    .filter(([, sid]) => sid)
+                    .map(([groupKey, sessionId]) => ({ groupKey, sessionId })),
+                )
+              }
+            >
+              {finishing ? <Loader2 className="size-4 animate-spin" /> : null}
+              按所选同步并启动
             </Button>
           </DialogFooter>
         </DialogContent>

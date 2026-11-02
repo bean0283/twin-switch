@@ -1,4 +1,5 @@
 pub mod app_overview;
+pub mod auto_checkin;
 pub mod checkin;
 pub mod client_usage;
 pub mod config;

@@ -92,6 +92,13 @@ impl Member {
     }
     fn lines(&self) -> Option<usize> {
         let s = self.session.as_ref()?;
+        // ⚠️ `stale` / `unknown` 的行数是**上次比对时**的数，文件后来又变过。
+        // 直接展示会和别处的「内容一致」自相矛盾（2026-11-02 用户截图：
+        // 同一组里两份显示 66123「分叉」、另两份 66212「相同」，实际早就同步一致了）。
+        // 宁可显示「—」，也不给一个已知过期的数字。
+        if s.dup_relation == "stale" || s.dup_relation == "unknown" {
+            return None;
+        }
         // `body_lines` 只在「同标题 ≥2」时才算过；0 表示没算，不是「空正文」。
         if s.has_body && s.body_lines > 0 {
             Some(s.body_lines)
@@ -433,6 +440,24 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
         ""
     };
     let src = g.source().map(|m| m.cid().to_string()).unwrap_or_default();
+    // 「谁最新」两个来源：
+    // - `content`：逐行比对过，`relation == latest` 是权威结论；
+    // - `mtime`：没比对过（新建 / 上次比对后又被改）时，只能按**文件更新时间**排。
+    //   ⚠️ 界面默认勾选优先用权威结论，其次才用 mtime —— 但**绝不能不给**：
+    //   2026-11-02 用户实测，最后用的那个账号 22:19 才写过，却因为「未重新比对」
+    //   被排到最后、默认没选上。
+    let newest_by_mtime = g
+        .members
+        .iter()
+        .filter(|m| !m.cid().is_empty() && m.has_body())
+        .max_by_key(|m| m.updated_at())
+        .map(|m| m.cid().to_string())
+        .unwrap_or_default();
+    // ⚠️ 只要有一个成员是 `stale`（上次比对之后它又写了新内容），
+    // 之前那个「谁最新」的结论就**整体作废** —— 它可能已经被超过了。
+    // 这时按修改时间判，比抱着旧结论不放要诚实（2026-11-02 用户实测）。
+    let has_stale = g.members.iter().any(|m| m.relation() == "stale");
+    let has_content_verdict = !has_stale && g.members.iter().any(|m| m.relation() == "latest");
     json!({
         "key": g.key,
         "groupId": g.group_id,
@@ -447,6 +472,16 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
         "behindCount": behind,
         "staleCount": stale,
         "sourceSessionId": src,
+        // 「按内容最新」的结论（比对过才有）
+        "newestSessionId": if has_content_verdict {
+            g.members.iter().find(|m| m.relation() == "latest").map(|m| m.cid().to_string()).unwrap_or_default()
+        } else {
+            newest_by_mtime.clone()
+        },
+        // 按修改时间最新的那份（永远给，供界面兜底）
+        "newestByTimeSessionId": newest_by_mtime,
+        // `content` = 有比对结论；`mtime` = 只能按时间判
+        "newestBasis": if has_content_verdict { "content" } else { "mtime" },
         "canUnify": g.members.len() >= 2 && g.members.iter().filter(|m| m.has_body()).count() >= 1,
         "missingAccounts": missing_accounts,
         "missingCount": missing_count,
@@ -485,6 +520,87 @@ pub fn list() -> Result<Value, String> {
         "items": items,
         "note": "只读聚合：以关联记录为准，没有关联记录的按同标题副本聚类",
     }))
+}
+
+/// 取指定组键的成员明细（供切号后的「分歧裁决」用）。
+///
+/// ⚠️ 必须返回**整组**（所有账号的副本），不能只给「源 / 目标」两份：
+/// 最新内容可能落在第三个账号上，只比两方会让用户以为只有两个选择。
+pub fn groups_for(keys: &[String]) -> Result<Vec<Value>, String> {
+    groups_for_opt(keys, false)
+}
+
+/// 对这些组的成员做一次**真读盘**的比对，并把结论落盘。
+///
+/// 返回 `(成功比对的份数, 因超限跳过的字节数)`。
+///
+/// - 只碰传入的组，不重扫整个会话库（`list_sessions_forced` 会读全部会话，几万个文件）
+/// - 有总字节上限：超了就跳过剩下的，界面按 `newestByTimeSessionId` 兜底
+/// - 跳过不等于「一致」：跳过的成员结论仍然是「未比对」，绝不冒充
+pub fn force_compare(keys: &[String]) -> (usize, u64) {
+    /// 一次最多读多少字节：本机四份 288 MB 的组约 1.2 GB，留一倍余量。
+    const MAX_BYTES: u64 = 3_000_000_000;
+
+    let want: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let Ok((groups, _)) = collect() else {
+        return (0, 0);
+    };
+    let mut values: Vec<(String, std::path::PathBuf, usize, String)> = Vec::new();
+    let mut used: u64 = 0;
+    let mut skipped_bytes: u64 = 0;
+
+    for g in groups.iter().filter(|g| want.contains(g.key.as_str())) {
+        for m in &g.members {
+            let cid = m.cid();
+            if cid.is_empty() || !m.has_body() {
+                continue;
+            }
+            let Some(path) = workbuddy_source::find_jsonl(cid) else {
+                continue;
+            };
+            let size = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(0);
+            if used + size > MAX_BYTES {
+                skipped_bytes += size;
+                continue;
+            }
+            used += size;
+            let ids = [cid.to_string()];
+            if let Some((lines, digest)) = workbuddy_source::content_stamp(&path, &ids) {
+                values.push((cid.to_string(), path, lines, digest));
+            }
+        }
+    }
+    let n = if values.is_empty() {
+        0
+    } else {
+        workbuddy_source::mark_compared(&values)
+    };
+    (n, skipped_bytes)
+}
+
+/// [`groups_for`] 的**强制比对**版本：先把这些组的成员逐份读回算摘要并落盘，再取明细。
+///
+/// 为什么切号时要强制比对：用户点「切换」就等于说「以某某为准」，
+/// 那时给一个「上次比对之后这份有新内容，未重新比对」的结论毫无用处 ——
+/// 他没法据此选择（2026-11-02 用户反馈：最后用的那个账号明明最新，却没被推荐）。
+///
+/// 代价是**真读盘**：一份 288 MB 的正文约 1–2 秒，四份就是几秒。
+/// 所以有总字节上限（见 [`force_compare`]），超了就退回按修改时间判，
+/// 绝不把「读不完」说成「一样」。
+pub fn groups_for_opt(keys: &[String], force: bool) -> Result<Vec<Value>, String> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if force {
+        let _ = force_compare(keys);
+    }
+    let want: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let (groups, accounts) = collect()?;
+    Ok(groups
+        .iter()
+        .filter(|g| want.contains(g.key.as_str()))
+        .map(|g| group_payload(g, &accounts))
+        .collect())
 }
 
 /// 单个关联组的成员明细（与 [`list`] 同源，保证数字一致）。
@@ -802,10 +918,41 @@ fn unify_locked(group_key: &str, source_session_id: &str) -> Result<Value, Strin
 
     let mut written: Vec<(String, std::path::PathBuf, Option<std::path::PathBuf>)> = Vec::new();
     let mut details: Vec<Value> = Vec::new();
+    let mut unchanged = 0usize;
     let result = (|| -> Result<(), String> {
         for (uid, cid) in &targets {
             let dest = workbuddy_source::find_jsonl(cid)
                 .unwrap_or_else(|| workbuddy_sessions::target_body_path(&src_path, cid));
+
+            // ⚠️ **已经一致的副本不要重写**。
+            //
+            // 用户反馈：「明明内容一样，但又按最新的进行了一次同步」。以前这里无条件
+            // `write_body`：一份 288 MB 的正文会整份复制一遍，耗时又不产生任何变化，
+            // 还会刷新 mtime ⇒ 下一轮「谁最新」的判断被这次无谓写入带偏。
+            //
+            // 判据用**摘要**（两侧都把彼此的 id 替换成占位符后比较），不是文件大小：
+            // 大小相同不代表内容相同。摘要按 (路径, 长度, mtime, ids) 缓存，第二次起不读盘。
+            if dest.is_file() {
+                let ids = [source_session_id.to_string(), cid.to_string()];
+                let same = match (
+                    workbuddy_source::content_stamp(&src_path, &ids),
+                    workbuddy_source::content_stamp(&dest, &ids),
+                ) {
+                    (Some(a), Some(b)) => a.0 == b.0 && a.1 == b.1,
+                    _ => false, // 读不出来就老实重写，绝不把「读失败」当「一样」
+                };
+                if same {
+                    unchanged += 1;
+                    details.push(json!({
+                        "uid": uid,
+                        "sessionId": cid,
+                        "skipped": "identical",
+                        "reason": "与标准副本内容已一致，未改动",
+                    }));
+                    continue;
+                }
+            }
+
             // 备份已有正文（不存在就是新建，回滚时删掉）。
             let saved = if dest.is_file() {
                 let slot = backup_dir.join(format!("{cid}.jsonl"));
@@ -943,7 +1090,10 @@ fn unify_locked(group_key: &str, source_session_id: &str) -> Result<Value, Strin
         "groupKey": new_key,
         "source": { "uid": src_uid, "sessionId": source_session_id },
         "synced": details,
-        "syncedCount": details.len(),
+        // `syncedCount` 只数**真正写过**的；`unchangedCount` 是「本来就一致、没动」。
+        // 两者必须分开报 —— 用户看到「同步 4 份」而其实一份都没变，会觉得被骗。
+        "syncedCount": details.iter().filter(|d| d.get("skipped").is_none()).count(),
+        "unchangedCount": unchanged,
         "backupDir": backup_dir.to_string_lossy(),
         "dbBackup": db_backup.to_string_lossy(),
         // 回读校验结论：`verified = false` 时正文已写入但内容对不上，界面必须照实说。
