@@ -360,20 +360,44 @@ fn campaign_headers(region: QoderRegion, token: &str, uid: &str) -> Vec<(String,
     out
 }
 
+/// 「本机缺设备身份」这一档的返回体。
+///
+/// ⚠️ `reason` / `needClient` 是**前端约定**：`checkin_run` 靠 `reason ==
+/// "NO_DEVICE_IDENTITY"` 把它单列成一档（"需装客户端"），不是"无进行中活动"。
+/// 改字段名必须同步改 `checkin.rs` 与 `checkin-button.tsx`。
+fn no_identity_claim_result(why: &str, camp_count: usize) -> Value {
+    json!({
+        "ok": false,
+        "blocked": true,
+        "needClient": true,
+        "reason": "NO_DEVICE_IDENTITY",
+        "message": no_identity_message(why, camp_count),
+    })
+}
+
+/// 「本机缺 Qoder 设备身份」这件事对用户怎么说 —— 签到与查活动共用同一份文案。
+///
+/// 要求：**先说清"不是你账号的问题"**，再给原因，再给可执行的三步。
+/// 只说"没有活动"会让用户以为今天没活动、明天再来，实际上明天还是这样。
+pub fn no_identity_message(why: &str, camp_count: usize) -> String {
+    format!(
+        "签到没有成功，原因在本机，不在账号：这台电脑取不到 Qoder 设备身份。\n\
+         具体：{why}\n\
+         为什么会导致签不了：服务端只给带了 cosy-machine* 设备头的请求下发「每天领 100 Credits」，\
+         缺了就只有社区活动（这次下发 {camp_count} 个）——所以它不是「今天没有活动」，\
+         也不是账号或官方规则的问题。\n\
+         怎么办（按顺序试）：\n\
+         ① 装 Qoder 国际版客户端并登录一次，再点签到（客户端自带 umid 组件，装好就能现取）；\n\
+         ② 已装但装在非默认位置：设环境变量 `QODER_UMID_PATH` 指向\
+         `…\\resources\\umid\\runtime-info.exe`；\n\
+         ③ 装不了客户端（无头机/容器）：在能签到的那台「导出账号包」，\
+         这台「导入账号包」，设备身份会随包落地。"
+    )
+}
+
 /// 这台机器有没有可用的 Qoder 机器身份（决定「签到拿不到积分」该怪谁）。
 ///
 /// 判据与 [`campaign_headers`] 实际发出去的头**同源**：机器级配置齐全，
-/// 或账号里存了原始 `cosy-machinetoken` + `cosy-machinetype`。
-///
-/// ⚠️ 别在这里另立判据 —— 一旦两边不一致，就会出现「文案说官方没有签到、
-/// 实际是缺配置」这种把用户劝退的错话（2026-11-01 用户反馈就是这个）。
-fn has_machine_identity(region: QoderRegion) -> bool {
-    // 只认**机器级**身份：判据必须等于 [`campaign_headers`] 真正发出去的东西。
-    // 以前这里还算「账号里有 token+type」，而那时头是派生的假 id —— 文案说「有身份、
-    // 是官方没有活动」，实际是缺配置，把用户直接劝退（2026-11-01 的坑）。
-    crate::modules::qoder_machine::identity(region).is_some()
-}
-
 fn token_of<'a>(account: &'a QoderAccount) -> Result<&'a str, String> {    account
         .access_token
         .as_deref()
@@ -460,10 +484,28 @@ pub async fn checkin_status(region: QoderRegion, account: &QoderAccount) -> Resu
         .iter()
         .filter(|c| c.get("claimStatus").and_then(Value::as_str) == Some("CLAIMABLE"))
         .collect();
+    // 「本机缺设备身份」必须跟活动列表**一起**返回：否则界面只看到
+    // "0 个可领活动"，用户会以为今天没活动（实际是这台机器签不了）。
+    let gap = crate::modules::qoder_machine::missing_identity_reason(region);
+    let identity_ok = gap.is_none();
+    let warning = if !identity_ok && matches!(region, QoderRegion::Global) {
+        json!(no_identity_message(
+            gap.as_deref().unwrap_or("未知"),
+            camps.len()
+        ))
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "available": true,
         "claimable": payload.get("claimable").cloned().unwrap_or(json!(false)),
         "claimableCount": claimable.len(),
+        "machineIdentity": {
+            "available": identity_ok,
+            "source": crate::modules::qoder_machine::identity(region).map(|i| i.source),
+            "reason": gap,
+        },
+        "warning": warning,
         "campaigns": camps.iter().map(|c| json!({
             "key": c.get("campaignKey"),
             "status": c.get("claimStatus"),
@@ -572,63 +614,66 @@ pub async fn checkin_claim_once(
     }
 
     if benefit.is_empty() {
-        // 两种情况要分开说：服务端**根本没下发**活动（新号/资格未开放，camps 为空），
-        // 与「有活动但都不是领积分型」（全是 VIEW_DETAILS 之类）。
-        let reason = if camps.is_empty() {
-            "NO_CAMPAIGNS_FOR_ACCOUNT"
-        } else {
-            "NO_BENEFIT_CAMPAIGN"
-        };
-        let message: String = if camps.is_empty() {
-            "上游没有给这个账号下发任何活动（新号或活动资格未开放；以客户端内实际显示为准）".to_string()
-        } else if !has_machine_identity(region) {
-            // ★★ 这里以前一律说「国际版没有每日签到积分，这是官方行为」——
-            // 那是**错误的归因**：同一台机器带上全套 `cosy-machine*` 头就能拿到
-            // `CLAIM_BENEFIT`（见 `qoder_machine` 模块头的真机对照）。
-            //
-            // 2026-11-02 再修正一次归因：设备身份**不需要从别的机器搬**，
-            // 本机装了 Qoder 就能由客户端自带组件现取（`qoder_umid`）。
-            // 所以这里要报的是「为什么没取到」，并给出最短的修法。
-            {
-                let why = crate::modules::qoder_umid::probe_cached(region, "")
-                    .err()
-                    .unwrap_or_else(|| "组件可用但没能读出完整三件套".to_string());
-                format!(
-                    "这台电脑没有取到 Qoder 设备身份（缺 cosy-machine* 头），服务端因此只下发了 {} 个社区活动、\
-                     不下发「每天领积分」。\n\
-                     原因：{why}\n\
-                     按顺序试：\n\
-                     ① 装 Qoder 官方客户端并**登录一次**，再点签到 —— 客户端自带 umid 组件，装好就能现取，不用搬配置；\n\
-                     ② 装在了非默认目录：设置环境变量 `QODER_UMID_PATH` 指向 `…\\resources\\umid\\runtime-info.exe`；\n\
-                     ③ 实在装不了客户端：在**能签到的那台**上「导出账号包」，这台「导入账号包」，\
-                     机器身份会随包落地。",
-                    camps.len()
-                )
+        // ⚠️ 归因顺序：**先看本机设备身份，再看账号/活动**。
+        //
+        // 服务端只给「带了全套 cosy-machine*」的请求下发「每天领 100 Credits」；
+        // 取不到身份时表现就是 camps 为空、或只有 VIEW_DETAILS 社区活动。
+        // 以前这里一律说「新号/资格未开放」「官方没有每日签到积分」——
+        // 用户照着做完全没用（2026-11-02 用户报的就是这个：换了台机器，签到只说没有活动）。
+        let gap = crate::modules::qoder_machine::missing_identity_reason(region);
+
+        // 国际版：设备身份是硬前提，直接判定成「本机缺客户端」并说明。
+        if matches!(region, QoderRegion::Global) {
+            if let Some(why) = gap.as_deref() {
+                return Ok(no_identity_claim_result(why, camps.len()));
             }
-        } else {
-            // 参考实现的三态语义：**有活动平台但没积分类活动** ≠ 失败，也 ≠ 已签。
-            // 国际版目前只下发 VIEW_DETAILS 型社区活动（如「1024 创造力集结」），
-            // 官方本来就没有每日签到积分；如实说清，别让用户以为是我们坏了。
-            let kinds: Vec<String> = camps
-                .iter()
-                .filter_map(|c| c.get("actionType").and_then(Value::as_str))
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
-            let uniq: Vec<String> = {
-                let mut v = kinds;
-                v.sort();
-                v.dedup();
-                v
-            };
-            format!(
-                "上游下发了 {} 个活动，但都不是「领积分」型（类型：{}）——国际版目前没有每日签到积分，这是官方行为",
-                camps.len(),
-                if uniq.is_empty() { "未标注".to_string() } else { uniq.join(" / ") }
-            )
+        }
+
+        // 国内版：设备头不是必需（实测不带也能领），所以不把它当结论，只在
+        // camps 为空这种"更可疑"的情况下补一句提示 —— 免得把真因藏起来。
+        if camps.is_empty() {
+            let mut message = "上游没有给这个账号下发任何活动（新号或活动资格未开放；以客户端内实际显示为准）".to_string();
+            if let Some(why) = gap.as_deref() {
+                message.push_str(&format!(
+                    "\n另外：本机也没取到 Qoder 设备身份（{why}）。国内版一般不需要它，\
+                     但如果你在客户端里明明能看到活动，装一次客户端并登录再试。"
+                ));
+            }
+            return Ok(json!({
+                "ok": false,
+                "blocked": true,
+                "reason": "NO_CAMPAIGNS_FOR_ACCOUNT",
+                "message": message,
+            }));
+        }
+
+        // 有活动、只是没有领积分型 —— 这是真的"没有可领的积分活动"。
+        // 参考实现的三态语义：既不是失败，也不是已签。
+        let kinds: Vec<String> = camps
+            .iter()
+            .filter_map(|c| c.get("actionType").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let uniq: Vec<String> = {
+            let mut v = kinds;
+            v.sort();
+            v.dedup();
+            v
         };
-        return Ok(json!({ "ok": false, "blocked": true, "reason": reason, "message": message }));
+        let message = format!(
+            "上游下发了 {} 个活动，但都不是「领积分」型（类型：{}）——国际版目前没有每日签到积分，这是官方行为",
+            camps.len(),
+            if uniq.is_empty() { "未标注".to_string() } else { uniq.join(" / ") }
+        );
+        return Ok(json!({
+            "ok": false,
+            "blocked": true,
+            "reason": "NO_BENEFIT_CAMPAIGN",
+            "message": message,
+        }));
     }
+
 
     let claimable: Vec<&Value> = benefit
         .iter()
@@ -1382,6 +1427,38 @@ pub fn home_summary() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 「本机缺设备身份」必须说清**不是账号问题**，并给出可执行的三步 ——
+    /// 只说"没有活动"会让用户以为明天再来就行，而明天照样签不了。
+    #[test]
+    fn no_identity_message_blames_the_machine_and_gives_steps() {
+        let msg = no_identity_message("本机没有找到 Qoder 客户端（国际版）", 1);
+        assert!(msg.contains("本机"), "{msg}");
+        assert!(msg.contains("不在账号"), "必须排除账号因素：{msg}");
+        assert!(msg.contains("本机没有找到 Qoder 客户端（国际版）"), "要带具体原因：{msg}");
+        assert!(msg.contains("每天领 100 Credits"), "要解释为什么签不了：{msg}");
+        assert!(msg.contains("装 Qoder 国际版客户端"), "要给第一条修法：{msg}");
+        assert!(msg.contains("QODER_UMID_PATH"), "要给非常规安装的修法：{msg}");
+        assert!(msg.contains("导出账号包"), "要给装不了客户端的退路：{msg}");
+        assert!(!msg.contains("官方行为"), "不能再说成官方规则：{msg}");
+    }
+
+    /// 返回体的 reason 是前端分档的唯一依据，改名等于把提示降级成"无活动"。
+    #[test]
+    fn no_identity_result_is_its_own_bucket() {
+        let v = no_identity_claim_result("没装客户端", 2);
+        assert_eq!(v.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(v.get("blocked").and_then(Value::as_bool), Some(true));
+        assert_eq!(v.get("needClient").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            v.get("reason").and_then(Value::as_str),
+            Some("NO_DEVICE_IDENTITY")
+        );
+        assert!(v.get("message").and_then(Value::as_str).is_some());
+    }
+
+
     use super::*;
 
     /// 账号包 v2（带机器身份）与 v1（裸数组）都要能解析 —— 用户手里有旧包。

@@ -243,6 +243,44 @@ pub fn status() -> Value {
     })
 }
 
+/// 为什么这台机器取不到设备身份（取得到就返回 `None`）。
+///
+/// 返回的是**给人看的原因**，用于签到失败时明确告知 —— 以前这种情况会被归因成
+/// 「官方没有签到活动」，用户按那个提示完全无从下手。
+pub fn missing_identity_reason(region: QoderRegion) -> Option<String> {
+    if identity(region).is_some() {
+        return None;
+    }
+    // ① 连组件都找不到 = 没装客户端（或装在非常规目录）。
+    if crate::modules::qoder_umid::locate(region).is_none() {
+        return Some(match region {
+            QoderRegion::Global => {
+                "本机没有找到 Qoder 客户端（国际版），因此取不到设备身份".to_string()
+            }
+            QoderRegion::Cn => {
+                "本机没有找到 Qoder CN 客户端，因此取不到设备身份".to_string()
+            }
+        });
+    }
+    // ② 组件在，但跑不出来 / 输出不全。
+    if let Err(e) = crate::modules::qoder_umid::probe_cached(region, "") {
+        return Some(format!("客户端组件运行失败：{e}"));
+    }
+    // ③ 组件跑通了，但读不到客户端设备号（多半是客户端还没登录）。
+    if machine_id_from_client(region).is_none() {
+        return Some(match region {
+            QoderRegion::Global => {
+                "读不到客户端的设备号（auth.machine-id）—— 客户端装好了但还没登录过".to_string()
+            }
+            QoderRegion::Cn => {
+                "读不到 Qoder CN 客户端的设备号（auth.machine-id）—— 客户端装好了但还没登录过"
+                    .to_string()
+            }
+        });
+    }
+    Some("设备身份不完整".to_string())
+}
+
 /// 请求头里的 `cosy-version`：**客户端版本**，取不到才退回一个占位值。
 ///
 /// 顺序：客户端 `build-manifest.json` → 配置文件里的 `clientVersion` → 常量。

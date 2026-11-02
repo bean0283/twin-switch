@@ -2676,6 +2676,8 @@ export type CheckinStatus =
   | "skipped"
   | "unavailable"
   | "inactive"
+  /** 本机缺前置条件（目前：Qoder 没装客户端 ⇒ 取不到设备身份）。不是账号问题。 */
+  | "need_client"
   | "failed";
 
 /** 一个账号的签到结果。 */
@@ -2699,7 +2701,7 @@ export interface CheckinItem {
   code: number | null;
 }
 
-/** 汇总。⚠️ 分档计数与上面六档一一对应，禁止把 `skipped` 并进 `failed`。 */
+/** 汇总。⚠️ 分档计数与上面七档一一对应，禁止把 `skipped` 并进 `failed`。 */
 export interface CheckinSummary {
   total: number;
   success: number;
@@ -2707,6 +2709,8 @@ export interface CheckinSummary {
   skipped: number;
   unavailable: number;
   inactive: number;
+  /** 本机缺前置条件（Qoder 设备身份取不到）—— 要单独提示用户去装客户端。 */
+  needClient: number;
   failed: number;
   /** 本次合计到账积分（`null` 的那些不计入）。 */
   gained: number;

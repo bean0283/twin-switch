@@ -83,6 +83,12 @@ pub mod status {
     pub const UNAVAILABLE: &str = "unavailable";
     /// 当前没有进行中的签到活动（WorkBuddy 特有）。
     pub const INACTIVE: &str = "inactive";
+    /// **本机**缺前置条件导致签不了（目前只有一种：Qoder 取不到设备身份 = 没装客户端）。
+    ///
+    /// 与 [`FAILED`] 分开：不是出错、也不是账号问题，装个客户端就好；
+    /// 与 [`INACTIVE`] 分开更要紧 —— 说成「无进行中活动」用户会明天再来，
+    /// 而明天照样签不了。
+    pub const NEED_CLIENT: &str = "need_client";
     /// 真的失败了。
     pub const FAILED: &str = "failed";
 }
@@ -1042,6 +1048,7 @@ fn summarize(items: &[Value]) -> Value {
         "skipped": count(status::SKIPPED),
         "unavailable": count(status::UNAVAILABLE),
         "inactive": count(status::INACTIVE),
+        "needClient": count(status::NEED_CLIENT),
         "failed": count(status::FAILED),
         "gained": round2(gained),
     })
@@ -1176,8 +1183,16 @@ pub async fn run(scope: Option<&str>, only_client: Option<&str>) -> Value {
                                 item = item.done(status::SUCCESS, msg);
                             }
                         } else if v.get("blocked").and_then(Value::as_bool) == Some(true) {
-                            // 有活动但前置条件没达成：不是失败，重试也没用。
-                            item = item.done(status::INACTIVE, msg);
+                            // 前置条件没达成：不是失败，重试也没用。
+                            // ⚠️ 「本机没装 Qoder」要单独一档：说成「无进行中活动」，
+                            //    用户会以为是今天没活动、明天再来 —— 明天还是签不了。
+                            if v.get("reason").and_then(Value::as_str)
+                                == Some("NO_DEVICE_IDENTITY")
+                            {
+                                item = item.done(status::NEED_CLIENT, msg);
+                            } else {
+                                item = item.done(status::INACTIVE, msg);
+                            }
                         } else {
                             item = item.done(status::FAILED, msg);
                         }
@@ -1217,10 +1232,11 @@ mod tests {
             status::SKIPPED,
             status::UNAVAILABLE,
             status::INACTIVE,
+            status::NEED_CLIENT,
             status::FAILED,
         ];
         let uniq: HashSet<&&str> = all.iter().collect();
-        assert_eq!(uniq.len(), all.len(), "六档状态必须互不相同");
+        assert_eq!(uniq.len(), all.len(), "七档状态必须互不相同");
     }
 
     #[test]
@@ -1232,15 +1248,18 @@ mod tests {
             json!({ "status": "skipped", "gained": null }),
             json!({ "status": "unavailable", "gained": null }),
             json!({ "status": "inactive", "gained": null }),
+            json!({ "status": "need_client", "gained": null }),
             json!({ "status": "failed", "gained": null }),
         ];
         let s = summarize(&items);
-        assert_eq!(s["total"], json!(7));
+        assert_eq!(s["total"], json!(8));
         assert_eq!(s["success"], json!(2));
         assert_eq!(s["already"], json!(1));
         assert_eq!(s["skipped"], json!(1));
         assert_eq!(s["unavailable"], json!(1));
         assert_eq!(s["inactive"], json!(1));
+        // 「本机没装客户端」不能被并进无活动或失败，否则界面上就少了一条该做的事。
+        assert_eq!(s["needClient"], json!(1));
         assert_eq!(s["failed"], json!(1));
         // `gained = null`（未知）不许被当成 0 之外的任何东西，也不许让求和失败。
         assert_eq!(s["gained"], json!(10.0));
