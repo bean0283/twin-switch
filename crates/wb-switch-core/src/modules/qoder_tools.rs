@@ -80,7 +80,8 @@ pub fn export(region: QoderRegion) -> Result<Value, String> {
     // 而这套身份的 machineCode/Type/Token 是客户端运行时生成、不落盘的（magpie /
     // qoder-checkin 也都是「在有客户端的机器上取一次，然后把 config 带走」）。
     // 所以账号包必须能把它带过去，否则新机器只能盲签。
-    let machine = crate::modules::qoder_machine::export_identity().ok();
+    // 装了客户端就能现取，所以这里不再要求"先手工抓包"；取不到才不带 machine 段。
+    let machine = crate::modules::qoder_machine::export_identity_for(region).ok();
     let pkg = json!({
         "format": PKG_FORMAT,
         "version": PKG_VERSION,
@@ -313,7 +314,7 @@ const PATH_CAMPAIGNS: &str = "/sash/api/v1/me/campaigns";
 /// ⚠️ 这组头**不是 COSY 签名**（`authorization` 仍是普通 `Bearer dt-…`），
 /// 只是把设备身份带上去。抓包实测：缺了它们 `/me/campaigns` 不返回活动。
 /// `cosy-version` 用客户端版本 `0.4.8`（实测通过），UA 也必须是 `Qoder`。
-fn campaign_headers(region: QoderRegion, token: &str) -> Vec<(String, String)> {
+fn campaign_headers(region: QoderRegion, token: &str, uid: &str) -> Vec<(String, String)> {
     // ⚠️⚠️ 设备头的取舍（照参考实现 `campaign.rs::desktop_headers` 的注释，实测踩坑）：
     //
     // **发派生假头会被服务端判定为非官方客户端，把 CLAIMABLE 的「每日领取 100 Credits」
@@ -326,7 +327,10 @@ fn campaign_headers(region: QoderRegion, token: &str) -> Vec<(String, String)> {
         ("accept".into(), "application/json".into()),
         ("authorization".into(), format!("Bearer {token}")),
         ("cosy-clienttype".into(), "10".into()),
-        ("cosy-version".into(), "0.4.8".into()),
+        // ⚠️ 这是**客户端**版本（读客户端 `build-manifest.json` 的 productVersion），
+        //    不是本工具版本 —— 写成本工具版本等于自曝「我不是那个客户端」。
+        //    （2026-11-02 改；以前写死 0.4.8）
+        ("cosy-version".into(), crate::modules::qoder_machine::cosy_version(region)),
         ("user-agent".into(), "Qoder".into()),
     ];
 
@@ -334,7 +338,7 @@ fn campaign_headers(region: QoderRegion, token: &str) -> Vec<(String, String)> {
     //    只带上面那 4 个 → claimable=false、只有 2 个 VIEW_DETAILS；
     //    带全套 6 个 → claimable=true、3 个活动含 CLAIM_BENEFIT/CLAIMABLE/100。
     //    （真机对照见 `qoder_machine` 模块文档）
-    let machine = crate::modules::qoder_machine::identity(region);
+    let machine = crate::modules::qoder_machine::identity_for(region, uid);
     if let Some(m) = &machine {
         out.extend(m.headers());
     }
@@ -384,7 +388,7 @@ pub async fn fetch_campaigns(region: QoderRegion, account: &QoderAccount) -> Res
     let mut req = client()?
         .get(format!("{}{PATH_CAMPAIGNS}", spec.openapi_base))
         .timeout(std::time::Duration::from_secs(20));
-    for (k, v) in campaign_headers(region, token) {
+    for (k, v) in campaign_headers(region, token, &account.uid) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| format!("活动列表请求失败：{e}"))?;
@@ -415,7 +419,7 @@ pub async fn claim_campaign(
             spec.openapi_base
         ))
         .timeout(std::time::Duration::from_secs(20));
-    for (k, v) in campaign_headers(region, token) {
+    for (k, v) in campaign_headers(region, token, &account.uid) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| format!("领取请求失败：{e}"))?;
@@ -581,17 +585,26 @@ pub async fn checkin_claim_once(
             // ★★ 这里以前一律说「国际版没有每日签到积分，这是官方行为」——
             // 那是**错误的归因**：同一台机器带上全套 `cosy-machine*` 头就能拿到
             // `CLAIM_BENEFIT`（见 `qoder_machine` 模块头的真机对照）。
-            // 换一台电脑签不了，几乎都是**这台机器没有机器身份**，与官方无关。
-            // 说成「官方没有」会让用户以为无解，直接放弃。
-            format!(
-                "这台电脑没有 Qoder 机器身份（缺 cosy-machine* 头），服务端因此只下发了 {} 个社区活动、\
-                 不下发「每天领积分」。\n\
-                 两种补法（任选其一）：\n\
-                 ① 在**能正常签到的那台电脑**上「导出账号包」，把这台「导入账号包」—— \
-                 机器身份已经在包里，导完直接能签；\n\
-                 ② 或者在那台的「设置 → Qoder 机器身份」点「导出」，把内容粘到这里点「导入」。",
-                camps.len()
-            )
+            //
+            // 2026-11-02 再修正一次归因：设备身份**不需要从别的机器搬**，
+            // 本机装了 Qoder 就能由客户端自带组件现取（`qoder_umid`）。
+            // 所以这里要报的是「为什么没取到」，并给出最短的修法。
+            {
+                let why = crate::modules::qoder_umid::probe_cached(region, "")
+                    .err()
+                    .unwrap_or_else(|| "组件可用但没能读出完整三件套".to_string());
+                format!(
+                    "这台电脑没有取到 Qoder 设备身份（缺 cosy-machine* 头），服务端因此只下发了 {} 个社区活动、\
+                     不下发「每天领积分」。\n\
+                     原因：{why}\n\
+                     按顺序试：\n\
+                     ① 装 Qoder 官方客户端并**登录一次**，再点签到 —— 客户端自带 umid 组件，装好就能现取，不用搬配置；\n\
+                     ② 装在了非默认目录：设置环境变量 `QODER_UMID_PATH` 指向 `…\\resources\\umid\\runtime-info.exe`；\n\
+                     ③ 实在装不了客户端：在**能签到的那台**上「导出账号包」，这台「导入账号包」，\
+                     机器身份会随包落地。",
+                    camps.len()
+                )
+            }
         } else {
             // 参考实现的三态语义：**有活动平台但没积分类活动** ≠ 失败，也 ≠ 已签。
             // 国际版目前只下发 VIEW_DETAILS 型社区活动（如「1024 创造力集结」），

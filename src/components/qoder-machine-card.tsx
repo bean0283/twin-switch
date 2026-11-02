@@ -1,5 +1,5 @@
 /**
- * Qoder 机器身份（`cosy-machine*` 头）—— 跨机器迁移卡片。
+ * Qoder 机器身份（`cosy-machine*` 头）—— 设备身份状态与跨机器迁移。
  *
  * ## 用户视角的问题
  *
@@ -8,11 +8,14 @@
  * 服务端靠 `cosy-machine*` 判断「这是不是装了官方客户端的那台机器」，
  * 缺了就不下发「每天领积分」的活动（只给社区活动 VIEW_DETAILS）。
  *
- * ## 为什么必须手动搬
+ * ## 两条路（按优先级）
  *
- * `machinecode` / `machinetype` / `machinetoken` 三个值由客户端**运行时生成、不落盘**
- * （已实测扫过 `%APPDATA%\com.qoder.app.stable` 与 `~/.qoder` 共 1 万多个文件，零命中），
- * 所以没法在新电脑上自动读出来，只能从能签到的那台导出。
+ * 1. **本机现取**：装了 Qoder 客户端 → 调它自带的 `resources\umid\runtime-info`
+ *    算出 `machineCode/Type/Token`。这是正路，新设备装好客户端就能签，不用搬配置。
+ * 2. **手工搬**：机器上装不了客户端（无头机、公司电脑）时，从能签到的那台导出、这台导入。
+ *
+ * 以前这里写的是「三个值不落盘，所以没法自动读」——值确实不落盘，但组件能现算，
+ * 2026-11-02 更正。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -133,6 +136,9 @@ export function QoderMachineCard() {
           「是不是装了官方客户端的那台机器」。
           <b>缺了它，签到只会拿到社区活动，拿不到「每天领积分」</b>
           —— 换电脑后签不了通常就是这个原因，与账号和官方规则都无关。
+          <br />
+          本机装了 Qoder 客户端时会自动从客户端取（<code className="text-xs">umid/runtime-info</code>），
+          不需要手动搬；只有装不了客户端的机器才需要下面那套导出/导入。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -165,6 +171,25 @@ export function QoderMachineCard() {
               <div className="break-all sm:col-span-2">
                 配置：<code className="font-mono">{st.path}</code>
               </div>
+              <div className="sm:col-span-2">
+                取身份方式：
+                {st.source?.cn === "umid" || st.source?.global === "umid" ? (
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    本机客户端现取（装了客户端即可，无需搬配置）
+                  </span>
+                ) : st.source?.cn === "config" || st.source?.global === "config" ? (
+                  <span>配置文件（抓包手填 / 从别的机器导入）</span>
+                ) : (
+                  <span className="text-amber-600 dark:text-amber-400">
+                    未取到 —— 装 Qoder 客户端并登录一次即可自动获取
+                  </span>
+                )}
+                {st.clientVersion ? (
+                  <>
+                    {" · "}客户端版本 <code className="font-mono">{st.clientVersion}</code>
+                  </>
+                ) : null}
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -176,7 +201,7 @@ export function QoderMachineCard() {
                 title={
                   st.ready
                     ? "把本机机器身份复制出来，粘到另一台电脑导入"
-                    : "这台机器还没配置机器身份，没有可导出的内容"
+                    : "本机没有可用身份：装 Qoder 客户端最省事；装不了才需要从别的机器导入"
                 }
               >
                 {busy === "export" ? (

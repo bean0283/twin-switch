@@ -2410,7 +2410,8 @@ export async function qoderSessionDuplicate(
  * Qoder 机器身份（`cosy-machine*` 头）状态。
  *
  * 服务端按这组头决定下发不下发「每天领积分」：缺了就只有社区活动（VIEW_DETAILS）。
- * 三个关键值客户端运行时才生成、不落盘，所以**换电脑必须搬**。
+ * 三个关键值客户端运行时才生成、不落盘，但**本机装了 Qoder 就能让客户端自带组件现取**
+ * （`resources\umid\runtime-info`），所以新设备装好客户端即可签到，不必从别的机器搬。
  */
 export interface QoderMachineStatus {
   path: string;
@@ -2421,7 +2422,13 @@ export interface QoderMachineStatus {
   autoMachineId: { cn: string | null; global: string | null };
   hostname: string;
   machineOs: string;
-  /** 三项关键字段齐了没有（齐了才可能拿到签到活动）。 */
+  /** 这份身份从哪来：config（抓包/导入）/ umid（本机客户端现取）。 */
+  source?: { cn: "config" | "umid" | null; global: "config" | "umid" | null };
+  /** 客户端版本（`cosy-version` 实际会发的值）。 */
+  clientVersion?: string | null;
+  /** 现取通道诊断：组件路径、是否跑通、失败原因。 */
+  probe?: Record<string, unknown>;
+  /** 有没有可用的完整身份（config 或 umid 任一路径）。 */
   ready: boolean;
 }
 
