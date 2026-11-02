@@ -24,6 +24,7 @@ pub mod qoder_api;
 pub mod qoder_cosy;
 pub mod qoder_login;
 pub mod qoder_machine;
+pub mod qoder_umid;
 pub mod qoder_sessions;
 pub mod qoder_tools;
 pub mod qoder_realm;

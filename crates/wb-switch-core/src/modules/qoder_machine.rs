@@ -19,13 +19,16 @@
 //! | --- | --- | --- |
 //! | `cosy-machineid` | `%APPDATA%\com.qoder{,.cn}.app.stable/auth.machine-id` | ✅ 自动读 |
 //! | `cosy-machinehostname` | 本机 hostname | ✅ 自动 |
-//! | `cosy-machineos` | 固定 `x86_64_win32` | ✅ 自动 |
-//! | `cosy-machinecode` | 客户端内部派生（16 hex） | ❌ 需抓包 |
-//! | `cosy-machinetype` | 客户端内部派生（20 hex） | ❌ 需抓包 |
-//! | `cosy-machinetoken` | **服务端签发**（客户端登录后拿到） | ❌ 需抓包 |
+//! | `cosy-machineos` | 按架构拼（`x86_64_win32`） | ✅ 自动 |
+//! | `cosy-machinecode` | **客户端 umid 组件现算** | ✅ 自动（装客户端即可） |
+//! | `cosy-machinetype` | 同上 | ✅ 自动 |
+//! | `cosy-machinetoken` | 同上（服务端签发，组件输出里带） | ✅ 自动 |
 //!
-//! 后三个无法自行计算，所以存成配置：`~/.twin-switch/qoder-machine.json`。
-//! 用户从抓包里粘一次即可；`machineid` / `hostname` / `os` 会自动补齐并写回。
+//! ⚠️ 2026-11-02 更正：这里以前写的是「后三个无法自行计算，只能抓包存配置」——
+//! **错了**。它们确实不落盘（扫一万多个文件无明文），但客户端自带的
+//! `resources/umid/runtime-info` 组件可以**现场算出来**，客户端主进程自己也是这么调的。
+//! 现取通道见 [`crate::modules::qoder_umid`]；本文件的配置只作为**兜底/可迁移**的那一份
+//! （抓包手填、或从另一台机器导入）。
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -48,6 +51,8 @@ pub struct MachineIdentity {
     pub machine_os: String,
     pub machine_token: String,
     pub machine_type: String,
+    /// 这份身份从哪来：`config`（抓包/导入）/ `umid`（本机客户端现取）。
+    pub source: &'static str,
 }
 
 impl MachineIdentity {
@@ -128,11 +133,27 @@ pub fn save(patch: &Value) -> Result<Value, String> {
     Ok(cur)
 }
 
-/// 组装可用的机器身份：抓包三项（配置里）+ 自动补齐的三项。
+/// 组装可用的机器身份：**先看配置，再看本机客户端现取**。
 ///
-/// 缺一不可 —— 缺 `machinecode/token/type` 里的任何一个都返回 `None`，
-/// 因为**发一半比不发更糟**（服务端会当成畸形客户端）。
+/// 顺序是有意为之：
+///
+/// 1. `~/.twin-switch/qoder-machine.json` 三项齐全（抓包粘的 / 从别的机器导入的）→ 用它。
+///    这是用户**显式**给的身份，可能就是在模拟另一台机器，不能被本机探测悄悄覆盖。
+/// 2. 否则跑本机 Qoder 自带的 `umid/runtime-info` 现取（见 [`crate::modules::qoder_umid`]）。
+///    ⇒ **新设备只要装了客户端并登录过，就能直接签到，不需要导包**（2026-11-02 改正：
+///    之前认为"三个值不落盘所以只能搬"，漏了客户端能现场生成这一条）。
+/// 3. 都没有 → `None`：一个 `cosy-machine*` 头都不发。半套（或假造）比不发更糟。
+///
+/// ⚠️ `machineId` 必须与 token **同源**：配置来的身份配配置里的 machineId；
+/// 现取的身份配**本机** `auth.machine-id`。混着发等于「token 属于 A 机器、id 属于 B 机器」，
+/// 服务端一眼看出不是官方客户端。
 pub fn identity(region: QoderRegion) -> Option<MachineIdentity> {
+    identity_for(region, "")
+}
+
+/// 同 [`identity`]，但把账号 uid 传给组件（组件用它判定 `accountOutcome`；
+/// 三件套本身是**机器级**、与账号无关 —— 实测同一台机器传不同 uid，token 逐字相同）。
+pub fn identity_for(region: QoderRegion, uid: &str) -> Option<MachineIdentity> {
     let cfg = load();
     let get = |k: &str| {
         cfg.get(k)
@@ -141,26 +162,46 @@ pub fn identity(region: QoderRegion) -> Option<MachineIdentity> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let machine_code = get("machineCode")?;
-    let machine_token = get("machineToken")?;
-    let machine_type = get("machineType")?;
 
-    // machineid 优先用配置里手填的，其次读客户端自己的文件（**按区域**）。
-    let machine_id = get("machineId")
-        .or_else(|| machine_id_from_client(region))
-        .or_else(|| cfg.get("machineId").and_then(Value::as_str).map(str::to_string))?;
+    // ① 配置文件里的整套身份。
+    if let (Some(machine_code), Some(machine_token), Some(machine_type)) = (
+        get("machineCode"),
+        get("machineToken"),
+        get("machineType"),
+    ) {
+        if let Some(machine_id) = get("machineId").or_else(|| machine_id_from_client(region)) {
+            return Some(MachineIdentity {
+                machine_code,
+                machine_hostname: get("machineHostname").unwrap_or_else(hostname),
+                machine_id,
+                machine_os: get("machineOs").unwrap_or_else(machine_os),
+                machine_token,
+                machine_type,
+                source: "config",
+            });
+        }
+    }
 
-    Some(MachineIdentity {
-        machine_code,
-        machine_hostname: get("machineHostname").unwrap_or_else(hostname),
-        machine_id,
-        machine_os: get("machineOs").unwrap_or_else(machine_os),
-        machine_token,
-        machine_type,
-    })
+    // ② 本机客户端现取。
+    if let Ok(risk) = crate::modules::qoder_umid::probe_cached(region, uid) {
+        // machineId 用本机的（与刚取的 token 同源）。读不到就放弃 —— 不拿别的机器 id 凑。
+        if let Some(machine_id) = machine_id_from_client(region) {
+            return Some(MachineIdentity {
+                machine_code: risk.machine_code,
+                machine_hostname: hostname(),
+                machine_id,
+                machine_os: machine_os(),
+                machine_token: risk.machine_token,
+                machine_type: risk.machine_type,
+                source: "umid",
+            });
+        }
+    }
+
+    None
 }
 
-/// 当前状态（给设置页显示：缺哪几项、machineid 有没有自动读到）。
+/// 当前状态（给设置页显示：缺哪几项、machineid 有没有自动读到、身份从哪来）。
 pub fn status() -> Value {
     let cfg = load();
     let has = |k: &str| {
@@ -169,6 +210,9 @@ pub fn status() -> Value {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     };
+    // 顺手把两条真实取值跑一遍（内部有 30 分钟缓存），状态页看到的 must 与实际发出去的一致。
+    let cn = identity(QoderRegion::Cn);
+    let global = identity(QoderRegion::Global);
     json!({
         "path": config_path().display().to_string(),
         "machineCode": has("machineCode"),
@@ -182,25 +226,52 @@ pub fn status() -> Value {
         },
         "hostname": hostname(),
         "machineOs": machine_os(),
-        "ready": identity(QoderRegion::Cn).is_some() || identity(QoderRegion::Global).is_some(),
+        // 这份身份到底从哪来：config = 抓包/导入，umid = 本机客户端现取，none = 都没有。
+        "source": {
+            "cn": cn.as_ref().map(|i| i.source),
+            "global": global.as_ref().map(|i| i.source),
+        },
+        // 客户端版本（cosy-version 应该用它，不是本工具版本）。
+        "clientVersion": crate::modules::qoder_umid::client_version(QoderRegion::Cn)
+            .or_else(|| crate::modules::qoder_umid::client_version(QoderRegion::Global)),
+        // 现取通道的诊断：组件在哪、跑没跑通、失败原因。
+        "probe": {
+            "cn": crate::modules::qoder_umid::diagnose(QoderRegion::Cn),
+            "global": crate::modules::qoder_umid::diagnose(QoderRegion::Global),
+        },
+        "ready": cn.is_some() || global.is_some(),
     })
+}
+
+/// 请求头里的 `cosy-version`：**客户端版本**，取不到才退回一个占位值。
+///
+/// 顺序：客户端 `build-manifest.json` → 配置文件里的 `clientVersion` → 常量。
+/// 常量只是让请求头形态完整（官方客户端一定有这个头），不代表真实客户端版本 ——
+/// 所以它必须排在最后，能读到真值就绝不用它。
+pub fn cosy_version(region: QoderRegion) -> String {
+    crate::modules::qoder_umid::client_version(region)
+        .or_else(|| {
+            load()
+                .get("clientVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "0.3.4".to_string())
 }
 
 // ---------------------------------------------------------------------------
 // 跨机器迁移
 //
-// ## 为什么需要导出/导入
+// ## 为什么还要保留导出/导入
 //
-// 这六个头是「这台机器装了官方客户端」的证明。服务端按它决定下发不下发
-// 「每天领 100 Credits」：**只带 clienttype/version/UA 时只有 VIEW_DETAILS**，
-// 带全套才有 `CLAIM_BENEFIT`（真机对照见模块头）。
+// 既然本机能现取（[`crate::modules::qoder_umid`]），为什么还留这套？
 //
-// 其中 `machinecode` / `machinetype` / `machinetoken` 客户端**运行时才生成、不落盘**
+// **不是所有机器都装得了客户端**：Linux 无头机、容器、青龙面板、公司电脑没权限装。
+// 对这种机器，唯一的路是把「已经装过客户端的那台」的身份搬过去。
+//
+// 另外 `machinecode` / `machinetype` / `machinetoken` 客户端**运行时才生成、不落盘**
 // （2026-11-01 实测：把 `%APPDATA%\com.qoder.app.stable` 与 `~/.qoder` 共 1 万多个文件
-// 全扫过，三个值一处明文都没有），所以**没法在新电脑上自动读出来**。
-//
-// 结论：换机器时只能把这份身份**带过去**。本模块提供导出/导入，
-// 就是让"能签到的那台"把身份交给"签不了的那台"。
+// 全扫过，三个值一处明文都没有）—— 所以"读文件"永远读不到，只能"让组件算"或"整份搬"。
 // ---------------------------------------------------------------------------
 
 /// 导出格式标识（与别的导出物区分，导入时先校验）。
@@ -210,38 +281,29 @@ pub const EXPORT_VERSION: u32 = 1;
 
 /// 导出机器身份（整份可迁移，含 machineid / hostname）。
 ///
-/// ⚠️ 为什么要连 `machineId` / `machineHostname` 一起导：服务端看到的是一整套身份，
-/// 只搬 token 而让新机器用自己的 machineid，等于"token 属于 A 机器、请求来自 B 机器"，
-/// 比不发更容易被判成异常客户端。整份照搬才是自洽的。
+/// 取值走 [`identity`]，所以**装了客户端就有东西可导**（现取），不必先手工抓包。
+/// 导出时把 `source` 一并写上，导入方一眼能看出这份是"本机现取"还是"抓包手填"。
 pub fn export_identity() -> Result<Value, String> {
-    let cfg = load();
-    let get = |k: &str| {
-        cfg.get(k)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let code = get("machineCode")
-        .ok_or("本机还没有机器身份（缺 machineCode）——请先在有官方客户端的机器上抓包配置")?;
-    let token = get("machineToken").ok_or("本机还没有机器身份（缺 machineToken）")?;
-    let mtype = get("machineType").ok_or("本机还没有机器身份（缺 machineType）")?;
-    // machineid 允许来自客户端文件（自动读），导出时固化下来，免得新机器读到不同的值。
-    let mid = get("machineId")
-        .or_else(|| machine_id_from_client(QoderRegion::Global))
-        .or_else(|| machine_id_from_client(QoderRegion::Cn))
-        .ok_or("读不到 machineId（客户端没安装或还没登录过）")?;
+    export_identity_for(QoderRegion::Cn)
+        .or_else(|e| export_identity_for(QoderRegion::Global).map_err(|_| e))
+}
 
+/// 按区域导出（区域决定去哪个安装目录取）。
+pub fn export_identity_for(region: QoderRegion) -> Result<Value, String> {
+    let id = identity(region).ok_or_else(|| {
+        "本机没有可用的 Qoder 机器身份：没装客户端（或组件跑不起来），也没导入过身份".to_string()
+    })?;
     Ok(json!({
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,
         "exportedAt": chrono::Local::now().to_rfc3339(),
-        "machineCode": code,
-        "machineType": mtype,
-        "machineToken": token,
-        "machineId": mid,
-        "machineHostname": get("machineHostname").unwrap_or_else(hostname),
-        "machineOs": get("machineOs").unwrap_or_else(machine_os),
+        "source": id.source,
+        "machineCode": id.machine_code,
+        "machineType": id.machine_type,
+        "machineToken": id.machine_token,
+        "machineId": id.machine_id,
+        "machineHostname": id.machine_hostname,
+        "machineOs": id.machine_os,
     }))
 }
 
@@ -290,11 +352,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_requires_all_three_captured_fields() {
-        // 配置为空时（测试环境通常没有这个文件）必须返回 None，不能拼半个头出去。
+    fn identity_is_none_when_no_config_and_no_client() {
+        // 只有「配置空 **且** 本机没有可用组件」时才必须返回 None。
+        // 装了 Qoder 的机器上 identity() 会走现取通道，这条断言不适用。
         let cfg = load();
-        if cfg.get("machineCode").is_none() {
+        let no_cfg = cfg.get("machineCode").is_none();
+        let no_component = crate::modules::qoder_umid::locate(QoderRegion::Cn).is_none()
+            && crate::modules::qoder_umid::locate(QoderRegion::Global).is_none();
+        if no_cfg && no_component {
             assert!(identity(QoderRegion::Cn).is_none());
+            assert!(identity(QoderRegion::Global).is_none());
+        }
+    }
+
+    /// 导出必须与 `identity` 同源：装了客户端就该能导出（不再要求先抓包）。
+    #[test]
+    fn export_matches_identity_source() {
+        let Ok(id) = std::panic::catch_unwind(|| identity(QoderRegion::Cn)) else {
+            return;
+        };
+        match id {
+            Some(id) => {
+                let v = export_identity_for(QoderRegion::Cn).expect("有身份就应当导得出来");
+                assert_eq!(v.get("source").and_then(Value::as_str), Some(id.source));
+                assert_eq!(
+                    v.get("machineId").and_then(Value::as_str),
+                    Some(id.machine_id.as_str())
+                );
+            }
+            None => assert!(export_identity_for(QoderRegion::Cn).is_err()),
         }
     }
 }
