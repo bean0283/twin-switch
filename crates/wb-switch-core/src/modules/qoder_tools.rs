@@ -1133,6 +1133,11 @@ pub async fn chat_once(
     //    「正文 = ""」，返回 200 ⇒ 客户端「已完成 + 一片空白」（2026-10-24 实测）。
     let mut calls: Vec<crate::modules::gateway_server::ToolCallAcc> = Vec::new();
     let mut finish: Option<String> = None;
+    // ★ 有没有真的读到上游的 usage 帧。收尾帧（`{"choices":[],"usage":{…}}`）是**紧跟**
+    //   `finish_reason` 之后单独一帧发的 —— 以前一看到 finish_reason 就 break，
+    //   于是 Qoder 的 token 用量永远是 0（2026-11-02 实测：指标里 prompt/completion 全 0，
+    //   而上游帧里明明有 `usage:{prompt_tokens:2..,completion_tokens:28,...}`）。
+    let mut usage_seen = false;
 
     let handle_line = |line: &str,
                        content: &mut String,
@@ -1143,7 +1148,8 @@ pub async fn chat_once(
                        errors: &mut Vec<String>,
                        finished: &mut bool,
                        calls: &mut Vec<crate::modules::gateway_server::ToolCallAcc>,
-                       finish: &mut Option<String>| {
+                       finish: &mut Option<String>,
+                       usage_seen: &mut bool| {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("data:") else {
             return;
@@ -1190,6 +1196,12 @@ pub async fn chat_once(
             }
         }
         // 信封里的 body 是**字符串**；直接是对象时也兼容。
+        // ⚠️ Qoder 的结束标记也是 body 字符串 `"[DONE]"`（不是裸的 `data: [DONE]`），
+        //    不认它就只能靠 finish_reason，也就必然漏掉之后的 usage 帧。
+        if envelope.get("body").and_then(Value::as_str).map(str::trim) == Some("[DONE]") {
+            *finished = true;
+            return;
+        }
         let inner: Value = match envelope.get("body") {
             Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
             Some(v @ Value::Object(_)) => v.clone(),
@@ -1208,6 +1220,7 @@ pub async fn chat_once(
             }
         }
         if let Some(u) = inner.get("usage") {
+            *usage_seen = true;
             *prompt_tokens = u
                 .get("prompt_tokens")
                 .and_then(Value::as_i64)
@@ -1247,10 +1260,11 @@ pub async fn chat_once(
                 if let Some(fr) = c.get("finish_reason").and_then(Value::as_str) {
                     *finish = Some(fr.to_string());
                 }
-                // 有 finish_reason 就说明这一轮说完了，不必等连接关闭。
-                if c.get("finish_reason").map(|v| !v.is_null()).unwrap_or(false) {
-                    *finished = true;
-                }
+                // ⚠️ 有 finish_reason **不等于**流结束：Qoder 之后还有一帧
+                //    `{"choices":[],"usage":{…}}`，再一帧 body=`"[DONE]"`。
+                //    以前在这里就把 finished 置真 ⇒ 收尾帧全丢 ⇒ token 用量恒为 0。
+                //    现在只记 finish，靠 `[DONE]`（或「finish + 已拿到 usage」）收尾，
+                //    最后用 3 秒空闲超时兜底（流不会自己关）。
             }
         }
     };
@@ -1294,9 +1308,14 @@ pub async fn chat_once(
                 &mut finished,
                 &mut calls,
                 &mut finish,
+                &mut usage_seen,
             );
         }
         if finished {
+            break;
+        }
+        // 已经说完了、也拿到用量 ⇒ 立刻收尾（不额外等 3 秒空闲超时）。
+        if finish.is_some() && usage_seen {
             break;
         }
     }
@@ -1313,6 +1332,7 @@ pub async fn chat_once(
             &mut finished,
             &mut calls,
             &mut finish,
+            &mut usage_seen,
         );
     }
     drop(stream);
