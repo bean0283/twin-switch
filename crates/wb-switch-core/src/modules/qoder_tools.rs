@@ -40,6 +40,11 @@ fn client() -> Result<reqwest::Client, String> {
 /// 导出账号包（**含明文凭据**）。返回 `{ count, filename, json, dir }`。
 ///
 /// 落盘到 `~/.twin-switch/qoder/exports/`，同时把 JSON 文本回给前端（方便用户直接复制）。
+/// 账号包格式（v2 起是对象，v1 是裸数组 —— 导入两版都认）。
+pub const PKG_FORMAT: &str = "twinswitch.qoder-accounts";
+/// 2 = 内嵌机器身份（换机器签到的关键），1 = 裸数组。
+pub const PKG_VERSION: u32 = 2;
+
 pub fn export(region: QoderRegion) -> Result<Value, String> {
     let list = qoder_accounts::list(region)?;
     if list.is_empty() {
@@ -61,16 +66,36 @@ pub fn export(region: QoderRegion) -> Result<Value, String> {
                 "credits": a.credits,
                 "creditsExpireAt": a.credits_expire_at,
                 "addedAt": a.created_at,
+                // 抓包留下的设备身份也一起带走：本机没有机器身份时，
+                // 至少让「账号里存了什么」在两台机器上是一致的（排查用）。
+                "cosyMachineToken": a.cosy_machine_token,
+                "cosyMachineType": a.cosy_machine_type,
             })
         })
         .collect();
+
+    // ★ 机器身份一起打包 —— 这是「换一台电脑签不了到」的正解。
+    //
+    // 签到的「每天领 100 Credits」活动只下发给**带了全套 cosy-machine* 头**的请求，
+    // 而这套身份的 machineCode/Type/Token 是客户端运行时生成、不落盘的（magpie /
+    // qoder-checkin 也都是「在有客户端的机器上取一次，然后把 config 带走」）。
+    // 所以账号包必须能把它带过去，否则新机器只能盲签。
+    let machine = crate::modules::qoder_machine::export_identity().ok();
+    let pkg = json!({
+        "format": PKG_FORMAT,
+        "version": PKG_VERSION,
+        "region": region.as_str(),
+        "exportedAt": chrono::Local::now().to_rfc3339(),
+        "machine": machine,
+        "accounts": items,
+    });
 
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let filename = format!("qoder-accounts-{}-{stamp}.json", region.as_str());
     let dir = crate::modules::config::store_dir().join("qoder").join("exports");
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
     let path = dir.join(&filename);
-    let text = serde_json::to_string_pretty(&items).map_err(|e| format!("序列化失败：{e}"))?;
+    let text = serde_json::to_string_pretty(&pkg).map_err(|e| format!("序列化失败：{e}"))?;
     std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
 
     Ok(json!({
@@ -78,6 +103,14 @@ pub fn export(region: QoderRegion) -> Result<Value, String> {
         "filename": filename,
         "path": path.display().to_string(),
         "json": text,
+        // 没有机器身份要**如实说**：这包导到别的机器上照样签不了，
+        // 用户得先在那台能签到的机器上把身份准备好。
+        "hasMachine": machine.is_some(),
+        "machineHint": if machine.is_some() {
+            Value::Null
+        } else {
+            json!("本机没有 Qoder 机器身份，导出的包不带设备头 —— 导到别的机器上仍然签不了到，请先在能签到的那台导出")
+        },
     }))
 }
 
@@ -118,6 +151,7 @@ pub fn import_preview(region: QoderRegion, json_text: &str) -> Result<Value, Str
         "total": items.len(),
         "items": rows,
         "rejected": rejected,
+        "hasMachine": machine_section(json_text).is_some(),
     }))
 }
 
@@ -193,19 +227,56 @@ pub fn import_apply(
         }
     }
 
+    // ★ 机器身份随包落地 —— 「换一台电脑签不了到」就靠这一步。
+    //
+    // 只在**本机没有**身份时写：已经有了就不覆盖（免得从一台签不了的机器导包，
+    // 反倒把能签到的这台写坏）。要强换走「设置 → 机器身份 → 导入」那条路。
+    // 失败**不算导入失败**（账号已经写进去了），如实报告即可。
+    let machine = match machine_section(json_text) {
+        None => json!({ "present": false }),
+        Some(m) => {
+            if crate::modules::qoder_machine::identity(region).is_some() {
+                json!({
+                    "present": true,
+                    "imported": false,
+                    "reason": "本机已有 Qoder 机器身份，未覆盖（需要强换请用「机器身份 → 导入」）"
+                })
+            } else {
+                match crate::modules::qoder_machine::import_identity(&m) {
+                    Ok(_) => json!({ "present": true, "imported": true }),
+                    Err(e) => json!({ "present": true, "imported": false, "reason": e }),
+                }
+            }
+        }
+    };
+
     Ok(json!({
         "imported": imported,
         "updated": updated,
         "skipped": skipped,
         "rejected": rejected,
+        "machine": machine,
     }))
+}
+
+/// 账号包里的机器身份（v2 格式才有；v1 裸数组没有）。
+fn machine_section(text: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    v.get("machine").filter(|m| m.is_object()).cloned()
 }
 
 fn parse_items(text: &str) -> Result<Vec<Map<String, Value>>, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("不是合法 JSON：{e}"))?;
-    let arr = v
-        .as_array()
-        .ok_or_else(|| "账号包应该是一个 JSON 数组".to_string())?;
+    // v2 是 `{format, version, machine, accounts:[…]}`；v1 是裸数组。两版都得认 ——
+    // 用户手里可能还存着旧包，没道理逼人重导一遍。
+    let arr = match &v {
+        Value::Array(a) => a,
+        Value::Object(o) => o
+            .get("accounts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "账号包对象里没有 accounts 数组".to_string())?,
+        _ => return Err("账号包应该是 JSON 数组，或带 accounts 数组的对象".into()),
+    };
     let mut out = Vec::new();
     for (i, item) in arr.iter().enumerate() {
         let Some(obj) = item.as_object() else {
@@ -242,7 +313,7 @@ const PATH_CAMPAIGNS: &str = "/sash/api/v1/me/campaigns";
 /// ⚠️ 这组头**不是 COSY 签名**（`authorization` 仍是普通 `Bearer dt-…`），
 /// 只是把设备身份带上去。抓包实测：缺了它们 `/me/campaigns` 不返回活动。
 /// `cosy-version` 用客户端版本 `0.4.8`（实测通过），UA 也必须是 `Qoder`。
-fn campaign_headers(region: QoderRegion, account: &QoderAccount, token: &str) -> Vec<(String, String)> {
+fn campaign_headers(region: QoderRegion, token: &str) -> Vec<(String, String)> {
     // ⚠️⚠️ 设备头的取舍（照参考实现 `campaign.rs::desktop_headers` 的注释，实测踩坑）：
     //
     // **发派生假头会被服务端判定为非官方客户端，把 CLAIMABLE 的「每日领取 100 Credits」
@@ -251,18 +322,6 @@ fn campaign_headers(region: QoderRegion, account: &QoderAccount, token: &str) ->
     // 所以只有两种形态：
     // - 账号库里存了**真实**设备身份（用户从抓包粘贴的 `cosy-machinetoken/type`）→ 全套照发；
     // - 没存 → 一个 `cosy-machine*` 头都不发，只带 `cosy-clienttype` / `cosy-version`。
-    let stored_token = account
-        .cosy_machine_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let stored_type = account
-        .cosy_machine_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let native = stored_token.zip(stored_type);
-
     let mut out: Vec<(String, String)> = vec![
         ("accept".into(), "application/json".into()),
         ("authorization".into(), format!("Bearer {token}")),
@@ -280,27 +339,19 @@ fn campaign_headers(region: QoderRegion, account: &QoderAccount, token: &str) ->
         out.extend(m.headers());
     }
 
-    // 账号级抓包只在**机器级身份缺失**时兜底。
+    // ⚠️ 账号级抓包（`cosy_machine_token` / `cosy_machine_type`）**不再兜底拼头**。
     //
-    // ⚠️ 以前是无条件发，于是机器级那套真实头会被这里的派生值覆盖：
-    // `cosy-machineid` / `cosy-machinecode` 都是 `derive_id(uid, "machine")` 算出来的**假值**，
-    // 与 `cosy-machinetoken`（真实、服务端签发）对不上 —— 服务端看到「token 属于 A 设备、
-    // id 属于 B 设备」，正是模块头说的「比不发更糟」。
-    // 现在两者都齐全时，一律以机器级那套为准（它是完整自洽的一组）。
-    if machine.is_none() {
-        if let Some((mtok, mtype)) = native {
-            let id = crate::modules::qoder_realm::derive_id(&account.uid, "machine");
-            out.push(("cosy-machineid".into(), id.clone()));
-            out.push(("cosy-machinetoken".into(), mtok.to_string()));
-            out.push(("cosy-machinetype".into(), mtype.to_string()));
-            out.push(("cosy-machinecode".into(), id.chars().take(20).collect()));
-            out.push(("cosy-machineos".into(), "x86_64_win32".into()));
-            out.push((
-                "cosy-machinehostname".into(),
-                std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into()),
-            ));
-        }
-    }
+    // 以前这里是这样干的：缺机器级身份时，用 `derive_id(uid, "machine")` 造一个
+    // `cosy-machineid` / `cosy-machinecode`，配上账号里存的真实 `machinetoken/type` 发出去。
+    // 结果是「token 属于 A 机器、id/code 属于 B 机器」—— 服务端一眼看出不是官方客户端，
+    // 反而连社区活动都不下发。这正是 module 文档里写的「比不发更糟」。
+    //
+    // 现在只有两种形态（与抓包实测一致）：
+    //   ① 有机器级身份文件（`~/.twin-switch/qoder-machine.json`）→ 整套真头；
+    //   ② 没有 → 一个 `cosy-machine*` 都不发（缺头只会少活动，不会被判异常）。
+    //
+    // 换机器怎么办：账号包里已经内嵌机器身份（见 `export` / `import_apply`），
+    // 在能签到的那台导出、在签不了的这台导入，就齐了。
     let _ = region;
     out
 }
@@ -312,12 +363,11 @@ fn campaign_headers(region: QoderRegion, account: &QoderAccount, token: &str) ->
 ///
 /// ⚠️ 别在这里另立判据 —— 一旦两边不一致，就会出现「文案说官方没有签到、
 /// 实际是缺配置」这种把用户劝退的错话（2026-11-01 用户反馈就是这个）。
-fn has_machine_identity(region: QoderRegion, account: &QoderAccount) -> bool {
-    if crate::modules::qoder_machine::identity(region).is_some() {
-        return true;
-    }
-    let has = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).is_some();
-    has(account.cosy_machine_token.as_deref()) && has(account.cosy_machine_type.as_deref())
+fn has_machine_identity(region: QoderRegion) -> bool {
+    // 只认**机器级**身份：判据必须等于 [`campaign_headers`] 真正发出去的东西。
+    // 以前这里还算「账号里有 token+type」，而那时头是派生的假 id —— 文案说「有身份、
+    // 是官方没有活动」，实际是缺配置，把用户直接劝退（2026-11-01 的坑）。
+    crate::modules::qoder_machine::identity(region).is_some()
 }
 
 fn token_of<'a>(account: &'a QoderAccount) -> Result<&'a str, String> {    account
@@ -334,7 +384,7 @@ pub async fn fetch_campaigns(region: QoderRegion, account: &QoderAccount) -> Res
     let mut req = client()?
         .get(format!("{}{PATH_CAMPAIGNS}", spec.openapi_base))
         .timeout(std::time::Duration::from_secs(20));
-    for (k, v) in campaign_headers(region, account, token) {
+    for (k, v) in campaign_headers(region, token) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| format!("活动列表请求失败：{e}"))?;
@@ -365,7 +415,7 @@ pub async fn claim_campaign(
             spec.openapi_base
         ))
         .timeout(std::time::Duration::from_secs(20));
-    for (k, v) in campaign_headers(region, account, token) {
+    for (k, v) in campaign_headers(region, token) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| format!("领取请求失败：{e}"))?;
@@ -527,7 +577,7 @@ pub async fn checkin_claim_once(
         };
         let message: String = if camps.is_empty() {
             "上游没有给这个账号下发任何活动（新号或活动资格未开放；以客户端内实际显示为准）".to_string()
-        } else if !has_machine_identity(region, account) {
+        } else if !has_machine_identity(region) {
             // ★★ 这里以前一律说「国际版没有每日签到积分，这是官方行为」——
             // 那是**错误的归因**：同一台机器带上全套 `cosy-machine*` 头就能拿到
             // `CLAIM_BENEFIT`（见 `qoder_machine` 模块头的真机对照）。
@@ -536,8 +586,10 @@ pub async fn checkin_claim_once(
             format!(
                 "这台电脑没有 Qoder 机器身份（缺 cosy-machine* 头），服务端因此只下发了 {} 个社区活动、\
                  不下发「每天领积分」。\n\
-                 请到**能正常签到的那台电脑**上，打开「设置 → Qoder 机器身份」点「导出」，\
-                 把内容粘到这里点「导入」，再重新签到。",
+                 两种补法（任选其一）：\n\
+                 ① 在**能正常签到的那台电脑**上「导出账号包」，把这台「导入账号包」—— \
+                 机器身份已经在包里，导完直接能签；\n\
+                 ② 或者在那台的「设置 → Qoder 机器身份」点「导出」，把内容粘到这里点「导入」。",
                 camps.len()
             )
         } else {
@@ -1317,6 +1369,33 @@ pub fn home_summary() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 账号包 v2（带机器身份）与 v1（裸数组）都要能解析 —— 用户手里有旧包。
+    #[test]
+    fn parse_items_accepts_both_package_shapes() {
+        let v1 = r#"[{"uid":"u1","domain":"qoder.sh","accessToken":"t"}]"#;
+        let items = parse_items(v1).expect("v1 裸数组要能读");
+        assert_eq!(items.len(), 1);
+        assert!(machine_section(v1).is_none(), "v1 不该有机器身份");
+
+        let v2 = r#"{"format":"twinswitch.qoder-accounts","version":2,
+                     "machine":{"machineCode":"c","machineToken":"t","machineType":"y","machineId":"m"},
+                     "accounts":[{"uid":"u1","domain":"qoder.sh","accessToken":"t"}]}"#;
+        let items = parse_items(v2).expect("v2 envelope 要能读");
+        assert_eq!(items.len(), 1);
+        let m = machine_section(v2).expect("v2 应当带机器身份");
+        assert_eq!(m.get("machineId").and_then(Value::as_str), Some("m"));
+    }
+
+    /// 缺 accounts 的对象要给出人话错误，不能 panic 或当成空包。
+    #[test]
+    fn parse_items_rejects_object_without_accounts() {
+        let bad = r#"{"format":"twinswitch.qoder-accounts","version":2}"#;
+        let err = parse_items(bad).unwrap_err();
+        assert!(err.contains("accounts"), "{err}");
+    }
+
     /// 把两个区域的模型清单**合并写进** `~/.twin-switch/models.json`（保留其他作用域）。
     #[tokio::test]
     #[ignore]
