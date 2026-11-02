@@ -1110,6 +1110,23 @@ async fn chat(
     // 真流式万一在某家上游上踩到边角（半截流比整段失败更难收拾），这是最快的止损手段。
     let stream_ok = want_stream && std::env::var("TWIN_TS_NO_STREAM").as_deref() != Ok("1");
     let mut upstream_req = req.clone();
+    // ⚠️⚠️ Trae 的 `llm_utils_chat` 只认 `system / assistant / user / tool / function`
+    // 这五个字面量，收到 `developer` 直接 400：
+    //   `developer is not one of [...] - messages[0].role`
+    // 而新版客户端（DeepSeek Harness 等）按 OpenAI 2024-12 的新规范发 `developer`
+    // —— 它只是 `system` 的后继别名，语义完全相同。
+    //
+    // 必须在**分发前**做：以前只在通用透传那条路上做（且只改首条），
+    // Trae / Qoder 走的是私有协议、根本到不了那段代码。
+    // 2026-11-02 用户实测：网关为此按积分池换了 3 个账号，全部失败 ——
+    // 换号解决不了**请求形状**问题，这类错误一换就是白撞三次。
+    let role_fixed = normalize_developer_roles(&mut upstream_req);
+    if role_fixed > 0 {
+        crate::modules::diag_log::info(
+            "gateway",
+            format!("已把 {role_fixed} 条 developer 角色还原为 system（Trae 等上游只认 system）"),
+        );
+    }
     let mut trace = Trace::new(&model, want_stream);
     // 这次请求记到哪把 Key 头上（额度在 `Trace::finish` 里统一记账）。
     trace.key_id = Some(key.id.clone());
@@ -1357,6 +1374,25 @@ fn normalize_first_role(body: &mut Value) -> bool {
         return true;
     }
     false
+}
+
+/// 把**所有** `developer` 角色还原成 `system`，返回改了几条。
+///
+/// 与 [`normalize_first_role`] 的区别：那个只改首条、只服务 WorkBuddy 的渠道校验；
+/// 这个是给**私有协议**用的 —— Trae 的角色白名单是硬校验，任何位置出现 `developer`
+/// 都会 400（2026-11-02 用户实测 `messages[0].role`）。
+fn normalize_developer_roles(body: &mut Value) -> usize {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for m in msgs.iter_mut() {
+        if m.get("role").and_then(Value::as_str) == Some("developer") {
+            m["role"] = json!("system");
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 请求体形状摘要：**只说结构，不带任何正文**。
@@ -2505,6 +2541,11 @@ async fn qoder_forward(
     )
     .await
     .map_err(|e| {
+            if e.to_ascii_lowercase().contains("provider_error") {
+                if let Some(p) = dump_rejected_body(req) {
+                    eprintln!("[qoder] provider_error，被拒请求已落盘：{p}");
+                }
+            }
             // 排队不是「网关坏了」，也不是「账号坏了」：换成 429 + 原话，
             // 客户端就会显示「请求过多/稍后重试」，而不是含糊的 502 服务器错误。
             // 状态码必须照实（「空」和「失败」不许长得一样）。
@@ -2691,6 +2732,19 @@ async fn qoder_stream(
                     Ok(v) => return Ok(v),
                     Err(queued @ OpenFail::Queued { .. }) => return Err(queued),
                     Err(OpenFail::Fatal(e)) => {
+                        // provider_error 是「上游自己那边炸了」，但**也可能是**我们的请求形状
+                        // 触发了它的内部断言（1MB / 199 条工具历史那种）。落一份原样请求，
+                        // 下次用户一报错我们就能对着真 body 查，不用再靠猜（11128 就是这么破的）。
+                        if e.to_ascii_lowercase().contains("provider_error") {
+                            let body = json!({
+                                "model": model,
+                                "messages": messages,
+                                "tools": tools,
+                            });
+                            if let Some(p) = dump_rejected_body(&body) {
+                                eprintln!("[qoder] provider_error，被拒请求已落盘：{p}");
+                            }
+                        }
                         let retryable = transient_upstream(&e);
                         eprintln!(
                             "[qoder] 打开流失败（第 {} 次，retryable={retryable}）：{e}",
@@ -3526,6 +3580,36 @@ fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trae 的角色白名单是硬校验：任何位置的 `developer` 都要还原成 `system`。
+    ///
+    /// 2026-11-02 用户实测：`400: developer is not one of ['system','assistant','user',
+    /// 'tool','function'] - messages[0].role`，网关还为此换了 3 个账号（全败）。
+    #[test]
+    fn developer_is_rewritten_everywhere_for_private_protocols() {
+        let mut body = json!({
+            "messages": [
+                { "role": "developer", "content": "系统提示" },
+                { "role": "user", "content": "hi" },
+                { "role": "developer", "content": "补充规则" },
+                { "role": "assistant", "content": "ok" }
+            ]
+        });
+        assert_eq!(normalize_developer_roles(&mut body), 2);
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        assert_eq!(body["messages"][2]["role"], json!("system"));
+        // 其它角色一个都不能动
+        assert_eq!(body["messages"][1]["role"], json!("user"));
+        assert_eq!(body["messages"][3]["role"], json!("assistant"));
+        // 再跑一次是幂等的
+        assert_eq!(normalize_developer_roles(&mut body), 0);
+
+        // 没有 messages / 不是数组：不许 panic
+        let mut empty = json!({});
+        assert_eq!(normalize_developer_roles(&mut empty), 0);
+        let mut bad = json!({ "messages": "x" });
+        assert_eq!(normalize_developer_roles(&mut bad), 0);
+    }
 
     /// 首条 `developer` 必须还原成 `system`：上游渠道校验只认字面量 system，
     /// 发 developer 就是 400 / 11128（2026-10-27 真机 A/B 证实）。

@@ -24,8 +24,90 @@ async fn main() {
         println!("没有可用账号");
         return;
     };
-    let messages = json!([{ "role": "user", "content": "只回复两个字：收到" }]);
-    let tools = json!([]);
+    // `--pad <KB>` 把对话填充到指定大小，`--tools <N>` 造 N 个工具 —— 用来验证
+    // 「上游是不是按请求体积/工具数拒绝」（2026-11-02：dsh 的 1MB 请求稳定 provider_error）。
+    let pad_kb: usize = std::env::args()
+        .position(|a| a == "--pad")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let tool_n: usize = std::env::args()
+        .position(|a| a == "--tools")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // `--history <N>`：造 N 轮「assistant tool_calls + tool 结果」，模拟真实 agent 历史。
+    let hist: usize = std::env::args()
+        .position(|a| a == "--history")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let pad = "内容".repeat(pad_kb * 1024 / 6);
+    if hist > 0 {
+        let mut msgs: Vec<serde_json::Value> = vec![json!({ "role": "system", "content": "你是助手。" })];
+        for i in 0..hist {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": { "name": "tool_0", "arguments": "{\"path\":\"a.txt\"}" }
+                }]
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": "结果".repeat(20)
+            }));
+        }
+        msgs.push(json!({ "role": "user", "content": "只回复两个字：收到" }));
+        println!("历史 {} 轮（{} 条消息）", hist, msgs.len());
+        // 直接用这份消息跑完整体验
+        let tools = json!((0..36).map(|i| json!({
+            "type": "function",
+            "function": {
+                "name": format!("tool_{i}"),
+                "description": "做点事情".repeat(6),
+                "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+            }
+        })).collect::<Vec<_>>());
+        match qoder_tools::chat_complete_ex(region, &acc, "gmodel", "GLM-5.3-Flash", &json!(msgs), Some(&tools)).await {
+            Ok(v) => println!("完成：usage={}", v.get("usage").map(|u| u.to_string()).unwrap_or_default()),
+            Err(e) => println!("失败：{}", e.chars().take(300).collect::<String>()),
+        }
+        return;
+    }
+    let messages = if pad_kb == 0 {
+        json!([{ "role": "user", "content": "只回复两个字：收到" }])
+    } else {
+        json!([
+            { "role": "system", "content": "你是助手。" },
+            { "role": "user", "content": pad },
+            { "role": "user", "content": "只回复两个字：收到" }
+        ])
+    };
+    let tools = if tool_n == 0 {
+        json!([])
+    } else {
+        json!((0..tool_n)
+            .map(|i| json!({
+                "type": "function",
+                "function": {
+                    "name": format!("tool_{i}"),
+                    "description": "做点事情".repeat(6),
+                    "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+                }
+            }))
+            .collect::<Vec<_>>())
+    };
+    println!(
+        "请求体约 {} KB，工具 {} 个",
+        (serde_json::to_string(&messages).map(|s| s.len()).unwrap_or(0)
+            + serde_json::to_string(&tools).map(|s| s.len()).unwrap_or(0))
+            / 1024,
+        tool_n
+    );
 
     // `--complete`：走网关同一条聚合路径（chat_complete_ex），直接看它拿到的 usage。
     if std::env::args().any(|a| a == "--complete") {
