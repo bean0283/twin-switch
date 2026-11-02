@@ -2524,10 +2524,6 @@ async fn qoder_forward(
     // 吃 OpenAI 形状的 tools）。之前完全没传 ⇒ 模型看不到工具 ⇒ 只会吐 XML 正文，
     // 提升成 tool_calls 后 content 变 null，客户端显示「已完成但空白」。
     let tools = req.get("tools").cloned().unwrap_or(Value::Null);
-    let has_tools = tools
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
     // `display_name` 只是给上游做界面/日志显示，但填真名比填代号更像官方客户端
     // （`DeepSeek-Flash` 而不是 `dfmodel`）。
     let shown = crate::modules::gateway_models::display_of(scope, model);
@@ -2563,7 +2559,7 @@ async fn qoder_forward(
         })?;
     // Qoder 的私有协议没有 function calling 通道，模型会把调用**写在正文里**
     // （`<function_calls><invoke …>`）。原样透出等于给客户端一段话术，这里提成标准 tool_calls。
-    Ok(lift_qoder_tool_calls(out, has_tools))
+    Ok(lift_qoder_tool_calls(out, &tools))
 }
 
 /// `QUEUED|<秒>|<文案>` → `(秒, 文案)`。标记不一定在开头（外面可能包了 `上游报错：`）。
@@ -2640,7 +2636,7 @@ async fn open_qoder_stream(
             })
         }
     };
-    let mut reader = StreamReader::new(resp, Kind::Qoder);
+    let mut reader = StreamReader::new(resp, Kind::Qoder).with_tools(tools);
     match reader.next_batch().await {
         Ok(Some(first)) => Ok((reader, first)),
         Ok(None) => Err(OpenFail::Fatal(
@@ -2708,6 +2704,8 @@ async fn qoder_stream(
     // 现在：立刻建立 SSE 响应 → 每次排队先推一条「⏳ 排队中」正文 → 再睡 → 重试。
     // 用户在自己的工具里就能看到排队状态，和 Qoder 客户端的
     // 「模型请求正在排队·预计等待不足 1 分钟」是同一个意思。
+    // 收尾时按 schema 校正工具参数类型要用同一份 tools（闭包会把它 move 走，先留一份）。
+    let tools_for_emitter = tools.clone();
     let open = move || {
         let region = region;
         let acc = acc.clone();
@@ -2765,7 +2763,7 @@ async fn qoder_stream(
 
     Ok(Upstream::Sse(respond_with_queue(
         // 用原始 `model`（&str）而不是被闭包 move 走的 `model_owned`。
-        Emitter::new(model),
+        Emitter::new(model).with_tools(&tools_for_emitter),
         trace,
         open,
         budget,
@@ -2931,12 +2929,138 @@ fn lift_text_tool_calls(text: &str) -> (String, Vec<Value>) {
     (rest.trim().to_string(), calls)
 }
 
+/// 按**工具 schema** 校正参数类型：模型常把 number/boolean 写成字符串。
+///
+/// 2026-11-02 用户实测（GLM-5.3-Flash 走 Qoder）：客户端连续报
+/// `invalid arguments: "timeoutMs" must be a number`、`"wait" must be a boolean`
+/// —— 模型给的是 `"timeoutMs": "30000"` / `"wait": "true"`，schema 要的是数字/布尔。
+/// 客户端校验的是**类型**，字符串再像也没用；这种错误模型很可能一直犯（它以为写 `"true"` 就行），
+/// 于是一整轮 agent 就在「调用→校验失败→再调用」里空转。
+///
+/// 有 `tools` 就有判据，逐字段对齐即可；没有 schema 的字段一律不动（宁可不改，也别猜）。
+pub fn coerce_tool_call_args(calls: &mut [Value], tools: &Value) {
+    let Some(list) = tools.as_array() else { return };
+    if list.is_empty() {
+        return;
+    }
+    for call in calls.iter_mut() {
+        let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(schema) = list.iter().find_map(|t| {
+            let f = t.get("function")?;
+            (f.get("name").and_then(Value::as_str) == Some(name)).then(|| f.get("parameters"))
+        }) else {
+            continue;
+        };
+        let Some(props) = schema
+            .and_then(|p| p.get("properties"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let Some(raw) = call.pointer("/function/arguments").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(mut args) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        let Some(obj) = args.as_object_mut() else { continue };
+        let mut changed = false;
+        for (k, v) in obj.iter_mut() {
+            let Some(want) = props.get(k) else { continue };
+            if coerce_value(v, want) {
+                changed = true;
+            }
+        }
+        if changed {
+            if let Ok(text) = serde_json::to_string(&args) {
+                if let Some(slot) = call.pointer_mut("/function/arguments") {
+                    *slot = json!(text);
+                }
+            }
+        }
+    }
+}
+
+/// 单个值按 schema 的 `type` 校正；返回是否改过。
+///
+/// `type` 允许是数组（`["integer","null"]` / `["string","number"]`），逐个试。
+fn coerce_value(v: &mut Value, schema: &Value) -> bool {
+    let types: Vec<String> = match schema.get("type") {
+        Some(Value::String(s)) => vec![s.to_ascii_lowercase()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.to_ascii_lowercase())
+            .collect(),
+        _ => return false,
+    };
+    // 已经是目标类型就别动
+    let already = |v: &Value, t: &str| match t {
+        "string" => v.is_string(),
+        "integer" | "number" => v.is_number(),
+        "boolean" => v.is_boolean(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        "null" => v.is_null(),
+        _ => false,
+    };
+    if types.iter().any(|t| already(v, t)) {
+        return false;
+    }
+    let Some(text) = v.as_str() else { return false };
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    for ty in &types {
+        match ty.as_str() {
+            "integer" | "number" => {
+                if let Ok(n) = serde_json::from_str::<Value>(t) {
+                    if n.is_number() {
+                        *v = n;
+                        return true;
+                    }
+                }
+            }
+            "boolean" => {
+                let low = t.to_ascii_lowercase();
+                if matches!(low.as_str(), "true" | "yes" | "1") {
+                    *v = json!(true);
+                    return true;
+                }
+                if matches!(low.as_str(), "false" | "no" | "0") {
+                    *v = json!(false);
+                    return true;
+                }
+            }
+            "array" | "object" => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(t) {
+                    let ok = if ty == "array" {
+                        parsed.is_array()
+                    } else {
+                        parsed.is_object()
+                    };
+                    if ok {
+                        *v = parsed;
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// 把 Qoder 的完整返回里的正文工具调用提成 `message.tool_calls`。
 ///
 /// ⚠️ `allow_tools` = 本次请求**客户端真的给了工具定义**。没给却提升成 `tool_calls`，
 /// 调用无处可去，客户端只会显示「已完成 + 一片空白」（2026-10-24 用户：带文件分析
 /// 那两次 7 秒就结束、什么都不出）。那种情况剥掉 XML、写明原因，至少不是空白。
-fn lift_qoder_tool_calls(mut v: Value, allow_tools: bool) -> Value {
+fn lift_qoder_tool_calls(mut v: Value, tools: &Value) -> Value {
+    let allow_tools = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
     let Some(content) = v
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -2947,10 +3071,14 @@ fn lift_qoder_tool_calls(mut v: Value, allow_tools: bool) -> Value {
     if !content.contains("<function_calls") {
         return v;
     }
-    let (rest, calls) = lift_text_tool_calls(&content);
+    let (mut calls, rest) = {
+        let (rest, calls) = lift_text_tool_calls(&content);
+        (calls, rest)
+    };
     if calls.is_empty() {
         return v;
     }
+    coerce_tool_call_args(&mut calls, tools);
     if !allow_tools {
         let names: Vec<&str> = calls
             .iter()
@@ -3150,7 +3278,8 @@ async fn trae_stream(
             ),
         ));
     }
-    let mut reader = StreamReader::new(resp, Kind::Trae);
+    let mut reader = StreamReader::new(resp, Kind::Trae)
+        .with_tools(req.get("tools").unwrap_or(&Value::Null));
     let first = match reader.next_batch().await {
         Ok(Some(v)) => v,
         Ok(None) => {
@@ -3580,6 +3709,53 @@ fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 模型把 number/boolean 写成字符串时，按 schema 纠回来 —— 否则客户端
+    /// `invalid arguments: "timeoutMs" must be a number` 会一直循环。
+    #[test]
+    fn tool_args_are_coerced_to_schema_types() {
+        let tools = json!([
+            { "type": "function", "function": {
+                "name": "run", "parameters": { "type": "object", "properties": {
+                    "timeoutMs": { "type": "integer" },
+                    "wait": { "type": "boolean" },
+                    "path": { "type": "string" },
+                    "count": { "type": ["number", "null"] }
+                } } } },
+            { "type": "function", "function": {
+                "name": "other", "parameters": { "type": "object", "properties": {} } } }
+        ]);
+        let mut calls = vec![
+            json!({ "function": { "name": "run", "arguments":
+                r#"{"timeoutMs":"30000","wait":"true","path":"123","count":"3"}"# } }),
+            // 未知工具 / 非法 JSON / 非字符串值：一律不动
+            json!({ "function": { "name": "unknown", "arguments": r#"{"a":"1"}"# } }),
+            json!({ "function": { "name": "run", "arguments": "not json" } }),
+        ];
+        coerce_tool_call_args(&mut calls, &tools);
+
+        let a: Value = serde_json::from_str(
+            calls[0]["function"]["arguments"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(a["timeoutMs"], json!(30000), "字符串数字要变数字：{a}");
+        assert_eq!(a["wait"], json!(true), "字符串布尔要变布尔：{a}");
+        assert_eq!(a["path"], json!("123"), "string 字段一个字都不许改：{a}");
+        assert_eq!(a["count"], json!(3), "type 数组里挑一个匹配的：{a}");
+
+        assert_eq!(calls[1]["function"]["arguments"], json!(r#"{"a":"1"}"#));
+        assert_eq!(calls[2]["function"]["arguments"], json!("not json"));
+    }
+
+    /// 没有 tools（客户端没给工具定义）时，参数必须原样保留 —— 没有 schema 就没有判据。
+    #[test]
+    fn tool_args_untouched_without_schema() {
+        let mut calls = vec![json!({ "function": { "name": "run", "arguments": r#"{"n":"1"}"# } })];
+        coerce_tool_call_args(&mut calls, &json!([]));
+        assert_eq!(calls[0]["function"]["arguments"], json!(r#"{"n":"1"}"#));
+        coerce_tool_call_args(&mut calls, &Value::Null);
+        assert_eq!(calls[0]["function"]["arguments"], json!(r#"{"n":"1"}"#));
+    }
 
     /// Trae 的角色白名单是硬校验：任何位置的 `developer` 都要还原成 `system`。
     ///
@@ -4024,7 +4200,7 @@ mod tool_call_tests {
         let v = json!({
             "choices": [{ "message": { "role": "assistant", "content": "普通回答" }, "finish_reason": "stop" }]
         });
-        let out = lift_qoder_tool_calls(v.clone(), true);
+        let out = lift_qoder_tool_calls(v.clone(), &json!([{ "type": "function", "function": { "name": "x", "parameters": { "type": "object" } } }]));
         assert_eq!(out, v);
     }
 

@@ -1183,10 +1183,9 @@ pub async fn chat_once(
                     let (wait, count) = crate::modules::gateway_stream::queue_wait_of(&raw);
                     // 约定：`QUEUED|<秒>|<可读文案>` —— 外层 chat_complete 据此等待重试。
                     format!(
-                        "QUEUED|{}|上游排队中（前面约 {} 人，预计等 {} 秒）",
+                        "QUEUED|{}|{}",
                         wait,
-                        count.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-                        wait
+                        crate::modules::gateway_stream::queue_text(wait, count)
                     )
                 } else {
                     format!("上游 HTTP {code}：{}", raw.chars().take(160).collect::<String>())
