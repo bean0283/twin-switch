@@ -1292,7 +1292,12 @@ fn should_failover(status: u16, msg: &str) -> bool {
     // WorkBuddy `11128 Illegal API invocation from an unapproved channel`：
     // 上游是按**账号/频道**判的（同一份 body 换其它账号就正常，见 2026-10-26 真机探针），
     // 所以它对「这个号」是死判据 ⇒ 必须换号，而不是直接把 400 丢给用户。
-    m.contains("11128")
+    // Qoder 把**自己内部 provider 故障**包成 400 provider_error 回来（2026-11-02 用户实测：
+    // 516ms 就返回、同号几秒后同 body 就正常）。它不是参数错，换号/重试有意义，
+    // 不能像普通 400 那样直接丢给用户。
+    m.contains("provider_error")
+        || m.contains("error in upstream response")
+        || m.contains("11128")
         || m.contains("unapproved channel")
         || m.contains("6804")
         || m.contains("quota exceeded")
@@ -2564,6 +2569,70 @@ fn pick_qoder_account<'a>(
     })
 }
 
+/// 打开一次 Qoder 流并**探到首帧**（没探到就等于没打开）。
+///
+/// 抽出来是为了让 [`qoder_stream`] 的 `open` 闭包能**重试**：原来这整段写在闭包里，
+/// 一次失败就只能回错误帧（见 `transient_upstream` 的注释）。
+async fn open_qoder_stream(
+    region: crate::modules::qoder_realm::QoderRegion,
+    acc: &crate::modules::qoder_accounts::QoderAccount,
+    model: &str,
+    shown: &str,
+    messages: &Value,
+    tools: &Value,
+) -> Result<(StreamReader, Vec<Delta>), OpenFail> {
+    let resp = crate::modules::qoder_tools::chat_open(
+        region,
+        acc,
+        model,
+        shown,
+        messages,
+        tools.as_object().map(|_| tools),
+    )
+    .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(match queue_parts(&e) {
+                Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
+                None => OpenFail::Fatal(format!("Qoder 上游：{e}")),
+            })
+        }
+    };
+    let mut reader = StreamReader::new(resp, Kind::Qoder);
+    match reader.next_batch().await {
+        Ok(Some(first)) => Ok((reader, first)),
+        Ok(None) => Err(OpenFail::Fatal(
+            "Qoder 返回了流，但既没有正文也没有工具调用".to_string(),
+        )),
+        Err(e) => Err(match queue_parts(&e) {
+            Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
+            None => OpenFail::Fatal(e),
+        }),
+    }
+}
+
+/// 这次上游失败值不值得**立刻重试一次**（同号、同 body）。
+///
+/// 判据只收「上游自己那边的问题」，绝不含参数错（400 参数错重试还是错，白等 800ms）：
+/// - `provider_error` / `Error in upstream response`：Qoder 把内部 provider 故障包成 400；
+/// - `5xx`：上游过载 / 网关抖动；
+/// - 传输层（`error sending request` / `connection` / `timed out`）：连都没连上；
+/// - 流打开了却一帧都没有：上游提前断流。
+fn transient_upstream(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    if crate::modules::gateway_pool::is_queued_hint(msg) {
+        return false; // 排队走 Queued 分支，不算"临时故障"
+    }
+    m.contains("provider_error")
+        || m.contains("error in upstream response")
+        || m.contains("上游 http 5")
+        || m.contains("error sending request")
+        || m.contains("connection")
+        || m.contains("timed out")
+        || m.contains("既没有正文也没有工具调用")
+}
+
 async fn qoder_stream(
     scope: &str,
     model: &str,
@@ -2606,35 +2675,37 @@ async fn qoder_stream(
         let messages = messages.clone();
         let tools = tools.clone();
         async move {
-            let resp = crate::modules::qoder_tools::chat_open(
-                region,
-                &acc,
-                &model,
-                &shown,
-                &messages,
-                tools.as_object().map(|_| &tools),
-            )
-            .await;
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(match queue_parts(&e) {
-                        Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
-                        None => OpenFail::Fatal(format!("Qoder 上游：{e}")),
-                    })
+            // ★★ 上游「临时故障」要重试一次再报错。
+            //
+            // 2026-11-02 用户实测：带 36 个工具的流式请求被上游以
+            // `HTTP 400 {"type":"provider_error","message":"Error in upstream response"}`
+            // 拒掉（516ms 就返回，说明不是参数错，是上游自己那边炸了）。
+            // 原来这里一次失败就直接把错误帧丢给客户端 —— 而同一个账号、同一份 body
+            // 过几秒就能正常出字。对这种错误「立刻重试一次」比让用户手点重发有用。
+            //
+            // 不换号是**有意**的：provider_error 属于上游路由/负载问题，换号收益不明；
+            // 而排队（Queued）绝对不能换号（队列是模型级的，换号只会再排一次）。
+            let mut last: Option<OpenFail> = None;
+            for attempt in 0..2 {
+                match open_qoder_stream(region, &acc, &model, &shown, &messages, &tools).await {
+                    Ok(v) => return Ok(v),
+                    Err(queued @ OpenFail::Queued { .. }) => return Err(queued),
+                    Err(OpenFail::Fatal(e)) => {
+                        let retryable = transient_upstream(&e);
+                        eprintln!(
+                            "[qoder] 打开流失败（第 {} 次，retryable={retryable}）：{e}",
+                            attempt + 1
+                        );
+                        last = Some(OpenFail::Fatal(e));
+                        if attempt == 0 && retryable {
+                            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                            continue;
+                        }
+                        break;
+                    }
                 }
-            };
-            let mut reader = StreamReader::new(resp, Kind::Qoder);
-            match reader.next_batch().await {
-                Ok(Some(first)) => Ok((reader, first)),
-                Ok(None) => Err(OpenFail::Fatal(
-                    "Qoder 返回了流，但既没有正文也没有工具调用".to_string(),
-                )),
-                Err(e) => Err(match queue_parts(&e) {
-                    Some((wait, msg)) => OpenFail::Queued { secs: wait, msg },
-                    None => OpenFail::Fatal(e),
-                }),
             }
+            Err(last.unwrap_or_else(|| OpenFail::Fatal("Qoder 上游打开失败".to_string())))
         }
     };
 
@@ -3514,6 +3585,28 @@ mod tests {
             400,
             r#"{"code":"11128","msg":"Illegal API invocation from an unapproved channel"}"#
         ));
+        // Qoder 内部 provider 故障也包成 400 —— 它不是参数错，换号/重试有意义
+        // （2026-11-02 用户实测：516ms 返回、同号几秒后同 body 正常）。
+        assert!(should_failover(
+            400,
+            r#"{"code":"provider_error","message":"Error in upstream response","type":"provider_error"}"#
+        ));
+    }
+
+    /// 「临时故障」与「参数错」必须分开：前者重试一次有用，后者重试是白等。
+    #[test]
+    fn transient_only_covers_upstream_side() {
+        // 上游自己那边炸了 / 连不上 / 流空 ⇒ 值得立刻重试一次
+        assert!(transient_upstream(
+            r#"上游 HTTP 400：{"code":"provider_error","message":"Error in upstream response"}"#
+        ));
+        assert!(transient_upstream("上游 HTTP 502：bad gateway"));
+        assert!(transient_upstream("error sending request for url (https://x)"));
+        assert!(transient_upstream("Qoder 返回了流，但既没有正文也没有工具调用"));
+        // 参数错 / 排队 / 凭据死 ⇒ 不重试
+        assert!(!transient_upstream("上游 HTTP 400：invalid request: messages[0].content"));
+        assert!(!transient_upstream("QUEUED|30|上游排队中（前面约 20 人）"));
+        assert!(!transient_upstream("上游 HTTP 401：TOKEN_EXPIRE"));
     }
 
     /// 不该换号的：参数错（换了也一样错）、模型不存在、以及**排队**。
