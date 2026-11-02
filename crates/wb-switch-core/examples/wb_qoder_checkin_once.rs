@@ -57,6 +57,11 @@ async fn main() {
                 "活动: claimable={} 可领 {} 个",
                 v["claimable"], v["claimableCount"]
             );
+            // 本机缺设备身份时，活动列表本身是**不可信**的（会少掉"每天领积分"那条），
+            // 所以要把后端一起返回的告警原样打出来。
+            if let Some(w) = v["warning"].as_str() {
+                println!("⚠️ 本机设备身份告警：\n{w}");
+            }
             for c in v["campaigns"].as_array().cloned().unwrap_or_default() {
                 println!(
                     "    {} | {} | {} | {:?} {:?}",

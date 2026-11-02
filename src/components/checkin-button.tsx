@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CalendarCheck, Loader2 } from "lucide-react";
+import { AlertTriangle, CalendarCheck, Loader2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -47,6 +47,12 @@ const STATUS_META: Record<CheckinStatus, { label: string; className: string }> =
     label: "无进行中活动",
     className: "border-border bg-muted text-muted-foreground",
   },
+  // ⚠️ 必须与「无进行中活动」分开：那一档是"今天真没有"，这一档是"这台机器根本签不了"。
+  // 合成一档，用户就会按"明天再来"处理，而明天照样失败。
+  need_client: {
+    label: "需装客户端",
+    className: "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+  },
   failed: {
     label: "失败",
     className: "border-destructive/40 bg-destructive/10 text-destructive",
@@ -74,6 +80,7 @@ function summarize(r: CheckinResult): string {
   if (s.skipped) parts.push(`跳过 ${s.skipped}`);
   if (s.unavailable) parts.push(`不可签 ${s.unavailable}`);
   if (s.inactive) parts.push(`无活动 ${s.inactive}`);
+  if (s.needClient) parts.push(`需装客户端 ${s.needClient}`);
   if (s.failed) parts.push(`失败 ${s.failed}`);
   return `共 ${s.total} 个账号：${parts.join(" · ")}，本次合计获得 ${s.gained} 积分`;
 }
@@ -174,6 +181,26 @@ export function CheckinButton({
             </div>
           ) : (
             <div className="max-h-[55vh] space-y-2 overflow-y-auto pr-1">
+              {/* ★ 环境级问题放在列表最上面：这是"整台机器签不了"，不是某条结果的细节。 */}
+              {result && result.summary.needClient > 0 ? (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <div className="min-w-0 space-y-1">
+                      <div className="font-medium">
+                        本机取不到 Qoder 设备身份，{result.summary.needClient} 个 Qoder
+                        账号这次签不了
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        这不是账号问题，也不是今天没有活动 —— 服务端只给带了设备身份的请求下发「每天 100
+                        Credits」，而设备身份要由客户端现取。装一次 Qoder
+                        并登录即可（装在非默认目录就设 <code className="text-[11px]">QODER_UMID_PATH</code>
+                        ）；装不了客户端的机器，用「Qoder 机器身份」卡片导入账号包。下面每条结果里写了具体原因。
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               {result?.items.map((it, i) => {
                 const meta = STATUS_META[it.status] ?? STATUS_META.failed;
                 return (
