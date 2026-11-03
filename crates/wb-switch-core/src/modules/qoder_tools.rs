@@ -1036,7 +1036,7 @@ fn full_body(
             }
         }
     }
-    let seed = crate::modules::gateway_stream::session_seed(model_key, uid, messages, tools);
+    let seed = crate::modules::gateway_stream::session_seed(model_key, uid, messages);
     body["session_id"] = json!(crate::modules::gateway_stream::session_id(&seed, "qoder-sess"));
     Ok(body)
 }
