@@ -38,6 +38,24 @@ pub enum Kind {
     Qoder,
 }
 
+impl Kind {
+    /// 「已经吐过内容之后」允许多久没有新数据。
+    ///
+    /// ⚠️ 这一档**必须按上游分**：
+    /// - **Qoder**：流答完不关连接，只能靠空闲判结束 ⇒ 8 秒（短一点，收尾快）。
+    /// - **Trae**：有自己的结束事件（`turn_completion` / `done`），不需要靠空闲判断结束。
+    ///   它在大上下文 + 工具规划时会**长时间不吐字**，之前把 Qoder 的 8 秒套在它身上，
+    ///   等于「模型一思考就被我们掐断」——用户看到的就是「Trae 模型一直超时」
+    ///   （2026-11-03 用户实测：8 秒空闲超时，客户端那边报 stream idle timeout）。
+    ///   120 秒只是**兜底**，正常情况下由结束事件收尾。
+    pub fn idle_after_start_secs(&self) -> u64 {
+        match self {
+            Kind::Qoder => 8,
+            Kind::Trae => 120,
+        }
+    }
+}
+
 /// 统一增量。三家解析完都落在这几个形态上。
 #[derive(Debug, Clone)]
 pub enum Delta {
@@ -522,9 +540,12 @@ impl StreamReader {
                 let out = self.parse_line(&rest)?;
                 return Ok(if out.is_empty() { None } else { Some(out) });
             }
-            // 已经吐过内容后给 8 秒：Qoder 的流答完不关连接，只能靠空闲判结束；
-            // 但给太短会在模型「喘口气」时把回答截断（截断比多等几秒糟得多）。
-            let idle = if self.started { 8 } else { 90 };
+            // 首包前给 90 秒（排队 / 冷启动）；吐过内容后按上游分档（见 `Kind::idle_after_start_secs`）。
+            let idle = if self.started {
+                self.kind.idle_after_start_secs()
+            } else {
+                90
+            };
             match tokio::time::timeout(Duration::from_secs(idle), self.stream.next()).await {
                 Ok(Some(Ok(bytes))) => {
                     self.buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -539,7 +560,7 @@ impl StreamReader {
                 Ok(None) => self.done = true,
                 Err(_) => {
                     return Err(if self.started {
-                        "上游流空闲超时（8 秒没有新数据）".to_string()
+                        format!("上游流空闲超时（{idle} 秒没有新数据）")
                     } else {
                         format!("上游 {idle} 秒没有任何输出（大概率在排队，或这个号被限流）")
                     })
@@ -1501,6 +1522,25 @@ mod queue_notice_tests {
             v.pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str()),
             Some("⏳ 上游排队中\n\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::Kind;
+
+    /// 回归：Trae 的「正文后空闲」**不能**用 Qoder 的 8 秒。
+    ///
+    /// 2026-11-03 用户实测：dsh 里用 Trae 的 GLM-5.3 一直超时，
+    /// 网关侧日志是「上游流空闲超时（8 秒没有新数据）」——
+    /// 模型在大上下文里思考 8 秒以上就被我们掐断。
+    #[test]
+    fn trae_allows_long_pauses_but_qoder_does_not() {
+        assert_eq!(Kind::Qoder.idle_after_start_secs(), 8, "Qoder 靠空闲判收尾，必须短");
+        assert!(
+            Kind::Trae.idle_after_start_secs() >= 60,
+            "Trae 有结束事件，空闲档只是兜底，不能短到掐断思考"
         );
     }
 }

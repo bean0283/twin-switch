@@ -18,7 +18,7 @@ use wb_switch_core::modules::{
     workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
     workbuddy_vault,
 };
-use wb_switch_core::modules::{workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
+use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -356,6 +356,26 @@ pub async fn trae_credits_one(client_key: Option<String>, id: String) -> Result<
 #[tauri::command]
 pub async fn checkin_run(scope: Option<String>, client_key: Option<String>) -> Result<Value, String> {
     Ok(checkin::run(scope.as_deref(), client_key.as_deref()).await)
+}
+
+/// 读某个 WorkBuddy 账号的成长中心任务列表。
+#[tauri::command]
+pub async fn workbuddy_growth_tasks(account_id: String) -> Result<Value, String> {
+    let acc = workbuddy_vault::find_account(&account_id)
+        .ok_or_else(|| format!("账号不存在：{account_id}"))?;
+    let tasks = workbuddy_growth::list_tasks(&acc).await?;
+    Ok(json!({ "ok": true, "tasks": tasks }))
+}
+
+/// 跑一批成长任务（`codes` 为空 = 所有还没完成的），跑完自动领奖。
+#[tauri::command]
+pub async fn workbuddy_growth_run(
+    account_id: String,
+    codes: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let acc = workbuddy_vault::find_account(&account_id)
+        .ok_or_else(|| format!("账号不存在：{account_id}"))?;
+    Ok(json!(workbuddy_growth::run_batch(&acc, codes).await))
 }
 
 /// 自动签到的当前状态（开关 + 今天各平台跑了没有 + 最近几天的记录）。

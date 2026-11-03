@@ -1682,3 +1682,56 @@ mod tests {
         assert_eq!(round2(-0.0).to_string(), "0");
     }
 }
+
+#[cfg(test)]
+mod growth_probe {
+    use super::*;
+
+    /// 真机探针：确认 growth 任务列表挂在哪个域名上、返回什么。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_growth_task_list() {
+        let accounts = workbuddy_vault::load_accounts();
+        println!("账号数 = {}", accounts.len());
+        let acc = accounts
+            .iter()
+            .find(|a| matches!(a.get("access_token"), Some(Value::String(s)) if s.len() > 40))
+            .expect("没有可用明文 token 的账号");
+        let token = acc["access_token"].as_str().unwrap();
+        let mut uid = workbuddy_auth::get_str(acc, "uid").unwrap_or_default();
+        if uid.is_empty() {
+            uid = jwt::payload(token)
+                .and_then(|p| p.get("sub").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_default();
+        }
+        println!("uid = {}…", &uid.chars().take(6).collect::<String>());
+        let h = wb_headers(token, &uid);
+
+        let url = "https://www.codebuddy.cn/v2/activity/growth/tasks";
+        let (st, _hd, text) = http_request_raw(url, "GET", None, Some(&h), None, true).await;
+        println!("HTTP={st}  字符数={}", text.len());
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let tasks = v["data"]["tasks"].as_array().cloned().unwrap_or_default();
+        println!("任务数 = {}", tasks.len());
+        if let Some(t) = tasks.iter().find(|t| t["task_code"] == "first_buddy") {
+            println!("样例(pretty)：{}", serde_json::to_string_pretty(t).unwrap_or_default());
+        }
+        for t in &tasks {
+            let g = |k: &str| t.get(k).cloned().unwrap_or(Value::Null);
+            println!(
+                "{:<26} 奖励{:>5}c{:>3}e  状态={:<10} 接受={:<12} 进度={}/{}  已领={}  {}",
+                t["task_code"].as_str().unwrap_or("?"),
+                t["reward_credit"].as_i64().unwrap_or(0),
+                t["reward_energy"].as_i64().unwrap_or(0),
+                t["status"].as_str().unwrap_or("-"),
+                g("accept_status").as_str().unwrap_or("-"),
+                g("progress").get("current").and_then(Value::as_i64)
+                    .or_else(|| g("current").as_i64()).unwrap_or(-1),
+                g("progress").get("target").and_then(Value::as_i64)
+                    .or_else(|| g("target").as_i64()).unwrap_or(-1),
+                g("claimed").as_bool().unwrap_or(false),
+                t["title"].as_str().unwrap_or(""),
+            );
+        }
+    }
+}

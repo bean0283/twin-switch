@@ -38,6 +38,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
 import { CheckinButton } from "@/components/checkin-button";
+import { WorkbuddyGrowthCard } from "@/components/workbuddy-growth-card";
 import {
   CreditBlock,
   CreditsDialog,
@@ -915,6 +916,7 @@ export default function WorkbuddySwitchPage() {
         <CreditsHeader credits={credits} accountCount={accounts.length} />
       </div>
 
+
       {loading ? (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           <Skeleton className="h-56 rounded-2xl" />
@@ -956,6 +958,16 @@ export default function WorkbuddySwitchPage() {
           })}
         </div>
       )}
+
+      {/* 成长任务：放在账号卡**下方**（先看账号，再处理任务）；可收纳，记住上次状态 */}
+      {accounts.length > 0 ? (
+        <div className="mt-8">
+          <WorkbuddyGrowthCard
+            accounts={accounts.map((a) => ({ id: a.id, name: a.name || a.nickname || a.id }))}
+            defaultAccountId={accounts.find((a) => a.isCurrent)?.id}
+          />
+        </div>
+      ) : null}
 
       <div className="mt-8">
         <Card>

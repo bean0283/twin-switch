@@ -282,6 +282,8 @@ pub fn run() {
             commands::trae_credits_query,
             commands::trae_credits_one,
             commands::checkin_run,
+            commands::workbuddy_growth_tasks,
+            commands::workbuddy_growth_run,
             commands::auto_checkin_state,
             commands::auto_checkin_set,
             commands::auto_checkin_maybe_run,

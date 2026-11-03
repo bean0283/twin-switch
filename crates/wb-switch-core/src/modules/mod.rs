@@ -70,5 +70,6 @@ pub mod workbuddy_session_edit;
 pub mod workbuddy_cleanup;
 pub mod workbuddy_credits;
 pub mod workbuddy_export;
+pub mod workbuddy_growth;
 pub mod workbuddy_import;
 pub mod workbuddy_source;
