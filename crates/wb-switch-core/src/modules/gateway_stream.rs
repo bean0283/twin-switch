@@ -60,6 +60,31 @@ pub enum Delta {
 /// 其中工具 schema 59.6k、messages 约 73k。门槛若设 80k，**这个已经出问题的请求
 /// 一条都不会被折**，等于没做。50k 以下的小请求完全不碰。
 const FOLD_TRIGGER_CHARS: usize = 50_000;
+
+/// 折叠门槛的**运行时覆盖**（长上下文场景必须能关）。
+///
+/// 为什么必须可配：要跑 1M 上下文（Trae / WorkBuddy 的超长窗口模型）时，
+/// 50k 字符就折老工具结果，等于把用户花钱买的 1M 窗口自己扔掉一大半。
+///
+/// - `TWIN_TS_FOLD=0`（或 `off`）：完全不折叠；
+/// - `TWIN_TS_FOLD_TRIGGER=800000`：只调门槛，保留折叠能力（推荐，比一刀关掉安全）；
+/// - 都不设：行为与以前完全一致（50k）。
+fn fold_trigger_chars() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if matches!(
+            std::env::var("TWIN_TS_FOLD").ok().as_deref(),
+            Some("0") | Some("off") | Some("false")
+        ) {
+            return usize::MAX;
+        }
+        std::env::var("TWIN_TS_FOLD_TRIGGER")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(FOLD_TRIGGER_CHARS)
+    })
+}
 /// 最近这么多条工具结果**保持原样** —— 正在干活的那几步不能被截断。
 const FOLD_KEEP_TOOLS: usize = 8;
 /// 折叠后的保留字数。
@@ -119,7 +144,7 @@ fn fold_history(msgs: &mut [Value]) -> usize {
         .iter()
         .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
         .sum();
-    if total <= FOLD_TRIGGER_CHARS {
+    if total <= fold_trigger_chars() {
         return 0;
     }
     let tool_idx: Vec<usize> = msgs

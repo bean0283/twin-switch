@@ -3187,7 +3187,17 @@ fn trae_body(model: &str, req: &Value, cred: &TraeCred) -> (Value, String) {
             json!(crate::modules::gateway_stream::session_id(&seed, "trae-proj")),
         );
         obj.insert("workspace_id".into(), json!("e04cdd"));
-        obj.insert("prompt_max_tokens".into(), json!(168_000));
+        // 这个字段是**告诉上游「我这段 prompt 最多多大」**。以前写死 168k ——
+        // 用 1M 窗口的模型时，等于自己把上限按到 168k。
+        // 用 `TWIN_TS_PROMPT_MAX_TOKENS=1000000` 可按模型/按需放开（默认保持 168k 不变）。
+        obj.insert(
+            "prompt_max_tokens".into(),
+            json!(std::env::var("TWIN_TS_PROMPT_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v >= 8_000)
+                .unwrap_or(168_000)),
+        );
         obj.insert("mode".into(), json!("FunctionCall"));
         obj.insert("ide_version".into(), json!(TRAE_IDE_VERSION));
         obj.insert("ide_version_code".into(), json!(TRAE_IDE_VERSION_CODE));
