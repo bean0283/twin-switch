@@ -2402,6 +2402,24 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// 从 `marker` 起截 **≤max_bytes 字节** 的源码窗口（对齐到字符边界）。
+    ///
+    /// ⚠️ 不能直接写 `&src[i..i + 260]`：那是裸字节下标，中文注释一多就会切在
+    /// 「走」「的」这种三字节字符中间，直接 `byte index ... is not a char boundary` panic
+    /// （2026-11-02 main 上 0.4.9 就是这么红的）。
+    /// 这里**保持原来的窗口大小语义**（≤N 字节），只是往回退到合法边界 ——
+    /// 换成"按字符数取"会把窗口撑大，断言会看到下一个分支的代码，反而误报。
+    fn src_arm<'a>(src: &'a str, marker: &str, max_bytes: usize) -> &'a str {
+        let i = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("找不到分支标记：{marker}"));
+        let mut end = (i + max_bytes).min(src.len());
+        while end > i && !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        &src[i..end]
+    }
+
     /// 「两边已经一致」**不许**再被报成「未同步」。
     ///
     /// 回归用（2026-11-02 用户报「明明没有分歧，切换时却说有 1 份未同步」）：
@@ -2413,8 +2431,7 @@ mod tests {
         //    断言字符串会把自己算进去（第一次就踩了）。
         //    直接检查分支体：已一致只能计数，不能进 skipped。
         let src = include_str!("workbuddy_sessions.rs");
-        let i = src.find("BodyRelation::Identical => {").expect("找不到一致分支");
-        let arm = &src[i..i + 260];
+        let arm = src_arm(&src, "BodyRelation::Identical => {", 260);
         assert!(
             !arm.contains("skipped.push"),
             "「已一致」是想要的状态，不是没同步成 —— 不能进 refreshSkipped"
@@ -2426,8 +2443,7 @@ mod tests {
     #[test]
     fn diverged_rows_carry_group_key() {
         let src = include_str!("workbuddy_sessions.rs");
-        let i = src.find("BodyRelation::Diverge => {").expect("找不到分歧分支");
-        let arm = &src[i..i + 900];
+        let arm = src_arm(&src, "BodyRelation::Diverge => {", 900);
         assert!(arm.contains("diverged.push"), "分歧应进 diverged，而不是 skipped");
         assert!(arm.contains("\"groupKey\": p.group_key"), "分歧行必须带关联组 key");
         assert!(!arm.contains("skipped.push"), "分歧不该再算作普通跳过");
