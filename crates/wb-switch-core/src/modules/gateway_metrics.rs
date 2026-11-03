@@ -55,6 +55,15 @@ pub struct Trace {
     pub queued_retries: usize,
     /// 排队累计等待毫秒（真实耗掉的时间，区别于 `total_ms` 里混着的上游生成时间）。
     pub queued_wait_ms: i64,
+    /// **会话身份键前 8 位**（`gateway_stream::conversation_key`，只给排查用）。
+    ///
+    /// 上游的 `conversation_id` = 身份 + 账号 uid + 日期，后两项分别有 `account`
+    /// 列和 `ts` 可查，所以这里只记身份：**它一变，上游就会当场多出一条用量记录**。
+    ///
+    /// 用户 2026-11-03 反馈「一条记录累加了两天」「同一段对话拆成两条」时，
+    /// 光看 token 是看不出上游认不认这是同一段对话的；有了这一列就能直接对账：
+    /// 同一段对话在一个自然日内，这里应当**始终是同一个值**。
+    pub conv: String,
     /// 上游报的「上下文缓存命中 token 数」。
     ///
     /// `None` = **上游没给这个字段**（Trae 渠道实测就不给），不是「命中 0」。
@@ -93,6 +102,7 @@ impl Trace {
             queued: false,
             queued_retries: 0,
             queued_wait_ms: 0,
+            conv: String::new(),
             cached_tokens: None,
             key_id: None,
             logged: false,
@@ -195,6 +205,7 @@ impl Trace {
             "chars": self.chars,
             "tools_chars": self.tools_chars,
             "folded": self.folded,
+            "conv": self.conv,
             "error": if flat.is_empty() { Value::Null } else { json!(flat) },
         });
         append(&line.to_string());

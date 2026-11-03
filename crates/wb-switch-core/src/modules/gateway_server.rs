@@ -1128,6 +1128,10 @@ async fn chat(
         );
     }
     let mut trace = Trace::new(&model, want_stream);
+    // 会话身份前 8 位进指标：用户报「同一段对话拆成两条记录 / 跨天累加」时，
+    // 直接看这一列就知道**是我们中途换了 id**，还是上游自己归账的问题。
+    // 身份 = 模型 + 归一化首条 user（不含 uid、不含日期），见 `gateway_stream`。
+    trace.conv = conv.chars().take(8).collect();
     // 这次请求记到哪把 Key 头上（额度在 `Trace::finish` 里统一记账）。
     trace.key_id = Some(key.id.clone());
     // 前缀稳定 + 历史折叠：确定性规则，同样的历史每轮折出同样的字节，
@@ -3149,12 +3153,9 @@ fn lift_qoder_tool_calls(mut v: Value, tools: &Value) -> Value {
 fn trae_body(model: &str, req: &Value, cred: &TraeCred) -> (Value, String) {
     let (config_name, model_name) = trae_model_config(model);
     let messages = req.get("messages").cloned().unwrap_or_else(|| json!([]));
-    let seed = crate::modules::gateway_stream::session_seed(
-        &model_name,
-        &cred.uid,
-        &messages,
-        req.get("tools"),
-    );
+    // 身份只看「模型 + 首条 user（去数字）」，见 `gateway_stream` 的会话身份说明。
+    // `tools` / `system` 会变（MCP 开关、dsh 截断系统提示词），参与就会中途换 id。
+    let seed = crate::modules::gateway_stream::session_seed(&model_name, &cred.uid, &messages);
     let mut body = req.clone();
     if let Some(obj) = body.as_object_mut() {
         // 上游要求 `messages[].content` 是数组（字符串形态会回 4001），

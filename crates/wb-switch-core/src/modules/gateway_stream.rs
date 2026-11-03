@@ -222,104 +222,164 @@ pub fn session_id(seed: &str, salt: &str) -> String {
     }
 }
 
-/// 会话指纹：**只用「一段对话开始时就不变」的东西**。
+// ---------------------------------------------------------------------------
+// 会话身份（2026-11-03 重做）
+// ---------------------------------------------------------------------------
+//
+// ## 为什么要重做
+//
+// 用户 2026-11-03 报了两件事，都在 Trae 的「用量明细」里能看到：
+//
+//   ① 一条 **11-02 18:09** 的记录（标题 `Prompt`）累计到 **1756.79 分**，
+//      今天的花费也算进了昨天那一行；
+//   ② 同一段对话被拆成两条记录（14:27 的「你能干什么」、16:09 的「你能吃法吗」）。
+//
+// 真机数据（`gateway-metrics.jsonl`）支持这个判断：那段对话从 11-02 18:09 一直续到
+// 11-03 16:13，`msgs` **692 → 1849 单调增长、中间没有一次回退**，也就是它自始至终
+// 是同一段对话。上游按我们发过去的 `conversation_id` 归账：
+//
+//   * id 不变 ⇒ 所有轮次累加进同一条记录，而记录的时间是它**第一次出现**的时刻
+//     ⇒ 今天的消耗显示在昨天那行（①）；
+//   * id 一变 ⇒ 当场多出一条新记录（②）。
+//
+// 旧指纹里恰好放了**会变的东西**：
+//
+//   * `system`：dsh 自己会把系统提示词截断成 `…<已截断，原长 27450 字>`（实测
+//     `messages[0]` 就是 2017 字正文 + 这行尾巴）。那个数字随说明文件改动而变，
+//     一变整段对话就换了 id。
+//   * 工具名：客户端开关 MCP 就变。
+//   * 首条 user：dsh 的 goal 模式把它写成 `<goal_round> … Round: 1/256`，
+//     轮次推进就变。
+//
+// 这三样都**不定义「这是哪段对话」**，只定义内容，所以不该进身份。
+//
+// ## 现在的口径
+//
+// 身份 = 上游模型 + **剥掉易变数字、折叠空白后的**首条 user。
+// 上游会话 ID = 身份 + 账号 uid + **本地日期**（见 [`conv_date`]），
+// 于是「同一段对话」在一个自然日内只有一个 id：不跨天累加、也不被中途改写拆开。
+//
+// ⚠️ 代价（有意的，写在前面）：跨天时第一笔请求会丢一次上游前缀缓存。
+// 一天一次、可预期；换来的是「用量明细按天可对账」。不想按天切就设
+// `TWIN_TS_CONV_ROTATE=off`，退回「整段对话一个 id」。
+
+/// 把「会随轮次变、但不改变对话身份」的内容抹平：**去掉所有 ASCII 数字**、
+/// 空白折叠成单个空格，再截 `limit` 个字符。
 ///
-/// 组成：上游模型名 + 账号 uid + system 提示词 + 工具名（排序后）+ 第一条 user 消息。
-/// ⚠️ 绝不能把「最后一条 user」或任何时间戳放进来 —— 那样每轮指纹都变，等于没做亲和。
-/// 这段对话的**身份**（不含账号）：模型 + 首条 user。
+/// 为什么直接去数字而不是逐条写正则：这类文本里的易变部分几乎都是数字
+/// （`Round: 1/256`、`原长 27450 字`、`2026-11-03`、`16:09:32`、`第 12 轮`），
+/// 而身份只需要「哪段对话」，丢掉数字带来的碰撞在实践中不存在
+/// （真撞上也只是两段对话共用一条用量记录，不影响模型输出）。
+fn stable_text(text: &str, limit: usize) -> String {
+    let mut out = String::with_capacity(limit.min(text.len()) + 8);
+    let mut n = 0usize;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            if n > 0 {
+                out.push(' ');
+                n += 1;
+            }
+            pending_space = false;
+        }
+        out.push(ch);
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// 某条消息的文本（`content` 可能是字符串，也可能是分段数组）。
+fn text_of(m: &Value) -> String {
+    match m.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// 第一条指定角色的消息（找不到就是空串）。
+fn first_text(arr: &[Value], role: &str) -> String {
+    arr.iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some(role))
+        .map(text_of)
+        .unwrap_or_default()
+}
+
+/// 会话身份（**不含账号、不含日期**）：上游模型 + 归一化后的首条 user。
+fn conversation_identity(model: &str, arr: &[Value]) -> String {
+    let mut s = String::with_capacity(2200);
+    s.push_str(model);
+    s.push('\u{1}');
+    s.push_str(&stable_text(&first_text(arr, "user"), 2000));
+    s
+}
+
+/// 会话指纹（给「会话粘性」用）：同一段对话固定同一个账号。
 ///
-/// 用途 = 会话粘性（同一段对话固定同一个账号）。**故意不含 uid**：
-/// 它回答的是「这是哪一段对话」，而不是「这是谁在跑」。
-///
-/// ⚠️ 不能直接用 [`session_seed`]：那个把 uid 也拼进去了（上游会话 ID 需要），
-/// 拿它当粘性键会导致「换号后键也变了」⇒ 永远粘不住。
+/// **故意不含 uid**：它回答的是「这是哪段对话」，不是「谁在跑」。
+/// **也不含日期**：跨零点的同一段对话应当继续粘在同一个账号上，
+/// 否则换号会连带换掉上游会话 ID，白丢一次前缀缓存。
 pub fn conversation_key(model: &str, req: &Value) -> String {
     let arr = req
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let first_user = arr
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .map(|m| match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => serde_json::to_string(other).unwrap_or_default(),
-            None => String::new(),
-        })
-        .unwrap_or_default();
-    let system = arr
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-        .map(|m| match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => serde_json::to_string(other).unwrap_or_default(),
-            None => String::new(),
-        })
-        .unwrap_or_default();
-    // 首条 user 截 2000 字、system 截 4000 字：与 `session_seed` 同口径，
-    // 保证「同一段对话」在这两处判定一致。
-    let mut seed = String::with_capacity(256);
-    seed.push_str(model);
-    seed.push('\u{1}');
-    seed.push_str(&system.chars().take(4000).collect::<String>());
-    seed.push('\u{1}');
-    seed.push_str(&first_user.chars().take(2000).collect::<String>());
-    // 取摘要做键：长对话首条 user 可能有几千字，直接当 HashMap 键太重。
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in seed.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    let seed = conversation_identity(model, &arr);
+    // 取摘要做键：首条 user 可能有几千字，直接当 HashMap 键太重。
+    format!("{:016x}", fnv1a64(seed.as_bytes()))
 }
 
-pub fn session_seed(model: &str, uid: &str, msgs: &Value, tools: Option<&Value>) -> String {
-    let arr = msgs.as_array().cloned().unwrap_or_default();
-    let text_of = |m: &Value| -> String {
-        match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => serde_json::to_string(other).unwrap_or_default(),
-            None => String::new(),
+/// 上游会话 ID 里那段**日期**。
+///
+/// `TWIN_TS_CONV_ROTATE=off/0/false` → 不按天切（退回旧行为：整段对话一个 id）。
+/// `TWIN_TS_CONV_DATE=2026-11-03` → 显式指定（单测用，避免多线程抢环境变量）。
+fn conv_date() -> String {
+    if matches!(
+        std::env::var("TWIN_TS_CONV_ROTATE").ok().as_deref(),
+        Some("off") | Some("0") | Some("false")
+    ) {
+        return String::new();
+    }
+    if let Ok(v) = std::env::var("TWIN_TS_CONV_DATE") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
         }
-    };
-    let system = arr
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-        .map(text_of)
-        .unwrap_or_default();
-    let first_user = arr
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .map(text_of)
-        .unwrap_or_default();
-    // 工具名排序后拼起来：工具顺序变了也不影响指纹。
-    let mut names: Vec<String> = tools
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names.dedup();
+    }
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
 
-    let mut seed = String::with_capacity(256);
-    seed.push_str(model);
+/// 上游会话 ID 的种子：身份 + 账号 uid + 日期。
+///
+/// uid 参与是**必须**的：上游的会话历史是挂在账号下的，两个账号共用一个
+/// `conversation_id` 没有意义（也拿不到各自的前缀缓存）。
+pub fn session_seed(model: &str, uid: &str, msgs: &Value) -> String {
+    session_seed_at(model, uid, msgs, &conv_date())
+}
+
+/// 可注入日期版本（单测用）。
+pub fn session_seed_at(model: &str, uid: &str, msgs: &Value, date: &str) -> String {
+    let arr = msgs.as_array().cloned().unwrap_or_default();
+    let identity = conversation_identity(model, &arr);
+    let mut seed = String::with_capacity(identity.len() + 64);
+    seed.push_str(&identity);
     seed.push('\u{1}');
     seed.push_str(uid);
-    seed.push('\u{1}');
-    seed.push_str(&names.join(","));
-    seed.push('\u{1}');
-    seed.push_str(&system.chars().take(4000).collect::<String>());
-    seed.push('\u{1}');
-    seed.push_str(&first_user.chars().take(2000).collect::<String>());
+    if !date.is_empty() {
+        seed.push('\u{1}');
+        seed.push_str(date);
+    }
     seed
 }
 
