@@ -1450,6 +1450,50 @@ export function workbuddySwitchPrecheck(accountId: string): Promise<WorkbuddySwi
   return call("workbuddy_switch_precheck", { accountId });
 }
 
+/** 一条成长中心任务。 */
+export interface WbGrowthTask {
+  code: string;
+  title: string;
+  desc: string;
+  rewardCredit: number;
+  rewardEnergy: number;
+  current: number;
+  target: number;
+  /** `not_accepted` / `accepted` / `completed` / `claimed`。 */
+  acceptStatus: string;
+  /** 进度已满且没领过 —— 现在点就能拿。 */
+  claimable: boolean;
+  /** 我们能自动完成这一条（后端判定，界面不许自己列一份）。 */
+  supported: boolean;
+}
+
+/** 跑一批之后的报告。 */
+export interface WbGrowthRunReport {
+  runs: Array<{ code: string; ok: boolean; message: string }>;
+  claimed: Array<{ code: string; title: string; credit: number; energy: number; already: boolean }>;
+  totalCredit: number;
+  totalEnergy: number;
+  /** 跑完仍未完成、也不是我们能做的 —— 要让用户知道得自己去点。 */
+  manual: WbGrowthTask[];
+}
+
+export function workbuddyGrowthTasks(accountId: string): Promise<{ ok: boolean; tasks: WbGrowthTask[] }> {
+  return call("workbuddy_growth_tasks", { accountId });
+}
+
+/**
+ * 跑一批成长任务（`codes` 省略 = 所有还没完成的），跑完自动领奖。
+ *
+ * ⚠️ 全程要几十秒（每个任务之间隔 0.9s，事件结算还要等 3s），
+ * 界面必须给「进行中」状态，不能让人以为点了没反应。
+ */
+export function workbuddyGrowthRun(
+  accountId: string,
+  codes?: string[],
+): Promise<WbGrowthRunReport> {
+  return call("workbuddy_growth_run", { accountId, codes });
+}
+
 /**
  * 对指定关联组逐份重新比对（真读盘）。
  *
