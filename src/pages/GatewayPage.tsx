@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { GatewayTabs } from "@/components/gateway-tabs";
 
 import {
   gatewayKeyCreate,
@@ -880,56 +881,63 @@ export default function GatewayPage() {
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-6">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-lg font-semibold">积分共享</h1>
-          <p className="mt-1 text-xs text-muted-foreground">
-            把 Trae / WorkBuddy / Qoder 的账号额度合成一个池子，按「谁先过期就用谁」供给本机其它 AI
-            工具。默认只监听本机；打开下面「局域网共享」后同网段设备（NAS、另一台电脑）也能用。
-          </p>
+      {/* 页头骨架（与「实时监控」逐像素一致，别单方面改）：
+          ① 标题行 h-8（右上角控件同高）
+          ② 描述 min-h-8 + line-clamp-2 —— 固定两行高，文案长短不再影响下方控件
+          ③ 分段切换永远在第三行：两页 y 坐标相同，来回切不会点空 */}
+      <header className="flex flex-col gap-2">
+        <div className="flex h-8 items-center justify-between gap-3">
+          <h1 className="truncate text-lg font-semibold leading-8">积分共享</h1>
+          {/* 右上角三个控件必须同一套规格：同高（h-8）、同为描边胶囊、不换行。
+              以前总开关是裸 checkbox + 状态长句，窗口一窄就被挤成竖排的窄条，
+              「刷新」还是手写的 button，和 Button 组件的高矮圆角都对不上 —— 用户 2026-11-03 截图。 */}
+          <div className="flex shrink-0 items-center gap-2">
+            <label
+              className="flex h-8 cursor-pointer items-center gap-2 whitespace-nowrap rounded-lg border border-border bg-background px-3 text-xs hover:bg-accent/50"
+              title={
+                gwOn
+                  ? "积分共享已开启；点这里关闭（网关会停止监听端口）"
+                  : "积分共享已关闭；点这里开启（网关恢复监听）"
+              }
+            >
+              <Switch
+                checked={gwOn}
+                disabled={gwBusy}
+                onCheckedChange={(on) => void toggleGw(on)}
+              />
+              <span className={cn("font-medium", !gwOn && "text-muted-foreground")}>积分共享</span>
+              <span
+                aria-hidden
+                className={cn(
+                  "size-1.5 rounded-full",
+                  gwOn ? "bg-emerald-500" : "bg-muted-foreground/40",
+                )}
+              />
+            </label>
+            <Button variant="outline" size="sm" asChild className="shrink-0 gap-1.5 whitespace-nowrap">
+              <Link to="/gateway-guide">
+                <BookOpen className="size-4" />
+                使用说明
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0 gap-1.5 whitespace-nowrap"
+              onClick={() => void reload()}
+            >
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+              刷新
+            </Button>
+          </div>
         </div>
-        {/* 右上角三个控件必须同一套规格：同高（h-8）、同为描边胶囊、不换行。
-            以前总开关是裸 checkbox + 状态长句，窗口一窄就被挤成竖排的窄条，
-            「刷新」还是手写的 button，和 Button 组件的高矮圆角都对不上 —— 用户 2026-11-03 截图。 */}
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-          <label
-            className="flex h-8 cursor-pointer items-center gap-2 whitespace-nowrap rounded-lg border border-border bg-background px-3 text-xs hover:bg-accent/50"
-            title={
-              gwOn
-                ? "积分共享已开启；点这里关闭（网关会停止监听端口）"
-                : "积分共享已关闭；点这里开启（网关恢复监听）"
-            }
-          >
-            <Switch
-              checked={gwOn}
-              disabled={gwBusy}
-              onCheckedChange={(on) => void toggleGw(on)}
-            />
-            <span className={cn("font-medium", !gwOn && "text-muted-foreground")}>积分共享</span>
-            <span
-              aria-hidden
-              className={cn(
-                "size-1.5 rounded-full",
-                gwOn ? "bg-emerald-500" : "bg-muted-foreground/40",
-              )}
-            />
-          </label>
-          <Button variant="outline" size="sm" asChild className="shrink-0 gap-1.5 whitespace-nowrap">
-            <Link to="/gateway-guide">
-              <BookOpen className="size-4" />
-              使用说明
-            </Link>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="shrink-0 gap-1.5 whitespace-nowrap"
-            onClick={() => void reload()}
-          >
-            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            刷新
-          </Button>
-        </div>
+
+        <p className="line-clamp-2 min-h-8 text-xs text-muted-foreground">
+          把 Trae / WorkBuddy / Qoder 的额度合成一个池子，按「谁先过期先用谁」供给本机其它 AI
+          工具。默认只监听本机；打开下面「局域网共享」后，同网段设备（NAS、另一台电脑）也能用。
+        </p>
+
+        <GatewayTabs />
       </header>
 
       {error && (

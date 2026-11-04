@@ -467,6 +467,10 @@ pub struct StreamReader {
     finish: Option<String>,
     /// 本次请求的工具定义：收尾时按 schema 校正参数类型（模型常把 number/bool 写成字符串）。
     tools: Value,
+    /// 实时监控的活跃条目 id（0 = 不登记）。
+    live_id: u64,
+    /// 自上次上报以来又收了多少字节（给活跃条目的「已收字节」用）。
+    live_pending: usize,
 }
 
 impl StreamReader {
@@ -482,7 +486,16 @@ impl StreamReader {
             usage: Value::Null,
             finish: None,
             tools: Value::Null,
+            live_id: 0,
+            live_pending: 0,
         }
+    }
+
+    /// 把这条流关联到实时监控的活跃条目（用于「已收字节」进度）。
+    ///
+    /// 单位是**上游原始字节**（含 SSE 帧与 JSON 结构），不是 token —— 界面上按 KB 显示。
+    pub fn set_live(&mut self, id: u64) {
+        self.live_id = id;
     }
 
     /// 带上工具定义：收尾时按 schema 把 `"30000"` / `"true"` 这类字符串纠回数字/布尔。
@@ -507,6 +520,8 @@ impl StreamReader {
             usage: Value::Null,
             finish: None,
             tools: Value::Null,
+            live_id: 0,
+            live_pending: 0,
         }
     }
 
@@ -521,13 +536,24 @@ impl StreamReader {
     ///
     /// ⚠️ 空闲超时分两档：还没吐过任何东西时给 90 秒（排队、冷启动），
     /// 已经在吐的时候只等 3 秒（Qoder 的流答完不关连接，只能靠空闲判结束）。
+    /// 把累积的字节数上报给实时监控（攒着批量报，避免每行一次加锁）。
+    fn flush_live(&mut self) {
+        if self.live_pending > 0 {
+            crate::modules::gateway_live::note_output(self.live_id, self.live_pending);
+            self.live_pending = 0;
+        }
+    }
+
     pub async fn next_batch(&mut self) -> Result<Option<Vec<Delta>>, String> {
         use futures_util::StreamExt;
         loop {
             if let Some(pos) = self.buf.find('\n') {
                 let line: String = self.buf.drain(..=pos).collect();
+                // 实时监控：按上游**原始字节**累加（含 SSE/JSON 开销，不等于 token）。
+                self.live_pending += line.len();
                 let out = self.parse_line(&line)?;
                 if !out.is_empty() {
+                    self.flush_live();
                     return Ok(Some(out));
                 }
                 continue;
@@ -537,7 +563,9 @@ impl StreamReader {
                     return Ok(None);
                 }
                 let rest = std::mem::take(&mut self.buf);
+                self.live_pending += rest.len();
                 let out = self.parse_line(&rest)?;
+                self.flush_live();
                 return Ok(if out.is_empty() { None } else { Some(out) });
             }
             // 首包前给 90 秒（排队 / 冷启动）；吐过内容后按上游分档（见 `Kind::idle_after_start_secs`）。
@@ -920,6 +948,22 @@ impl Emitter {
 /// `tokio::mpsc::Receiver` → `Stream`（不引新依赖，也不依赖 `futures` 的 unfold 特性门）。
 struct RxStream {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    /// 实时监控的活跃条目 id：响应体被丢弃时（= 客户端断开 / 用户手动停止）立刻摘掉它。
+    live_id: u64,
+}
+
+/// 响应体一被丢弃就收尾。
+///
+/// ⚠️ 这就是「手动停止任务后，面板里还显示在跑」的修法：客户端断开时 axum 丢掉响应体，
+/// 而生产端的 `tx.send` 要等**下一块上游数据**才会失败 —— 中间可能几十秒；
+/// 若上游正好在长时间思考，则更久。挂在响应体上的守护在断开那一刻就生效。
+///
+/// 正常结束不会误伤：`finish()` 在关掉 `tx` 之前就跑了，条目已经不在活跃表里，
+/// 这里再 `abandon` 一次是幂等的。
+impl Drop for RxStream {
+    fn drop(&mut self) {
+        crate::modules::gateway_live::abandon(self.live_id);
+    }
 }
 
 impl futures_util::Stream for RxStream {
@@ -938,6 +982,7 @@ pub fn respond(
     pending: Vec<Delta>,
     mut trace: Trace,
 ) -> Response {
+    let live_id = trace.live_id;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let head = em.opening_frame();
@@ -961,7 +1006,7 @@ pub fn respond(
         pump_reader(&mut em, &mut reader, &tx, &mut trace).await;
     });
 
-    sse_response(rx)
+    sse_response(rx, live_id)
 }
 
 /// 把 reader 读到结束，边读边发；收尾统一交给 `em`（错误帧 / 结束帧）。
@@ -1022,7 +1067,10 @@ async fn pump_reader(
     }
 }
 
-fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Response {
+fn sse_response(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    live_id: u64,
+) -> Response {
     (
         StatusCode::OK,
         [
@@ -1030,7 +1078,7 @@ fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>) 
             (header::CACHE_CONTROL, "no-cache"),
             (header::CONNECTION, "keep-alive"),
         ],
-        Body::from_stream(RxStream { rx }),
+        Body::from_stream(RxStream { rx, live_id }),
     )
         .into_response()
 }
@@ -1064,6 +1112,7 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(StreamReader, Vec<Delta>), OpenFail>> + Send,
 {
+    let live_id = trace.live_id;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let head = em.opening_frame();
@@ -1132,7 +1181,7 @@ where
         pump_reader(&mut em, &mut reader, &tx, &mut trace).await;
     });
 
-    sse_response(rx)
+    sse_response(rx, live_id)
 }
 
 /// 把上游的「上下文缓存命中」字段归一化成各家客户端都认得的样子。
@@ -1216,6 +1265,8 @@ pub fn passthrough(
     rewrite_model: Option<(String, String)>,
 ) -> Response {
     use futures_util::StreamExt;
+    // 生产端会把 `trace` move 进任务；响应体上的断开守护要用这个 id，先取出来。
+    let live_id = trace.live_id;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
@@ -1236,6 +1287,7 @@ pub fn passthrough(
                         None => b,
                     };
                     seen += b.len();
+                    crate::modules::gateway_live::note_output(trace.live_id, b.len());
                     if trace.first_byte_ms.is_none() {
                         trace.first_byte();
                     }
@@ -1276,7 +1328,7 @@ pub fn passthrough(
             (header::CACHE_CONTROL, "no-cache"),
             (header::CONNECTION, "keep-alive"),
         ],
-        Body::from_stream(RxStream { rx }),
+        Body::from_stream(RxStream { rx, live_id }),
     )
         .into_response()
 }
@@ -1541,6 +1593,41 @@ mod idle_tests {
         assert!(
             Kind::Trae.idle_after_start_secs() >= 60,
             "Trae 有结束事件，空闲档只是兜底，不能短到掐断思考"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_stream_tests {
+    use super::RxStream;
+
+    /// 客户端断开（响应体被丢弃）那一刻，活跃条目必须立刻消失。
+    ///
+    /// 生产端的 `tx.send` 要等下一块上游数据才失败；上游在思考时可能很久。
+    #[test]
+    fn dropping_response_body_clears_active() {
+        let _g = crate::modules::gateway_live::test_lock();
+        let before = crate::modules::gateway_live::snapshot(60)["kpi"]["active"]
+            .as_u64()
+            .unwrap();
+        let id = crate::modules::gateway_live::start("m-drop", "trae-cn", None);
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(4);
+            let body = RxStream { rx, live_id: id };
+            assert_eq!(
+                crate::modules::gateway_live::snapshot(60)["kpi"]["active"]
+                    .as_u64()
+                    .unwrap(),
+                before + 1
+            );
+            drop(body); // 模拟客户端断开
+        }
+        assert_eq!(
+            crate::modules::gateway_live::snapshot(60)["kpi"]["active"]
+                .as_u64()
+                .unwrap(),
+            before,
+            "响应体丢弃后不该还挂在「正在跑」"
         );
     }
 }

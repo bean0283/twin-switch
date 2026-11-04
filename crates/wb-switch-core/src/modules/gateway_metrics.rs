@@ -74,6 +74,12 @@ pub struct Trace {
     /// 由 `chat()` 在校验 Key 之后填。换号重试时 clone 出去的每份都带着它 ——
     /// 但只有最终落盘的那份会 `finish()`，所以用量只记一次，不会因为换号重复计。
     pub key_id: Option<String>,
+    /// 实时监控里的活跃条目 id（0 = 没登记）。
+    ///
+    /// 在 [`Trace::new`] 里登记（那时还不知道 scope / 账号，key 也没定），
+    /// scope / key 由 [`Trace::hit`] 补上，最后由 [`Trace::finish`] 收尾。
+    /// **换号重试不重复登记**：克隆共享同一个 id，一条用户请求只算一个活跃。
+    pub live_id: u64,
     /// 已经写过盘，避免同一份记录落两行。
     ///
     /// ⚠️ 故意**不用** `Arc<AtomicBool>`：换号重试时每次尝试都是 `Clone` 出来的一份，
@@ -84,6 +90,13 @@ pub struct Trace {
 
 impl Trace {
     pub fn new(model: &str, stream: bool) -> Self {
+        // ★ 实时监控的活跃条目**在这里登记**，不在 `hit()`。
+        //
+        // 以前在 `hit()` 里登记，而换号重试用的是 `trace.clone()` + `hit()`：
+        // 每个克隆的 `live_id` 都是 0 ⇒ **每个克隆都新登记一条**，而只有最后成功的
+        // 那条会 `finish`。于是「正在跑」只增不减（用户 2026-11-04：手动停了任务，
+        // 面板还显示在跑）。现在按 Trace 实例登记，克隆自带同一个 id，天然只算一条。
+        let live_id = crate::modules::gateway_live::start(model, "", None);
         Self {
             model: model.to_string(),
             scope: String::new(),
@@ -105,6 +118,7 @@ impl Trace {
             conv: String::new(),
             cached_tokens: None,
             key_id: None,
+            live_id,
             logged: false,
         }
     }
@@ -117,6 +131,9 @@ impl Trace {
     pub fn hit(&mut self, scope: &str, account: &str) {
         self.scope = scope.to_string();
         self.account = account.to_string();
+        // 条目已在 `new()` 里登记过（克隆共享同一个 id），这里只补「最终用的是谁」。
+        crate::modules::gateway_live::set_scope(self.live_id, scope);
+        crate::modules::gateway_live::set_key(self.live_id, self.key_id.as_deref());
     }
 
     pub fn note_failover(&mut self) {
@@ -140,6 +157,8 @@ impl Trace {
     pub fn first_byte(&mut self) {
         if self.first_byte_ms.is_none() {
             self.first_byte_ms = Some(self.elapsed_ms());
+            // 实时监控：活跃条目从「等首字」切到「输出中」。
+            crate::modules::gateway_live::first_byte(self.live_id);
         }
     }
 
@@ -176,6 +195,15 @@ impl Trace {
                 self.completion_tokens,
             );
         }
+        // 实时监控收尾（活跃 -1 + 计入秒桶/分钟桶）。与落盘同一收口，不会漏也不会重复。
+        crate::modules::gateway_live::finish(
+            self.live_id,
+            ok,
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.first_byte_ms,
+            self.queued,
+        );
         let flat: String = err
             .replace(['\n', '\r', '\t'], " ")
             .chars()
@@ -238,5 +266,36 @@ fn append(line: &str) {
     {
         let _ = f.write_all(line.as_bytes());
         let _ = f.write_all(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod live_link_tests {
+    use super::Trace;
+
+    /// 换号重试的真实形状是 `trace.clone()` + `hit()`：**一条用户请求只能算一条活跃**。
+    ///
+    /// 2026-11-04 用户报「手动停止任务，监控里还在跑」——根因就是每个克隆都各自登记，
+    /// 只有最后收尾的那条会被摘掉，其余永远挂着。
+    #[test]
+    fn trace_clones_share_one_live_entry() {
+        let _g = crate::modules::gateway_live::test_lock();
+        let before = crate::modules::gateway_live::snapshot(60)["kpi"]["active"]
+            .as_u64()
+            .unwrap();
+
+        let mut base = Trace::new("m-clone", true);
+        base.key_id = Some("k1".into());
+        let mut a = base.clone();
+        a.hit("trae-cn", "acc1");
+        let mut b = base.clone();
+        b.hit("trae-cn", "acc2");
+
+        let active = crate::modules::gateway_live::snapshot(60)["kpi"]["active"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(active - before, 1, "克隆必须共享同一个 live_id");
+
+        crate::modules::gateway_live::abandon(base.live_id);
     }
 }

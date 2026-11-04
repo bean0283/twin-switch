@@ -18,7 +18,7 @@ use wb_switch_core::modules::{
     workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
     workbuddy_vault,
 };
-use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
+use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -3997,6 +3997,15 @@ pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
         "enabled": gateway_server::enabled(),
         "status": gateway_server::status(),
     }))
+}
+
+/// 积分共享的**实时监控**快照：内存态，不读磁盘，前端每秒拉一次。
+///
+/// `window_secs` 支持 60 / 300 / 3600（其它值就近取）。字段见
+/// `crates/wb-switch-core/src/modules/gateway_live.rs` 的 `snapshot`。
+#[tauri::command]
+pub fn gateway_live_stats(window_secs: Option<u64>) -> Result<Value, String> {
+    Ok(gateway_live::snapshot(window_secs.unwrap_or(60)))
 }
 
 /// 局域网开关：开了才绑 `0.0.0.0`（局域网其它设备能连），默认只绑回环。
