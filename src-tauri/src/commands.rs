@@ -3068,6 +3068,11 @@ mod main_thread_guard {
         // 真正的路径解析（含一次性的旧目录搬迁）已经在 `lib.rs::run()` 里、
         // 任何命令可能被调用之前跑完了，所以这里不会碰磁盘。
         "store_dir_info",
+        // 实时监控快照：只读进程内的秒级桶（`gateway_live::snapshot`），
+        // 不碰磁盘、不发请求。窗口被 clamp 到 3600 个桶，聚合是纯内存循环。
+        // ⚠️ 这条原来漏登记，导致 `heavy_commands_must_not_be_sync` 在
+        //    feat/gateway-live-monitor 分支上直接是红的（2026-11-04 合并时补上）。
+        "gateway_live_stats",
     ];
 
     /// 扫自己的源码：任何被 `#[tauri::command]` 标注的**同步** `pub fn`
