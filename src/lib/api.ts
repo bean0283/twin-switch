@@ -2586,6 +2586,82 @@ export async function gatewaySetEnabled(
 }
 
 
+/** 实时监控：KPI。速率都按窗口秒数折算（`tok/s`、`req/min`）。 */
+export interface GatewayLiveKpi {
+  windowSecs: number;
+  requests: number;
+  rpm: number;
+  inTokPerSec: number;
+  outTokPerSec: number;
+  failed: number;
+  /**
+   * 被中断的请求（客户端点了停止 / 连接断开）。
+   *
+   * 刻意**不并入 `requests` / `failed`**：中断既不算成功也不算失败，更没有 token。
+   * 面板用它来解释「为什么窗口里全是 0」—— 不是你点的时候统计坏了，是请求被停了。
+   */
+  aborted: number;
+  queued: number;
+  active: number;
+  /** 首字**均值**（桶里只存了和与个数，不是中位数）。 */
+  ttftAvgMs: number;
+  ttftSamples: number;
+}
+
+export interface GatewayLivePoint {
+  t: number;
+  inTok: number;
+  outTok: number;
+  requests: number;
+  failed: number;
+}
+
+export interface GatewayLiveActive {
+  model: string;
+  scope: string;
+  key: string;
+  elapsedMs: number;
+  ttftMs: number | null;
+  /** `waiting` = 还没吐首字；`streaming` = 已经在输出。 */
+  phase: "waiting" | "streaming";
+  /** 已收上游原始字节（含 SSE/JSON 开销，**不是 token**）。 */
+  gotBytes: number;
+}
+
+export interface GatewayLiveKeyRow {
+  key: string;
+  keyId: string;
+  promptTokens: number;
+  completionTokens: number;
+  requests: number;
+  active: number;
+}
+
+export interface GatewayLiveAlert {
+  level: "info" | "warn" | "error";
+  kind: string;
+  text: string;
+  hint: string;
+}
+
+export interface GatewayLiveSnapshot {
+  kpi: GatewayLiveKpi;
+  series: GatewayLivePoint[];
+  active: GatewayLiveActive[];
+  keys: GatewayLiveKeyRow[];
+  alerts: GatewayLiveAlert[];
+  sampledAt: number;
+}
+
+/**
+ * 实时监控快照（内存态，不读磁盘）。
+ *
+ * `windowSecs` 支持 60 / 300 / 3600。前端每秒拉一次；页面不可见时不要拉。
+ */
+export async function gatewayLiveStats(windowSecs = 60): Promise<GatewayLiveSnapshot> {
+  return invoke("gateway_live_stats", { windowSecs });
+}
+
 /**
  * 局域网共享开关。开了才绑 `0.0.0.0`（同网段其它设备能连），默认只绑回环。
  *

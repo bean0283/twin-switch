@@ -1238,6 +1238,14 @@ async fn chat(
         );
     }
     let mut trace = Trace::new(&model, want_stream);
+    // 活跃条目的守卫：**离开这个函数的任何路径**都要摘掉这条「正在跑」。
+    //
+    // 2026-11-04 实测：流式请求发出后用户立刻点了停止 —— 此时上游还没回响应头，
+    // 函数还 await 在 `forward` 里，hyper 丢掉整个 future，于是既没有 `finish`
+    // 也没有 `RxStream`（它还没被造出来），条目就挂在「正在跑」里直到 20 分钟兜底清扫。
+    // 所以守卫不能按 `want_stream` 分叉，必须**一律持有**；
+    // 真正把 body 交出去的流式成功分支调 `disarm()` 移交寿命（见 `Upstream::Sse`）。
+    let mut live_scope = crate::modules::gateway_live::ActiveGuard(trace.live_id);
     // 会话身份前 8 位进指标：用户报「同一段对话拆成两条记录 / 跨天累加」时，
     // 直接看这一列就知道**是我们中途换了 id**，还是上游自己归账的问题。
     // 身份 = 模型 + 归一化首条 user（不含 uid、不含日期），见 `gateway_stream`。
@@ -1307,6 +1315,9 @@ async fn chat(
                 gateway_keys::touch(&key.id);
                 gateway_pool::clear_cooldown(&cand.key, Some(&bare));
                 // 指标在流结束时由 `gateway_stream::respond` 落盘（那时才知道 ttft 与用量）。
+                // 寿命移交：从现在起「正在跑」由响应体上的 `RxStream` 与 `Trace::finish` 管，
+                // 函数返回不再等于请求结束。
+                live_scope.disarm();
                 return resp;
             }
             Err((code, msg)) => {
@@ -2756,6 +2767,7 @@ async fn open_qoder_stream(
     shown: &str,
     messages: &Value,
     tools: &Value,
+    live_id: u64,
 ) -> Result<(StreamReader, Vec<Delta>), OpenFail> {
     let resp = crate::modules::qoder_tools::chat_open(
         region,
@@ -2776,6 +2788,8 @@ async fn open_qoder_stream(
         }
     };
     let mut reader = StreamReader::new(resp, Kind::Qoder).with_tools(tools);
+    // 关联实时监控：这条流的「已收字节」要能出现在活跃列表里。
+    reader.set_live(live_id);
     match reader.next_batch().await {
         Ok(Some(first)) => Ok((reader, first)),
         Ok(None) => Err(OpenFail::Fatal(
@@ -2845,6 +2859,8 @@ async fn qoder_stream(
     // 「模型请求正在排队·预计等待不足 1 分钟」是同一个意思。
     // 收尾时按 schema 校正工具参数类型要用同一份 tools（闭包会把它 move 走，先留一份）。
     let tools_for_emitter = tools.clone();
+    // 实时监控的活跃条目 id（`trace` 后面会被闭包外的逻辑用到，这里先取出来传进去）。
+    let live_id = trace.live_id;
     let open = move || {
         let region = region;
         let acc = acc.clone();
@@ -2865,7 +2881,7 @@ async fn qoder_stream(
             // 而排队（Queued）绝对不能换号（队列是模型级的，换号只会再排一次）。
             let mut last: Option<OpenFail> = None;
             for attempt in 0..2 {
-                match open_qoder_stream(region, &acc, &model, &shown, &messages, &tools).await {
+                match open_qoder_stream(region, &acc, &model, &shown, &messages, &tools, live_id).await {
                     Ok(v) => return Ok(v),
                     Err(queued @ OpenFail::Queued { .. }) => return Err(queued),
                     Err(OpenFail::Fatal(e)) => {
@@ -3426,6 +3442,8 @@ async fn trae_stream(
     }
     let mut reader = StreamReader::new(resp, Kind::Trae)
         .with_tools(req.get("tools").unwrap_or(&Value::Null));
+    // 关联实时监控：这条流的「已收字节」要能出现在活跃列表里。
+    reader.set_live(trace.live_id);
     let first = match reader.next_batch().await {
         Ok(Some(v)) => v,
         Ok(None) => {

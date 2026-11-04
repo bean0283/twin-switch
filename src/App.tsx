@@ -24,6 +24,7 @@ import WorkbuddyCleanupPage from "@/pages/WorkbuddyCleanupPage";
 import QoderCleanupPage from "@/pages/QoderCleanupPage";
 import TraeCleanupPage from "@/pages/TraeCleanupPage";
 import SettingsPage from "@/pages/SettingsPage";
+import GatewayLivePage from "@/pages/GatewayLivePage";
 import GatewayPage from "@/pages/GatewayPage";
 import GatewayGuidePage from "@/pages/GatewayGuidePage";
 import QoderAccountsPage from "@/pages/QoderAccountsPage";
@@ -285,6 +286,7 @@ export default function App() {
             <Route path="/sessions" element={<SessionsHubPage />} />
             <Route path="/qoder-sessions" element={<QoderSessionsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />
+            <Route path="/gateway/live" element={<GatewayLivePage />} />
             <Route path="/gateway-guide" element={<GatewayGuidePage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

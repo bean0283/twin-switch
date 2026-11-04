@@ -241,6 +241,7 @@ pub fn run() {
             commands::gateway_status,
             commands::gateway_guide_selftest,
             commands::gateway_set_enabled,
+            commands::gateway_live_stats,
             commands::gateway_set_lan,
             commands::gateway_pool,
             commands::gateway_routing,
