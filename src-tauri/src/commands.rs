@@ -3969,23 +3969,34 @@ pub async fn qoder_account_set_cosy(    region: String,
 
 
 /// 积分共享总开关：关掉会**真的停掉网关**（释放端口），不只是隐藏入口。
+///
+/// ⚠️ 2026-11-04 用户反馈「开关经常无效，要重启软件」：以前是 `spawn(restart)` 后
+/// 就立刻返回 Ok —— 重启失败只往 stderr 打一行，界面永远停在「开关是开的、状态未启动」。
+/// 现在**等它真的起来 / 真的停下**，失败如实报错并把配置回滚，界面才有得看。
 #[tauri::command]
 pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
+    let port = gateway_keys::GATEWAY_PORT;
     gateway_server::set_enabled(enabled)?;
     if enabled {
-        let port = gateway_keys::GATEWAY_PORT;
-        tauri::async_runtime::spawn(async move {
-            // `restart` 而不是 `serve`：刚关过的话旧实例还在退出，`serve` 会因幂等直接返回，
-            // 结果「开关是开的、端口没人听」。
-            if let Err(e) = gateway_server::restart(port).await {
-                eprintln!("[gateway] {e}");
-            }
-        });
-        gateway_wait_listening(gateway_keys::GATEWAY_PORT, 4000).await;
-    } else {
-        gateway_server::request_stop();
+        if let Err(e) = gateway_server::restart(port).await {
+            let _ = gateway_server::set_enabled(false);
+            return Err(format!("没能启动网关：{e}"));
+        }
+        if !gateway_wait_listening(port, 4000).await {
+            let _ = gateway_server::set_enabled(false);
+            return Err(format!(
+                "网关启动后 4 秒内没在端口 {port} 上应答（可能被安全软件拦了）"
+            ));
+        }
+    } else if let Err(e) = gateway_server::stop(5000).await {
+        // 停不掉就把配置改回去：不能留下「文件里关着、实际还在监听」的状态
+        let _ = gateway_server::set_enabled(true);
+        return Err(format!("没能停掉网关：{e}"));
     }
-    Ok(json!({ "enabled": enabled, "status": gateway_server::status() }))
+    Ok(json!({
+        "enabled": gateway_server::enabled(),
+        "status": gateway_server::status(),
+    }))
 }
 
 /// 局域网开关：开了才绑 `0.0.0.0`（局域网其它设备能连），默认只绑回环。
@@ -3993,19 +4004,28 @@ pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
 /// ⚠️ 改绑定地址必须**重绑端口**，所以这里会重启网关 —— 正在生成的对话会断。
 #[tauri::command]
 pub async fn gateway_set_lan(lan: bool) -> Result<Value, String> {
+    let prev = gateway_server::lan_enabled();
     gateway_server::set_lan(lan)?;
     // 总开关关着的时候不需要重绑（根本没监听），改配置就够了，下次启动生效。
     let enabled = gateway_server::enabled();
     if enabled {
         let port = gateway_keys::GATEWAY_PORT;
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = gateway_server::restart(port).await {
-                eprintln!("[gateway] {e}");
-            }
-        });
-        gateway_wait_listening(gateway_keys::GATEWAY_PORT, 5000).await;
+        if let Err(e) = gateway_server::restart(port).await {
+            let _ = gateway_server::set_lan(prev);
+            return Err(format!("没能切换绑定地址：{e}"));
+        }
+        if !gateway_wait_listening(port, 5000).await {
+            let _ = gateway_server::set_lan(prev);
+            return Err(format!(
+                "切换后 5 秒内没在端口 {port} 上应答，已回退到原来的绑定方式"
+            ));
+        }
     }
-    Ok(json!({ "lan": lan, "enabled": enabled, "status": gateway_server::status() }))
+    Ok(json!({
+        "lan": gateway_server::lan_enabled(),
+        "enabled": enabled,
+        "status": gateway_server::status(),
+    }))
 }
 
 /// 等端口真有应答（`127.0.0.1:<port>` 能连上）。返回是否连上 —— 超时不算成功。

@@ -407,17 +407,62 @@ async fn wait_stopped(timeout_ms: u64) -> bool {
     true
 }
 
+/// 收到停止信号后，最多再等这么久让在途请求收尾；超时就直接丢弃 serve 任务。
+///
+/// 取 2 秒：正常收尾（没有长连接）在几十毫秒内完成；而流式代理一条对话动辄几分钟，
+/// 不能让它把「关开关」这个动作拖住。
+const STOP_GRACE_MS: u64 = 2_000;
+
+/// 起网关并在后台跑循环，**绑定成功就返回**（不等它退出）。
+///
+/// 这是「用户点开关」该用的入口：交互只需要知道「起来了没有」，
+/// 不需要陪着 serve 跑一整天。给启动路径用的是 [`serve`]（前台等）。
+pub async fn start(port: u16) -> Result<(), String> {
+    let _guard = toggle_lock().lock().await;
+    stop(3000).await?;
+    match spawn_serve(port).await? {
+        // 已经有一个在跑（`stop` 之后不该出现，防御性处理）
+        None => Ok(()),
+        // 丢掉 JoinHandle 只是 **detach**（tokio 里任务照跑），循环自己在退出时清状态。
+        Some(handle) => {
+            drop(handle);
+            Ok(())
+        }
+    }
+}
+
 /// 换绑定模式 / 改端口后**真的重启**：停旧 → 等端口释放 → 起新。必须在一个 tokio 运行时里调用。
 ///
-/// 这是 `serve` 的推荐入口（`serve` 保留幂等语义，给启动时用）。
+/// ⚠️ 语义是「**重启并返回**」，不是「陪着服务跑到停」—— 名字沿用历史，行为等同 [`start`]。
+/// 以前的 `restart` 末尾是 `serve(port).await`，会一直不返回；调用方只能 `spawn` 它再去
+/// poll 端口，这也正是「开关没反应」那套两段式刷新绕不开的原因。
 pub async fn restart(port: u16) -> Result<(), String> {
-    request_stop();
-    if !wait_stopped(3000).await {
-        let msg = "旧网关实例 3 秒内没退出（可能有正在进行的对话），本次没重新监听；再点一次开关即可";
-        set_last_error(Some(msg.to_string()));
-        return Err(msg.to_string());
+    start(port).await
+}
+
+/// 开关/重启的串行锁（见 [`start`]）。
+fn toggle_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// 停网关，并**等到它真的退出**（`STARTED_AT` 归零、端口已释放）才返回。
+///
+/// ⚠️ 这是 2026-11-04 那个「开关经常没反应、要重启软件」的核心：以前关开关只
+/// `request_stop()` 发个信号就返回，界面立刻去读状态——此时旧实例还在优雅退出，
+/// 端口没放；用户再点「开」，`restart` 等 3 秒等不到就放弃。两次一折腾就卡死在
+/// 「开关是开的、端口没人听」，只能重启软件。
+pub async fn stop(timeout_ms: u64) -> Result<(), String> {
+    if STARTED_AT.load(Ordering::Relaxed) == 0 {
+        return Ok(());
     }
-    serve(port).await
+    request_stop();
+    if wait_stopped(timeout_ms).await {
+        return Ok(());
+    }
+    let msg = format!("网关 {timeout_ms} ms 内还没停下来（仍有连接在收尾），请再点一次开关");
+    set_last_error(Some(msg.clone()));
+    Err(msg)
 }
 
 /// 启动时的 `serve`：**端口暂时被占就退避重试**，直到起来或预算用完。
@@ -470,9 +515,22 @@ pub fn bind_ip(lan: bool) -> [u8; 4] {
     }
 }
 
+/// 前台跑网关（启动路径用）：绑定成功后一直跑到有人喊停。
 pub async fn serve(port: u16) -> Result<(), String> {
+    match spawn_serve(port).await? {
+        None => Ok(()),
+        Some(handle) => handle.await.map_err(|e| format!("网关任务异常：{e}"))?,
+    }
+}
+
+/// 绑定端口 → 起后台循环 → **立刻返回 JoinHandle**；绑定失败直接 Err。
+///
+/// 返回 `None` 表示已经有一个在跑（保持 `serve` 原来的幂等语义）。
+async fn spawn_serve(
+    port: u16,
+) -> Result<Option<tokio::task::JoinHandle<Result<(), String>>>, String> {
     if STARTED_AT.load(Ordering::Relaxed) > 0 {
-        return Ok(());
+        return Ok(None);
     }
     // 绑定地址由 `lan` 开关决定：默认只听回环。
     let lan = lan_enabled();
@@ -503,27 +561,79 @@ pub async fn serve(port: u16) -> Result<(), String> {
         let _ = crate::modules::trae_credits::query(None, false).await;
     });
     let app = build_router();
-    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let (tx, _) = tokio::sync::watch::channel(false);
+    // 两个订阅者：一个交给 axum 的 graceful shutdown，一个留给循环等「有人喊停」。
+    let mut rx_stop = tx.subscribe();
+    let mut rx_grace = tx.subscribe();
     if let Ok(mut guard) = shutdown_tx().lock() {
         *guard = Some(tx);
     }
-    let result = axum::serve(
-        listener,
-        // 必须带 connect info：`lan_guard` 靠它判断「这个请求是不是从本机来的」。
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        // 关掉开关时收到 `true` → 优雅退出并释放端口。
-        let _ = rx.changed().await;
-    })
-    .await
-    .map_err(|e| format!("网关退出：{e}"));
-    STARTED_AT.store(0, Ordering::Relaxed);
-    LAN_ACTIVE.store(false, Ordering::Relaxed);
-    if let Ok(mut guard) = shutdown_tx().lock() {
-        *guard = None;
+
+    Ok(Some(tokio::spawn(async move {
+        let mut inner = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                // 必须带 connect info：`lan_guard` 靠它判断「这个请求是不是从本机来的」。
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                // 关掉开关时收到 `true` → 优雅退出并释放端口。
+                let _ = rx_grace.changed().await;
+            })
+            .await
+        });
+
+        // ⚠️⚠️ 停止必须有**硬上限**（2026-11-04 用户反馈「开关经常无效、要重启软件」）。
+        //
+        // axum 的 graceful shutdown 会一直等所有连接结束；网关做流式代理，一条对话的
+        // SSE 可以挂几分钟，客户端还常保持 keep-alive。以前这里没有上限，
+        // `restart` 等 3 秒就放弃 ⇒ 状态卡在「开关开着但端口没人听」，只能重启进程。
+        //
+        // 现在的语义：收到停止信号 → 最多再等 `STOP_GRACE_MS` 让在途请求收尾 →
+        // 还没结束就 abort 掉 serve 任务（监听与连接一并关闭，端口立刻释放）。
+        // 用户点「关」就是要它停，正在生成的对话本来就该断（界面上已写明）。
+        //
+        // 顺序要紧：先 abort + await（**端口真的放开**），再清 `STARTED_AT`。
+        // 反过来的话 `stop()` 会在端口还占着时就返回，紧接着的 `bind` 会撞「端口被占用」。
+        let result = tokio::select! {
+            r = &mut inner => join_result(r),
+            _ = rx_stop.changed() => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(STOP_GRACE_MS),
+                    &mut inner,
+                )
+                .await
+                {
+                    Ok(r) => join_result(r),
+                    Err(_) => {
+                        eprintln!(
+                            "[gateway] {STOP_GRACE_MS} ms 内仍有连接没收尾，强制停止（端口已释放）"
+                        );
+                        inner.abort();
+                        let _ = inner.await;
+                        Ok(())
+                    }
+                }
+            }
+        };
+        STARTED_AT.store(0, Ordering::Relaxed);
+        LAN_ACTIVE.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = shutdown_tx().lock() {
+            *guard = None;
+        }
+        result
+    })))
+}
+
+/// serve 任务的结束结果 → 统一错误文案。
+fn join_result(
+    r: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("网关退出：{e}")),
+        Err(e) => Err(format!("网关任务异常：{e}")),
     }
-    result
 }
 
 /// 请求体上限（字节）。
@@ -3744,6 +3854,20 @@ fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+    /// 没在跑的时候 `stop()` 必须**立刻**返回。
+    ///
+    /// 否则用户点「关」会白等满超时预算（3 秒），体感就是「点了没反应」。
+    #[tokio::test]
+    async fn stop_returns_immediately_when_not_running() {
+        let t = std::time::Instant::now();
+        let r = super::stop(500).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(200),
+            "空转的 stop 不该等：{:?}",
+            t.elapsed()
+        );
+    }
     use super::*;
 
     /// 模型把 number/boolean 写成字符串时，按 schema 纠回来 —— 否则客户端

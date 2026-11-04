@@ -2573,8 +2573,15 @@ export async function qoderAccountSetCosy(
 }
 
 
-/** 积分共享总开关（关闭会真的停掉网关）。 */
-export async function gatewaySetEnabled(enabled: boolean): Promise<{ enabled: boolean }> {
+/**
+ * 积分共享总开关（关闭会真的停掉网关）。
+ *
+ * 命令层会**等到端口真的起来 / 真的停掉**才返回，所以这里带 `status`：
+ * 调用方直接用它更新界面，不必再 poll 一次（两段式刷新最容易前后矛盾）。
+ */
+export async function gatewaySetEnabled(
+  enabled: boolean,
+): Promise<{ enabled: boolean; status: unknown }> {
   return invoke("gateway_set_enabled", { enabled });
 }
 

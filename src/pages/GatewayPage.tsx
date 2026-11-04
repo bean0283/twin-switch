@@ -447,6 +447,8 @@ export default function GatewayPage() {
   const [scanning, setScanning] = useState(false);
   /// 积分共享总开关（关闭会真的停网关）。
   const [gwOn, setGwOn] = useState(true);
+  /// 开关正在生效中（起/停都要等端口真的变化，期间禁掉开关，避免连点两次抢端口）。
+  const [gwBusy, setGwBusy] = useState(false);
   /// 局域网共享（真的绑 0.0.0.0 才为 true）。切换会重启网关。
   const [lanOn, setLanOn] = useState(false);
   const [lanBusy, setLanBusy] = useState(false);
@@ -847,6 +849,35 @@ export default function GatewayPage() {
     return strip(status?.localAddr ?? `http://127.0.0.1:${status?.port ?? 57892}/v1`);
   }, [status]);
 
+  /// 总开关。命令层已经**等到端口真的起来/真的停掉**才返回，所以这里以返回的
+  /// `status.running` 为准，不再「发一次命令再 poll 一次」—— 两段式刷新最容易前后矛盾。
+  const toggleGw = useCallback(async (on: boolean) => {
+    setGwBusy(true);
+    setError(null);
+    setGwOn(on); // 乐观更新，失败回滚
+    try {
+      const r = await gatewaySetEnabled(on);
+      const s = r.status as Status | undefined;
+      if (s) setStatus(s);
+      const running = Boolean(s?.running);
+      setGwOn(running);
+      if (on && !running) {
+        toast.error("网关没能启动", {
+          description: s?.bindError ?? "端口没起来，看看是不是被安全软件拦了",
+        });
+      } else if (on) {
+        toast.success("积分共享已开启", { description: "网关已开始监听端口" });
+      } else {
+        toast.success("积分共享已关闭", { description: "网关已停止监听，端口已释放" });
+      }
+    } catch (err) {
+      setError(String(err));
+      setGwOn(!on);
+    } finally {
+      setGwBusy(false);
+    }
+  }, []);
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-6">
       <header className="flex flex-wrap items-start justify-between gap-3">
@@ -871,16 +902,8 @@ export default function GatewayPage() {
           >
             <Switch
               checked={gwOn}
-              onCheckedChange={async (on) => {
-                setGwOn(on);
-                try {
-                  await gatewaySetEnabled(on);
-                  await reload();
-                } catch (err) {
-                  setError(String(err));
-                  setGwOn(!on);
-                }
-              }}
+              disabled={gwBusy}
+              onCheckedChange={(on) => void toggleGw(on)}
             />
             <span className={cn("font-medium", !gwOn && "text-muted-foreground")}>积分共享</span>
             <span
