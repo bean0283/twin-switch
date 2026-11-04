@@ -15,6 +15,12 @@ import type { UpdateSnapshot } from "@/lib/types";
 import { openReleaseUrl } from "@/lib/update";
 import { useUpdateState } from "@/lib/use-update-state";
 import { cn } from "@/lib/utils";
+import {
+  isGrowthRevealed,
+  matchGrowthShortcut,
+  tapVersion,
+  toggleGrowthReveal,
+} from "@/lib/growth-reveal";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -81,7 +87,26 @@ export function UpdateEntry({ fallbackVersion }: { fallbackVersion?: string }) {
 
   const busy = snapshot.phase === "checking" || snapshot.phase === "downloading";
   const line = statusLine(snapshot);
-  const version = snapshot.current || fallbackVersion || "0.4.9";
+  const version = snapshot.current || fallbackVersion || "0.4.10";
+
+  /**
+   * 暗号 2：`Ctrl + Shift + Alt + G` 切换成长任务显隐。
+   *
+   * 挂在这里是因为侧栏这个组件全程常驻，不用关心当前在哪个页面。
+   * 用捕获阶段监听，避免被页面里某个输入框的按键处理吞掉。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!matchGrowthShortcut(e)) return;
+      e.preventDefault();
+      toggleGrowthReveal();
+      toast.success(isGrowthRevealed() ? "成长任务已显示" : "成长任务已隐藏", {
+        description: "本次运行有效，重启后恢复隐藏",
+      });
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
 
   useEffect(() => {
     if (snapshot.phase !== "available" || !snapshot.latest) return;
@@ -97,12 +122,22 @@ export function UpdateEntry({ fallbackVersion }: { fallbackVersion?: string }) {
     <>
       <div className="mt-auto select-none px-1 pt-3">
         <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
-          <span
-            className="truncate text-xs text-sidebar-foreground/40"
+          {/* ⚠️ 这行同时是「隐藏入口」的第一个暗号：3 秒内连点 5 次。
+              外观保持原样（不可选中、无 hover 变化），不提示可点。 */}
+          <button
+            type="button"
+            onClick={() => {
+              if (tapVersion()) {
+                toast.success(isGrowthRevealed() ? "成长任务已显示" : "成长任务已隐藏", {
+                  description: "本次运行有效，重启后恢复隐藏",
+                });
+              }
+            }}
+            className="truncate text-left text-xs text-sidebar-foreground/40"
             title={`TwinSwitch v${version}`}
           >
             TwinSwitch v{version}
-          </span>
+          </button>
           <button
             type="button"
             onClick={() => setOpen(true)}

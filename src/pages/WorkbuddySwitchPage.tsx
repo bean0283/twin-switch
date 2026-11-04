@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
@@ -39,6 +39,7 @@ import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
 import { CheckinButton } from "@/components/checkin-button";
 import { WorkbuddyGrowthCard } from "@/components/workbuddy-growth-card";
+import { isGrowthRevealed, subscribeGrowthReveal } from "@/lib/growth-reveal";
 import {
   CreditBlock,
   CreditsDialog,
@@ -196,6 +197,18 @@ function WorkbuddyAccountCard({
 
 export default function WorkbuddySwitchPage() {
   const [list, setList] = useState<WorkbuddyAccountList | null>(null);
+
+  /**
+   * 成长任务是否已用暗号叫出。
+   *
+   * ⚠️ 默认 `false`，而且**不落盘** —— 重启应用一定回到隐藏。
+   * 未叫出时卡片**整个不渲染**：不是 hidden，是不挂载，任务列表的请求也不会发。
+   */
+  const growthRevealed = useSyncExternalStore(
+    subscribeGrowthReveal,
+    isGrowthRevealed,
+    () => false,
+  );
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -959,8 +972,9 @@ export default function WorkbuddySwitchPage() {
         </div>
       )}
 
-      {/* 成长任务：放在账号卡**下方**（先看账号，再处理任务）；可收纳，记住上次状态 */}
-      {accounts.length > 0 ? (
+      {/* 成长任务：**默认隐藏**，靠暗号叫出（版本号连点 5 次 / Ctrl+Shift+Alt+G）。
+          未叫出时不渲染、不请求，页面上不留痕迹。 */}
+      {growthRevealed && accounts.length > 0 ? (
         <div className="mt-8">
           <WorkbuddyGrowthCard
             accounts={accounts.map((a) => ({ id: a.id, name: a.name || a.nickname || a.id }))}
