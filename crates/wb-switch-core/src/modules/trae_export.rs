@@ -924,6 +924,9 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Turn {
     pub role: String,
+    /// 可读正文：**不含**工具调用块，详情弹窗与「查看」用它。
+    pub prose: String,
+    /// 导出用的完整文本（正文 + 工具调用块），MD 导出保持原样。
     pub text: String,
     /// 该轮出现过的工具名（去重，供记忆交接统计）。
     pub tools: Vec<String>,
@@ -1159,10 +1162,20 @@ fn task_tool_blocks(raw: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// `server_history_info.messages` 增量流重组：以 user 为界分组 assistant 文本。
-/// 返回 (分组文本, 每组工具名) 或 None。
-fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>>, Vec<Vec<String>>)> {
+///
+/// 返回 `(分组文本, 每组工具名, 每组纯正文)` 或 None。第三个是 2026-11-04 加的：
+/// 前两个是给 **Markdown 导出**用的（要让用户看到「模型调用了什么工具」），
+/// 而**会话详情的弹窗只该显示对话本身** —— 工具调用已经由 `toolCalls` 计数体现，
+/// 把 `**[Shell]** {"command":…}` 这种块铺在正文里，看起来就是一堆原始 JSON
+/// （用户 2026-11-04 截图：Trae 的详情和 WorkBuddy 完全不是一个东西）。
+fn server_stream_groups(
+    conn: &Connection,
+    sid: &str,
+) -> Option<(Vec<Vec<String>>, Vec<Vec<String>>, Vec<Vec<String>>)> {
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut names: Vec<Vec<String>> = Vec::new();
+    // 只装 `content[].text`，工具块一律不进。
+    let mut prose: Vec<Vec<String>> = Vec::new();
     let mut stmt = conn
         .prepare(
             "SELECT messages FROM server_history_info WHERE conversation_id=? \
@@ -1189,6 +1202,7 @@ fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>
             if role == "user" {
                 groups.push(Vec::new());
                 names.push(Vec::new());
+                prose.push(Vec::new());
                 continue;
             }
             if role != "assistant" {
@@ -1197,8 +1211,11 @@ fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>
             if groups.is_empty() {
                 groups.push(Vec::new());
                 names.push(Vec::new());
+                prose.push(Vec::new());
             }
             let mut texts: Vec<String> = Vec::new();
+            // 同一批正文再喂一份给 `prose`（详情弹窗只认它，工具块不进）。
+            let mut prose_texts: Vec<String> = Vec::new();
             match m.get("content") {
                 Some(Value::Array(arr)) => {
                     for p in arr {
@@ -1207,6 +1224,7 @@ fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>
                                 let t = t.trim();
                                 if !t.is_empty() {
                                     texts.push(t.to_string());
+                                    prose_texts.push(t.to_string());
                                 }
                             }
                         }
@@ -1216,6 +1234,7 @@ fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>
                     let s = s.trim();
                     if !s.is_empty() {
                         texts.push(s.to_string());
+                        prose_texts.push(s.to_string());
                     }
                 }
                 _ => {}
@@ -1243,12 +1262,18 @@ fn server_stream_groups(conn: &Connection, sid: &str) -> Option<(Vec<Vec<String>
                     g.push(t);
                 }
             }
+            let pg = prose.last_mut().unwrap();
+            for t in prose_texts {
+                if pg.is_empty() || pg.last().unwrap() != &t {
+                    pg.push(t);
+                }
+            }
         }
     }
     if groups.is_empty() {
         None
     } else {
-        Some((groups, names))
+        Some((groups, names, prose))
     }
 }
 
@@ -1290,7 +1315,7 @@ pub fn fetch_conversation(conn: &Connection, sid: &str) -> Result<Vec<Turn>, Str
     }
 
     let groups = server_stream_groups(conn, sid);
-    let asst_texts: Option<Vec<String>> = if let Some((g, _)) = &groups {
+    let asst_texts: Option<Vec<String>> = if let Some((g, _, _)) = &groups {
         if g.len() == asst_mids.len() {
             Some(g.iter().map(|x| x.join("\n\n")).collect())
         } else {
@@ -1299,7 +1324,17 @@ pub fn fetch_conversation(conn: &Connection, sid: &str) -> Result<Vec<Turn>, Str
     } else {
         None
     };
-    let group_names: Option<Vec<Vec<String>>> = groups.map(|(_, n)| n);
+    // 同一批分组的「纯正文」（不含工具调用块）—— 只有会话详情用它。
+    let asst_prose: Option<Vec<String>> = if let Some((_, _, p)) = &groups {
+        if p.len() == asst_mids.len() {
+            Some(p.iter().map(|x| x.join("\n\n")).collect())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let group_names: Option<Vec<Vec<String>>> = groups.map(|(_, n, _)| n);
 
     let mut turns: Vec<Turn> = Vec::with_capacity(rows.len());
     let mut asst_i = 0usize;
@@ -1312,7 +1347,8 @@ pub fn fetch_conversation(conn: &Connection, sid: &str) -> Result<Vec<Turn>, Str
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap_or_default();
-            turns.push(Turn { role, text: general_text(&raw), tools: Vec::new() });
+            let tm = general_text(&raw);
+            turns.push(Turn { role, prose: tm.clone(), text: tm, tools: Vec::new() });
         } else {
             let i = asst_i;
             asst_i += 1;
@@ -1359,8 +1395,23 @@ pub fn fetch_conversation(conn: &Connection, sid: &str) -> Result<Vec<Turn>, Str
                     tools.push(n.clone());
                 }
             }
+            // 详情弹窗只显示 `prose`：对话正文 + 该轮最终回答摘要，
+            // **不含** `**[Shell]** {json}` 这类工具块（它们已由 `toolCalls` 计数体现）。
+            // 老库没有 server 事件流时 `assistant_text` 本身是干净的，直接用 text。
+            let mut prose = match &asst_prose {
+                Some(ps) => ps[i].clone(),
+                None => text.clone(),
+            };
+            let sm = &summaries[i];
+            if !sm.is_empty() && !prose.contains(sm.as_str()) {
+                if !prose.is_empty() {
+                    prose.push_str("\n\n");
+                }
+                prose.push_str(sm);
+            }
             turns.push(Turn {
                 role,
+                prose: prose.trim().to_string(),
                 text: text.trim().to_string(),
                 tools,
             });
@@ -1614,6 +1665,10 @@ pub fn session_detail(client_key: &str, session_id: &str) -> Result<Value, Strin
 
 /// 把扁平的 user/assistant 消息序列配对成「提问 + 回答」回合。
 ///
+/// ⚠️ 取的是 `Turn.prose`（纯对话正文），不是 `text` —— 后者带着工具调用块，
+/// 那是给 Markdown 导出看的；塞进详情弹窗就是一堆 `**[Shell]** {json}` 原始串
+/// （用户 2026-11-04：Trae 的详情和 WorkBuddy 完全不是一个东西）。
+///
 /// 规则（与 MD 导出的并列顺序一致，不丢消息）：
 /// - `user` 起一个新回合；
 /// - `assistant` 追加到当前回合的回答里，多条用空行连接；
@@ -1628,16 +1683,57 @@ fn pair_rounds(turns: &[Turn]) -> Vec<Value> {
         if t.role == "user" {
             // 遇到新的 user：先把上一回合收口
             flush_round(&mut out, &mut cur_user, &mut cur_asst, &mut cur_tools);
-            cur_user = Some(t.text.clone());
+            cur_user = Some(t.prose.clone());
         } else {
-            if !t.text.is_empty() {
-                cur_asst.push(t.text.clone());
+            if !t.prose.is_empty() {
+                cur_asst.push(t.prose.clone());
             }
             cur_tools += t.tools.len();
         }
     }
     flush_round(&mut out, &mut cur_user, &mut cur_asst, &mut cur_tools);
     out
+}
+
+/// 把「工具调用块」从正文里剔掉（详情弹窗专用）。
+///
+/// `render_trae_tool` 产出的每个块都以 `🔧 **[工具名]**` 起头，而对话正文本身
+/// 不会凭空出现这个标记 —— 按空行分段、丢掉这种段即可。
+///
+/// 为什么还要这一道：`Turn.prose` 已经拿不到工具块了，但有的会话
+/// （例如会调「回复用户」这类自定义工具的）**上游把工具调用写进了该轮的
+/// 最终摘要**，那部分是正文的一部分，只能在最后这一层挡。
+fn strip_tool_blocks(s: &str) -> String {
+    if !s.contains("🔧 **[") {
+        return s.trim().to_string();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for seg in s.split("\n\n") {
+        let t = seg.trim_start();
+        let Some(rest) = t.strip_prefix("🔧 **[") else {
+            kept.push(seg.to_string());
+            continue;
+        };
+        // 唯一例外：「回复用户」这个工具的入参就是给人看的那句话，捞出来当正文。
+        // 其余工具块一律丢弃 —— 它们只是“模型调用了什么”，已经由 `toolCalls` 计数体现。
+        if rest.starts_with("ReplyUser]**") {
+            if let Some(msg) = tool_message(seg) {
+                kept.push(msg);
+            }
+        }
+    }
+    kept.join("\n\n").trim().to_string()
+}
+
+/// 从工具块里取出 `{"message": "…"}` 的正文（只对 `ReplyUser` 有意义）。
+fn tool_message(seg: &str) -> Option<String> {
+    let start = seg.find('{')?;
+    let end = seg.rfind('}')?;
+    let v: Value = serde_json::from_str(&seg[start..=end]).ok()?;
+    v.get("message")
+        .and_then(|m| m.as_str())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
 }
 
 /// 把当前累积的回合推进 `out`；尚未开始任何内容时是空操作。
@@ -1651,8 +1747,8 @@ fn flush_round(
         return;
     }
     out.push(json!({
-        "userText": user.take().unwrap_or_default(),
-        "assistantText": asst.join("\n\n"),
+        "userText": strip_tool_blocks(&user.take().unwrap_or_default()),
+        "assistantText": strip_tool_blocks(&asst.join("\n\n")),
         "toolCalls": *tools,
     }));
     asst.clear();
@@ -1797,12 +1893,24 @@ mod tests {
     fn turn(role: &str, text: &str, tools: &[&str]) -> Turn {
         Turn {
             role: role.to_string(),
+            prose: text.to_string(),
             text: text.to_string(),
             tools: tools.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     /// 正常的 user/assistant 交错：逐条配对成回合。
+    /// 详情里的正文必须是「人话」：工具块丢掉，「回复用户」的内容留下。
+    #[test]
+    fn strip_tool_blocks_keeps_prose_and_reply() {
+        let raw = "先说结论。\n\n🔧 **[Shell]**\n```json\n{\"command\":\"ls\"}\n```\n\n🔧 **[ReplyUser]**\n```json\n{\"message\":\"嗨，我在。\"}\n```";
+        assert_eq!(strip_tool_blocks(raw), "先说结论。\n\n嗨，我在。");
+        // 没有工具块的正文原样返回（只裁掉首尾空白）
+        assert_eq!(strip_tool_blocks("  一段普通正文  "), "一段普通正文");
+        // 全是工具块时给空串，前端会显示「(无正文)」，而不是一堆 JSON
+        assert_eq!(strip_tool_blocks("🔧 **[Shell]**\n```json\n{}\n```"), "");
+    }
+
     #[test]
     fn pair_rounds_matches_user_with_following_assistant() {
         let turns = vec![
