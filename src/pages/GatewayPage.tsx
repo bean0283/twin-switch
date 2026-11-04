@@ -1,11 +1,12 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, ChevronDown, Copy, KeyRound, Loader2, Plus, RefreshCw, Server, Trash2, XCircle } from "lucide-react";
 
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { GatewayTabs } from "@/components/gateway-tabs";
+import { PillTabs } from "@/components/pill-tabs";
 
 import {
   gatewayKeyCreate,
@@ -366,6 +367,23 @@ function Card({
   );
 }
 
+/**
+ * 积分共享页的四个分区。
+ *
+ * 顺序就是一套决策链，不要随意调：
+ *   接入（怎么连进来）→ Key（谁能用）→ 选号（用谁的额度）→ 模型（能要什么）
+ *
+ * 标签都控制在 1~3 个字，是为了让药丸**切换时宽度基本不变** —— 否则鼠标会跟着跑。
+ */
+const SUB_TABS = [
+  { id: "access", label: "接入" },
+  { id: "key", label: "Key" },
+  { id: "route", label: "选号" },
+  { id: "model", label: "模型" },
+] as const;
+
+type SubTab = (typeof SUB_TABS)[number]["id"];
+
 export default function GatewayPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [pool, setPool] = useState<PoolEntry[]>([]);
@@ -386,13 +404,36 @@ export default function GatewayPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
+   * 二级分区（接入 / Key / 选号 / 模型）。
+   *
+   * 为什么分：这一页原来把 7 张卡片竖着堆下来，一屏根本装不下（用户 2026-11-04 截图），
+   * 而且「网关地址」和「模型清单」这种八竿子打不着的东西挤在同一条滚动带里。
+   * 四个分区是**同一件事的四个阶段**（怎么连 → 谁能用 → 用谁的额度 → 能要什么），
+   * 拆完每屏只有 1~3 张卡，关联性还在。
+   *
+   * 状态存在 URL 的 `?t=` 上：刷新、从别的页面退回来都不会跳回第一段。
+   */
+  const [search, setSearch] = useSearchParams();
+  const rawTab = search.get("t");
+  const tab: SubTab = SUB_TABS.some((t) => t.id === rawTab) ? (rawTab as SubTab) : "access";
+  const setTab = (id: SubTab) => {
+    const next = new URLSearchParams(search);
+    next.set("t", id);
+    setSearch(next, { replace: true });
+  };
+  /**
    * 当前展开的区（**可以同时展开多个**）。
    *
    * ⚠️ 2026-10-30 用户明确要求：点开一个区不许把别的区收回去，只有**再次点击同一个**
    * 才收起。早期是手风琴（一次只开一个），用户要对照「网关地址 / Key / 模型」时
    * 每切一次就得重开一次，等于没折叠。
+   *
+   * 2026-11-04 改成**默认全展开**：分区之后每页只剩 1~3 张卡，进来先看到内容更直接；
+   * 折叠能力仍在，想收就点标题。
    */
-  const [openCards, setOpenCards] = useState<Set<string>>(() => new Set(["gateway"]));
+  const [openCards, setOpenCards] = useState<Set<string>>(
+    () => new Set(["gateway", "keys", "routing", "pool", "preview", "models", "upstream"]),
+  );
   const fold = (key: string) => ({
     collapsed: !openCards.has(key),
     onToggle: () =>
@@ -937,7 +978,12 @@ export default function GatewayPage() {
           工具。默认只监听本机；打开下面「局域网共享」后，同网段设备（NAS、另一台电脑）也能用。
         </p>
 
-        <GatewayTabs />
+        {/* 一级：积分共享 / 实时监控；二级：本页的四个分区。
+            一级永远在最左 —— 二级只在积分共享页出现，它消失时不能推动一级（用户 2026-11-04 报过错位）。 */}
+        <div className="flex flex-wrap items-center gap-2">
+          <GatewayTabs />
+          <PillTabs items={SUB_TABS} value={tab} onChange={setTab} ariaLabel="积分共享分区" />
+        </div>
       </header>
 
       {error && (
@@ -947,6 +993,7 @@ export default function GatewayPage() {
         </div>
       )}
 
+      {tab === "access" && <>
       <Card
         {...fold("gateway")}
         title="网关状态与接入"
@@ -1111,7 +1158,9 @@ export default function GatewayPage() {
           </div>
         </div>
       </Card>
+      </>}
 
+      {tab === "key" && <>
       <Card
         {...fold("keys")}
         title="网关 Key"
@@ -1413,7 +1462,9 @@ export default function GatewayPage() {
           </div>
         )}
       </Card>
+      </>}
 
+      {tab === "route" && <>
       <Card
         {...fold("routing")}
         title="积分使用策略"
@@ -1616,7 +1667,69 @@ export default function GatewayPage() {
         )}
       </Card>
 
+      <Card
+        {...fold("preview")}
+        title="选号预览"
+        desc="只算不发，不消耗额度；这里算的是「按最早过期」的结果，实际选号还受上面的策略影响"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="GLM-5.3 或 qoder:GLM-5.3"
+            className="h-8 w-64 rounded-lg border border-border bg-background px-2.5 text-xs outline-none focus:border-primary"
+          />
+          <button
+            type="button"
+            onClick={() => void doPreview()}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-3 text-xs hover:bg-accent"
+          >
+            <Server className="size-3.5" />
+            预览
+          </button>
+        </div>
+        {preview && (
+          <div className="mt-3 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs">
+            <div>
+              候选 <span className="font-mono">{preview.candidates.join(" / ") || "—"}</span>
+            </div>
+            <div className="mt-1">
+              {preview.picked ? (
+                <>
+                  选中{" "}
+                  <span className="font-medium">
+                    {preview.picked.scope} / {preview.picked.label}
+                  </span>
+                  {preview.picked.remaining != null && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      · 剩余 {Math.round(preview.picked.remaining)}
+                    </span>
+                  )}
+                  <span className="text-muted-foreground"> · {fmtExpiry(preview.picked.expires_at)}</span>
+                  {/* 这个号在当前模型上的限额：有就说明为什么它不是「完全没问题」 */}
+                  {(preview.picked.limited_models?.length ?? 0) > 0 && (
+                    <span
+                      className="ml-2 rounded bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-600"
+                      title={preview.picked.limited_models
+                        .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
+                        .join("\n")}
+                    >
+                      {preview.picked.limited_models[0].model} ·{" "}
+                      {fmtRecover(preview.picked.limited_models[0].reset_at)}
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span className="text-muted-foreground">{preview.reason ?? "没有可用账号"}</span>
+              )}
+            </div>
+          </div>
+        )}
+      </Card>
+      </>}
 
+      {tab === "model" && <>
       <Card
         {...fold("models")}
         title="模型管理"
@@ -1968,68 +2081,9 @@ export default function GatewayPage() {
           </div>
         )}
       </Card>
+      </>}
 
-      <Card
-        {...fold("preview")}
-        title="选号预览"
-        desc="只算不发，不消耗额度；这里算的是「按最早过期」的结果，实际选号还受上面的策略影响"
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="GLM-5.3 或 qoder:GLM-5.3"
-            className="h-8 w-64 rounded-lg border border-border bg-background px-2.5 text-xs outline-none focus:border-primary"
-          />
-          <button
-            type="button"
-            onClick={() => void doPreview()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-3 text-xs hover:bg-accent"
-          >
-            <Server className="size-3.5" />
-            预览
-          </button>
-        </div>
-        {preview && (
-          <div className="mt-3 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs">
-            <div>
-              候选 <span className="font-mono">{preview.candidates.join(" / ") || "—"}</span>
-            </div>
-            <div className="mt-1">
-              {preview.picked ? (
-                <>
-                  选中{" "}
-                  <span className="font-medium">
-                    {preview.picked.scope} / {preview.picked.label}
-                  </span>
-                  {preview.picked.remaining != null && (
-                    <span className="text-muted-foreground">
-                      {" "}
-                      · 剩余 {Math.round(preview.picked.remaining)}
-                    </span>
-                  )}
-                  <span className="text-muted-foreground"> · {fmtExpiry(preview.picked.expires_at)}</span>
-                  {/* 这个号在当前模型上的限额：有就说明为什么它不是「完全没问题」 */}
-                  {(preview.picked.limited_models?.length ?? 0) > 0 && (
-                    <span
-                      className="ml-2 rounded bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-600"
-                      title={preview.picked.limited_models
-                        .map((m) => `${m.model} 至 ${new Date(m.reset_at).toLocaleString()}`)
-                        .join("\n")}
-                    >
-                      {preview.picked.limited_models[0].model} ·{" "}
-                      {fmtRecover(preview.picked.limited_models[0].reset_at)}
-                    </span>
-                  )}
-                </>
-              ) : (
-                <span className="text-muted-foreground">{preview.reason ?? "没有可用账号"}</span>
-              )}
-            </div>
-          </div>
-        )}
-      </Card>
-
+      {tab === "access" && <>
       <Card {...fold("upstream")} title="上游地址" desc="决定请求真正发到哪里；没登记的产品会返回 501 并说明原因">
         <div className="flex flex-wrap gap-2">
           <button
@@ -2076,6 +2130,7 @@ export default function GatewayPage() {
           </div>
         )}
       </Card>
+      </>}
     </div>
   );
 }

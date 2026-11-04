@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertTriangle,
@@ -30,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { QoderMachineCard } from "@/components/qoder-machine-card";
+import { PillTabs } from "@/components/pill-tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import * as api from "@/lib/api";
 import {
@@ -65,6 +66,23 @@ import type {
  *  3. **保存后用返回值刷界面**（后端回读一次再返回），不会出现「存进去的是 A、
  *     界面显示的还是 B」。
  */
+
+/**
+ * 设置页的三个分区。
+ *
+ * 分组依据是「改动会影响什么」：
+ *   客户端（找不找得到程序 / 切号时同步什么）→ 备份（动库前留不留底）→ 诊断（出问题留证据）
+ *
+ * 标签都控制在 2~3 个字：药丸切换时宽度基本不变，鼠标不会跟着跑。
+ */
+const SETTING_TABS = [
+  { id: "client", label: "客户端" },
+  { id: "backup", label: "备份" },
+  { id: "diagnostics", label: "诊断" },
+] as const;
+
+type SettingTab = (typeof SETTING_TABS)[number]["id"];
+
 export default function SettingsPage() {
   const [snap, setSnap] = useState<SettingsSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -292,15 +310,37 @@ export default function SettingsPage() {
   /** WorkBuddy 是否被手动指定。 */
   const wbManual = wbDraft.trim().length > 0;
 
+  /**
+   * 二级分区：客户端 / 备份 / 诊断。
+   *
+   * 这一页原来也是把 4 张卡竖着堆下来，而且「程序路径」「写库备份」「诊断日志」
+   * 是三件互不相干的事，挤在同一条滚动带里只能靠翻找。分区之后每屏 1~3 张卡。
+   *
+   * 状态放 URL 的 `?t=`：刷新、从清理页退回来都不会跳回第一段。
+   */
+  const [search, setSearch] = useSearchParams();
+  const rawTab = search.get("t");
+  const tab: SettingTab = SETTING_TABS.some((t) => t.id === rawTab)
+    ? (rawTab as SettingTab)
+    : "client";
+  const setTab = (id: SettingTab) => {
+    const next = new URLSearchParams(search);
+    next.set("t", id);
+    setSearch(next, { replace: true });
+  };
+
   return (
-    <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-5 px-4 py-6">
+    <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-4 px-4 py-6">
       <div>
         <h1 className="text-xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        {/* `min-h` + `line-clamp-2`：把描述锁在两行高，下面的药丸不会因为文案换行而上下跳 */}
+        <p className="mt-1 line-clamp-2 min-h-[2.5rem] text-sm text-muted-foreground">
           工具自己的偏好（落在 <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.twin-switch/settings.json</code>）。
           这里改的都是「本工具怎么干活」，不会动 Trae / WorkBuddy 客户端里的任何数据。
         </p>
       </div>
+
+      <PillTabs items={SETTING_TABS} value={tab} onChange={setTab} ariaLabel="设置分区" />
 
       {loading ? (
         <Card>
@@ -327,6 +367,7 @@ export default function SettingsPage() {
         </Alert>
       ) : draft && snap && beforeWrite !== null ? (
         <>
+          {tab === "client" && <>
           {/* ── 客户端主程序路径（T69） ─────────────────────────────────── */}
           <Card data-settings-exe="1">
             <CardHeader>
@@ -671,6 +712,9 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
 
+          </>}
+
+          {tab === "backup" && <>
           {/* ── 写库前整库备份（T66，默认关） ─────────────────────────────── */}
           <Card data-settings-loaded="1">
             <CardHeader>
@@ -897,6 +941,37 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
 
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <AlertTriangle className="size-4" />
+            备份为什么会占盘
+          </CardTitle>
+          <CardDescription>
+            <strong className="text-foreground">新备份（T66 起）</strong>是页级增量：只存跟原库不同的页，
+            通常几 MB —— 打开「写库前整库备份」也不至于再堆出 GB。
+            <br />
+            <strong className="text-foreground">老备份（T66 之前）</strong>是整份库副本，一次删会话就落下
+            300 MB 上下，改几次回合就能堆到 GB 级 —— 盘上现存的那批就是这些。
+            清理页里「工具残留」那一类会把每一批列出来（
+            <strong className="text-foreground">最旧的排在前面</strong>），并标出哪几批超出了上面的策略；
+            每一批都能单独「还原」回实时库。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Link
+            to="/trae-cleanup"
+            className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+          >
+            去清理页看每一批备份
+            <ArrowRight className="size-3.5" />
+          </Link>
+        </CardContent>
+      </Card>
+
+          </>}
+
+          {tab === "diagnostics" && <>
           {/* ── 诊断日志（默认关） ─────────────────────────────────────────
               加这个的直接原因：有用户报「账号刷新失败 / 401」而开发侧复现不了 ——
               只能让出问题那台机器自己留证据。默认必须关。 */}
@@ -1166,40 +1241,15 @@ export default function SettingsPage() {
               )}
             </CardContent>
           </Card>
+          </>}
         </>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <AlertTriangle className="size-4" />
-            备份为什么会占盘
-          </CardTitle>
-          <CardDescription>
-            <strong className="text-foreground">新备份（T66 起）</strong>是页级增量：只存跟原库不同的页，
-            通常几 MB —— 打开「写库前整库备份」也不至于再堆出 GB。
-            <br />
-            <strong className="text-foreground">老备份（T66 之前）</strong>是整份库副本，一次删会话就落下
-            300 MB 上下，改几次回合就能堆到 GB 级 —— 盘上现存的那批就是这些。
-            清理页里「工具残留」那一类会把每一批列出来（
-            <strong className="text-foreground">最旧的排在前面</strong>），并标出哪几批超出了上面的策略；
-            每一批都能单独「还原」回实时库。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Link
-            to="/trae-cleanup"
-            className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-          >
-            去清理页看每一批备份
-            <ArrowRight className="size-3.5" />
-          </Link>
-        </CardContent>
-      </Card>
 
-      {/* Qoder 机器身份：与 settings.json 无关，所以放在加载态外面 ——
-          设置读取失败时它照样能用（换电脑签不了正需要它）。 */}
-      <QoderMachineCard />
+      {/* Qoder 机器身份：与 settings.json 无关，所以**放在加载态外面** ——
+          设置读取失败时它照样能用（换电脑签不了正需要它）。
+          但它属于「这台机器上的客户端」，所以跟着「客户端」分区走，不在别的分区里晃。 */}
+      {tab === "client" && <QoderMachineCard />}
     </div>
   );
 }
