@@ -10,10 +10,10 @@ import {
   ChevronRight,
   Copy,
   Database,
+  Eye,
   FileDown,
   FolderOpen,
   HardDrive,
-  Import,
   KeyRound,
   Layers,
   LayoutList,
@@ -56,7 +56,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
 import { resolveSelectableKey } from "@/lib/trae-client-list";
-import { defaultTargetClient, targetClientOptions } from "@/lib/trae-import-target";
 import { readStored, STORAGE_PREFIX, writeStored } from "@/lib/storage-keys";
 import { cn } from "@/lib/utils";
 import type {
@@ -64,8 +63,6 @@ import type {
   TraeCloudDeleteInfo,
   TraeDecryptedStatus,
   TraeDeleteInfo,
-  TraeImportCandidate,
-  TraeImportInspect,
   TraeImportReport,
   TraeInstalledClient,
   TraeLinkGroup,
@@ -73,6 +70,7 @@ import type {
   TraeLinkMemberRow,
   TraeLinkOverview,
   TraeLinksPreview,
+  TraeSessionDetail,
   TraeSessionInfo,
 } from "@/lib/trae-types";
 
@@ -161,6 +159,17 @@ export default function TraeRecordsPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [editSeed, setEditSeed] = useState<string | null>(null);
   /**
+   * 只读详情（行上「查看」）。
+   *
+   * 与 WorkBuddy 会话页**同一个交互**：点眼睛 → 弹窗按回合列出「提问 / 回答 / 工具调用次数」，
+   * 不进编辑态、不碰库。以前这里放的是「导入到其他账号的本地库」，
+   * 那个动作和上面的「复制关联」重复（都是把一条会话复制到另一个账号的库），
+   * 2026-11-04 用户要求撤掉，换成查看。
+   */
+  const [detail, setDetail] = useState<TraeSessionDetail | null>(null);
+  /** 正在读详情的那一条（行级 loading，不牵连同页其它行 —— 与 WorkBuddy 一致）。 */
+  const [detailBusy, setDetailBusy] = useState<string | null>(null);
+  /**
    * 待删除的会话。
    *
    * 1 条 = 单条删除，先走 `trae_delete_info` 逐表预检；
@@ -178,18 +187,6 @@ export default function TraeRecordsPage() {
    * 不叫 `selected`：本页已有的 `selected` 是「当前选中的客户端」，同名会撞。
    */
   const [recordSel, setRecordSel] = useState<Set<string>>(new Set());
-
-  // 跨账号导入
-  const [importTarget, setImportTarget] = useState<TraeSessionInfo | null>(null);
-  const [importCandidates, setImportCandidates] = useState<TraeImportCandidate[]>([]);
-  const [importHints, setImportHints] = useState<string[]>([]);
-  const [importDstClient, setImportDstClient] = useState<string | null>(null);
-  const [importDst, setImportDst] = useState<string | null>(null);
-  const [importUid, setImportUid] = useState<string | null>(null);
-  const [importInspect, setImportInspect] = useState<TraeImportInspect | null>(null);
-  const [importProgress, setImportProgress] = useState<string[]>([]);
-  const [importBusy, setImportBusy] = useState(false);
-  const [importReport, setImportReport] = useState<TraeImportReport | null>(null);
 
   // 跨账号关联（同客户端、两个账号之间的会话副本关系）
   const [linkSrcUid, setLinkSrcUid] = useState<string>("");
@@ -250,8 +247,8 @@ export default function TraeRecordsPage() {
     let active = true;
     let un: (() => void) | undefined;
     void listen<{ line: string }>("trae-import-progress", (e) => {
-      // 同一个事件源同时喂单会话导入与批量复制两条进度；两边都收，各自只在运行中展示。
-      setImportProgress((prev) => [...prev, e.payload.line]);
+      // 这个事件源原来是「单会话导入 + 批量复制」两条进度共用的；
+      // 单会话那个入口 2026-11-04 已撤掉（与「复制关联」重复），现在只喂批量复制。
       setCopyProgress((prev) => [...prev, e.payload.line]);
     }).then((u) => {
       if (active) un = u;
@@ -263,57 +260,21 @@ export default function TraeRecordsPage() {
     };
   }, []);
 
-  async function openImport(s: TraeSessionInfo) {
+  /**
+   * 打开只读详情（行上的眼睛）。
+   *
+   * 和 WorkBuddy 会话页同一条路径：走 `trae_session_detail` 把整条会话读出来，
+   * 只读、不改库。错误只弹 toast，不把页面打成错误态 —— 单条读失败不该影响整页。
+   */
+  async function openDetail(s: TraeSessionInfo) {
     if (!clientKey) return;
-    // ⚠️ 不能直接用「正在浏览的客户端」当目标：2026-10 官方把 TRAE SOLO 并进 Trae CN 之后，
-    //    SOLO 已经没有自己的程序了，把会话导进它的库**不报错、也不会生效**
-    //    （客户端永远不会去读那个目录）。落到承载方，见 `defaultTargetClient`。
-    setImportDstClient(defaultTargetClient(clientKey, clients));
-    setImportDst(null);
-    setImportUid(null);
-    setImportInspect(null);
-    setImportProgress([]);
-    setImportReport(null);
-    setImportHints([]);
-    setImportTarget(s);
+    setDetailBusy(s.id);
     try {
-      const { candidates, hints } = await api.traeImportCandidates(clientKey, s.id);
-      setImportCandidates(candidates);
-      setImportHints(hints);
-      if (candidates.length === 1) {
-        void inspectDst(candidates[0]);
-      }
-    } catch (cause) {
-      toast.error("读取可导入目标失败", { description: api.asError(cause) });
-    }
-  }
-
-  async function inspectDst(c: TraeImportCandidate) {
-    setImportDst(`${c.client_key}::${c.account_id}`);
-    setImportUid(c.uid);
-    setImportInspect(null);
-    try {
-      setImportInspect(await api.traeImportInspect(c.client_key, c.account_id));
-    } catch (cause) {
-      toast.error("目标探测失败", { description: api.asError(cause) });
-    }
-  }
-
-  async function confirmImport() {
-    if (!clientKey || !importTarget || !importDst || !importUid || importBusy) return;
-    setImportBusy(true);
-    setImportProgress([]);
-    setImportReport(null);
-    try {
-      const res = await api.traeImportRun(clientKey, importDst.split("::")[0], importUid, [importTarget.id]);
-      setImportReport(res);
-      toast.success(`已导入「${importTarget.title || "（无标题）"}」`, {
-        description: `目标：${res.target_label} · 复制 ${res.copied_rows} 行 · 校验会话 ${res.verified_sessions} 个 · ${res.relaunched ? "已自动重启客户端" : "客户端未自动重启"}`,
-      });
-    } catch (cause) {
-      toast.error("导入失败", { description: api.asError(cause) });
+      setDetail(await api.traeSessionDetail(clientKey, s.id));
+    } catch (e) {
+      toast.error("读取会话详情失败", { description: api.asError(e) });
     } finally {
-      setImportBusy(false);
+      setDetailBusy(null);
     }
   }
 
@@ -1671,17 +1632,23 @@ export default function TraeRecordsPage() {
                               >
                                 <Pencil className="size-4" />
                               </Button>
-                              <Button size="sm" variant="ghost" onClick={() => void onExportSession(s)} disabled={busy} title="导出 MD">
-                                <FileDown className="size-4" />
-                              </Button>
+                              {/* 与 WorkBuddy 会话页同一套按钮、同一个顺序：
+                                  编辑 → 查看 → 导出 → 删除。别单独调换其中两个。 */}
                               <Button
                                 size="sm"
                                 variant="ghost"
-                                onClick={() => void openImport(s)}
-                                disabled={busy}
-                                title="导入到其他账号的本地库"
+                                onClick={() => void openDetail(s)}
+                                disabled={busy || detailBusy === s.id}
+                                title="查看会话详情（只读：按回合列出提问 / 回答 / 工具调用次数，不碰库）"
                               >
-                                <Import className="size-4" />
+                                {detailBusy === s.id ? (
+                                  <Loader2 className="size-4 animate-spin" />
+                                ) : (
+                                  <Eye className="size-4" />
+                                )}
+                              </Button>
+                              <Button size="sm" variant="ghost" onClick={() => void onExportSession(s)} disabled={busy} title="导出 MD">
+                                <FileDown className="size-4" />
                               </Button>
                               <Button
                                 size="sm"
@@ -2616,187 +2583,42 @@ export default function TraeRecordsPage() {
         </DialogContent>
       </Dialog>
 
-      {/* 跨账号导入 */}
-      <Dialog
-        open={importTarget !== null}
-        onOpenChange={(v) => {
-          if (!v && !importBusy) {
-            setImportTarget(null);
-            setImportDstClient(null);
-            setImportDst(null);
-            setImportInspect(null);
-            setImportReport(null);
-            setImportProgress([]);
-          }
-        }}
-      >
-        <ResizableDialogContent storageKey="trae-import-account">
+      {/* 会话详情（只读）—— 与 WorkBuddy 会话页的详情弹窗同构：
+          标题 / id / 「N 个回合 · 归属」/ 逐回合「提问 + 回答 + 工具调用次数」。
+          刻意只读：要改内容走左边的「编辑」。 */}
+      <Dialog open={!!detail} onOpenChange={(o) => !o && setDetail(null)}>
+        <ResizableDialogContent storageKey="trae-session-detail">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Import className="size-4" />
-              导入到其他账号
-            </DialogTitle>
-            <DialogDescription className="break-words">
-              「{importTarget?.title || "（无标题）"}」→ 目标账号本地库
-              <span className="block font-mono text-xs">{importTarget?.id}</span>
-            </DialogDescription>
+            <DialogTitle className="truncate">{detail?.title || "（无标题）"}</DialogTitle>
+            <DialogDescription className="break-all text-xs">{detail?.session_id}</DialogDescription>
           </DialogHeader>
-
-          {importCandidates.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              本机没有可导入账号（无已登录或留有解密库的账号）。
+          <div className="min-h-0 space-y-3 overflow-auto pr-1 text-sm">
+            <p className="text-xs text-muted-foreground">
+              {detail?.turns ?? 0} 个回合 · {detail?.messages ?? 0} 条消息 · 归属{" "}
+              {detail?.owner_label || detail?.owner_uid || "—"}
             </p>
-          ) : (
-            <div className="min-h-0 space-y-3 overflow-y-auto pr-1 text-sm">
-              {/* 目标客户端维度：仅展示所选客户端下的账号 */}
-              {clients.length > 0 ? (
-                <div>
-                  <div className="mb-1 text-xs text-muted-foreground">目标客户端</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {targetClientOptions(clients)
-                      .map((c) => {
-                        const active = c.key === importDstClient;
-                        return (
-                          <button
-                            key={c.key}
-                            type="button"
-                            disabled={importBusy}
-                            onClick={() => {
-                              setImportDstClient(c.key);
-                              setImportDst(null);
-                              setImportInspect(null);
-                              setImportReport(null);
-                            }}
-                            className={cn(
-                              "rounded-lg border px-2.5 py-1.5 transition-colors",
-                              active
-                                ? "border-foreground/20 bg-foreground/[0.06] font-medium"
-                                : "border-border hover:bg-foreground/[0.03]",
-                            )}
-                          >
-                            {c.label}
-                          </button>
-                        );
-                      })}
-                  </div>
+            {(detail?.rounds ?? []).slice(0, 50).map((r, i) => (
+              <div key={i} className="rounded-md border p-3">
+                <div className="mb-1 text-xs font-medium text-muted-foreground">回合 {i + 1}</div>
+                <div className="mb-2 whitespace-pre-wrap">
+                  <span className="text-xs text-muted-foreground">提问：</span>
+                  {r.userText || "(无正文)"}
                 </div>
-              ) : null}
-
-              {(() => {
-                const shown = importCandidates.filter((c) => c.client_key === importDstClient);
-                if (shown.length === 0) {
-                  return (
-                    <p className="text-sm text-muted-foreground">
-                      该客户端下没有可导入账号（需先在本机登录过或留有解密库）。
-                    </p>
-                  );
-                }
-                return (
-                  <div>
-                    <div className="mb-1 text-xs text-muted-foreground">选择目标账号</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {shown.map((c) => {
-                        const key = `${c.client_key}::${c.account_id}`;
-                        return (
-                          <button
-                            key={key}
-                            type="button"
-                            disabled={importBusy}
-                            onClick={() => void inspectDst(c)}
-                            title={
-                              c.is_source
-                                ? "导入到原账号 = 同库复制一份（生成新 id），原记录保留"
-                                : undefined
-                            }
-                            className={cn(
-                              "rounded-lg border px-2.5 py-1.5 transition-colors",
-                              importDst === key
-                                ? "border-foreground/20 bg-foreground/[0.06] font-medium"
-                                : "border-border hover:bg-foreground/[0.03]",
-                              !c.db_exists && "opacity-60",
-                            )}
-                          >
-                            <span className="block">{c.label}</span>
-                            <span className="block text-[11px] text-muted-foreground">
-                              {c.client_label}
-                              {c.is_current ? " · 当前登录" : ""}
-                              {c.is_source ? " · 原账号（同库复制）" : ""}
-                              {!c.db_exists ? " · 未登录过" : ""}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {importHints.length > 0 ? (
-                <div className="space-y-1 rounded-lg bg-amber-500/10 p-3 text-xs leading-5 text-amber-700">
-                  {importHints.map((h, i) => (
-                    <div key={i}>{h}</div>
-                  ))}
+                <div className="whitespace-pre-wrap">
+                  <span className="text-xs text-muted-foreground">回答：</span>
+                  {r.assistantText || "(无正文)"}
                 </div>
-              ) : null}
-
-              {importInspect ? (
-                <div className="flex flex-wrap gap-1.5">
-                  <Badge variant={importInspect.db_exists ? "default" : "secondary"}>
-                    {importInspect.db_exists ? "已有本地库" : "无本地库"}
-                  </Badge>
-                  <Badge variant={importInspect.key_ready ? "default" : "secondary"}>
-                    密钥：{importInspect.key_ready ? "可用" : importInspect.key_source === "scan_available" ? "需扫描" : "缺失"}
-                  </Badge>
-                  <Badge variant={importInspect.running ? "secondary" : "outline"}>
-                    {importInspect.running ? "客户端运行中（将自动退出）" : "客户端已退出"}
-                  </Badge>
-                  <Badge variant="outline">现有 {importInspect.sessions_now} 个会话</Badge>
-                </div>
-              ) : null}
-
-              <Alert>
-                <AlertTriangle className="size-4" />
-                <AlertDescription className="leading-5">
-                  导入会把该会话写进目标账号的本地加密库（原库是否先备份到工具目录，取决于「设置 → 写库前整库备份」开关；默认关闭）。写入前会自动退出目标客户端；
-                  目标账号须已在本机登录过。同客户端跨账号（如 Trae CN 的 A→B）会在库内复制会话并生成新 id，源账号记录保留。
-                  与云端任务列表的同步行为未定义，若云端清理本地孤儿行，导入的会话可能被覆盖。
-                </AlertDescription>
-              </Alert>
-
-              {importProgress.length ? (
-                <pre className="max-h-40 overflow-auto rounded-lg bg-muted/60 p-3 text-xs leading-5 text-muted-foreground">
-                  {importProgress.join("\n")}
-                </pre>
-              ) : null}
-
-              {importReport ? (
-                <div className="space-y-1.5 rounded-lg bg-emerald-500/10 p-3 text-xs text-emerald-700">
-                  <div>复制 {importReport.copied_rows} 行（{importReport.sessions_requested} 个会话），回写 {importReport.pages} 页</div>
-                  <div>新库自检会话数：{importReport.verified_sessions}</div>
-                  {importReport.skipped.length ? (
-                    <div>跳过（目标库已存在）：{importReport.skipped.join(", ")}</div>
-                  ) : null}
-                  <div className="break-all font-mono text-emerald-600/80">
-                    备份：
-                    {importReport.backup_dir || "未备份（「设置 → 写库前整库备份」已关闭）"}
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setImportTarget(null)} disabled={importBusy}>
-              取消
-            </Button>
-            <Button
-              disabled={!importDst || !importInspect?.db_exists || importBusy}
-              onClick={() => void confirmImport()}
-            >
-              {importBusy ? <Loader2 className="size-4 animate-spin" /> : <Import className="size-4" />}
-              开始导入
-            </Button>
-          </DialogFooter>
+                {r.toolCalls > 0 && (
+                  <div className="mt-2 text-xs text-muted-foreground">过程工具调用 {r.toolCalls} 次</div>
+                )}
+              </div>
+            ))}
+            {(detail?.rounds?.length ?? 0) > 50 && (
+              <p className="text-xs text-muted-foreground">
+                仅显示前 50 个回合，完整内容请用导出 Markdown。
+              </p>
+            )}
+          </div>
         </ResizableDialogContent>
       </Dialog>
 
