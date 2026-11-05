@@ -146,6 +146,91 @@ fn neutralize_text(text: &str) -> Option<String> {
 ///
 /// 只碰 `role` 是 `system` / `developer` 的消息；user / assistant / tool 一律不动
 /// （实测拦截只发生在 system 里，动用户内容属于越权）。
+/// 上一次 11128 的时间（毫秒）。0 = 没命中过。
+static BLOCKED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 命中后维持「降级模式」多久。
+///
+/// 10 分钟：够覆盖一轮连续请求；上游如果只是偶发抽风，过期后自动回到
+/// 「零宽空格」那套无损做法（它保留原句，比整句改写更保守）。
+const DEGRADE_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+/// 记一次 11128（被渠道校验拦下）。
+pub fn note_blocked() {
+    BLOCKED_AT.store(
+        crate::modules::config::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 现在是否处于「降级模式」。
+pub fn degrade_active() -> bool {
+    let at = BLOCKED_AT.load(std::sync::atomic::Ordering::Relaxed);
+    at > 0 && crate::modules::config::now_ms() - at < DEGRADE_WINDOW_MS
+}
+
+/// 把「被拦的那一句」**整句换成中性句**。
+///
+/// ## 为什么还要这一层
+///
+/// 零宽空格是无损做法（原句还在，只是匹配不到），但它**依赖上游做子串匹配**。
+/// 2026-11-05 统计：411 条网关错误里 `11128` 占 44 条 —— 说明零宽空格偶尔还是被
+/// 归一化后命中。这时需要一个更彻底的兜底：把整句换掉。
+///
+/// 只在**降级模式**下用（刚被拦过），平时仍然走无损的零宽空格 ——
+/// 不然所有人的提示词都会被动过。
+fn degrade_text(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let pos = lower.find("deepseek")?;
+    if !lower[pos..].contains("harness") {
+        return None;
+    }
+    let start = text[..pos].rfind(". ").map(|i| i + 2).unwrap_or(0);
+    let end = text[pos..].find('.').map(|i| pos + i + 1).unwrap_or(text.len());
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str("You are a helpful assistant.");
+    out.push_str(&text[end..]);
+    Some(out)
+}
+
+/// 同 [`neutralize_system`]，但走**整句替换**。返回改过几处。
+pub fn degrade_system(body: &mut serde_json::Value) -> usize {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+    let mut hits = 0usize;
+    for m in msgs.iter_mut() {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "system" && role != "developer" {
+            continue;
+        }
+        match m.get_mut("content") {
+            Some(serde_json::Value::String(s)) => {
+                if let Some(fixed) = degrade_text(s) {
+                    *s = fixed;
+                    hits += 1;
+                }
+            }
+            Some(serde_json::Value::Array(parts)) => {
+                for p in parts.iter_mut() {
+                    let Some(s) = p.get("text").and_then(|v| v.as_str()).map(str::to_string) else {
+                        continue;
+                    };
+                    if let Some(fixed) = degrade_text(&s) {
+                        if let Some(obj) = p.as_object_mut() {
+                            obj.insert("text".into(), serde_json::Value::String(fixed));
+                        }
+                        hits += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    hits
+}
+
 pub fn neutralize_system(body: &mut serde_json::Value) -> usize {
     let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return 0;
@@ -186,6 +271,17 @@ pub fn neutralize_system(body: &mut serde_json::Value) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 降级模式：把整句换掉（零宽空格被上游归一化识破时的兜底）。
+    #[test]
+    fn degrade_replaces_whole_sentence() {
+        let raw = "You are an AI agent powered by DeepSeek Harness. Follow the rules below.";
+        let fixed = degrade_text(raw).expect("必须命中");
+        assert!(!fixed.to_lowercase().contains("deepseek harness"), "仍能被匹配：{fixed}");
+        assert!(fixed.contains("Follow the rules below."), "后面的内容不许丢：{fixed}");
+        // 不含那两句时一个字都不改
+        assert!(degrade_text("You are a helpful assistant.").is_none());
+    }
 
     /// 真机实测被拦的那一句，中和后必须变样、且语义字符一位不少。
     #[test]

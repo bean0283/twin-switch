@@ -1126,7 +1126,18 @@ async fn chat(
     // 而这次请求的模型只有 Trae 作用域 —— 不校验就会把别家的号硬塞进来，
     // 既是越权（Key 授权可能不含那个作用域），也必然请求失败。
     // 所以这里复用 `preview` 算好的 `candidates`（允许的作用域列表），而不是只看「池子里有、没冷却」。
-    let pool_now = gateway_pool::usable();
+    // 积分保底：余额低于保底线的号不派单（详见 `gateway_pool::credit_floor`）。
+    // 全都低于线时退回全部可用号并在指标里留痕 —— 不能让请求直接失败。
+    let (pool_now, floor_relaxed) = gateway_pool::usable_above_floor();
+    if floor_relaxed {
+        crate::modules::diag_log::warn(
+            "gateway",
+            format!(
+                "所有账号积分都低于保底线 {}，本次已放宽（模型 {bare}）",
+                gateway_pool::credit_floor()
+            ),
+        );
+    }
     let now_ms = crate::modules::config::now_ms();
     let find_usable = |key: &str| {
         pool_now
@@ -1321,6 +1332,11 @@ async fn chat(
                 return resp;
             }
             Err((code, msg)) => {
+                // 命中渠道校验（11128）⇒ 记一笔，接下来的请求改用整句替换的提示词。
+                // 只改**提示词策略**，不额外罚号：冷却仍按原来的账号级判据走。
+                if msg.contains("11128") || msg.contains("unapproved channel") {
+                    crate::modules::gateway_prompt::note_blocked();
+                }
                 // 上游报错 → 反馈给池子（冷却/标记），下一个请求也不会再撞同一个。
                 // ⚠️ 按 **(账号, 模型)** 记账：429 只锁这个模型，别的模型还能用这个号。
                 //
@@ -1449,7 +1465,10 @@ fn should_failover(status: u16, msg: &str) -> bool {
     }
     // 上下文超长 = **请求本身**的问题，与账号无关：换号换不掉 token 数。
     // 2026-11-02 实测：连换 3 个号全撞同一个 4026，客户端还当成可重试错误重试了 5 轮。
-    if crate::modules::gateway_pool::is_context_overflow(msg) {
+    //
+    // 同一类还有「请求形状不对 / 被内容策略拦」（见 `is_request_fault`）——
+    // 判据只有一处，别再这里单独列关键字。
+    if crate::modules::gateway_pool::is_request_fault(msg) {
         return false;
     }
     let m = msg.to_ascii_lowercase();
@@ -1884,11 +1903,25 @@ async fn forward(
     // 跟渠道无关；2026-10-26 真机 A/B 已证实，见 `gateway_prompt` 模块头注释）。
     // DeepSeek Harness 每轮都注入这句 ⇒ 不打这个补丁，走 WB 的每一轮必被拦。
     if cand.product == "workbuddy" || scope.starts_with("wb") {
-        let hits = crate::modules::gateway_prompt::neutralize_system(&mut body);
+        // 刚被 11128 拦过 ⇒ 零宽空格那套可能已被上游归一化识破，改用整句替换兜底。
+        // 平时仍走无损做法（原句保留，只插零宽空格）。
+        let degraded = crate::modules::gateway_prompt::degrade_active();
+        let hits = if degraded {
+            crate::modules::gateway_prompt::degrade_system(&mut body)
+        } else {
+            crate::modules::gateway_prompt::neutralize_system(&mut body)
+        };
         if hits > 0 {
             crate::modules::diag_log::info(
                 "gateway",
-                format!("workbuddy：system 命中关键词风控，已中和 {hits} 处（零宽空格，语义不变）"),
+                format!(
+                    "workbuddy：system 命中关键词风控，已{} {hits} 处",
+                    if degraded {
+                        "整句替换（降级模式）"
+                    } else {
+                        "中和（零宽空格，语义不变）"
+                    }
+                ),
             );
         }
     }

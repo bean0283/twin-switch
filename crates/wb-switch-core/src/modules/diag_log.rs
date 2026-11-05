@@ -118,8 +118,16 @@ impl DiagLogConfig {
     }
 
     /// 该级别要不要记：`info` 记全部，`error` 只记 error。
+    ///
+    /// ⚠️⚠️ **必须忽略大小写**。`write()` 传进来的是落盘用的 `"ERROR"`（大写），
+    /// 而这里以前只 match 小写 `"error"` —— 于是永远落进 `_` 分支，
+    /// 返回 `self.level == "info"`；默认级别正是 `error` ⇒ **返回 false**，
+    /// 结果是「开着诊断日志、级别选仅错误，却一个字都不会写」。
+    ///
+    /// 2026-11-05 用户反馈「一直开着但日志是空的」，实测复现：
+    /// 直接调 `append_at` 能写（Ok），走 `error()` 却什么都不落盘。
     fn allows(&self, level: &str) -> bool {
-        match level {
+        match level.to_ascii_lowercase().as_str() {
             "error" => true,
             _ => self.level == "info",
         }
@@ -671,5 +679,60 @@ mod tests {
         let t = truncate(&long);
         assert!(t.len() < LINE_MAX_BYTES + 100, "必须截断到上限附近");
         assert!(t.contains("已截断"), "要标记已截断");
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// 回归：`write()` 用的是大写 `"ERROR"`，级别判断必须忽略大小写。
+    ///
+    /// 这个 bug 的症状极隐蔽：界面显示「已开启 / 仅错误」，日志目录却永远是空的，
+    /// 看起来像「最近没出错」，实际是**一条都写不进去**。
+    #[test]
+    fn error_level_accepts_uppercase_tag() {
+        let cfg = DiagLogConfig {
+            enabled: true,
+            level: "error".to_string(),
+            ..DiagLogConfig::default()
+        };
+        assert!(cfg.allows("ERROR"), "大写 ERROR 必须被放行");
+        assert!(cfg.allows("error"));
+        // 仅错误级别下，WARN / INFO 仍然不落盘
+        assert!(!cfg.allows("WARN"));
+        assert!(!cfg.allows("INFO"));
+    }
+
+    /// info 级别记全部。
+    #[test]
+    fn info_level_accepts_everything() {
+        let cfg = DiagLogConfig {
+            enabled: true,
+            level: "info".to_string(),
+            ..DiagLogConfig::default()
+        };
+        assert!(cfg.allows("ERROR"));
+        assert!(cfg.allows("WARN"));
+        assert!(cfg.allows("INFO"));
+    }
+}
+
+#[cfg(test)]
+mod live_probe {
+    /// 真机自检：走**真实**写入口（读真实设置、写真实目录）记一条。
+    /// 用来区分「日志没写」和「本来就没有错误」。
+    #[test]
+    #[ignore]
+    fn probe_write_once() {
+        println!("log_root = {:?}", super::log_root());
+        println!("config   = {:?}", super::config_now());
+        super::error("probe", "日志通道自检：能看见这行说明写入正常");
+        let cfg = super::config_now();
+        let now = super::now_ms();
+        println!("now_ms = {now}");
+        println!("day_dir = {:?}", super::day_dir_name(now));
+        let r = super::append_at(&super::log_root(), &cfg, "ERROR", "probe", "直接调用 append_at", now);
+        println!("append_at 结果 = {r:?}");
     }
 }
