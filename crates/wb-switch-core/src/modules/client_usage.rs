@@ -17,7 +17,8 @@
 //!
 //! ① `score` 降序 → ② `lastUsedAt` 降序 → ③ 内置偏好顺序 → ④ `key` 字典序。
 //!
-//! 没有任何历史时只剩 ③ —— 于是首屏就是内置偏好，**`solo-cn` 排第一**（用户最常用的那个）。
+//! 没有任何历史时只剩 ③ —— 于是首屏就是内置偏好，**`trae-cn` 排第一**
+//! （`solo-cn` 已弃用，见 `DEFAULT_PREFERENCE` 的注释）。
 //! 换句话说：默认值本身就是「用户要的那个顺序」，记忆只是在此之上做微调。
 //!
 //! ## 边界（两条硬约束）
@@ -51,9 +52,12 @@ pub const SWITCH_WEIGHT: u64 = 3;
 
 /// 内置偏好顺序：**没有任何历史记录时**的默认排列。
 ///
-/// `solo-cn`（TRAE SOLO CN）排第一 —— 这是实际最常用的客户端，新装用户一进来就该看到它。
-/// 不在表里的 key 排在所有在表 key 之后。
-pub const DEFAULT_PREFERENCE: &[&str] = &["solo-cn", "trae-cn", "solo-intl", "trae-intl"];
+/// ⚠️ `solo-cn`（TRAE SOLO CN）已弃用并从列表移除（2026-11-05）：
+/// 网关早就不认它，账号也统一在 `trae-cn` 下，留着它只会让后来的人以为它还在用。
+///
+/// 不在表里的 key 排在所有在表 key 之后 —— 所以即使老机器的使用记录里还留着
+/// `solo-cn`，它也不会被排到前面（`order_keys` 只对**实际检测到的**客户端排序）。
+pub const DEFAULT_PREFERENCE: &[&str] = &["trae-cn", "trae-intl"];
 
 /// 单个客户端的使用记录。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,15 +312,18 @@ mod tests {
             .collect()
     }
 
-    /// 默认值就是用户要的那个顺序：**没有任何历史时 solo-cn 排第一**。
+    /// 没有历史时按内置偏好排，`trae-cn` 第一。
+    ///
+    /// 老机器的使用记录里可能还留着已弃用的 `solo-cn`：它**不该**因此被排到前面，
+    /// 但也不能被丢掉（万一真有残留目录，列表里还得看得见）。这里一并锁住。
     #[test]
-    fn empty_history_falls_back_to_preference_with_solo_cn_first() {
-        let keys = ["trae-cn", "solo-cn", "trae-intl", "solo-intl"];
+    fn empty_history_falls_back_to_trae_first() {
+        let keys = ["solo-cn", "trae-intl", "trae-cn", "solo-intl"];
         let got = order_keys(&keys, &BTreeMap::new());
         assert_eq!(
             got,
-            vec!["solo-cn", "trae-cn", "solo-intl", "trae-intl"],
-            "没有历史时必须按内置偏好排，solo-cn 第一"
+            vec!["trae-cn", "trae-intl", "solo-cn", "solo-intl"],
+            "内置偏好先排 trae，不在表里的（solo）落到后面按字典序"
         );
     }
 
@@ -369,7 +376,7 @@ mod tests {
     /// 内置偏好顺序本身不能忘掉 solo-cn 第一（改这张表就等于改了默认体验）。
     #[test]
     fn default_preference_starts_with_solo_cn() {
-        assert_eq!(DEFAULT_PREFERENCE.first().copied(), Some("solo-cn"));
+        assert_eq!(DEFAULT_PREFERENCE.first().copied(), Some("trae-cn"));
     }
 
     fn fake_client(key: &'static str, runnable: bool) -> InstalledClient {

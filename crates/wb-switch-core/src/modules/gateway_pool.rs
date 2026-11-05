@@ -190,6 +190,57 @@ pub fn usable() -> Vec<PoolEntry> {
     snapshot().into_iter().filter(|e| e.usable).collect()
 }
 
+// ---------------------------------------------------------------- 积分保底
+
+/// 积分保底线：余额低于它的账号，**不再派新请求**。
+///
+/// ## 为什么要这条线
+///
+/// 选号只看「谁的积分最快要过期」，于是一个只剩 5 分的号照样会被派付费请求。
+/// 打穿之后这个号当天就废了 —— 连免费模型都回 402（额度彻底归零），
+/// 而用户根本不知道是哪一次请求把它打穿的。
+///
+/// 留一点底，让账号还能「活着」：查额度、跑免费模型、等次日重置。
+///
+/// ## 取值
+///
+/// 默认 100（参考实现的实测结论同量级）；可用 `TWIN_CREDIT_FLOOR` 覆盖，
+/// 设 `0` 等于关闭这条规则。
+pub fn credit_floor() -> f64 {
+    std::env::var("TWIN_CREDIT_FLOOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(100.0)
+}
+
+/// 这个账号是不是「低于保底线」。
+///
+/// ⚠️ **额度未知（`None`）不算低于**：没查过额度不等于没钱，
+/// 把它排除会让「刚加进来还没查额度」的号彻底无法使用。
+pub fn below_floor(e: &PoolEntry, floor: f64) -> bool {
+    floor > 0.0 && e.remaining.map(|r| r < floor).unwrap_or(false)
+}
+
+/// 选出真正可派单的池子：优先只用「还在保底线之上」的账号。
+///
+/// 若**所有**可用账号都低于保底线，则退回用全部可用账号 ——
+/// 用户此刻要的是回答，不是让请求失败。但会返回 `true` 表示「已放宽」，
+/// 调用方据此在指标里留痕（否则「为什么派给了只剩 5 分的号」永远查不到）。
+pub fn usable_above_floor() -> (Vec<PoolEntry>, bool) {
+    let all = usable();
+    let floor = credit_floor();
+    if floor <= 0.0 {
+        return (all, false);
+    }
+    let above: Vec<PoolEntry> = all.iter().filter(|e| !below_floor(e, floor)).cloned().collect();
+    if above.is_empty() && !all.is_empty() {
+        return (all, true);
+    }
+    (above, false)
+}
+
+
 // ---------------------------------------------------------------- 错误反馈
 //
 // 照参考实现（buddy-switch-gateway/src/qoder/pool.rs）的四类处理：
@@ -381,6 +432,37 @@ fn parse_stamp(s: &str) -> Option<chrono::NaiveDateTime> {
     None
 }
 
+/// 这个错误是不是**请求本身**的问题（跟账号健不健康无关）。
+///
+/// 命中就做两件事：**不冷却账号**、**不换号重试**。
+///
+/// ## 为什么单独做成一个函数
+///
+/// 之前这些是「碰巧」不罚的：`classify` 的 `match http_status` 里 4xx 落到 `_ => None`。
+/// 一旦以后有人把 400 也纳进冷却范围（看起来很像「合理的补全」），
+/// 下面这些本来无害的错误会立刻开始封号，而且没有任何测试会红。
+///
+/// ## 收录的判据
+///
+/// - 上下文/提示词超长：换号换不掉 token 数
+/// - `11101`：非流式请求不支持（是我们发错了形状）
+/// - 内容策略拦截：是**这句话**被拦，不是这个号坏了
+pub fn is_request_fault(body_hint: &str) -> bool {
+    if is_context_overflow(body_hint) {
+        return true;
+    }
+    let h = body_hint.to_ascii_lowercase();
+    h.contains("11101")                      // non-stream chat request is not supported
+        || h.contains("11115")               // prompt is too long / 超长
+        || h.contains("prompt is too long")
+        || h.contains("content_filter")      // 内容过滤
+        || h.contains("content policy")
+        || h.contains("inappropriate content")
+        || body_hint.contains("内容安全")
+        || body_hint.contains("包含敏感")
+        || body_hint.contains("不符合规范")
+}
+
 /// 记录一次上游失败并置冷却。
 ///
 /// **记账粒度按失败性质分叉**（这是「换号换得对不对」的分水岭）：
@@ -453,6 +535,13 @@ fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'stati
     // 否则会把「账号没问题、只是排队」误判成「凭据死」打死。
     let hint = body_hint.to_ascii_lowercase();
     if is_queued_hint(body_hint) {
+        return None;
+    }
+
+    // 请求本身的问题（超长 / 形状错 / 被内容策略拦）⇒ 账号是健康的，**一律不罚**。
+    // 这条必须在配额判断之前：11115「prompt is too long」的字样里也带 "too long"，
+    // 被后面那些宽松的关键词匹配到就会误锁一个健康账号。
+    if is_request_fault(body_hint) {
         return None;
     }
 
@@ -1249,6 +1338,62 @@ pub fn clear_cooldown(key: &str, model: Option<&str>) {
 /// Qoder 区域 → 作用域字符串（界面展示用）。
 pub fn qoder_scope(region: QoderRegion) -> String {
     format!("qoder-{}", region.as_str())
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    fn entry(remaining: Option<f64>) -> PoolEntry {
+        PoolEntry {
+            key: "workbuddy:u1".into(),
+            product: "workbuddy".into(),
+            scope: "wb-cn".into(),
+            label: "u1".into(),
+            remaining,
+            expires_at: None,
+            usable: true,
+            reason: None,
+            cooldown_until: None,
+            limited_models: Vec::new(),
+        }
+    }
+
+    /// 低于保底线要被排除；额度未知不能排除（没查过 ≠ 没钱）。
+    #[test]
+    fn below_floor_only_when_known_and_low() {
+        assert!(below_floor(&entry(Some(5.0)), 100.0));
+        assert!(!below_floor(&entry(Some(150.0)), 100.0));
+        assert!(!below_floor(&entry(None), 100.0), "额度未知不该被当成 0");
+        // 关掉保底（floor=0）时谁都不算低
+        assert!(!below_floor(&entry(Some(0.0)), 0.0));
+    }
+
+    /// 「请求本身的问题」不罚账号 —— 这条以前是**碰巧**成立的（4xx 落到 `_ => None`），
+    /// 一旦有人把 4xx 纳进冷却范围就会静默开始封号，所以钉死。
+    #[test]
+    fn request_faults_never_cool_down() {
+        for hint in [
+            "Trae 上游报错 code 4026: context length has exceeded",
+            r#"{"code":11115,"msg":"prompt is too long: 1395254 tokens"}"#,
+            r#"{"code":"11101","msg":"Non-stream chat request is currently not supported"}"#,
+            "content_filter triggered",
+        ] {
+            assert!(is_request_fault(hint), "应判为请求问题：{hint}");
+            assert_eq!(
+                classify(400, hint, now_ms()),
+                None,
+                "请求问题不该产生冷却：{hint}"
+            );
+        }
+    }
+
+    /// 真·账号问题仍要冷却（别把上面的放宽做成「什么都不罚」）。
+    #[test]
+    fn real_account_faults_still_cool_down() {
+        assert!(classify(401, "invalid token", now_ms()).is_some());
+        assert!(classify(500, "internal error", now_ms()).is_some());
+    }
 }
 
 #[cfg(test)]
