@@ -50,6 +50,8 @@ type PoolEntry = {
   expires_at: number | null;
   usable: boolean;
   reason: string | null;
+  /** 冷却原因类别（auth_dead / transient / balance_exhausted / rate_limited）。 */
+  cooldown_kind?: string | null;
   cooldown_until: number | null;
   /// 按模型记的限额（后端 `gateway_pool::model_limits`）——只锁这几个模型，号还能用。
   limited_models: { model: string; reset_at: number; kind: string }[];
@@ -167,6 +169,14 @@ type Preview = {
   candidates: string[];
   picked: PoolEntry | null;
   reason: string | null;
+};
+
+/** 冷却原因 → 一句人话（值来自后端 `classify` 的 kind）。 */
+const COOLDOWN_CAUSE: Record<string, string> = {
+  auth_dead: "凭据失效，需重新登录",
+  transient: "上游抖动，等它自己恢复",
+  balance_exhausted: "额度用完，等重置",
+  rate_limited: "触发频率限制，稍后自动恢复",
 };
 
 const PRODUCTS: Record<string, string> = { trae: "Trae", workbuddy: "WorkBuddy", qoder: "Qoder" };
@@ -1552,7 +1562,13 @@ export default function GatewayPage() {
         ) : (
           <div className="flex flex-col gap-4">
             {grouped.map(([product, rows]) => {
-              const on = rows.filter((r) => r.usable).length;
+              // ⚠️ 「可用」要对得上每一行：冷却中的号虽然凭据是好的，但此刻**发不出去**，
+              // 以前这里只数 `usable`，于是块头写「2/2 可用」、下面两行却都在冷却 ——
+              // 用户看到自相矛盾的数字，就不知道该信哪个（issue #15）。
+              const nowMs = Date.now();
+              const on = rows.filter(
+                (r) => r.usable && !(r.cooldown_until && r.cooldown_until > nowMs),
+              ).length;
               const collapsed = poolCollapsed.has(product);
               return (
                 <div key={product} className="rounded-lg border border-border">
@@ -1624,12 +1640,19 @@ export default function GatewayPage() {
                               <td className="px-3 py-2">{fmtExpiry(r.expires_at)}</td>
                               <td className="px-3 py-2">
                                 {r.cooldown_until && r.cooldown_until > Date.now() ? (
-                                  /* 整号冷却：上游明确拒绝了这个账号（凭据死 / 传输炸） */
+                                  /* 整号冷却：上游明确拒绝了这个账号（凭据死 / 传输炸）。
+                                     ⚠️ 只说「几分钟后恢复」不够 —— 用户判断不了该不该去重新登录，
+                                     所以把冷却**类别**一起显示出来。 */
                                   <span
-                                    className="cursor-help text-amber-600"
-                                    title={`上游报错后暂停到 ${new Date(r.cooldown_until).toLocaleString()}，期间不会选它`}
+                                    className="block cursor-help text-amber-600"
+                                    title={`${COOLDOWN_CAUSE[r.cooldown_kind ?? ""] ?? "上游报错"}：暂停到 ${new Date(
+                                      r.cooldown_until,
+                                    ).toLocaleString()}，期间不会选它`}
                                   >
-                                    {fmtRecover(r.cooldown_until)}
+                                    <span>{fmtRecover(r.cooldown_until)}</span>
+                                    <span className="mt-0.5 block max-w-[16rem] text-[10px] leading-tight font-normal text-muted-foreground">
+                                      {COOLDOWN_CAUSE[r.cooldown_kind ?? ""] ?? "上游报错"}
+                                    </span>
                                   </span>
                                 ) : r.limited_models.length > 0 ? (
                                   /* 模型级冷却：只有这几个模型用完，别的模型照常能用 */
@@ -1645,13 +1668,29 @@ export default function GatewayPage() {
                                 ) : r.usable ? (
                                   <span className="text-emerald-600">可用</span>
                                 ) : (
-                                  /* 原因可能很长（401 / 过期 / 无凭据），放 title，表格不被撑宽 */
-                                  <span
-                                    className="cursor-help text-destructive"
-                                    title={r.reason ?? "不可用"}
-                                  >
-                                    不可用
-                                  </span>
+                                  /* ⚠️ 原因不能只塞进 title：不悬停就只看到「不可用」，
+                                     用户根本不知道该怎么修（issue #15 的反馈就是这个）。
+                                     所以「短原因 · 做法」直接显示在下面一行，全文仍放 title。 */
+                                  (() => {
+                                    const [cause, advice] = (r.reason ?? "原因未知").split("｜");
+                                    return (
+                                      <span
+                                        className="block cursor-help text-destructive"
+                                        title={r.reason ?? "不可用"}
+                                      >
+                                        <span>不可用</span>
+                                        <span className="mt-0.5 block max-w-[16rem] text-[10px] leading-tight font-normal text-muted-foreground">
+                                          {cause}
+                                          {advice ? (
+                                            <span className="text-amber-600 dark:text-amber-400">
+                                              {" "}
+                                              · {advice}
+                                            </span>
+                                          ) : null}
+                                        </span>
+                                      </span>
+                                    );
+                                  })()
                                 )}
                               </td>
                             </tr>

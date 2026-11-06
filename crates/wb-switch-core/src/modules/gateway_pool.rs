@@ -46,6 +46,11 @@ pub struct PoolEntry {
     pub reason: Option<String>,
     /// 冷却截止（毫秒）—— 上游报错后由 [`apply_error`] 写入，`None` = 没在冷却。
     pub cooldown_until: Option<i64>,
+    /// 冷却的**原因类别**（`auth_dead` / `transient` / `balance_exhausted` / `rate_limited`）。
+    ///
+    /// ⚠️ 只给「几点恢复」是不够的：用户看到「3 分钟后恢复」根本判断不了
+    /// 是该去重新登录（凭据死），还是什么都不用做（上游抖了一下）。
+    pub cooldown_kind: Option<String>,
     /// **按模型**记的限额（照 changexbc/workbuddy-switch 的 `limits.rs` 台账口径）。
     ///
     /// 上游 429 说的通常是「这个号的这个模型今天用完了」，不是「这个号废了」——
@@ -631,6 +636,19 @@ pub fn cooling_until(key: &str, model: Option<&str>) -> Option<i64> {
     }
 }
 
+/// 冷却的**原因类别**（与 `classify` 的返回值同源，别再各写一套）。
+pub fn cooling_kind(key: &str, model: Option<&str>) -> Option<&'static str> {
+    let now = now_ms();
+    let m = cooldowns().lock().ok()?;
+    let pick = |k: String| -> Option<&'static str> {
+        m.get(&k).filter(|(until, _)| *until > now).map(|(_, kind)| *kind)
+    };
+    match model {
+        Some(name) => pick(cooldown_key(key, Some(name))).or_else(|| pick(key.to_string())),
+        None => pick(key.to_string()),
+    }
+}
+
 /// 某账号所有**模型级**限额（界面展示「哪些模型要等到几点」）。
 pub fn model_limits(key: &str) -> Vec<ModelLimit> {
     let now = now_ms();
@@ -689,6 +707,7 @@ pub fn last_error() -> Option<String> {
 fn with_cooldowns(mut entries: Vec<PoolEntry>, model: Option<&str>) -> Vec<PoolEntry> {
     for e in entries.iter_mut() {
         e.cooldown_until = cooling_until(&e.key, model);
+        e.cooldown_kind = cooling_kind(&e.key, model).map(str::to_string);
         e.limited_models = model_limits(&e.key);
     }
     entries.sort_by(|a, b| {
@@ -718,13 +737,14 @@ fn qoder_entries() -> Vec<PoolEntry> {
                 expires_at: a.credits_expire_at,
                 usable,
                 cooldown_until: None,
+                cooldown_kind: None,
                 limited_models: Vec::new(),
                 reason: if usable {
                     None
                 } else if a.disabled {
-                    Some("已停用".into())
+                    Some("已停用｜到账号页重新启用该账号".into())
                 } else {
-                    Some("还没有凭据".into())
+                    Some("还没有凭据｜点该账号重新登录，或导入本机登录态".into())
                 },
             }
         })
@@ -823,6 +843,7 @@ fn workbuddy_entries() -> Vec<PoolEntry> {
                 expires_at,
                 usable,
                 cooldown_until: None,
+                cooldown_kind: None,
                 limited_models: Vec::new(),
                 reason: if usable {
                     None
@@ -832,9 +853,9 @@ fn workbuddy_entries() -> Vec<PoolEntry> {
                         auth_error.unwrap_or("登录态已被服务端作废")
                     ))
                 } else if expired {
-                    Some("登录态已过期，需重新登录".into())
+                    Some("登录态已过期｜重新登录该账号后重试".into())
                 } else {
-                    Some("还没有凭据".into())
+                    Some("还没有凭据｜点该账号重新登录，或导入本机登录态".into())
                 },
             })
         })
@@ -1058,13 +1079,14 @@ fn trae_entries() -> Vec<PoolEntry> {
             expires_at,
             usable: has_cred && !expired,
             reason: if !has_cred {
-                Some("缺少可用登录态（storage.json 里没有能解开的授权）".into())
+                Some("缺少可用登录态｜用这个账号登录一次 Trae，再点「导入本机登录态」".into())
             } else if expired {
-                Some("积分已过期".into())
+                Some("积分已过期｜重新登录该账号刷新额度，或换用其它账号".into())
             } else {
                 None
             },
             cooldown_until: None,
+            cooldown_kind: None,
             limited_models: Vec::new(),
         });
     }
@@ -1355,6 +1377,7 @@ mod floor_tests {
             usable: true,
             reason: None,
             cooldown_until: None,
+            cooldown_kind: None,
             limited_models: Vec::new(),
         }
     }
@@ -1470,6 +1493,7 @@ mod tests {
             usable: true,
             reason: None,
             cooldown_until: None,
+            cooldown_kind: None,
             limited_models: Vec::new(),
         };
         let mut list = vec![
@@ -1744,7 +1768,7 @@ mod tests {
     fn urgency_sorts_missing_expiry_last() {
         let mk = |expires_at: Option<i64>| PoolEntry {
             key: "k".into(), product: "p".into(), scope: "s".into(), label: "l".into(),
-            remaining: None, expires_at, usable: true, reason: None, cooldown_until: None,
+            remaining: None, expires_at, usable: true, reason: None, cooldown_until: None, cooldown_kind: None,
             limited_models: Vec::new(),
         };
         assert!(mk(Some(100)).urgency() < mk(Some(200)).urgency());
@@ -1773,6 +1797,27 @@ mod lock_scope_probe {
                 ),
                 Err(e) => eprintln!("[probe] {m} → 失败：{e}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_dump_probe {
+    use super::*;
+
+    /// 只读探针：打印池子里每个账号的 usable / reason / 冷却 / 限额。
+    #[test]
+    #[ignore]
+    fn probe_dump_pool() {
+        for e in snapshot() {
+            if e.product != "trae" {
+                continue;
+            }
+            println!(
+                "{} scope={} usable={} reason={:?} cooldown_until={:?} remaining={:?} limits={}",
+                e.key, e.scope, e.usable, e.reason, e.cooldown_until, e.remaining,
+                e.limited_models.len()
+            );
         }
     }
 }
