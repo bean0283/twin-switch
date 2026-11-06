@@ -1387,6 +1387,25 @@ pub struct LinkGroup {
     pub members: Vec<LinkMember>,
 }
 
+/// 被用户**明确拆开**的成员：这条副本不再参与「同标题副本」的自动聚类。
+///
+/// ## 为什么需要这个
+///
+/// 列表里的组有两种来源：正式记录（`link:<id>`），和**没有记录、按标题聚出来的**
+/// 副本（`dup:<标题>`）。用户对后者点「取消关联」时，本来就没有记录可删 ——
+/// 于是下次刷新，同一个标题又把它们聚回来，界面上表现为
+/// 「点了取消关联，它还在，刷新也还在」（2026-11-06 用户报告）。
+///
+/// 所以「拆开」这件事本身要落盘：记下 (账号, 会话)，聚类时跳过它们。
+/// 重新手动关联会清掉对应条目（见 `clear_splits`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkSplit {
+    pub uid: String,
+    pub session_id: String,
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkStore {
@@ -1394,6 +1413,9 @@ pub struct LinkStore {
     pub version: u32,
     #[serde(default)]
     pub groups: Vec<LinkGroup>,
+    /// 已拆开的成员（见 [`LinkSplit`]）。老文件没有这个字段 ⇒ 空表。
+    #[serde(default)]
+    pub splits: Vec<LinkSplit>,
 }
 
 fn links_file() -> PathBuf {
@@ -1425,7 +1447,16 @@ pub(crate) fn save_links(store: &LinkStore) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建关联存储目录失败: {e}"))?;
     }
-    let text = serde_json::to_string_pretty(store).map_err(|e| format!("序列化关联记录失败: {e}"))?;
+    // 拆分标记会随「取消关联」一直累积，封顶 200 条（保留最新的）——
+    // 这东西只影响自动聚类，丢老的不会让任何关联关系失效。
+    let mut trimmed = store.clone();
+    if trimmed.splits.len() > 200 {
+        trimmed.splits.sort_by_key(|s| s.at);
+        let cut = trimmed.splits.len() - 200;
+        trimmed.splits.drain(0..cut);
+    }
+    let text =
+        serde_json::to_string_pretty(&trimmed).map_err(|e| format!("序列化关联记录失败: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("写入关联记录失败: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("替换关联记录失败: {e}"))?;
@@ -1456,6 +1487,13 @@ pub(crate) fn upsert_group(
     now: i64,
 ) -> String {
     store.version = LINK_STORE_VERSION;
+    // 用户主动把这两条关联起来 ⇒ 之前「已拆开」的标记作废，否则它们永远不进自动聚类。
+    store
+        .splits
+        .retain(|s| !(s.uid == target_uid && s.session_id == target_cid));
+    store
+        .splits
+        .retain(|s| !(s.uid == source_uid && s.session_id == source_cid));
     if let Some(group) = store.groups.iter_mut().find(|g| {
         g.members
             .iter()
@@ -2702,6 +2740,7 @@ mod tests {
         let b1 = ws("s-b1", "B", "t", "", 100);
         let store = LinkStore {
             version: LINK_STORE_VERSION,
+            splits: Vec::new(),
             groups: vec![LinkGroup {
                 id: "g1".to_string(),
                 created_at: 1,
@@ -2788,6 +2827,7 @@ mod tests {
         // 关联组里记着 A→B，但那份副本 s-gone 已经不在库里了。
         let store = LinkStore {
             version: LINK_STORE_VERSION,
+            splits: Vec::new(),
             groups: vec![LinkGroup {
                 id: "g1".into(),
                 created_at: 1,
@@ -2816,6 +2856,7 @@ mod tests {
         let alive = vec![&a1, &b1];
         let store = LinkStore {
             version: LINK_STORE_VERSION,
+            splits: Vec::new(),
             groups: vec![LinkGroup {
                 id: "g1".into(),
                 created_at: 1,
