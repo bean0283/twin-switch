@@ -248,6 +248,13 @@ fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), Strin
     };
     let accounts = usable_accounts();
     let store = workbuddy_sessions::load_links()?;
+    // 用户明确「取消关联」拆开过的副本：不再参与同标题聚类。
+    // 没有这一条，取消关联对「本来就没有正式记录」的组等于没做 —— 刷新又聚回来。
+    let split: HashSet<(String, String)> = store
+        .splits
+        .iter()
+        .map(|s| (s.uid.clone(), s.session_id.clone()))
+        .collect();
 
     // (uid, cid) → 会话
     let mut index: HashMap<(String, String), WbSession> = HashMap::new();
@@ -294,6 +301,9 @@ fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), Strin
             continue;
         }
         if used.contains(&(s.user_id.clone(), s.id.clone())) {
+            continue;
+        }
+        if split.contains(&(s.user_id.clone(), s.id.clone())) {
             continue;
         }
         by_dup
@@ -1167,7 +1177,7 @@ pub fn link_session(
 fn apply_unlink_store(
     store: &mut workbuddy_sessions::LinkStore,
     group_id: Option<&str>,
-    removed: &[String],
+    removed: &[(String, String)],
     keep: &[(String, String)],
     now: i64,
 ) -> Result<bool, String> {
@@ -1180,7 +1190,7 @@ fn apply_unlink_store(
             };
             store.groups[idx]
                 .members
-                .retain(|m| !removed.iter().any(|u| *u == m.uid));
+                .retain(|m| !removed.iter().any(|(u, _)| *u == m.uid));
             // 只剩 0/1 个成员时「组」不成立：留着会让那份副本永远被算作「已关联」，
             // 以后再也无法和别的副本聚到一起。
             if store.groups[idx].members.len() <= 1 {
@@ -1206,6 +1216,29 @@ fn apply_unlink_store(
                 });
             }
             // keep < 2：没有可登记的组合，什么都不写（单份副本本来就不成组）。
+        }
+    }
+    // ★ 不管哪种组，**被拆开的成员都要落盘**：否则下次列表按同标题又聚回来，
+    //   用户看到的就是「点了取消关联，它还在，刷新也还在」（2026-11-06）。
+    //   组被整体删掉时，留下来的那些也没了记录，一并记上（这段对话已经散开）。
+    let mut remember: Vec<(String, String)> = removed.to_vec();
+    if group_deleted {
+        remember.extend(keep.iter().cloned());
+    }
+    if !remember.is_empty() {
+        store.version = workbuddy_sessions::LINK_STORE_VERSION;
+    }
+    for (uid, sid) in remember {
+        if !store
+            .splits
+            .iter()
+            .any(|s| s.uid == uid && s.session_id == sid)
+        {
+            store.splits.push(workbuddy_sessions::LinkSplit {
+                uid,
+                session_id: sid,
+                at: now,
+            });
         }
     }
     Ok(group_deleted)
@@ -1250,11 +1283,12 @@ pub fn unlink_members(group_key: &str, uids: &[String]) -> Result<Value, String>
     }
     let remove_all = want.is_empty();
 
-    let mut removed: Vec<String> = Vec::new();
+    // removed 带 session id：拆开这件事要按 (账号, 会话) 落盘，光有 uid 定位不到副本。
+    let mut removed: Vec<(String, String)> = Vec::new();
     let mut keep: Vec<(String, String)> = Vec::new();
     for (uid, sid) in members.iter() {
         if remove_all || want.iter().any(|w| w == uid) {
-            removed.push(uid.clone());
+            removed.push((uid.clone(), sid.clone()));
         } else {
             keep.push((uid.clone(), sid.clone()));
         }
@@ -1276,7 +1310,7 @@ pub fn unlink_members(group_key: &str, uids: &[String]) -> Result<Value, String>
     Ok(json!({
         "ok": true,
         "title": title,
-        "removed": removed,
+        "removed": removed.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
         "removedCount": removed.len(),
         "remaining": keep.len(),
         "groupDeleted": group_deleted,
@@ -1378,6 +1412,55 @@ fn with_group_key(out: &mut Value, fallback: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「取消关联」必须留下痕迹：否则同标题副本下次刷新又被聚回来
+    /// （2026-11-06 用户：取消关联后记录一直都在）。
+    #[test]
+    fn unlink_of_dup_group_records_split() {
+        let mut store = workbuddy_sessions::LinkStore::default();
+        let removed = vec![
+            ("u1".to_string(), "s1".to_string()),
+            ("u2".to_string(), "s2".to_string()),
+        ];
+        let keep: Vec<(String, String)> = vec![];
+        // group_id = None ⇒ 同标题聚类组（本来就没有正式记录）
+        let deleted = apply_unlink_store(&mut store, None, &removed, &keep, 100).unwrap();
+        assert!(!deleted);
+        assert_eq!(store.splits.len(), 2, "两条都要记下「已拆开」");
+        assert!(store
+            .splits
+            .iter()
+            .any(|s| s.uid == "u1" && s.session_id == "s1"));
+    }
+
+    /// 正式组删到只剩 1 个成员时整组解散 —— 留下的那个也要记，
+    /// 否则它作为「无记录副本」又被标题聚回去。
+    #[test]
+    fn unlink_to_single_member_deletes_group_and_records_both() {
+        let mut store = workbuddy_sessions::LinkStore::default();
+        store.groups.push(workbuddy_sessions::LinkGroup {
+            id: "g1".to_string(),
+            created_at: 1,
+            members: vec![
+                workbuddy_sessions::LinkMember {
+                    uid: "u1".to_string(),
+                    session_id: "s1".to_string(),
+                    linked_at: 1,
+                },
+                workbuddy_sessions::LinkMember {
+                    uid: "u2".to_string(),
+                    session_id: "s2".to_string(),
+                    linked_at: 1,
+                },
+            ],
+        });
+        let removed = vec![("u2".to_string(), "s2".to_string())];
+        let keep = vec![("u1".to_string(), "s1".to_string())];
+        let deleted = apply_unlink_store(&mut store, Some("g1"), &removed, &keep, 200).unwrap();
+        assert!(deleted, "只剩 1 个成员时组应当解散");
+        assert!(store.groups.is_empty());
+        assert_eq!(store.splits.len(), 2, "被移除的与留下的都要记");
+    }
 
     fn member(uid: &str, digest: &str, relation: &str, has_body: bool) -> Member {
         let s = WbSession {
