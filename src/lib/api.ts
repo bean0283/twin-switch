@@ -2774,3 +2774,99 @@ export async function gatewayGuideSelftest(args: {
 }> {
   return invoke("gateway_guide_selftest", args);
 }
+
+// ---------------------------------------------------------------------------
+// 青龙面板（token / 环境变量提交）
+// ---------------------------------------------------------------------------
+
+export interface QinglongConfigView {
+  enabled: boolean;
+  url: string;
+  clientId: string;
+  hasSecret: boolean;
+  secretMasked: string;
+  envTrae: string;
+  envWb: string;
+  envQoder: string;
+}
+
+export interface QinglongStatus {
+  enabled: boolean;
+  connected?: boolean;
+  base?: string;
+  envs?: number;
+  envTrae?: string;
+  envWb?: string;
+  envQoder?: string;
+  error?: string;
+}
+
+/** 提交结果：覆盖（updated）或新增（created）。 */
+export interface QinglongSubmitResult {
+  action: "updated" | "created";
+  envName: string;
+  ids?: unknown[];
+  matched?: number;
+  remark?: string;
+  id?: number;
+}
+
+/** 通用变量提交遇到同名时：列出既有条目让用户选「覆盖哪条 / 追加」。 */
+export interface QinglongEnvChoice {
+  needChoice: true;
+  envName: string;
+  existing: { id: number; remarks: string; valuePreview: { len: number } }[];
+}
+
+export async function qinglongConfigGet(): Promise<QinglongConfigView> {
+  return invoke("qinglong_config_get");
+}
+
+/** 保存配置；`clientSecret` 传 null/空 = 保留原值。 */
+export async function qinglongConfigSet(args: {
+  enabled?: boolean;
+  url?: string;
+  clientId?: string;
+  clientSecret?: string | null;
+  envTrae?: string;
+  envWb?: string;
+  envQoder?: string;
+}): Promise<{ saved: boolean }> {
+  return invoke("qinglong_config_set", {
+    enabled: args.enabled ?? null,
+    url: args.url ?? null,
+    clientId: args.clientId ?? null,
+    clientSecret: args.clientSecret ?? null,
+    envTrae: args.envTrae ?? null,
+    envWb: args.envWb ?? null,
+    envQoder: args.envQoder ?? null,
+  });
+}
+
+export async function qinglongStatus(): Promise<QinglongStatus> {
+  return invoke("qinglong_status");
+}
+
+export async function qinglongSubmitToken(
+  provider: string,
+  token: string,
+  remark: string,
+): Promise<QinglongSubmitResult> {
+  return invoke("qinglong_submit_token", { provider, token, remark: remark || null });
+}
+
+export async function qinglongSubmitEnv(args: {
+  name: string;
+  value: string;
+  remarks?: string;
+  mode?: "update" | "append";
+  envId?: number;
+}): Promise<QinglongSubmitResult | QinglongEnvChoice> {
+  return invoke("qinglong_submit_env", {
+    name: args.name,
+    value: args.value,
+    remarks: args.remarks ?? null,
+    mode: args.mode ?? null,
+    envId: args.envId ?? null,
+  });
+}

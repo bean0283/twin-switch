@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, Eye, EyeOff, Loader2, RefreshCw, ShieldAlert, X } from "lucide-react";
+import { Check, Copy, Eye, EyeOff, Loader2, RefreshCw, ShieldAlert, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -108,6 +108,7 @@ export function AccountTokenDialog({
   targetKey,
   accountId,
   accountName,
+  onRefreshed,
   extraFooter,
 }: {
   open: boolean;
@@ -122,6 +123,14 @@ export function AccountTokenDialog({
   accountId: string | null;
   /** 只在标题上给人看，不参与取值。 */
   accountName?: string | null;
+  /**
+   * 刷新成功后的回调（可选）。
+   *
+   * ⚠️ 必须传：弹窗自己 `load()` 只更新弹窗内的数据，**页面账号卡上的
+   * 「N 天后过期」读的是页面自己的列表**——不回调刷新它，就会出现
+   * 「token 已刷新、卡片还挂着旧有效期」的假象（2026-11-07 用户实测踩到）。
+   */
+  onRefreshed?: () => void;
   /**
    * 产品独有的附加操作（渲染在「关闭」左边）。
    *
@@ -150,6 +159,13 @@ export function AccountTokenDialog({
   const [refreshShift, setRefreshShift] = useState<RefreshShift | null>(null);
   /** 非空 = 正在问「要不要强制刷新」。 */
   const [forceAsk, setForceAsk] = useState<{ remainingDays: number; thresholdDays: number } | null>(null);
+
+  // ---- 青龙提交（设置里开了开关才有；连接失败 = 不显示按钮，只给一行灰字） ----
+  const [qlStatus, setQlStatus] = useState<api.QinglongStatus | null>(null);
+  const [qlBusy, setQlBusy] = useState(false);
+  const [qlDone, setQlDone] = useState<api.QinglongSubmitResult | null>(null);
+  /** 提交备注 = 账号显示名（新增变量的备注；Qoder 匹配也按它）。 */
+  const qlRemark = accountName ?? "";
 
   const load = useCallback(async () => {
     if (!accountId) return;
@@ -185,12 +201,21 @@ export function AccountTokenDialog({
       setRefreshError(null);
       setRefreshShift(null);
       void load();
+      // 青龙状态顺带探一次（后端开关没开时直接短返回，不打网络）。
+      setQlStatus(null);
+      setQlDone(null);
+      void api
+        .qinglongStatus()
+        .then((st) => setQlStatus(st))
+        .catch(() => setQlStatus({ enabled: false }));
     } else if (!open) {
       setInfo(null);
       setError(null);
       setForceAsk(null);
       setRefreshError(null);
       setRefreshShift(null);
+      setQlStatus(null);
+      setQlDone(null);
     }
   }, [open, provider, targetKey, accountId, load]);
 
@@ -260,6 +285,8 @@ export function AccountTokenDialog({
         before && after ? { before, after, shortened: after < before } : null,
       );
       await load();
+      // 让页面把账号列表也重读一遍：卡片上的「N 天后过期」要跟着新有效期走。
+      onRefreshed?.();
     } catch (cause) {
       const detail = api.asError(cause);
       setRefreshError(detail);
@@ -277,6 +304,34 @@ export function AccountTokenDialog({
     provider === "trae" ? "Trae" : provider === "qoder" ? "Qoder" : "WorkBuddy";
   /** 官方签发的有效期天数 —— **按产品分流**，只用于文案举例（判定一律看 token 的 `exp`）。 */
   const issuedDays = ISSUED_VALIDITY_DAYS[provider];
+
+  // ---- 青龙提交（开关开 + 连接成功才显示按钮；失败给一行灰字，绝不瞎猜） ----
+  const qlEnvName =
+    provider === "trae"
+      ? qlStatus?.envTrae
+      : provider === "workbuddy"
+        ? qlStatus?.envWb
+        : qlStatus?.envQoder;
+  const qlShow = qlStatus?.enabled === true && qlStatus.connected === true;
+
+  async function submitToQinglong() {
+    if (!token) return;
+    setQlBusy(true);
+    try {
+      const res = await api.qinglongSubmitToken(provider, token, qlRemark);
+      setQlDone(res);
+      toast.success(
+        res.action === "updated"
+          ? `已覆盖 ${res.matched ?? res.ids?.length ?? 0} 条 ${res.envName} 旧变量`
+          : `已新增环境变量 ${res.envName}`,
+        { description: res.action === "updated" ? `面板变量 id：${(res.ids ?? []).join("、")}` : `备注：${res.remark || "（空）"}` },
+      );
+    } catch (cause) {
+      toast.error("提交到青龙失败", { description: api.asError(cause) });
+    } finally {
+      setQlBusy(false);
+    }
+  }
 
   return (
     <>
@@ -409,6 +464,41 @@ export function AccountTokenDialog({
                 </div>
               ) : null}
               </div>
+
+              {/* 青龙一键提交：开关开 + 连接成功才出现；连接失败 = 不显示按钮，只留一行灰字。
+                  ⚠️ 弹窗打开时就探测过（qinglongStatus，8 秒兜底超时），这里不再等网络。 */}
+              {qlStatus?.enabled === true && !qlShow ? (
+                <div className="text-xs text-muted-foreground">
+                  青龙面板不可达（{qlStatus.error ?? "未知原因"}），提交按钮已隐藏。去「设置 → 青龙面板」检查地址与凭据。
+                </div>
+              ) : null}
+              {qlShow ? (
+                <div className="grid gap-2 rounded-lg border px-3 py-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={qlBusy || !token}
+                      onClick={() => void submitToQinglong()}
+                    >
+                      {qlBusy ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
+                      提交到青龙{qlEnvName ? `（${qlEnvName}）` : ""}
+                    </Button>
+                    <span className="text-xs font-medium text-emerald-600">已连接</span>
+                  </div>
+                  {qlDone ? (
+                    <div className="text-xs text-muted-foreground">
+                      {qlDone.action === "updated"
+                        ? `已覆盖 ${qlDone.matched ?? 0} 条同账号旧变量（id：${(qlDone.ids ?? []).join("、")}）`
+                        : `已新增 ${qlDone.envName}，备注「${qlDone.remark || "（空）"}」`}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-muted-foreground">
+                      按账号自动匹配旧变量：命中 = 覆盖，未命中 = 新增（备注「{qlRemark || "（空）"}」）。
+                    </div>
+                  )}
+                </div>
+              ) : null}
 
               {/* 续期 */}
               <div className="flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2.5">

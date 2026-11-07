@@ -61,8 +61,16 @@ pub struct QoderAccount {
     #[serde(default)]
     pub credits: Option<f64>,
     /// 额度到期时间（毫秒）。
+    ///
+    /// ⚠️ 上游会用 **9999-12-31**（`253402214400000`）表示「不限期」，
+    /// 那是哨兵不是日期。以前原样存进去，界面渲染成 `12/31 08:00`，
+    /// 用户以为今年年底就过期了（2026-11-06 反馈）。
+    /// 现在哨兵会把本字段置空、改由 `credits_expire_never` 表达。
     #[serde(default)]
     pub credits_expire_at: Option<i64>,
+    /// 上游明确说「不限期」（而不是「没提供」）。
+    #[serde(default)]
+    pub credits_expire_never: bool,
     /// 上次成功查到额度的时刻（毫秒）—— 卡片上的「x 分钟前更新」就是它。
     #[serde(default)]
     pub credits_updated_at: Option<i64>,
@@ -173,6 +181,7 @@ impl QoderAccount {
             plan: None,
             credits: None,
             credits_expire_at: None,
+            credits_expire_never: false,
             credits_updated_at: None,
             credit_parts: Vec::new(),
             cosy_machine_token: None,
@@ -236,11 +245,32 @@ pub fn trash_file(region: QoderRegion) -> PathBuf {
 // ---------------------------------------------------------------- 读写
 
 fn read_file(path: &PathBuf) -> Result<AccountFile, String> {
-    match std::fs::read(path) {
+    let mut file = match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| format!("账号库格式损坏：{}（{e}）", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AccountFile::default()),
-        Err(e) => Err(format!("读取账号库失败：{}（{e}）", path.display())),
+            .map_err(|e| format!("账号库格式损坏：{}（{e}）", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AccountFile::default(),
+        Err(e) => return Err(format!("读取账号库失败：{}（{e}）", path.display())),
+    };
+    normalize_legacy_expiry(&mut file);
+    Ok(file)
+}
+
+/// 把**旧数据**里的到期时间哨兵就地归一化（只在内存里改，不主动回写文件）。
+///
+/// 为什么非做不可：修复之前每次刷新都会把上游的 `expiresAt` 原样落盘，
+/// 所以现在磁盘上躺着一堆 `253402214400000`（9999-12-31）。如果只在新响应解析时
+/// 才转成「不限期」，那些老数据要等到**每个账号都被手动刷新一次**才会消失 ——
+/// 期间界面继续显示 `12/31 08:00`，用户以为还没修好（2026-11-07 就是这么反馈的）。
+///
+/// 判据与上游解析共用 [`crate::modules::qoder_realm::is_never_expires`]。
+fn normalize_legacy_expiry(file: &mut AccountFile) {
+    for a in file.accounts.iter_mut() {
+        if let Some(ms) = a.credits_expire_at {
+            if crate::modules::qoder_realm::is_never_expires(ms) {
+                a.credits_expire_at = None;
+                a.credits_expire_never = true;
+            }
+        }
     }
 }
 
@@ -414,6 +444,38 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 旧数据归一化：磁盘上早就落了一堆哨兵（`253402214400000` = 9999-12-31），
+    /// 读出来必须变成「不限期」。否则用户得逐个账号手动刷新才能摆脱 `12/31 08:00`
+    /// —— 2026-11-07 用户看到「还是识别不出来」就是这个原因。
+    #[test]
+    fn legacy_sentinel_expiry_becomes_never_expires() {
+        let mk = |exp: Option<i64>| -> AccountFile {
+            let a: QoderAccount = serde_json::from_value(json!({
+                "id": "acc", "uid": "u", "region": "cn", "created_at": 0,
+                "credits_expire_at": exp,
+            }))
+            .expect("构造账号");
+            AccountFile { version: 1, accounts: vec![a] }
+        };
+
+        let mut legacy = mk(Some(253_402_214_400_000));
+        normalize_legacy_expiry(&mut legacy);
+        assert_eq!(legacy.accounts[0].credits_expire_at, None, "哨兵必须清空");
+        assert!(legacy.accounts[0].credits_expire_never, "哨兵要标成不限期");
+
+        // 真实日期一个字都不许动（否则就是把有用的信息洗掉）
+        let mut real = mk(Some(1_795_098_481_000));
+        normalize_legacy_expiry(&mut real);
+        assert_eq!(real.accounts[0].credits_expire_at, Some(1_795_098_481_000));
+        assert!(!real.accounts[0].credits_expire_never);
+
+        // 本来就是「没提供」：保持没提供，不能顺手标成不限期
+        let mut none = mk(None);
+        normalize_legacy_expiry(&mut none);
+        assert_eq!(none.accounts[0].credits_expire_at, None);
+        assert!(!none.accounts[0].credits_expire_never);
+    }
 
     /// 令牌形状必须与 Trae / WorkBuddy 一致（共用弹窗只认这一种）。
     #[test]

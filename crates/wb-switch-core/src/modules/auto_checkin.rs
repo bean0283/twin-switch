@@ -162,7 +162,7 @@ static RUNNING: OnceLock<Mutex<bool>> = OnceLock::new();
 ///
 /// 未开启时两者都为空、不发任何请求。
 pub async fn maybe_run(trigger: &str) -> Value {
-    let mut s = load();
+    let s = load();
     if !s.enabled {
         return json!({ "ran": [], "skipped": SCOPES, "reason": "disabled", "state": state() });
     }

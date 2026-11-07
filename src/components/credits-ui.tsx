@@ -52,6 +52,8 @@ export interface CreditPack {
    * 而 Qoder 的额度接口根本不给到期时间 —— 显示成「长期有效」就是编事实。
    */
   expiryUnavailable?: boolean;
+  /** 上游明确「不限期」（不是「没提供」）。 */
+  neverExpires?: boolean;
 }
 
 export interface CreditView {
@@ -79,6 +81,8 @@ export interface CreditView {
   notes?: string[];
   /** 整份数据都没有到期时间（见 `CreditPack.expiryUnavailable`）。 */
   expiryUnavailable?: boolean;
+  /** 上游明确「不限期」（与「没提供」是两回事）。 */
+  neverExpires?: boolean;
 }
 
 /** 7 天 = 快到期的界。 */
@@ -169,7 +173,7 @@ function PackageRow({ p }: { p: CreditPack }) {
           </span>
         </span>
         <span className={cn("shrink-0 text-[11px] tabular-nums", expiryTone(p))}>
-          {p.expired ? "已到期" : p.expiryUnavailable ? "到期未提供" : fmtExpiry(p.expireAt)}
+          {p.expired ? "已到期" : p.neverExpires ? "不限期" : p.expiryUnavailable ? "到期未提供" : fmtExpiry(p.expireAt)}
         </span>
       </div>
       {p.total == null ? (
@@ -197,7 +201,7 @@ function PackageDetailRow({ p }: { p: CreditPack }) {
                 ? `到期 ${fmtFullDateTime(p.expireAt)}`
                 : p.expiryUnavailable
                   ? "到期时间未提供（上游不返回）"
-                  : "长期有效"}
+                  : "不限期"}
           </div>
         </div>
         <div className="shrink-0 text-right text-xs">
@@ -339,7 +343,7 @@ export function CreditBlock({
               ? `最近到期 ${fmtExpiry(shown[0].expireAt)}`
               : item.expiryUnavailable || shown[0]?.expiryUnavailable
                 ? "到期时间未提供"
-                : "当前积分长期有效"}
+                : "不限期"}
         </span>
         {active.length > 2 ? (
           <button

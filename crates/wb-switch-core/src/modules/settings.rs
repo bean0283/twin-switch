@@ -361,12 +361,71 @@ pub struct Settings {
     /// 形状与清理策略见 [`crate::modules::diag_log`]。
     #[serde(default)]
     pub log: crate::modules::diag_log::DiagLogConfig,
+    /// **青龙面板对接**（2026-11-07 新增）。**默认关闭**。
+    ///
+    /// 开启后：账号 token 弹窗出现「提交到青龙」按钮、设置页出现通用环境变量提交。
+    /// 开关是用户亲手打开的 —— 往第三方面板写 token 必须显式授权，绝不能默认带上。
+    /// 字段说明与提交判据见 [`crate::modules::qinglong`]。
+    #[serde(default)]
+    pub qinglong: QinglongConfig,
+}
+
+/// 青龙面板连接配置。
+///
+/// ⚠️ `client_secret` 明文存 settings.json：它本来就是面板自己的应用凭据（与
+/// 青龙「应用」页里能看到的东西同一份），不是账号密码级敏感物；settings.json
+/// 只在本机用户目录，与现有各配置的存放口径一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QinglongConfig {
+    /// 提交入口总开关（**默认关**）。
+    pub enabled: bool,
+    /// 面板入口地址（可带穿透跳转；真实基址自动跟随 302 解出并缓存）。
+    pub url: String,
+    /// 青龙「应用」的 Client ID。
+    pub client_id: String,
+    /// 青龙「应用」的 Client Secret。
+    pub client_secret: String,
+    /// Trae token 的环境变量名（默认 `TRAE_TOKEN`）。
+    pub env_trae: String,
+    /// WorkBuddy token 的环境变量名（默认 `WB_TOKEN`）。
+    pub env_wb: String,
+    /// Qoder token 的环境变量名（默认 `QODER_TOKEN`）。
+    pub env_qoder: String,
+}
+
+impl Default for QinglongConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            env_trae: "TRAE_TOKEN".into(),
+            env_wb: "WB_TOKEN".into(),
+            env_qoder: "QODER_TOKEN".into(),
+        }
+    }
+}
+
+impl QinglongConfig {
+    /// 去首尾空白；变量名里的空格一律剥掉（青龙变量名不允许空格）。
+    pub fn sanitized(mut self) -> Self {
+        self.url = self.url.trim().to_string();
+        self.client_id = self.client_id.trim().to_string();
+        self.client_secret = self.client_secret.trim().to_string();
+        self.env_trae = self.env_trae.replace(' ', "");
+        self.env_wb = self.env_wb.replace(' ', "");
+        self.env_qoder = self.env_qoder.replace(' ', "");
+        self
+    }
 }
 
 impl Settings {
     pub fn sanitized(mut self) -> Self {
         self.backup_retention = self.backup_retention.sanitized();
         self.log = self.log.sanitized();
+        self.qinglong = self.qinglong.sanitized();
         // 去掉空白项与空值：空串留在磁盘上等于「设了一个空路径」，
         // 会让界面显示「已手动指定」而实际什么都没指定。
         self.trae_exe = self

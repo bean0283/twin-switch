@@ -1212,6 +1212,7 @@ export default function WorkbuddySwitchPage() {
         targetKey={null}
         accountId={tokenTarget?.id ?? null}
         accountName={tokenTarget?.name ?? null}
+        onRefreshed={() => void load()}
       />
 
       {/* 删除 */}

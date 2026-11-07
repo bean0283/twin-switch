@@ -138,6 +138,20 @@ pub const PATH_CAMPAIGNS: &str = "/sash/api/v1/me/campaigns";
 pub const PATH_CHECKIN_STATUS: &str = "/sash/api/v1/me/daily-check-in/status";
 pub const PATH_CHECKIN_CLAIM: &str = "/sash/api/v1/me/daily-check-in/claim";
 
+/// 这个「到期时间」其实是「永不过期」的哨兵值吗。
+///
+/// Qoder 用 `expiresAt = 253402214400000`（9999-12-31）表示**不限期**，
+/// 那是哨兵不是日期：原样当日期用，界面就会显示成 `12/31 08:00`，
+/// 用户以为是今年年底到期（2026-11-06 反馈）。
+///
+/// 阈值取 2100-01-01：正常套餐不可能签到下个世纪，比它大的一定是哨兵。
+///
+/// ⚠️ 这是**唯一判据出口**：`qoder_api::parse_quota` 与 `qoder_accounts::read_file`
+/// 的旧数据归一化都走它，别在别处再写一遍比较。
+pub fn is_never_expires(ms: i64) -> bool {
+    ms >= 4_102_444_800_000
+}
+
 /// 以 `uid` 与 `salt` 稳定派生一个 32 位十六进制标识（MD5，与官方客户端同构）。
 ///
 /// 参考实现特别注明：**不要**改成自创摘要 —— 这些值会作为
@@ -168,8 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn derive_id_is_stable_and_salted() {
-        let a = derive_id("u-1", "machine");
+    fn sentinel_expiry_is_recognised() {
+        // 上游真机值：9999-12-31，含义「不限期」
+        assert!(is_never_expires(253_402_214_400_000));
+        // 真实套餐周期（2026-11-03 21:38 UTC）不能被误判
+        assert!(!is_never_expires(1_795_098_481_000));
+        // 界取 2100-01-01：前一天仍是真实日期，当天起算哨兵
+        assert!(!is_never_expires(4_102_444_799_999));
+        assert!(is_never_expires(4_102_444_800_000));
+    }
+
+    #[test]
+    fn derive_id_is_stable_and_salted() {        let a = derive_id("u-1", "machine");
         assert_eq!(a, derive_id("u-1", "machine"));
         assert_eq!(a.len(), 32);
         assert_ne!(a, derive_id("u-1", "session"), "不同 salt 必须不同");

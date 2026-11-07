@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    app_overview, auto_checkin, checkin, client_usage, config, error_log, settings, trae_backup, trae_cleanup,
+    app_overview, auto_checkin, checkin, client_usage, config, error_log, qinglong, settings, trae_backup, trae_cleanup,
     trae_credits, trae_delete,
     trae_discover, trae_export, trae_handoff, trae_import, trae_memory_scan, trae_oauth,
     trae_profile, trae_remote, trae_session_edit, trae_session_pack, trae_switch, trae_vault,
@@ -4121,4 +4121,115 @@ pub async fn gateway_guide_selftest(
     model: Option<String>,
 ) -> Result<Value, String> {
     Ok(gateway_server::selftest(key, model).await)
+}
+
+// ---------------------------------------------------------------------------
+// 青龙面板（设置页配置 + token / 环境变量提交）
+// ---------------------------------------------------------------------------
+
+/// 读青龙配置（secret 打码返回，前端只显示是否已填）。
+#[tauri::command]
+pub async fn qinglong_config_get() -> Result<Value, String> {
+    off_main(|| {
+        let s = settings::load();
+        let q = &s.qinglong;
+        Ok(json!({
+            "enabled": q.enabled,
+            "url": q.url,
+            "clientId": q.client_id,
+            "hasSecret": !q.client_secret.is_empty(),
+            "secretMasked": mask_secret(&q.client_secret),
+            "envTrae": q.env_trae,
+            "envWb": q.env_wb,
+            "envQoder": q.env_qoder,
+        }))
+    })
+    .await
+    .and_then(|inner| inner)
+}
+
+/// 保存青龙配置（secret 传 null / 空串 = 保留原值）。保存后开关开着就自动测一次连接。
+#[tauri::command]
+pub async fn qinglong_config_set(
+    enabled: Option<bool>,
+    url: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    env_trae: Option<String>,
+    env_wb: Option<String>,
+    env_qoder: Option<String>,
+) -> Result<Value, String> {
+    off_main(move || {
+        let mut s = settings::load();
+        let q = &mut s.qinglong;
+        if let Some(v) = enabled {
+            q.enabled = v;
+        }
+        if let Some(v) = url {
+            q.url = v;
+        }
+        if let Some(v) = client_id {
+            q.client_id = v;
+        }
+        // secret 传 None / 空串 = 不改（界面上留空就是「保持原值」）。
+        if let Some(v) = client_secret {
+            if !v.trim().is_empty() {
+                q.client_secret = v;
+            }
+        }
+        if let Some(v) = env_trae {
+            q.env_trae = v;
+        }
+        if let Some(v) = env_wb {
+            q.env_wb = v;
+        }
+        if let Some(v) = env_qoder {
+            q.env_qoder = v;
+        }
+        s.qinglong = s.qinglong.clone().sanitized();
+        settings::save(&s)?;
+        Ok(json!({ "saved": true }))
+    })
+    .await
+    .and_then(|inner| inner)
+}
+
+/// 探测连接状态（token 弹窗按钮的显示依据）。开关没开直接回 `{enabled:false}`，不打网络。
+#[tauri::command]
+pub async fn qinglong_status() -> Result<Value, String> {
+    Ok(qinglong::status().await)
+}
+
+/// 提交一个账号 token（弹窗的「⬆ 提交到青龙」）。
+#[tauri::command]
+pub async fn qinglong_submit_token(
+    provider: String,
+    token: String,
+    remark: Option<String>,
+) -> Result<Value, String> {
+    qinglong::submit_token(&provider, &token, remark.as_deref().unwrap_or("")).await
+}
+
+/// 提交一条通用环境变量（设置页）。同名已存在且未指定 mode 时返回 `needChoice` + 现有清单。
+#[tauri::command]
+pub async fn qinglong_submit_env(
+    name: String,
+    value: String,
+    remarks: Option<String>,
+    mode: Option<String>,
+    env_id: Option<i64>,
+) -> Result<Value, String> {
+    qinglong::submit_env(&name, &value, remarks.as_deref().unwrap_or(""), mode.as_deref(), env_id)
+        .await
+}
+
+/// secret 打码：只留前后各 2 个字符。
+fn mask_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 4 {
+        return "*".repeat(n);
+    }
+    let head: String = s.chars().take(2).collect();
+    let tail: String = s.chars().skip(n - 2).collect();
+    format!("{head}{}{tail}", "*".repeat(n.saturating_sub(4).min(10)))
 }

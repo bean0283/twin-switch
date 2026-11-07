@@ -30,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { QoderMachineCard } from "@/components/qoder-machine-card";
+import { QinglongCard } from "@/components/qinglong-card";
 import { PillTabs } from "@/components/pill-tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import * as api from "@/lib/api";
@@ -78,6 +79,7 @@ import type {
 const SETTING_TABS = [
   { id: "client", label: "客户端" },
   { id: "backup", label: "备份" },
+  { id: "qinglong", label: "青龙面板" },
   { id: "diagnostics", label: "诊断" },
 ] as const;
 
@@ -924,6 +926,7 @@ export default function SettingsPage() {
                   setExeDraft({ ...(snap.traeExe ?? {}) });
                   setWbDraft(snap.workbuddyExe ?? "");
                   setQoderDraft({ ...(snap.qoderExe ?? {}) });
+                  setLogDraft(snap.log ?? null);
                 }}
                 data-action="reset"
               >
@@ -970,6 +973,8 @@ export default function SettingsPage() {
       </Card>
 
           </>}
+
+          {tab === "qinglong" && <QinglongCard />}
 
           {tab === "diagnostics" && <>
           {/* ── 诊断日志（默认关） ─────────────────────────────────────────
@@ -1082,6 +1087,29 @@ export default function SettingsPage() {
                         data-field="logMaxFiles"
                       />
                     </label>
+                  </div>
+
+                  {/* 保存 / 放弃：日志草稿随整份设置一起落盘（save() 里的 log 补丁）。
+                      ⚠️ 这里必须有自己的按钮 —— 保存按钮原本只在「备份」tab，
+                      用户在诊断页改了记录级别根本找不到地方保存（2026-11-07 反馈）。 */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" onClick={() => void save()} disabled={saving || !dirty} data-action="save">
+                      {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                      保存设置
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={saving || !dirty}
+                      onClick={() => setLogDraft(snap.log ?? null)}
+                      data-action="resetLog"
+                    >
+                      <RotateCcw className="size-4" />
+                      放弃修改
+                    </Button>
+                    {!dirty && (
+                      <span className="text-xs text-muted-foreground">改动后可保存；与其它 tab 的设置共用一次保存。</span>
+                    )}
                   </div>
 
                   <div className="rounded-lg border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
