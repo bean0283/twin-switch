@@ -62,6 +62,8 @@ type QoderAccount = {
   plan: string | null;
   credits: number | null;
   credits_expire_at: number | null;
+  /** 上游明确「不限期」（`expiresAt` 是 9999-12-31 哨兵）。 */
+  credits_expire_never?: boolean;
   credits_updated_at: number | null;
   /**
    * 积分包明细（上游 `userQuota` / `addOnQuota` 两块，各算一个包）。
@@ -138,7 +140,15 @@ function qoderToView(a: QoderAccount): CreditView {
   }
   // 到期时间来自上游顶层 `expiresAt`（整个套餐周期共用），由后端写进 credits_expire_at。
   // 没有才说「未提供」——**不能一律说未提供**（2026-10-25 之前就是这么错的）。
-  const exp = a.credits_expire_at ?? null;
+  //
+  // ⚠️ 哨兵（`253402214400000` = 9999-12-31，含义「不限期」）在这里再兜一次：
+  // 后端读库时已经归一化，这一层是防「旧 IPC 缓存 / 别处构造的对象」把假日期漏出来。
+  // 阈值与后端 `qoder_realm::is_never_expires` 同一个（2100-01-01）。
+  const rawExp = a.credits_expire_at ?? null;
+  const neverExpires =
+    a.credits_expire_never === true || (rawExp != null && rawExp >= 4_102_444_800_000);
+  const exp = neverExpires ? null : rawExp;
+
   const parts = a.credit_parts ?? [];
   // 老数据（还没重新查过）没有分块明细：用合计出一行「额度合计」，
   // 而不是显示「暂无可用积分」——额度明明已经查到了，说没有就是骗人。
@@ -152,7 +162,8 @@ function qoderToView(a: QoderAccount): CreditView {
           used: p.used,
           remaining: p.remaining,
           expireAt: exp,
-          expiryUnavailable: exp == null,
+          expiryUnavailable: exp == null && !neverExpires,
+          neverExpires,
         }))
       : [
           {
@@ -162,7 +173,8 @@ function qoderToView(a: QoderAccount): CreditView {
             used: 0,
             remaining: a.credits,
             expireAt: exp,
-            expiryUnavailable: exp == null,
+            expiryUnavailable: exp == null && !neverExpires,
+            neverExpires,
           },
         ];
   const totalSum = parts.reduce((n, p) => n + (p.total || 0), 0);
@@ -173,7 +185,8 @@ function qoderToView(a: QoderAccount): CreditView {
     packCount: packs.filter((p) => (p.remaining ?? 0) > 0).length,
     packs,
     updatedAt: a.credits_updated_at ?? null,
-    expiryUnavailable: exp == null,
+    expiryUnavailable: exp == null && !neverExpires,
+    neverExpires,
     notes: parts.length === 0 ? ["点「刷新积分」可看到分块明细"] : [],
   };
 }
@@ -788,6 +801,7 @@ export default function QoderAccountsPage() {
         targetKey={dialog?.region ?? null}
         accountId={dialog?.id ?? null}
         accountName={dialog ? dialog.name || dialog.uid : null}
+        onRefreshed={() => void reload()}
         extraFooter={
           dialog ? (
             <Button
@@ -829,6 +843,12 @@ export default function QoderAccountsPage() {
           国内版与国际版分开落盘（<span className="font-mono">accounts.cn.json</span> /{" "}
           <span className="font-mono">accounts.global.json</span>），删除只是挪进回收站。token 只存在本机账号库里，
           不往任何第三方发送；「积分共享」按「谁先过期用谁」排序时会用到这里的额度。
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+          积分到期时间只取上游额度接口的 <span className="font-mono">expiresAt</span>。它描述的是「套餐周期」，
+          且上游用 9999-12-31 作为「不限期」哨兵，所以卡片可能显示「不限期」；网页
+          （<span className="font-mono">qoder.cn/account/usage</span>）里每个资源包各自的有效期属于另一套
+          Web 会话接口，开放接口不返回，本工具拿不到。
         </p>
       </section>
     </div>

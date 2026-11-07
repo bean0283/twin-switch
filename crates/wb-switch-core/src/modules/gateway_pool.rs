@@ -562,6 +562,17 @@ fn classify(http_status: u16, body_hint: &str, now: i64) -> Option<(i64, &'stati
     //
     // 判据放宽成「能解析出重置时刻就当额度耗尽」：不再挑文案里的关键词，
     // 上游换个说法（`将于…` / JSON `resetTime`）也不会退化成 60 秒。
+    // ★ Qoder 额度耗尽是 **403 + code 112 + pricingUrl**（2026-11-06 实测）：
+    //   {"code":"112","message":"{\"pricingUrl\":\"https://qoder.com.cn/pricing?client=qoder\"}"}
+    // 它一个「额度」字样都没有，会掉进下面的 `403 => auth_dead`（锁 30 分钟 +
+    // 界面显示「凭据失效」，用户以为要去重新登录）—— 实际只是这个号用完了。
+    let qoder_exhausted = hint.contains("\"code\":\"112\"")
+        || hint.contains("pricingurl")
+        || hint.contains("pricing?client=");
+    if qoder_exhausted {
+        return Some((next_reset_window(now), "balance_exhausted"));
+    }
+
     let quota_words = hint.contains("6804")
         || hint.contains("频率限制")
         || body_hint.contains("使用量已超出")
@@ -1330,6 +1341,18 @@ pub fn ordered_candidates(model: &str) -> Result<Vec<PoolEntry>, String> {
     let mut out: Vec<PoolEntry> = usable()
         .into_iter()
         .filter(|e| scopes.contains(&e.scope))
+        // ⚠️ **已知余额 <= 0 的号不再参与派单**。
+        //
+        // 为什么必须在这里拦、不能靠失败后换号：Qoder 的流是**懒打开**的
+        // （`qoder_stream` 把 open 塞进闭包，等响应体被 poll 时才真发请求），
+        // 上游的「额度用完 403」因此发生在**已经决定用这个号之后** ——
+        // 那时字节都开始往客户端走了，换号这条路已经断了（2026-11-06 实测：
+        // 一个 0 分号被选中，旁边还有 1600 分的号干看着，failovers=0 直接失败）。
+        //
+        // 余额未知（None）不能排除：没查过 ≠ 没钱。
+        // 阈值用 `<= 0` 而不是保底线：这里只挡「确定一点都没有」的，
+        // 更保守的保底由 `usable_above_floor` 负责（那是产品策略，这是正确性）。
+        .filter(|e| e.remaining.map(|r| r > 0.0).unwrap_or(true))
         .collect();
     // ⚠️ 必须用**这次请求的模型**重算有效冷却：`usable()` 里算的是整号级，
     // 而「只在这个模型上被限」的号在那里看起来毫无问题，会被排到队首再撞一次。
@@ -1360,6 +1383,28 @@ pub fn clear_cooldown(key: &str, model: Option<&str>) {
 /// Qoder 区域 → 作用域字符串（界面展示用）。
 pub fn qoder_scope(region: QoderRegion) -> String {
     format!("qoder-{}", region.as_str())
+}
+
+#[cfg(test)]
+mod qoder_quota_tests {
+    use super::*;
+
+    /// Qoder 的额度耗尽长这样：403 + code 112 + pricingUrl，**没有「额度」字样**。
+    /// 以前会掉进 `403 => auth_dead`：锁 30 分钟、界面显示「凭据失效」，
+    /// 用户跑去重新登录也解决不了（本来只是这个号用完了）。
+    #[test]
+    fn qoder_403_quota_is_balance_not_auth() {
+        let body = r#"{"code":"112","message":"{\"pricingUrl\":\"https://qoder.com.cn/pricing?client=qoder\"}"}"#;
+        let (until, kind) = classify(403, body, now_ms()).expect("必须产生冷却");
+        assert_eq!(kind, "balance_exhausted", "应判为额度耗尽，不是凭据死");
+        assert!(until > now_ms(), "要有一个未来的恢复时间");
+    }
+
+    /// 真正的 401 仍然是凭据问题（别把上面那条放宽成「403 一律不罚」）。
+    #[test]
+    fn real_401_still_means_auth() {
+        assert_eq!(classify(401, "unauthorized", now_ms()).unwrap().1, "auth_dead");
+    }
 }
 
 #[cfg(test)]
@@ -1818,6 +1863,28 @@ mod pool_dump_probe {
                 e.key, e.scope, e.usable, e.reason, e.cooldown_until, e.remaining,
                 e.limited_models.len()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cand_probe {
+    use super::*;
+
+    /// 只读探针：看某个模型实际会拿到几个候选账号（换号能力取决于这个数）。
+    #[test]
+    #[ignore]
+    fn probe_candidates() {
+        for m in ["qoder:GLM-5.3-Flash", "trae:glm-5.3-flash"] {
+            match ordered_candidates(m) {
+                Ok(v) => {
+                    println!("{m}: {} 个候选", v.len());
+                    for e in v {
+                        println!("   {} usable={} cd={:?} remaining={:?}", e.key, e.usable, e.cooldown_until, e.remaining);
+                    }
+                }
+                Err(e) => println!("{m}: 解析失败 {e}"),
+            }
         }
     }
 }

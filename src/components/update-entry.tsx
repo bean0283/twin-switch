@@ -87,7 +87,7 @@ export function UpdateEntry({ fallbackVersion }: { fallbackVersion?: string }) {
 
   const busy = snapshot.phase === "checking" || snapshot.phase === "downloading";
   const line = statusLine(snapshot);
-  const version = snapshot.current || fallbackVersion || "0.4.11";
+  const version = snapshot.current || fallbackVersion || "0.4.12";
 
   /**
    * 暗号 2：`Ctrl + Shift + Alt + G` 切换成长任务显隐。

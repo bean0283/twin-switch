@@ -17,6 +17,7 @@ pub mod gateway_server;
 pub mod gateway_stream;
 pub mod gateway_wb;
 pub mod jwt;
+pub mod qinglong;
 pub mod process_list;
 pub mod qoder_accounts;
 pub mod qoder_auth_dat;

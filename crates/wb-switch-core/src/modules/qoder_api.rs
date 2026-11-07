@@ -30,6 +30,8 @@ pub struct QuotaView {
     /// 「到期时间未提供」，其实是漏读了这个字段（真机实测：`1793713084271` = 2026-11-03 21:38）。
     /// 语义是**当前套餐周期结束时间**，两块额度共用同一个到期。
     pub expire_at: Option<i64>,
+    /// 上游明确「不限期」（`expiresAt` 是 9999-12-31 那种哨兵）。
+    pub never_expires: bool,
     /// **按块**的明细：Qoder 上游把额度分成 `userQuota` 与 `addOnQuota` 两块，
     /// 界面要像 Trae / WorkBuddy 那样逐包显示，所以这里就分好再往下传。
     /// 哪块上游没给就少一项（不补 0 —— 0 和「没有这块」是两件事）。
@@ -114,6 +116,11 @@ pub async fn fetch_quota(account: &QoderAccount) -> Result<QuotaView, String> {
 }
 
 /// 解析额度响应（与参考实现同一套判据）。
+///
+/// 「到期时间是哨兵」的唯一判据在 [`crate::modules::qoder_realm::is_never_expires`]，
+/// 这里重新导出只是为了让调用方少写路径。
+pub use crate::modules::qoder_realm::is_never_expires;
+
 pub fn parse_quota(payload: &Value) -> Result<QuotaView, String> {
     let user = payload.get("userQuota").and_then(Value::as_object);
     let add_on = payload.get("addOnQuota").and_then(Value::as_object);
@@ -129,10 +136,15 @@ pub fn parse_quota(payload: &Value) -> Result<QuotaView, String> {
 
     // 分块明细：上游给哪块就出哪块。`remaining` 缺失时用 total-used 兜底
     // （只在 total>0 时兜底，否则会把「不知道」写成 0）。
-    let expire_at = payload
+    // ⚠️ `expiresAt` 可能是 **9999-12-31 的哨兵**（`253402214400000`），含义是「不限期」。
+    // 原样当日期用，界面就会显示成「12/31 08:00」——用户以为是今年年底到期。
+    // 这里把哨兵转成 `None` + `never_expires`，让上层能分开表达「不限期」和「没提供」。
+    let raw_expire = payload
         .get("expiresAt")
         .and_then(Value::as_i64)
         .filter(|v| *v > 0);
+    let never_expires = raw_expire.map(is_never_expires).unwrap_or(false);
+    let expire_at = raw_expire.filter(|v| !is_never_expires(*v));
 
     // 第三块：组织资源包（企业/团队账号才有，个人账号没有这个键）。
     // 官方 SDK 文档写的是「用 cap 表示总量，另有 used / remaining / available」，
@@ -210,7 +222,7 @@ pub fn parse_quota(payload: &Value) -> Result<QuotaView, String> {
     let remaining: f64 = parts.iter().map(|p| p.remaining).sum();
     let used: f64 = parts.iter().map(|p| p.used).sum();
     let total: f64 = parts.iter().map(|p| p.total).sum();
-    Ok(QuotaView { remaining, used, total, is_exceeded, expire_at, parts, raw: payload.clone() })
+    Ok(QuotaView { remaining, used, total, is_exceeded, expire_at, never_expires, parts, raw: payload.clone() })
 }
 
 /// 查套餐（Pro Trial 之类），原样返回。
@@ -395,7 +407,19 @@ pub async fn refresh_account(account: &QoderAccount) -> Result<QoderAccount, Str
         a.credits = Some(quota.remaining);
         a.credit_parts = quota.parts.clone();
         // 上游这次没给就保留上次的值（别把已知的到期时间擦成空）。
-        a.credits_expire_at = quota.expire_at.or(a.credits_expire_at);
+        // ⚠️ 不能简单 `.or(旧值)`：上游把「不限期」表达成 9999-12-31 哨兵，
+        // 那条路径下 `expire_at` 是 None，`.or()` 会把历史上的哨兵值留着，
+        // 界面继续显示「12/31 08:00」。三种情况要分开：
+        //   ① 明确不限期 → 清空日期 + 置 never
+        //   ② 给了真实日期 → 覆盖 + 取消 never
+        //   ③ 这次没给 → 保留旧值（别因为一次缺字段就把到期时间抹了）
+        if quota.never_expires {
+            a.credits_expire_at = None;
+            a.credits_expire_never = true;
+        } else if quota.expire_at.is_some() {
+            a.credits_expire_at = quota.expire_at;
+            a.credits_expire_never = false;
+        }
         // 上游没给过期时间就不写 —— 不能编一个出来。
         a.plan = plan_name.clone().or_else(|| a.plan.clone());
         a.credits_updated_at = Some(now);
@@ -581,5 +605,77 @@ mod tests {
         let v = json!({"userQuota": {"remaining": 0.0, "used": 0.0, "total": 0.0}});
         let q = parse_quota(&v).unwrap();
         assert_eq!(q.ratio(), None);
+    }
+}
+
+#[cfg(test)]
+mod quota_probe {
+    use super::*;
+
+    /// 真机探针：打印额度响应里跟「有效期」有关的字段。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_quota_expire() {
+        let list = crate::modules::qoder_accounts::list_all().unwrap_or_default();
+        let Some(a) = list.first() else {
+            println!("没有 qoder 账号");
+            return;
+        };
+        match super::fetch_quota(a).await {
+            Ok(v) => {
+                println!("remaining={:?} total={:?} expire_at={:?}", v.remaining, v.total, v.expire_at);
+                println!("raw 顶层键: {:?}", v.raw.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
+                println!("raw = {}", serde_json::to_string(&v.raw).unwrap_or_default().chars().take(1600).collect::<String>());
+            }
+            Err(e) => println!("失败: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pack_discover_probe {
+    use super::*;
+
+    /// 真机探针：试若干个候选路径，看哪个能返回「资源包 + 有效期」。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_find_packs() {
+        let list = crate::modules::qoder_accounts::list_all().unwrap_or_default();
+        let Some(a) = list.first() else { return };
+        let token = a.access_token.clone().unwrap_or_default();
+        let spec = realm_spec(a.region);
+        let paths = [
+            PATH_QUOTA_USAGE,
+            "/algo/api/v2/quota/packages",
+            "/algo/api/v2/quota/package/list",
+            "/algo/api/v2/quota/detail",
+            "/algo/api/v2/quota/usage/detail",
+            "/algo/api/v2/credit/packages",
+            "/algo/api/v2/user/quota",
+            "/algo/api/v2/quota/plan",
+        ];
+        for p in paths {
+            let url = format!("{}{}", spec.openapi_base, p);
+            let mut req = match client() {
+                Ok(c) => c.get(&url).timeout(std::time::Duration::from_secs(15)),
+                Err(e) => {
+                    println!("client 失败: {e}");
+                    return;
+                }
+            };
+            for (k, v) in openapi_headers(a.region, &a.uid, &token) {
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let st = r.status().as_u16();
+                    let body = r.text().await.unwrap_or_default();
+                    let snip: String = body.chars().take(160).collect();
+                    println!("[{st}] {p} :: {snip}");
+                }
+                Err(e) => println!("[ERR] {p} -> {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
     }
 }

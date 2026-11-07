@@ -1818,6 +1818,9 @@ export default function TraeSwitchPage() {
         targetKey={clientKey}
         accountId={tokenTarget?.id ?? null}
         accountName={tokenTarget ? tokenTarget.displayName || tokenTarget.id : null}
+        onRefreshed={() => {
+          if (clientKey) void loadOverview(clientKey);
+        }}
       />
 
       {/* ⚠️ 2026-10-14（T65 二改）：原来这里还有两个 `Dialog`
