@@ -18,6 +18,8 @@ import { toast } from "sonner";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
+import { RenewAllTokensButton } from "@/components/renew-all-tokens";
+import { SHOW_LOCAL_LOGIN_IMPORT } from "@/lib/feature-flags";
 import { CheckinButton } from "@/components/checkin-button";
 import {
   CreditBlock as CreditBlockView,
@@ -34,6 +36,7 @@ import {
   qoderAccountRemove,
   qoderAccountRename,
   qoderAccountSwitch,
+  qoderAccountTokenRefresh,
   qoderImportApply,
   qoderImportLocal,
   qoderImportPreview,
@@ -535,10 +538,14 @@ export default function QoderAccountsPage() {
       </header>
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onClick={() => void doImportLocal()} className="gap-1.5">
-          <FileInput className="size-4" />
-          导入本机账号
-        </Button>
+        {/* ⚠️ 2026-11-08 用户要求：前端隐藏入口，后端 `qoder_import_local` 保留。
+            恢复方式：`@/lib/feature-flags` 的 `SHOW_LOCAL_LOGIN_IMPORT` 改回 true。 */}
+        {SHOW_LOCAL_LOGIN_IMPORT ? (
+          <Button variant="outline" size="sm" onClick={() => void doImportLocal()} className="gap-1.5">
+            <FileInput className="size-4" />
+            导入本机账号
+          </Button>
+        ) : null}
         <Button
           variant="outline"
           size="sm"
@@ -706,24 +713,40 @@ export default function QoderAccountsPage() {
           <span>{fmtAgo(summary.latest)}</span>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void refreshAll()}
-          disabled={refreshingAll || busy || shown.length === 0}
-          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-        >
-          {refreshingAll || busy ? (
-            <Loader2 className="size-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="size-3.5" />
-          )}
-          刷新积分
-        </button>
+        {/* 一键续期：只作用于**本区域**的账号（首页没有这个入口），确认后才执行。
+            两个按钮同属右侧动作组，`ml-auto` 挪到包裹层上，避免把续期按钮顶到左边。 */}
+        <div className="ml-auto flex items-center gap-2">
+          <RenewAllTokensButton
+            product={`Qoder（${currentRegion?.label ?? (tab === "cn" ? "国内版" : "国际版")}）`}
+            ids={shown.map((a) => a.id)}
+            renew={(id) => {
+              const acc = shown.find((x) => x.id === id);
+              return qoderAccountTokenRefresh(acc?.region ?? tab, id);
+            }}
+            onFinished={() => {
+              void reload();
+              void refreshAll();
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => void refreshAll()}
+            disabled={refreshingAll || busy || shown.length === 0}
+            className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            {refreshingAll || busy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            刷新积分
+          </button>
+        </div>
       </div>
 
       {shown.length === 0 ? (
         <section className="rounded-2xl border bg-card px-5 py-10 text-center text-sm text-muted-foreground">
-          这个区域还没有账号。点上面「导入本机账号」，或用「浏览器登录」。
+          这个区域还没有账号。点上面「浏览器登录」添加，或导入账号包。
         </section>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">

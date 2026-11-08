@@ -5,6 +5,7 @@ import {
   LayoutList,
   Loader2,
   Pencil,
+  Pin,
   RefreshCw,
   Save,
   Search,
@@ -24,10 +25,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import type { SessionTextHitSession } from "@/lib/trae-types";
 import {
   qoderSessionDeleteMany,
   qoderSessionDetail,
   qoderSessionRename,
+  qoderSessionSearch,
   qoderSessionsList,
   qoderSessionUpdateMessage,
   qoderSessionDeleteMessage,
@@ -53,6 +56,8 @@ type SessionRow = {
   bytes: number;
   source: string;
   importedFrom: string | null;
+  /** 客户端侧栏置顶（`chat_session_sidebar_placements.pinned`）。 */
+  pinned: boolean;
 };
 
 type Message = {
@@ -138,6 +143,12 @@ export default function QoderSessionsPage() {
   const [ws, setWs] = useState<string>("");
   const [query, setQuery] = useState<string>("");
   const [byWorkspace, setByWorkspace] = useState<boolean>(true);
+  /** 只看置顶（`chat_session_sidebar_placements.pinned`）。 */
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  /** 正文搜索命中（Qoder 库很小，实测毫秒级，可以跟着防抖跑）。 */
+  const [contentHits, setContentHits] = useState<Map<string, SessionTextHitSession>>(new Map());
+  const [contentSearching, setContentSearching] = useState(false);
+  const [contentInfo, setContentInfo] = useState<{ scanned: number; elapsedMs: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -214,20 +225,62 @@ export default function QoderSessionsPage() {
       .sort((a, b) => b.lastAt - a.lastAt || a.label.localeCompare(b.label));
   }, [rows]);
 
+  /**
+   * 正文搜索（防抖 400 ms，≥2 字）。
+   *
+   * Qoder 的正文在本地 SQLite 里且量很小（本机 32 条消息），可以跟着输入跑；
+   * Trae / WorkBuddy 也是同一套 UX，三个页面用同一份结果结构。
+   */
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) {
+      setContentHits(new Map());
+      setContentInfo(null);
+      setContentSearching(false);
+      return;
+    }
+    let alive = true;
+    setContentSearching(true);
+    const timer = window.setTimeout(() => {
+      void qoderSessionSearch(region, q, 300)
+        .then((r) => {
+          if (!alive) return;
+          if (r.ok === false) throw new Error(r.error || "搜索失败");
+          const next = new Map<string, SessionTextHitSession>();
+          for (const hit of r.sessions ?? []) next.set(hit.sessionId, hit);
+          setContentHits(next);
+          setContentInfo({ scanned: r.scanned ?? 0, elapsedMs: r.elapsedMs ?? 0 });
+        })
+        .catch(() => {
+          // 失败不清空已有结果：清空会让用户以为「内容没了」。
+          if (alive) setContentInfo(null);
+        })
+        .finally(() => {
+          if (alive) setContentSearching(false);
+        });
+    }, 400);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [region, query]);
+
   /** 搜索 + 空间筛选后的行（时间倒序，与客户端列表一致）。 */
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     return rows
       .filter((r) => {
         if (ws && (r.workspaceKey ?? "") !== ws) return false;
+        if (pinnedOnly && !r.pinned) return false;
         if (!q) return true;
-        return [r.title, r.workspace, r.workspacePath, r.id, r.model].some((v) =>
+        const metaHit = [r.title, r.workspace, r.workspacePath, r.id, r.model].some((v) =>
           (v ?? "").toLowerCase().includes(q),
         );
+        return metaHit || contentHits.has(r.id);
       })
       .slice()
-      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  }, [rows, ws, query]);
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.updatedAt || 0) - (a.updatedAt || 0));
+  }, [rows, ws, query, pinnedOnly, contentHits]);
 
   /** 按空间分组（顺序跟着 `wsOptions`：最近活动的在前）。 */
   const wsGroups = useMemo(() => {
@@ -447,16 +500,19 @@ export default function QoderSessionsPage() {
                 <option value="cn">国内版</option>
                 <option value="global">国际版</option>
               </select>
-              {/* 搜索：只搜元数据（正文要逐条读 SQLite，不放在这里） */}
+              {/* 搜索：标题/空间/id 本地即时筛；≥2 字还会搜对话正文（防抖 400ms）。 */}
               <div className="relative">
                 <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="搜索标题 / 空间 / 会话 id"
-                  className="h-8 w-[220px] pl-7 pr-7 text-xs"
+                  placeholder="标题 / 空间 / id / 对话内容"
+                  className="h-8 w-[230px] pl-7 pr-7 text-xs"
+                  title="两个字符以上会同时搜索对话正文（提问与回答）"
                 />
-                {query ? (
+                {contentSearching ? (
+                  <Loader2 className="absolute top-1/2 right-1.5 size-3.5 -translate-y-1/2 animate-spin text-muted-foreground" />
+                ) : query ? (
                   <button
                     type="button"
                     title="清除搜索"
@@ -467,6 +523,28 @@ export default function QoderSessionsPage() {
                   </button>
                 ) : null}
               </div>
+
+              {/* 只看置顶：Qoder 客户端侧栏的置顶（`chat_session_sidebar_placements.pinned`）。 */}
+              <button
+                type="button"
+                className={cn(
+                  "flex h-8 items-center gap-1 rounded-lg border px-2 text-xs",
+                  pinnedOnly ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60",
+                )}
+                aria-pressed={pinnedOnly}
+                title="只显示在 Qoder 客户端里置顶过的会话"
+                onClick={() => {
+                  setPinnedOnly((v) => !v);
+                  setSelected(new Set());
+                }}
+                data-action="pinned-only"
+              >
+                <Pin className="size-3.5" />
+                只看置顶
+                <span className="tabular-nums opacity-70">
+                  {rows.filter((r) => r.pinned).length}
+                </span>
+              </button>
               <select
                 value={ws}
                 onChange={(e) => setWs(e.target.value)}
@@ -546,6 +624,9 @@ export default function QoderSessionsPage() {
                       <div className="space-y-2">
                         <div>
                           没有匹配的会话 —— 筛选后 0 条，该版本共 {rows.length} 条。
+                          {contentInfo
+                            ? `（正文已扫 ${contentInfo.scanned} 条消息，${contentInfo.elapsedMs} ms）`
+                            : ""}
                         </div>
                         <button
                           type="button"
@@ -553,6 +634,9 @@ export default function QoderSessionsPage() {
                           onClick={() => {
                             setQuery("");
                             setWs("");
+                            setPinnedOnly(false);
+                            setContentHits(new Map());
+                            setContentInfo(null);
                           }}
                         >
                           清除搜索与筛选
@@ -604,6 +688,9 @@ export default function QoderSessionsPage() {
                       </td>
                       <td className="px-3 py-2">
                         <div className="flex flex-wrap items-center gap-1.5">
+                          {r.pinned ? (
+                            <Pin className="size-3.5 shrink-0 text-primary" aria-label="已置顶" />
+                          ) : null}
                           <span className="font-medium">{r.title || "（无标题）"}</span>
                           {r.archived && <Badge variant="outline">归档</Badge>}
                           {r.importedFrom && (
@@ -627,6 +714,31 @@ export default function QoderSessionsPage() {
                             {r.cwd || "—"}
                           </span>
                         </div>
+                        {/* 正文命中预览（关键词 ≥2 字时后端才会返回） */}
+                        {contentHits.get(r.id) ? (
+                          <div className="mt-0.5 flex items-start gap-1.5 text-[11px] text-muted-foreground">
+                            <Badge variant="secondary" className="shrink-0">
+                              正文 {(contentHits.get(r.id)?.hits ?? 0) + " 处"}
+                            </Badge>
+                            <span
+                              className="min-w-0 truncate"
+                              title={(contentHits.get(r.id)?.items ?? [])
+                                .map(
+                                  (it) =>
+                                    `${it.role === "user" ? "提问" : "回答"}：${it.snippet}`,
+                                )
+                                .join("\n")}
+                            >
+                              {contentHits.get(r.id)?.items?.[0]
+                                ? `${
+                                    contentHits.get(r.id)?.items[0].role === "user"
+                                      ? "提问"
+                                      : "回答"
+                                  }：${contentHits.get(r.id)?.items[0].snippet}`
+                                : ""}
+                            </span>
+                          </div>
+                        ) : null}
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap text-xs text-muted-foreground">
                         {fmtTime(r.updatedAt)}

@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::modules::qoder_realm::QoderRegion;
 
@@ -61,10 +61,14 @@ pub fn list(region: QoderRegion, include_archived: bool) -> Result<Vec<Value>, S
         "select s.session_id, s.title, s.cwd, s.model, s.created_at, s.updated_at, s.archived,
                 (select count(*) from chat_session_messages m where m.session_id = s.session_id),
                 (select coalesce(sum(m.payload_bytes), 0) from chat_session_messages m where m.session_id = s.session_id),
-                s.extra_json
+                s.extra_json,
+                -- 收敛成 0/1 整数：`pinned` 列的存储类型在不同版本里见过 INTEGER 与 TEXT，
+                -- 直接 `get::<i64>` 遇到 '1' 会失败并静默变成「没置顶」。
+                case when coalesce((select max(p.pinned) from chat_session_sidebar_placements p
+                                    where p.session_id = s.session_id), 0) then 1 else 0 end as pinned
          from chat_sessions s
          where s.deleted_at is null {}
-         order by s.updated_at desc
+         order by pinned desc, s.updated_at desc
          limit 500",
         if include_archived { "" } else { "and s.archived = 0" }
     );
@@ -93,6 +97,8 @@ pub fn list(region: QoderRegion, include_archived: bool) -> Result<Vec<Value>, S
                 "bytes": r.get::<_, i64>(8).unwrap_or(0),
                 "source": source,
                 "importedFrom": imported_from,
+                // 置顶来自 `chat_session_sidebar_placements.pinned`（客户端侧栏的置顶）。
+                "pinned": r.get::<_, i64>(10).unwrap_or(0) != 0,
             }))
         })
         .map_err(|e| format!("读取会话失败：{e}"))?;
@@ -123,6 +129,140 @@ fn parse_extra(raw: Option<&str>) -> (String, Option<String>) {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     (source, imported)
+}
+
+/// 会话正文搜索（用户提问 + 助手回答）。
+///
+/// 数据面：`chat_session_messages.payload_json` → `parts[type=text].text`。
+/// 与详情用的是同一套取文规则（`type=thinking` 的思维链**不算**正文，否则搜
+/// "the user asks" 会把一堆思维链当命中）。
+///
+/// 先用 SQL `LIKE` 粗筛（会命中 `payload_json` 里的键名，例如 `finalTextId`，
+/// 所以必须再用提取后的正文复核一次），再逐条截片段并去重。
+pub fn search_messages(
+    region: QoderRegion,
+    query: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let q = query.trim();
+    if q.chars().count() < 2 {
+        return Ok(json!({ "query": q, "sessions": [], "scanned": 0, "elapsedMs": 0 }));
+    }
+    let started = std::time::Instant::now();
+    let conn = open(region)?;
+    let pattern = crate::modules::search_text::like_pattern(q);
+    let q_lower = q.to_lowercase();
+    let limit = limit.clamp(1, 500);
+    const PER_SESSION: usize = 3;
+
+    let mut stmt = conn
+        .prepare(
+            "select m.session_id, m.role, m.payload_json, coalesce(m.created_at, 0),
+                    s.title, s.updated_at, s.cwd,
+                    case when coalesce((select max(p.pinned) from chat_session_sidebar_placements p
+                                        where p.session_id = s.session_id), 0) then 1 else 0 end
+             from chat_session_messages m
+             join chat_sessions s on s.session_id = m.session_id
+             where s.deleted_at is null and m.payload_json like ?1 escape '\\'
+             order by s.updated_at desc",
+        )
+        .map_err(|e| format!("正文搜索失败：{e}"))?;
+    let rows = stmt
+        .query_map([&pattern], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                r.get::<_, i64>(7).unwrap_or(0),
+            ))
+        })
+        .map_err(|e| format!("正文搜索失败：{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("正文读取失败：{e}"))?;
+
+    let mut scanned = 0usize;
+    // session_id → 聚合结果（保持插入顺序用 Vec 记顺序，便于排序）。
+    let mut order: Vec<String> = Vec::new();
+    let mut agg: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (sid, role, payload, created_at, title, updated, cwd, pinned) in rows {
+        scanned += 1;
+        let parsed: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        let parts = parsed
+            .get("parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for part in &parts {
+            if part.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(snippet) =
+                crate::modules::search_text::snippet_of(text, &q_lower, 40)
+            else {
+                continue;
+            };
+            let fingerprint: String = text.chars().take(80).collect();
+            if !seen.insert(format!("{sid}|{role}|{fingerprint}")) {
+                continue;
+            }
+            let (workspace_key, workspace) = crate::modules::workspace::workspace_of(&cwd);
+            let entry = agg.entry(sid.clone()).or_insert_with(|| {
+                order.push(sid.clone());
+                json!({
+                    "sessionId": sid,
+                    "title": title,
+                    "workspace": workspace,
+                    "workspaceKey": workspace_key,
+                    "updatedAt": updated,
+                    "pinned": pinned != 0,
+                    "hits": 0,
+                    "items": [],
+                })
+            });
+            let hits = entry.get("hits").and_then(Value::as_u64).unwrap_or(0) + 1;
+            entry["hits"] = json!(hits);
+            if let Some(items) = entry.get_mut("items").and_then(Value::as_array_mut) {
+                if items.len() < PER_SESSION {
+                    items.push(json!({
+                        "role": if role.is_empty() { "assistant" } else { role.as_str() },
+                        "snippet": snippet,
+                        "at": created_at,
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut sessions: Vec<Value> = order
+        .into_iter()
+        .filter_map(|sid| agg.remove(&sid))
+        .collect();
+    sessions.sort_by(|a, b| {
+        let ap = a.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        let bp = b.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        let au = a.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        let bu = b.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        bp.cmp(&ap).then_with(|| bu.cmp(&au))
+    });
+    let total = sessions.len();
+    sessions.truncate(limit);
+    Ok(json!({
+        "query": q,
+        "sessions": sessions,
+        "matchedSessions": total,
+        "truncated": total > limit,
+        "scanned": scanned,
+        "elapsedMs": started.elapsed().as_millis() as u64,
+    }))
 }
 
 /// 会话详情：逐条消息（正文只取 `parts[type=text]`）。
@@ -908,6 +1048,36 @@ pub fn counts() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真机探针（`#[ignore]`）：Qoder 正文搜索，只读。
+    ///
+    /// 跑法：`cargo test -p wb-switch-core --lib qoder_search_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn qoder_search_probe_reads_real_content() {
+        for region in [QoderRegion::Cn, QoderRegion::Global] {
+            let v = match search_messages(region, "你好", 10) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("{:?} 搜索不可用：{e}", region);
+                    continue;
+                }
+            };
+            println!(
+                "{:?} 命中 {} 个会话（扫 {} 条消息，{} ms）",
+                region, v["matchedSessions"], v["scanned"], v["elapsedMs"]
+            );
+            for s in v["sessions"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "  [{}] hits={} pinned={} {}",
+                    s["sessionId"].as_str().unwrap_or(""),
+                    s["hits"],
+                    s["pinned"],
+                    s["title"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
 
     #[test]
     fn missing_db_is_reported_not_empty() {

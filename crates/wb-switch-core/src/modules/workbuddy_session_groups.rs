@@ -1473,6 +1473,7 @@ mod tests {
             model: String::new(),
             deleted: false,
             has_body,
+            pinned: false,
             body_bytes: 100,
             body_lines: 5,
             content_digest: digest.to_string(),

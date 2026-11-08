@@ -67,6 +67,13 @@ pub struct WbSession {
     /// 归一化时会把「本副本自己的会话 id」替换成固定标记，于是同一段对话在两个
     /// 账号里的两份副本可以拿到**同一个摘要**——这正是「哪些是同一份、谁更新」的判据。
     pub content_digest: String,
+    /// 是否被 WorkBuddy 置顶。
+    ///
+    /// ⚠️ 这个状态**不在** `workbuddy.db` 里（`sessions` 表没有置顶列，只有
+    /// `spaces.pinned` 那是「空间置顶」）。客户端把它存在自己的侧栏快照：
+    /// `~/.workbuddy/<uid>/sidebar-list-snapshot.json` → `items[].isPinned`。
+    /// 快照是缓存，可能比客户端慢一拍（客户端退出/切账号时才落盘），但这是本机唯一来源。
+    pub pinned: bool,
     /// 同标题分组键（归一化标题；唯一标题时为空串）。
     pub dup_group: String,
     /// 同组内是否为最新副本（无重复时为 true）。
@@ -1223,6 +1230,9 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
     drop(conn);
 
     let mut out: Vec<WbSession> = Vec::with_capacity(rows.len());
+    // 每个账号的置顶快照只读一次（快照按账号分目录）。
+    let mut pinned_cache: std::collections::HashMap<String, std::collections::HashMap<String, bool>> =
+        std::collections::HashMap::new();
     for (id, cwd, user_id, title, custom, created, updated, deleted, model) in rows {
         let body = find_jsonl(&id);
         let body_bytes = body
@@ -1230,6 +1240,14 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .unwrap_or(0);
+        // 置顶取自该账号的侧栏快照（按 uid 分目录，一个账号只读一次）。
+        let uid_key = user_id.clone().unwrap_or_default();
+        let pinned = pinned_cache
+            .entry(uid_key.clone())
+            .or_insert_with(|| pinned_snapshot(&uid_key))
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
         out.push(WbSession {
             title: custom
                 .or(title)
@@ -1243,6 +1261,7 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
             model: model.unwrap_or_default(),
             deleted: deleted.map(|d| d != 0).unwrap_or(false),
             has_body: body.is_some(),
+            pinned,
             body_bytes,
             body_lines: 0,
             content_digest: String::new(),
@@ -1252,8 +1271,8 @@ pub fn list_sessions() -> Result<Vec<WbSession>, String> {
             dup_relation: String::new(),
         });
     }
-    // 按最后更新时间倒序，与客户端列表观感一致
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // 置顶优先，其次按最后更新时间倒序（与客户端列表观感一致）
+    out.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.updated_at.cmp(&a.updated_at)));
     // 同标题副本的新旧判定（多账号时同一段对话会有多份，必须能分清谁是最新）。
     // 不重排列表：重复副本的时间本来就接近，天然相邻，全局「最近优先」的顺序更顺手。
     annotate_duplicates(&mut out);
@@ -1268,6 +1287,42 @@ pub fn list_sessions_forced() -> Result<Vec<WbSession>, String> {
     let mut out = list_sessions()?;
     annotate_duplicates_opt(&mut out, true);
     Ok(out)
+}
+
+/// 读某账号的「会话置顶快照」：`~/.workbuddy/<uid>/sidebar-list-snapshot.json`。
+///
+/// ⚠️ 这是客户端自己落的**缓存**，不是权威表：`workbuddy.db` 的 `sessions` 表里
+/// 根本没有置顶列（`spaces.pinned` 是「空间置顶」，不是会话）。所以：
+/// - 文件不存在 / 解析失败 ⇒ 一律返回空表（当没置顶），绝不让它阻塞会话列表；
+/// - 想让客户端把最新置顶写下来，需要在客户端里退出一次（它退出时才落盘）。
+/// 宁可显示「没置顶」，也不能因为读不到快照就让整个列表报错。
+pub fn pinned_snapshot(uid: &str) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    if uid.trim().is_empty() {
+        return out;
+    }
+    let path = data_root().join(uid).join("sidebar-list-snapshot.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return out;
+    };
+    let Some(items) = v.get("items").and_then(Value::as_array) else {
+        return out;
+    };
+    for it in items {
+        let (Some(id), Some(pinned)) = (
+            it.get("id").and_then(Value::as_str),
+            it.get("isPinned").and_then(Value::as_bool),
+        ) else {
+            continue;
+        };
+        if pinned {
+            out.insert(id.to_string(), true);
+        }
+    }
+    out
 }
 
 /// 在 `projects/` 下任意子目录中定位 `{会话id}.jsonl`。
@@ -1750,6 +1805,7 @@ mod tests {
             model: String::new(),
             deleted: false,
             has_body,
+            pinned: false,
             body_bytes: if has_body { 10 } else { 0 },
             body_lines: 0,
             content_digest: String::new(),

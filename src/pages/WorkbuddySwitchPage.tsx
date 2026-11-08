@@ -46,6 +46,8 @@ import {
   CreditsHeader,
   useWorkbuddyCredits,
 } from "@/components/workbuddy-credits";
+import { RenewAllTokensButton } from "@/components/renew-all-tokens";
+import { SHOW_LOCAL_LOGIN_IMPORT } from "@/lib/feature-flags";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { pickDefaultStandard, sessionLinkNote } from "@/lib/wb-switch-note";
@@ -716,10 +718,14 @@ export default function WorkbuddySwitchPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => void runImportLocal()} disabled={busyId !== null}>
-            {busyId === "import" ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-            导入本机登录态
-          </Button>
+          {/* ⚠️ 2026-11-08 用户要求：前端隐藏入口，后端导入命令保留。
+              恢复方式：`@/lib/feature-flags` 的 `SHOW_LOCAL_LOGIN_IMPORT` 改回 true。 */}
+          {SHOW_LOCAL_LOGIN_IMPORT ? (
+            <Button variant="outline" size="sm" onClick={() => void runImportLocal()} disabled={busyId !== null}>
+              {busyId === "import" ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+              导入本机登录态
+            </Button>
+          ) : null}
           <Button variant="outline" size="sm" onClick={() => void startOauth()} disabled={busyId !== null}>
             {busyId === "oauth" ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
             扫码添加账号
@@ -926,7 +932,22 @@ export default function WorkbuddySwitchPage() {
 
       {/* 顶部工具条：账号数 + 合计积分 + 刷新积分 */}
       <div className="mb-4">
-        <CreditsHeader credits={credits} accountCount={accounts.length} />
+        <CreditsHeader
+          credits={credits}
+          accountCount={accounts.length}
+          // 一键续期只作用于本页账号（首页没有这个入口），确认后才执行。
+          actions={
+            <RenewAllTokensButton
+              product="WorkBuddy"
+              ids={accounts.map((a) => a.id)}
+              renew={(id) => api.workbuddyAccountTokenRefresh(id, true)}
+              onFinished={() => {
+                void load();
+                void credits.refresh();
+              }}
+            />
+          }
+        />
       </div>
 
 
@@ -938,7 +959,7 @@ export default function WorkbuddySwitchPage() {
       ) : error ? null : accounts.length === 0 ? (
         <Card>
           <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            账号库还是空的。点「导入本机登录态」把当前登录的 WorkBuddy 账号收进来，或用「扫码添加账号」新增。
+            账号库还是空的。点「扫码添加账号」新增，或用「导入账号包」把已有账号搬进来。
           </CardContent>
         </Card>
       ) : (

@@ -305,6 +305,8 @@ fn session_item(s: &workbuddy_source::WbSession) -> Value {
         "dupGroup": s.dup_group,
         "isNewest": s.is_newest,
         "dupNote": s.dup_note,
+        // 置顶状态来自客户端侧栏快照（见 `workbuddy_source::pinned_snapshot`）
+        "pinned": s.pinned,
     })
 }
 
@@ -330,6 +332,218 @@ pub fn list_for_account(uid: &str) -> Value {
         "sessions": sessions,
     })
 }
+
+/// 会话正文搜索（用户提问 + 助手回答）。
+///
+/// 数据面：正文是 `~/.workbuddy/projects/**.jsonl`（本机 86 个文件 / 1.7 GB）。
+/// 三级过滤，顺序不能反：
+///   1. **文件级**：整份读成字节，`contains_ci_bytes` 做 SIMD 子串匹配，没命中就整个跳过；
+///   2. **行级**：命中的文件也只逐行按字节筛，只有含关键词的那一行才解码成字符串；
+///   3. **结构级**：只认 `type=message` 的 user/assistant 行，再复核提取后的正文。
+///
+/// ⚠️ 两个实测教训（都改过一版）：
+/// - 对命中文件直接 `parse_body`（整份 JSON 解析）一次搜索要 **27 s**（有的会话 19 MB）；
+/// - 串行扫 1.7 GB，release 构建也要 **5.5 s**。现在按文件并行扫（线程数按 CPU 上限 8），
+///   同一份数据约 1 s。debug 构建里 memchr 没有 SIMD，数字会难看很多，别拿 debug 判断性能。
+///
+/// `uid` 为空 = 全部账号（记录页默认单账号，传当前账号能少扫一半）。
+pub fn search_messages(uid: Option<&str>, query: &str, limit: usize) -> Value {
+    let q = query.trim();
+    if q.chars().count() < 2 {
+        // 单字搜索在 1.7 GB 上既慢又全是噪音，与 Trae / Qoder 两侧的最小长度一致。
+        return json!({ "query": q, "sessions": [], "scanned": 0, "elapsedMs": 0 });
+    }
+    let started = std::time::Instant::now();
+    let all = match workbuddy_source::list_sessions() {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e, "query": q, "sessions": [] }),
+    };
+    let q_lower = q.to_lowercase();
+    let limit = limit.clamp(1, 500);
+
+    // 候选：未删除 + 有正文 + 账号匹配。
+    let filters_uid = uid.filter(|u| !u.trim().is_empty());
+    let targets: Vec<&workbuddy_source::WbSession> = all
+        .iter()
+        .filter(|s| !s.deleted && s.has_body)
+        .filter(|s| match filters_uid {
+            Some(u) => s.user_id == u,
+            None => true,
+        })
+        .collect();
+
+    // 一次遍历建「会话 id → 正文路径」索引（`find_jsonl` 每次都要 walk 一遍 projects/）。
+    let index = jsonl_index();
+
+    // 并行扫：按文件切块给线程池，合并后再统一排序（结果与线程调度无关）。
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let chunk = targets.len().div_ceil(threads).max(1);
+    let mut partial: Vec<(Vec<Value>, usize, usize)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in targets.chunks(chunk) {
+            let index = &index;
+            let q_lower = &q_lower;
+            handles.push(scope.spawn(move || scan_files(part, index, q, q_lower)));
+        }
+        for h in handles {
+            if let Ok(v) = h.join() {
+                partial.push(v);
+            }
+        }
+    });
+
+    let mut files = 0usize;
+    let mut lines = 0usize;
+    let mut hits: Vec<Value> = Vec::new();
+    for (mut h, f, l) in partial {
+        files += f;
+        lines += l;
+        hits.append(&mut h);
+    }
+
+    hits.sort_by(|a, b| {
+        let ap = a.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        let bp = b.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        let au = a.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        let bu = b.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+        bp.cmp(&ap).then_with(|| bu.cmp(&au))
+    });
+    let total = hits.len();
+    hits.truncate(limit);
+    json!({
+        "query": q,
+        "sessions": hits,
+        "matchedSessions": total,
+        "truncated": total > limit,
+        "scanned": files,
+        "scannedLines": lines,
+        "elapsedMs": started.elapsed().as_millis() as u64,
+    })
+}
+
+/// 扫一批会话的正文文件，返回（命中会话, 扫了多少文件, 解析了多少条候选行）。
+fn scan_files(
+    sessions: &[&workbuddy_source::WbSession],
+    index: &std::collections::HashMap<String, std::path::PathBuf>,
+    q: &str,
+    q_lower: &str,
+) -> (Vec<Value>, usize, usize) {
+    const PER_SESSION: usize = 3;
+    let mut out: Vec<Value> = Vec::new();
+    let mut files = 0usize;
+    let mut lines = 0usize;
+
+    for s in sessions {
+        let Some(path) = index.get(&s.id) else { continue };
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        files += 1;
+        if !crate::modules::search_text::contains_ci_bytes(&bytes, q) {
+            continue;
+        }
+        let mut items: Vec<Value> = Vec::new();
+        let mut count = 0usize;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // ⚠️ 按**字节**切行，只把命中的行解码成字符串：整份 `from_utf8_lossy` 会为
+        //    1.7 GB 再扫一遍，并给每个 19 MB 文件分配一份副本（实测第二大开销）。
+        for line_bytes in bytes.split(|b| *b == b'\n') {
+            if !crate::modules::search_text::contains_ci_bytes(line_bytes, q) {
+                continue;
+            }
+            let line = String::from_utf8_lossy(line_bytes);
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            let role = v.get("role").and_then(Value::as_str).unwrap_or("");
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            let content = v.get("content").cloned().unwrap_or(Value::Null);
+            let body_text = workbuddy_source::join_content_blocks(&content);
+            if body_text.is_empty() {
+                continue;
+            }
+            lines += 1;
+            // 用户消息里的注入片段（IDE 打开文件提示、todo 提醒）不属于「用户说的话」，
+            // 与详情/导出口径一致：提取一次再匹配，免得搜到一堆系统提示。
+            let shown = if role == "user" {
+                workbuddy_source::extract_user_text(&body_text)
+            } else {
+                body_text
+            };
+            let Some(snippet) = crate::modules::search_text::snippet_of(&shown, q_lower, 40) else {
+                continue;
+            };
+            let fingerprint: String = shown.chars().take(80).collect();
+            if !seen.insert(format!("{role}|{fingerprint}")) {
+                continue;
+            }
+            count += 1;
+            if items.len() < PER_SESSION {
+                items.push(json!({
+                    "role": role,
+                    "snippet": snippet,
+                    "at": v.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+                }));
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        let (workspace_key, workspace) = crate::modules::workspace::workspace_of(&s.cwd);
+        out.push(json!({
+            "sessionId": s.id,
+            "title": s.title,
+            "workspace": workspace,
+            "workspaceKey": workspace_key,
+            "updatedAt": s.updated_at,
+            "pinned": s.pinned,
+            "ownerUid": s.user_id,
+            "ownerLabel": workbuddy_accounts::label_for(&s.user_id),
+            "hits": count,
+            "items": items,
+        }));
+    }
+    (out, files, lines)
+}
+
+/// `projects/` 下全部 `{会话id}.jsonl` 的索引（一次性目录遍历）。
+fn jsonl_index() -> std::collections::HashMap<String, std::path::PathBuf> {
+    let mut out = std::collections::HashMap::new();
+    let projects = workbuddy_source::data_root().join("projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return out;
+    };
+    for entry in dirs.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.insert(stem.to_string(), p);
+                }
+            }
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&p) else { continue };
+        for f in files.flatten() {
+            let fp = f.path();
+            if fp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
+                    out.insert(stem.to_string(), fp);
+                }
+            }
+        }
+    }
+    out
+}
+
 
 /// 列出本机全部会话按 uid 分组（账号选择器和「未归属」排查用）。
 ///
@@ -2438,6 +2652,35 @@ pub fn unlink_group(group_id: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真机探针（`#[ignore]`）：对着本机真实数据跑一次正文搜索，只读。
+    ///
+    /// 跑法：`cargo test -p wb-switch-core --lib wb_search_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wb_search_probe_reads_real_content() {
+        let v = search_messages(None, "签到", 10);
+        println!(
+            "命中会话 {} 个（扫 {} 个文件，{} ms）",
+            v["matchedSessions"], v["scanned"], v["elapsedMs"]
+        );
+        for s in v["sessions"].as_array().cloned().unwrap_or_default() {
+            println!(
+                "[{}] hits={} pinned={} {}",
+                s["sessionId"].as_str().unwrap_or(""),
+                s["hits"],
+                s["pinned"],
+                s["title"].as_str().unwrap_or("")
+            );
+            for it in s["items"].as_array().cloned().unwrap_or_default() {
+                println!("   {} | {}", it["role"].as_str().unwrap_or(""), it["snippet"].as_str().unwrap_or(""));
+            }
+        }
+        // 置顶快照：本机应至少能读出结构（没有置顶也不该 panic，只回空表）。
+        let all = workbuddy_source::list_sessions().expect("读会话列表失败");
+        let pinned: Vec<_> = all.iter().filter(|s| s.pinned).map(|s| s.title.clone()).collect();
+        println!("置顶会话 {} 条：{:?}", pinned.len(), pinned);
+    }
     use rusqlite::Connection;
 
     /// 从 `marker` 起截 **≤max_bytes 字节** 的源码窗口（对齐到字符边界）。
@@ -2685,6 +2928,7 @@ mod tests {
             model: "m".to_string(),
             deleted: false,
             has_body: true,
+            pinned: false,
             body_bytes: 10,
             body_lines: 1,
             content_digest: digest.to_string(),

@@ -43,6 +43,8 @@ import type {
   TraeScanResult,
   TraeSessionDetail,
   TraeSessionInfo,
+  TraeMsgSearchResult,
+  SessionTextSearchResult,
   TraeEditCellResult,
   TraeEditDoc,
   TraeEditReport,
@@ -307,11 +309,26 @@ export function traeCleanupWorkingFiles(): Promise<{
   return call("trae_cleanup_working_files", {});
 }
 
-/** Trae 会话列表（解密库，按最后活动倒序）。 */
+/** Trae 会话列表（解密库，置顶优先，其次按最后活动倒序）。 */
 export function traeListSessions(
   clientKey: string,
 ): Promise<{ sessions: TraeSessionInfo[] }> {
   return call("trae_list_sessions", { clientKey });
+}
+
+/**
+ * 会话记录页的正文搜索（用户提问 + 助手回答）。
+ *
+ * ⚠️ 走的是 SQLite 里的真实正文，不是元数据：`history_v2` 是流式累积表，
+ * 后端已按 message_id 收窄成「最完整一帧」再匹配，单次几十到几百毫秒。
+ * 前端务必**防抖**并给「搜索中」状态，别每敲一个字发一次。
+ */
+export function traeSearchMessages(
+  clientKey: string,
+  query: string,
+  limit?: number,
+): Promise<TraeMsgSearchResult> {
+  return call("trae_search_messages", { clientKey, query, limit: limit ?? null });
 }
 
 /**
@@ -1646,6 +1663,20 @@ export function workbuddySessionListByAccount(): Promise<WbSessionListByAccount>
   return call("workbuddy_session_list_by_account");
 }
 
+/**
+ * WorkBuddy 会话正文搜索（提问 + 回答）。
+ *
+ * ⚠️ 正文是 `~/.workbuddy/projects/**.jsonl`（本机 1.7 GB / 63 个会话），release 实测
+ * 一次全扫约 3 秒。**不要跟输入框的每次按键联动**，要么回车触发、要么明确点按钮。
+ */
+export function workbuddySessionSearch(
+  uid: string | null,
+  query: string,
+  limit?: number,
+): Promise<SessionTextSearchResult> {
+  return call("workbuddy_session_search", { uid, query, limit: limit ?? null });
+}
+
 export function workbuddySessionList(uid: string): Promise<WbSessionList> {
   return call("workbuddy_session_list", { uid });
 }
@@ -2435,6 +2466,20 @@ export async function qoderSessionsList(
   }[]
 > {
   return invoke("qoder_sessions_list", { region, includeArchived });
+}
+
+/**
+ * Qoder 会话正文搜索（提问 + 回答）。
+ *
+ * 正文在 `chat_session_messages.payload_json.parts[type=text]`，库很小（本机 32 条消息），
+ * 实测毫秒级，可以跟防抖联动。
+ */
+export async function qoderSessionSearch(
+  region: string,
+  query: string,
+  limit?: number,
+): Promise<SessionTextSearchResult> {
+  return call("qoder_session_search", { region, query, limit: limit ?? null });
 }
 
 export async function qoderSessionDetail(

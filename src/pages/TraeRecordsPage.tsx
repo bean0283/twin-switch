@@ -20,6 +20,7 @@ import {
   Link2Off,
   Loader2,
   Pencil,
+  Pin,
   RefreshCw,
   ScanSearch,
   Search,
@@ -72,6 +73,7 @@ import type {
   TraeLinksPreview,
   TraeSessionDetail,
   TraeSessionInfo,
+  TraeMsgHitSession,
 } from "@/lib/trae-types";
 
 /** 关联组状态 → 文案与配色（与 WorkBuddy 侧保持一致，改一处即两端同步）。 */
@@ -145,6 +147,13 @@ export default function TraeRecordsPage() {
   const [query, setQuery] = useState("");
   const [wsFilter, setWsFilter] = useState("");
   const [byWorkspace, setByWorkspace] = useState(true);
+  // 只看置顶（Trae 客户端里手动置顶的那几条；`chat_session.is_pinned`）
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  // 正文搜索：关键词 → 该会话的命中（用户提问 + 助手回答）。
+  // 元数据本地筛，正文走后端查库；两者合并成「这条会话要不要显示」。
+  const [contentHits, setContentHits] = useState<Map<string, TraeMsgHitSession>>(new Map());
+  const [contentSearching, setContentSearching] = useState(false);
+  const [contentInfo, setContentInfo] = useState<{ scanned: number; elapsedMs: number } | null>(null);
   // 导出目录（默认路径提示 + 打开按钮）
   const [exportDir, setExportDir] = useState("");
   // 解密库的表清单默认收起（~180 张表的标签墙会占掉半屏）
@@ -642,17 +651,61 @@ export default function TraeRecordsPage() {
       .sort((a, b) => b.last.localeCompare(a.last) || a.label.localeCompare(b.label));
   }, [sessions]);
 
+  /**
+   * 正文搜索：关键词 → 命中的会话（防抖 400 ms）。
+   *
+   * ⚠️ 只有 2 个字以上才查库：单字会把全库扫一遍，而且结果必然是一屏噪音。
+   * ⚠️ 失败时**保留上一次结果**、只清掉统计行 —— 搜索失败不等于「没有这条会话」，
+   *    把列表清空会让用户以为内容丢了。
+   */
+  useEffect(() => {
+    const q = query.trim();
+    if (!clientKey || !status?.exists || q.length < 2) {
+      setContentHits(new Map());
+      setContentInfo(null);
+      setContentSearching(false);
+      return;
+    }
+    let alive = true;
+    setContentSearching(true);
+    const timer = window.setTimeout(() => {
+      void api
+        .traeSearchMessages(clientKey, q, 300)
+        .then((r) => {
+          if (!alive) return;
+          const next = new Map<string, TraeMsgHitSession>();
+          for (const hit of r.sessions ?? []) next.set(hit.session_id, hit);
+          setContentHits(next);
+          setContentInfo({ scanned: r.scanned ?? 0, elapsedMs: r.elapsedMs ?? 0 });
+        })
+        .catch(() => {
+          if (alive) setContentInfo(null);
+        })
+        .finally(() => {
+          if (alive) setContentSearching(false);
+        });
+    }, 400);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [clientKey, query, status?.exists]);
+
   const visibleSessions = useMemo(() => {
     const q = query.trim().toLowerCase();
+    const raw = query.trim();
     return (sessions ?? []).filter((s) => {
       if (ownerFilter && s.owner_label !== ownerFilter) return false;
       if (wsFilter && (s.workspace_key ?? "") !== wsFilter) return false;
+      if (pinnedOnly && !s.pinned) return false;
       if (!q) return true;
-      return [s.title, s.workspace, s.workspace_path, s.id, s.owner_label].some((v) =>
+      const metaHit = [s.title, s.workspace, s.workspace_path, s.id, s.owner_label].some((v) =>
         (v ?? "").toLowerCase().includes(q),
       );
+      // 元数据命中直接留；否则看正文里有没有（正文结果由后端给）。
+      return metaHit || (raw.length >= 2 && contentHits.has(s.id));
     });
-  }, [sessions, ownerFilter, wsFilter, query]);
+  }, [sessions, ownerFilter, wsFilter, query, pinnedOnly, contentHits]);
 
   /** 按空间分组（分组顺序 = 组内第一条的时间，列表本来就按最后活动倒序）。 */
   const wsGroups = useMemo(() => {
@@ -714,7 +767,7 @@ export default function TraeRecordsPage() {
   // 切客户端 / 换筛选后清空勾选（理由见上）。依赖里放的是「会改变可见集合」的那两个。
   useEffect(() => {
     setRecordSel(new Set());
-  }, [clientKey, ownerFilter, wsFilter, query]);
+  }, [clientKey, ownerFilter, wsFilter, query, pinnedOnly]);
 
   // 列表刷新后把已经不存在的会话 id 从勾选里摘掉（例如在别处删过了）。
   useEffect(() => {
@@ -1446,16 +1499,20 @@ export default function TraeRecordsPage() {
                 ))}
               </select>
 
-              {/* 搜索：只搜元数据（正文在 SQLite 里，逐条读代价太高，占位符已写明） */}
+              {/* 搜索：标题/空间/id 本地即时筛，**正文**（提问 + 回答）走后端查库（防抖 400ms）。
+                  两字起才查正文 —— 单字会把全库扫一遍且结果全是噪音。 */}
               <div className="relative">
                 <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="搜索标题 / 工作空间 / 会话 id"
-                  className="h-9 w-[250px] pl-8 pr-8 text-sm"
+                  placeholder="搜索标题 / 空间 / 会话 id / 对话内容"
+                  className="h-9 w-[290px] pl-8 pr-8 text-sm"
+                  title="标题与空间本地匹配；两个字符以上会同时搜索对话正文（提问与回答）"
                 />
-                {query ? (
+                {contentSearching ? (
+                  <Loader2 className="absolute top-1/2 right-2 size-4 -translate-y-1/2 animate-spin text-muted-foreground" />
+                ) : query ? (
                   <button
                     type="button"
                     title="清除搜索"
@@ -1466,6 +1523,23 @@ export default function TraeRecordsPage() {
                   </button>
                 ) : null}
               </div>
+
+              {/* 只看置顶：Trae 客户端里手动置顶的会话（`chat_session.is_pinned`）。 */}
+              <Button
+                size="sm"
+                variant={pinnedOnly ? "default" : "outline"}
+                className="h-9"
+                aria-pressed={pinnedOnly}
+                title="只显示在 Trae 客户端里置顶过的会话"
+                onClick={() => setPinnedOnly((v) => !v)}
+                data-action="pinned-only"
+              >
+                <Pin className="size-4" />
+                只看置顶
+                <span className="ml-1 tabular-nums opacity-70">
+                  {(sessions ?? []).filter((s) => s.pinned).length}
+                </span>
+              </Button>
 
               {/* 工作空间筛选（数量与分组表头同源：都来自当前 sessions） */}
               <select
@@ -1595,8 +1669,17 @@ export default function TraeRecordsPage() {
                             />
                           </TableCell>
                           <TableCell className="max-w-[420px]">
-                            <div className="truncate font-medium" title={s.title}>
-                              {s.title || "（无标题）"}
+                            <div className="flex items-center gap-1.5">
+                              {/* 置顶标记：与 Trae 客户端一致，列表本来就把置顶排在最前 */}
+                              {s.pinned ? (
+                                <Pin
+                                  className="size-3.5 shrink-0 text-primary"
+                                  aria-label="已置顶"
+                                />
+                              ) : null}
+                              <span className="truncate font-medium" title={s.title}>
+                                {s.title || "（无标题）"}
+                              </span>
                             </div>
                             <div className="flex items-center gap-1.5">
                               {!byWorkspace ? (
@@ -1609,6 +1692,30 @@ export default function TraeRecordsPage() {
                                 {s.id}
                               </span>
                             </div>
+                            {/* 正文命中：给一行预览 + 命中处数（一段就够了，多了行高会炸）。
+                                只有关键词 ≥2 字时后端才会返回，所以平时这一行不占位。 */}
+                            {contentHits.get(s.id) ? (
+                              <div className="mt-0.5 flex items-start gap-1.5 text-[11px] text-muted-foreground">
+                                <Badge variant="secondary" className="shrink-0">
+                                  正文 {(contentHits.get(s.id)?.hits ?? 0) + " 处"}
+                                </Badge>
+                                <span
+                                  className="min-w-0 truncate"
+                                  title={(contentHits.get(s.id)?.items ?? [])
+                                    .map((it) => `${
+                                      it.role === "user" ? "提问" : "回答"}：${it.snippet}`)
+                                    .join("\n")}
+                                >
+                                  {contentHits.get(s.id)?.items?.[0]
+                                    ? `${
+                                        contentHits.get(s.id)?.items[0].role === "user"
+                                          ? "提问"
+                                          : "回答"
+                                      }：${contentHits.get(s.id)?.items[0].snippet}`
+                                    : ""}
+                                </span>
+                              </div>
+                            ) : null}
                           </TableCell>
                           <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                             {s.updated || "—"}
@@ -1703,7 +1810,13 @@ export default function TraeRecordsPage() {
               <div className="space-y-2">
                 <p className="text-sm text-muted-foreground">
                   {sessions?.length
-                    ? `没有匹配的会话 —— 筛选后 0 条，该客户端共 ${sessions.length} 条。`
+                    ? `没有匹配的会话 —— 筛选后 0 条，该客户端共 ${sessions.length} 条。${
+                        contentInfo
+                          ? `（正文已扫 ${contentInfo.scanned.toLocaleString("zh-CN")} 条，${
+                              contentInfo.elapsedMs
+                            } ms）`
+                          : ""
+                      }`
                     : "解密库中没有会话记录。"}
                 </p>
                 {sessions?.length ? (
@@ -1714,6 +1827,7 @@ export default function TraeRecordsPage() {
                       setQuery("");
                       setWsFilter("");
                       setOwnerFilter("");
+                      setPinnedOnly(false);
                     }}
                   >
                     清除搜索与筛选

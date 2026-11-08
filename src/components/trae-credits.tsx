@@ -267,10 +267,13 @@ export function TraeCreditsHeader({
   credits: c,
   accountCount,
   clientLabel,
+  actions,
 }: {
   credits: TraeCreditsState;
   accountCount: number;
   clientLabel?: string | null;
+  /** 刷新按钮左边的附加动作（账号页的「一键续期」）。 */
+  actions?: React.ReactNode;
 }) {
   const { result, error, busy, refresh } = c;
   return (
@@ -290,6 +293,7 @@ export function TraeCreditsHeader({
       refreshLabel="刷新积分"
       refreshHint="逐个账号拉取真实昵称 / 头像 / 手机号与积分包明细；5 分钟内重复点会直接复用缓存。"
       error={error}
+      actions={actions}
     />
   );
 }

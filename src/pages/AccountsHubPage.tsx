@@ -15,7 +15,7 @@ export default function AccountsHubPage() {
       <div>
         <h1 className="text-xl font-semibold tracking-tight">账号管理</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Trae / WorkBuddy / Qoder 三个产品的账号：切换、导入本机登录态、看积分与到期时间。
+          Trae / WorkBuddy / Qoder 三个产品的账号：切换、添加账号、一键续期、看积分与到期时间。
           会话不在这一组，在「会话管理」里。
         </p>
       </div>
@@ -26,13 +26,13 @@ export default function AccountsHubPage() {
             to="/trae-switch"
             icon={<UserRound className="size-4" />}
             title="Trae 账号管理"
-            desc="切换账号、导入本机登录态、看积分与到期时间"
+            desc="切换账号、一键续期、看积分与到期时间"
           />
           <HubCard
             to="/workbuddy-switch"
             icon={<UserRound className="size-4" />}
             title="WorkBuddy 账号管理"
-            desc="扫码添加、导入登录态、切换与积分"
+            desc="扫码添加、切换与一键续期"
           />
           <HubCard
             to="/qoder-accounts"

@@ -435,6 +435,7 @@ export function CreditsSummaryBar({
   refreshLabel = "刷新积分",
   refreshHint,
   error,
+  actions,
 }: {
   title?: string;
   /** 卡片数量。 */
@@ -456,6 +457,8 @@ export function CreditsSummaryBar({
   /** 刷新按钮的悬停说明（讲清这一次刷新顺带更新了什么）。 */
   refreshHint?: string;
   error?: string | null;
+  /** 刷新按钮左边的附加动作（各账号页自己的「一键续期」）。 */
+  actions?: React.ReactNode;
 }) {
   return (
     <section className="space-y-2">
@@ -482,16 +485,19 @@ export function CreditsSummaryBar({
             <span className="ml-1 text-xs text-muted-foreground">读取账号中…</span>
           )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onRefresh}
-          disabled={busy}
-          title={refreshHint}
-        >
-          {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-          {busy ? "查询中…" : refreshLabel}
-        </Button>
+        <div className="flex items-center gap-2">
+          {actions}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onRefresh}
+            disabled={busy}
+            title={refreshHint}
+          >
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            {busy ? "查询中…" : refreshLabel}
+          </Button>
+        </div>
       </div>
 
       {hint ? <p className="text-[11px] text-muted-foreground">{hint}</p> : null}

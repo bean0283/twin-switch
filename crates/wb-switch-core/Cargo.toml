@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "0.4.12"
+version = "0.4.13"
 edition = "2021"
 description = "TwinSwitch（双栖）核心逻辑（账号 / 切换 / 会话 / 解密 / 导入 / 清理），不依赖 Tauri，可被桌面端与 CLI 复用"
 
@@ -21,6 +21,9 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 会话关联的内容版本（归一化行摘要 / 全文摘要）。不能改用 DefaultHasher：跨进程
 # 与跨版本都不稳定，无法作为持久化内容身份。
 sha2 = "0.10"
+# 会话正文搜索：WorkBuddy 的正文是 86 个 JSONL（本机 1.7 GB），逐字节子串匹配
+# 必须走 SIMD 版 memchr，`windows()` 那种 O(n·m) 写法会慢一个数量级。
+memchr = "2"
 # Qoder 的 X-Machine-ID / X-Session-ID 必须与官方客户端同构：md5("{salt}:{uid}")。
 # 参考实现明确注明不要改成自创摘要（值会发给上游，上游只认这个形态）。
 md-5 = "0.10"

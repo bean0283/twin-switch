@@ -829,6 +829,23 @@ pub async fn trae_session_detail(client_key: String, session_id: String) -> Resu
         .map_err(|e| e.to_string())?
 }
 
+/// 会话记录页的正文搜索：在用户提问与助手回答里找关键词（只读）。
+///
+/// ⚠️ 必须在 blocking 线程跑：`history_v2` 是流式累积表，单条回答有几十帧，
+/// 收窄后仍要扫几十 MB —— 放主线程会卡住整个界面（Tauri 同步命令跑主线程）。
+#[tauri::command]
+pub async fn trae_search_messages(
+    client_key: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        trae_export::search_messages(&client_key, &query, limit.unwrap_or(200))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 会话编辑器：读出该会话在全部相关表里的行（结构化 JSON，含列元数据）。**只读。**
 #[tauri::command]
 pub async fn trae_session_edit_doc(client_key: String, session_id: String) -> Result<Value, String> {
@@ -2357,6 +2374,24 @@ pub async fn workbuddy_session_list(uid: String) -> Value {
         .unwrap_or_else(|e| json!({ "ok": false, "error": e, "sessions": [] }))
 }
 
+/// 会话正文搜索（用户提问 + 助手回答）。
+///
+/// ⚠️ 正文是 `~/.workbuddy/projects/**.jsonl`（本机 1.7 GB），必须放 blocking 线程，
+/// 且后端先按字节筛再解析 —— 前端要防抖，别每敲一个字发一次。
+#[tauri::command]
+pub async fn workbuddy_session_search(
+    uid: Option<String>,
+    query: String,
+    limit: Option<usize>,
+) -> Value {
+    let echo = query.clone();
+    off_main(move || {
+        workbuddy_sessions::search_messages(uid.as_deref(), &query, limit.unwrap_or(200))
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e, "query": echo, "sessions": [] }))
+}
+
 /// 会话详情：库行 + 正文回合（只读）。
 #[tauri::command]
 pub async fn workbuddy_session_detail(uid: String, cid: String) -> Value {
@@ -3879,6 +3914,20 @@ pub async fn qoder_session_detail(region: String, session_id: String) -> Result<
 #[tauri::command]
 pub async fn qoder_sessions_counts() -> Result<Value, String> {
     Ok(qoder_sessions::counts())
+}
+
+/// 会话正文搜索（用户提问 + 助手回答）。
+///
+/// 正文在 `chat_session_messages.payload_json.parts[type=text]`，SQL 粗筛后
+/// 还要用提取出的正文复核（`payload_json` 里有 `finalTextId` 这类键名会误命中）。
+#[tauri::command]
+pub async fn qoder_session_search(
+    region: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    off_main(move || qoder_sessions::search_messages(r, &query, limit.unwrap_or(200))).await?
 }
 
 

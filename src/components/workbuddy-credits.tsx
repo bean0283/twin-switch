@@ -195,10 +195,13 @@ export function useWorkbuddyCredits(): CreditsState {
 export function CreditsHeader({
   credits: c,
   accountCount,
+  actions,
 }: {
   credits: CreditsState;
   /** 本工具账号库里的账号数（卡片数量），与本模块的 `meta.count` 可能不同。 */
   accountCount: number;
+  /** 刷新按钮左边的附加动作（账号页的「一键续期」）。 */
+  actions?: React.ReactNode;
 }) {
   const { meta, result, error, busy, refresh } = c;
   const loaded = result && !result.empty ? result : null;
@@ -213,6 +216,7 @@ export function CreditsHeader({
       onRefresh={() => void refresh()}
       refreshHint="逐个账号拉取积分包明细；刚查过的账号会直接复用缓存。"
       error={error}
+      actions={actions}
     />
   );
 }

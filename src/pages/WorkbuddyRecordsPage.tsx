@@ -13,6 +13,7 @@ import {
   Link2Off,
   Loader2,
   Pencil,
+  Pin,
   RefreshCw,
   Archive,
   PackageOpen,
@@ -61,6 +62,7 @@ import type {
   WbSessionDetail,
   WbSessionItem,
   WbSessionLinkAllReport,
+  SessionTextHitSession,
 } from "@/lib/trae-types";
 
 function humanSize(bytes: number): string {
@@ -145,6 +147,18 @@ export default function WorkbuddyRecordsPage() {
   const [query, setQuery] = useState("");
   const [wsFilter, setWsFilter] = useState("");
   const [byWorkspace, setByWorkspace] = useState(true);
+  /** 只看置顶（客户端侧栏快照里的 `isPinned`）。 */
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  /**
+   * 正文搜索（**回车触发**）。
+   *
+   * ⚠️ 不做「边打字边搜」：正文是 1.7 GB 的 JSONL，release 实测一次全扫约 3 秒，
+   *    跟着按键跑等于把机器当扫描仪用。标题/空间/id 仍是即时本地过滤。
+   */
+  const [contentQuery, setContentQuery] = useState("");
+  const [contentHits, setContentHits] = useState<Map<string, SessionTextHitSession>>(new Map());
+  const [contentSearching, setContentSearching] = useState(false);
+  const [contentInfo, setContentInfo] = useState<{ scanned: number; elapsedMs: number } | null>(null);
   /**
    * 同标题折叠（默认开）。
    *
@@ -324,17 +338,57 @@ export default function WorkbuddyRecordsPage() {
    */
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
+    // 正文结果只对「那次搜索的关键词」有效：改过搜索框就不该继续拿旧命中把行留在列表里。
+    const useContent = contentQuery !== "" && contentQuery === query.trim();
     return sessions
       .filter((s) => {
         if (wsFilter && (s.workspaceKey ?? "") !== wsFilter) return false;
+        if (pinnedOnly && !s.pinned) return false;
         if (!q) return true;
-        return [s.title, s.workspace, s.workspacePath, s.id, s.model].some((v) =>
+        const metaHit = [s.title, s.workspace, s.workspacePath, s.id, s.model].some((v) =>
           (v ?? "").toLowerCase().includes(q),
         );
+        // 正文命中来自回车触发的那次搜索，与元数据命中取并集。
+        return metaHit || (useContent && contentHits.has(s.id));
       })
       .slice()
-      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  }, [sessions, query, wsFilter]);
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.updatedAt || 0) - (a.updatedAt || 0));
+  }, [sessions, query, wsFilter, pinnedOnly, contentHits, contentQuery]);
+
+  /**
+   * 回车触发：搜对话正文（提问 + 回答）。
+   *
+   * ⚠️ 一次全扫约 2~4 秒（1.7 GB），期间不能重复触发；失败时**保留上一次结果**，
+   * 只弹错 —— 搜索失败不等于「内容不存在」。
+   */
+  async function searchContent() {
+    const raw = query.trim();
+    if (raw.length < 2) {
+      toast.info("至少输入两个字", { description: "正文搜索最小长度 2，避免单字把全库扫一遍。" });
+      return;
+    }
+    if (contentSearching) return;
+    setContentSearching(true);
+    try {
+      const r = await api.workbuddySessionSearch(uid || null, raw, 300);
+      if (r.ok === false) throw new Error(r.error || "搜索失败");
+      const next = new Map<string, SessionTextHitSession>();
+      for (const hit of r.sessions ?? []) next.set(hit.sessionId, hit);
+      setContentHits(next);
+      setContentQuery(raw);
+      setContentInfo({ scanned: r.scanned ?? 0, elapsedMs: r.elapsedMs ?? 0 });
+      setSelected(new Set());
+      if (next.size === 0) {
+        toast.info("正文里没有匹配", {
+          description: `扫了 ${r.scanned ?? 0} 个会话正文，用时 ${r.elapsedMs ?? 0} ms`,
+        });
+      }
+    } catch (e) {
+      toast.error("正文搜索失败", { description: api.asError(e).split("\n")[0] });
+    } finally {
+      setContentSearching(false);
+    }
+  }
 
   /** 按工作空间分组（分组顺序 = 组内最新一条的时间降序）。 */
   const wsGroups = useMemo(() => {
@@ -886,7 +940,8 @@ export default function WorkbuddyRecordsPage() {
                   ))}
                 </select>
 
-                {/* 搜索：只搜元数据，正文不在这里（占位符里写清） */}
+                {/* 搜索：标题/空间/id 即时本地过滤；**回车**才搜正文
+                    （正文是 1.7 GB 的 JSONL，跟着按键搜等于把机器当扫描仪）。 */}
                 <div className="relative">
                   <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   <Input
@@ -895,10 +950,32 @@ export default function WorkbuddyRecordsPage() {
                       setQuery(e.target.value);
                       setSelected(new Set());
                     }}
-                    placeholder="搜索标题 / 工作空间 / 会话 id"
-                    className="h-9 w-[250px] pl-8 pr-8"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void searchContent();
+                      }
+                    }}
+                    placeholder="标题 / 空间 / id（回车搜正文）"
+                    className="h-9 w-[260px] pl-8 pr-8"
+                    title="输入两个字符以上、按回车可搜索对话正文（提问与回答）"
                   />
-                  {query && (
+                  {contentSearching ? (
+                    <Loader2 className="text-muted-foreground absolute top-1/2 right-2 size-3.5 -translate-y-1/2 animate-spin" />
+                  ) : contentQuery ? (
+                    <button
+                      type="button"
+                      title="清除正文搜索"
+                      className="text-muted-foreground absolute top-1/2 right-2 -translate-y-1/2"
+                      onClick={() => {
+                        setContentQuery("");
+                        setContentHits(new Map());
+                        setContentInfo(null);
+                      }}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  ) : query ? (
                     <button
                       type="button"
                       title="清除搜索"
@@ -910,8 +987,28 @@ export default function WorkbuddyRecordsPage() {
                     >
                       <X className="size-3.5" />
                     </button>
-                  )}
+                  ) : null}
                 </div>
+
+                {/* 只看置顶：状态来自客户端侧栏快照（`sessions` 表没有置顶列）。 */}
+                <Button
+                  size="sm"
+                  variant={pinnedOnly ? "default" : "outline"}
+                  className="h-9"
+                  aria-pressed={pinnedOnly}
+                  title="只显示在 WorkBuddy 客户端里置顶过的会话（客户端退出时才会把最新置顶写下来）"
+                  onClick={() => {
+                    setPinnedOnly((v) => !v);
+                    setSelected(new Set());
+                  }}
+                  data-action="pinned-only"
+                >
+                  <Pin className="size-4" />
+                  只看置顶
+                  <span className="ml-1 tabular-nums opacity-70">
+                    {sessions.filter((s) => s.pinned).length}
+                  </span>
+                </Button>
 
                 {/* 工作空间筛选：数量来自当前列表（与分组表头同源） */}
                 <select
@@ -1024,6 +1121,11 @@ export default function WorkbuddyRecordsPage() {
                 <div className="space-y-2 py-6 text-center">
                   <p className="text-sm text-muted-foreground">
                     没有匹配的会话 —— 筛选后 0 条，该账号共 {sessions.length} 条
+                    {contentInfo
+                      ? `（正文已扫 ${contentInfo.scanned.toLocaleString("zh-CN")} 个会话，${
+                          contentInfo.elapsedMs
+                        } ms）`
+                      : ""}
                   </p>
                   <Button
                     variant="outline"
@@ -1031,6 +1133,10 @@ export default function WorkbuddyRecordsPage() {
                     onClick={() => {
                       setQuery("");
                       setWsFilter("");
+                      setPinnedOnly(false);
+                      setContentQuery("");
+                      setContentHits(new Map());
+                      setContentInfo(null);
                       setSelected(new Set());
                     }}
                   >
@@ -1115,6 +1221,9 @@ export default function WorkbuddyRecordsPage() {
                               </td>
                               <td className="max-w-[420px] px-3 py-2">
                                 <div className="flex min-w-0 items-center gap-1.5">
+                                  {s.pinned ? (
+                                    <Pin className="size-3.5 shrink-0 text-primary" aria-label="已置顶" />
+                                  ) : null}
                                   <span className="truncate font-medium">{s.title}</span>
                                   {groupSize > 1 && (
                                     <Badge
@@ -1137,6 +1246,30 @@ export default function WorkbuddyRecordsPage() {
                                     {s.workspacePath || "（没有工作目录）"}
                                   </span>
                                 </div>
+                                {contentHits.get(s.id) ? (
+                                  <div className="mt-0.5 flex items-start gap-1.5 text-[11px] text-muted-foreground">
+                                    <Badge variant="secondary" className="shrink-0">
+                                      正文 {(contentHits.get(s.id)?.hits ?? 0) + " 处"}
+                                    </Badge>
+                                    <span
+                                      className="min-w-0 truncate"
+                                      title={(contentHits.get(s.id)?.items ?? [])
+                                        .map(
+                                          (it) =>
+                                            `${it.role === "user" ? "提问" : "回答"}：${it.snippet}`,
+                                        )
+                                        .join("\n")}
+                                    >
+                                      {contentHits.get(s.id)?.items?.[0]
+                                        ? `${
+                                            contentHits.get(s.id)?.items[0].role === "user"
+                                              ? "提问"
+                                              : "回答"
+                                          }：${contentHits.get(s.id)?.items[0].snippet}`
+                                        : ""}
+                                    </span>
+                                  </div>
+                                ) : null}
                                 {s.dupNote && groupSize > 1 && !groupNewest ? (
                                   <div className="truncate text-[11px] text-amber-600">
                                     {s.dupNote}

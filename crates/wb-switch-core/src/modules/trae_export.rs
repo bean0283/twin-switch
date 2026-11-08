@@ -834,6 +834,13 @@ pub struct SessionInfo {
     pub workspace_key: String,
     /// 原样路径（正斜杠），用于提示与定位。
     pub workspace_path: String,
+    /// 是否被 Trae 置顶（`chat_session.is_pinned`，客户端里那条「置顶」）。
+    ///
+    /// 客户端把置顶会话排在列表最前面；我们要跟它一致，否则「只看置顶」筛出来
+    /// 的顺序和客户端看到的不是一回事。
+    pub pinned: bool,
+    /// 置顶时刻（`pinned_at`，秒；0 = 没置顶）。同为客户端的排序依据。
+    pub pinned_at: i64,
 }
 
 /// 列出全部会话（按最后活动时间倒序），带归属账号信息。
@@ -844,10 +851,12 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
             "SELECT s.session_id, s.session_title, s.created_at, s.updated_at, \
                     COALESCE(p.user_id, '') AS owner_uid, \
                     COALESCE(p.absolute_path, '') AS project_path, \
-                    COALESCE(p.name, '') AS project_name \
+                    COALESCE(p.name, '') AS project_name, \
+                    CASE WHEN COALESCE(s.is_pinned, 0) THEN 1 ELSE 0 END AS pinned, \
+                    COALESCE(s.pinned_at, 0) AS pinned_at \
              FROM chat_session s \
              LEFT JOIN project p ON s.project_id = p.project_id \
-             ORDER BY ifnull(s.updated_at, s.created_at) DESC",
+             ORDER BY pinned DESC, pinned_at DESC, ifnull(s.updated_at, s.created_at) DESC",
         )
         .map_err(|e| format!("会话列表查询失败: {e}"))?;
     let rows = stmt
@@ -860,6 +869,8 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })
         .map_err(|e| format!("会话列表查询失败: {e}"))?
@@ -891,7 +902,7 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, title, created, updated, owner_uid, project_path, project_name)| {
+        .map(|(id, title, created, updated, owner_uid, project_path, project_name, pinned, pinned_at)| {
             let owner_label = if owner_uid.is_empty() {
                 "（无归属）".into()
             } else {
@@ -912,9 +923,205 @@ pub fn list_sessions(client_key: &str) -> Result<Vec<SessionInfo>, String> {
                 workspace,
                 workspace_key,
                 workspace_path: project_path.replace('\\', "/"),
+                pinned: pinned != 0,
+                pinned_at,
             }
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// 正文搜索（会话记录页的「搜索对话内容」）
+// ---------------------------------------------------------------------------
+//
+// 为什么不能只用前端过滤：正文根本不在列表数据里（列表只回元数据）。
+//
+// 数据面（只有一处靠得住）：
+//   - **用户提问 + 助手回答** → `history_v2.messages`（`raw_messages[].content[].text`，两侧都有）
+//
+// ⚠️ `chat_message_general` 看着像「用户消息表」，但它的 `message_id` 与 `chat_message`
+//    大多对不上（实测 488 行只有 14 行能关联到会话），当来源会大面积漏搜，已弃用。
+//
+// ⚠️ `history_v2` 是**流式累积**：同一条 message_id 有几十行（每一帧一份快照），
+//    直接 LIKE 会一条回答命中几十次（实测「后端」两个字 1328 行 / 474 条消息）。
+//    所以先按 message_id 取 `MAX(id)`（最完整那一帧）再匹配，扫描量从 72 MB 降到 1 MB 级。
+//
+// ⚠️ `server_history_info` 看着更像正文，但它只覆盖少数会话（实测 10 个会话里只有 3 个），
+//    拿它当唯一来源会让大部分会话搜不到东西。
+
+/// 一个会话内的一处命中。
+#[derive(Debug, Clone, Serialize)]
+pub struct MsgHit {
+    /// `user` / `assistant`。
+    pub role: String,
+    /// 命中位置前后各截一段，已压成单行（前端一行显示）。
+    pub snippet: String,
+    /// 该消息的时间（秒 → 已格式化，可能是空串：库里没这条记录）。
+    pub at: String,
+}
+
+/// 一个命中会话的汇总。
+#[derive(Debug, Clone, Serialize)]
+pub struct MsgHitSession {
+    pub session_id: String,
+    pub title: String,
+    pub owner_label: String,
+    pub workspace: String,
+    pub updated: String,
+    pub pinned: bool,
+    /// 命中总处数（可能大于 `items.len()`，列表只带前几条用于预览）。
+    pub hits: usize,
+    pub items: Vec<MsgHit>,
+}
+
+// LIKE 转义与片段截取由 `modules::search_text` 统一提供（三端同口径）。
+pub(crate) use crate::modules::search_text::{like_pattern, snippet_of};
+
+/// 会话记录页的正文搜索。
+///
+/// `limit` = 最多返回多少个会话（按列表顺序：置顶优先、其次最近活动）。
+pub fn search_messages(client_key: &str, query: &str, limit: usize) -> Result<Value, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(json!({ "query": "", "sessions": [], "scanned": 0, "elapsed_ms": 0 }));
+    }
+    let started = std::time::Instant::now();
+    let conn = open_decrypted(client_key)?;
+    let pattern = like_pattern(q);
+    let q_lower = q.to_lowercase();
+    let limit = limit.clamp(1, 500);
+
+    // 会话元数据（与列表同源：标题 / 归属 / 空间 / 置顶 / 最后活动）。
+    let mut meta: HashMap<String, MsgHitSession> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_id, s.session_title, COALESCE(s.updated_at, s.created_at), \
+                        COALESCE(p.user_id, ''), COALESCE(p.name, ''), COALESCE(p.absolute_path, ''), \
+                        CASE WHEN COALESCE(s.is_pinned, 0) THEN 1 ELSE 0 END \
+                 FROM chat_session s LEFT JOIN project p ON s.project_id = p.project_id",
+            )
+            .map_err(|e| format!("会话元数据查询失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|e| format!("会话元数据查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("会话元数据读取失败: {e}"))?;
+        for (id, title, updated, uid, pname, ppath, pinned) in rows {
+            let (_, workspace) = crate::modules::workspace::workspace_with_name(&pname, &ppath);
+            let owner_label = if uid.is_empty() {
+                "（无归属）".to_string()
+            } else {
+                crate::modules::trae_vault::account_label(client_key, &uid)
+            };
+            meta.insert(
+                id.clone(),
+                MsgHitSession {
+                    session_id: id,
+                    title: title.trim().to_string(),
+                    owner_label,
+                    workspace,
+                    updated: format_ts(&updated),
+                    pinned: pinned != 0,
+                    hits: 0,
+                    items: Vec::new(),
+                },
+            );
+        }
+    }
+
+    // 只搜「列表里真实存在」的会话：搜出来的会话若不在列表里，用户点进去一脸问号。
+    let mut scanned = 0usize;
+    // 每个会话最多留几条预览（列表一行一条，多了没处显示）。
+    const PER_SESSION: usize = 3;
+
+    // ---- 正文（用户提问 + 助手回答都在 `history_v2.raw_messages` 里）---------
+    //
+    // 为什么只查这一张表：
+    //   - `chat_message_general` 看着像「用户消息表」，但它的 `message_id` 与
+    //     `chat_message` 大多对不上（实测 488 行只有 14 行能关联到会话），
+    //     用它当来源会漏掉绝大多数提问；
+    //   - `history_v2` 的 `raw_messages` 同时含 user 与 assistant 两侧原文，
+    //     实测覆盖 10 个会话里的 9 个，是唯一可靠且完整的正文源。
+    //
+    // ⚠️ 它是**流式累积**表：一条消息几十帧，先按 message_id 取 MAX(id) 再匹配。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.session_id, h.messages, COALESCE(m.created_at, 0) \
+                 FROM history_v2 h \
+                 JOIN (SELECT message_id, MAX(id) AS keep_id FROM history_v2 \
+                       WHERE ifnull(deleted_at, 0)=0 GROUP BY message_id) k ON k.keep_id = h.id \
+                 JOIN chat_session s ON s.session_id = h.session_id \
+                 LEFT JOIN chat_message m ON m.message_id = h.message_id \
+                 WHERE h.messages LIKE ?1 ESCAPE '\\'",
+            )
+            .map_err(|e| format!("正文搜索失败: {e}"))?;
+        let rows = stmt
+            .query_map([&pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                ))
+            })
+            .map_err(|e| format!("正文搜索失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("正文读取失败: {e}"))?;
+        scanned += rows.len();
+        for (sid, raw, at) in rows {
+            if !meta.contains_key(&sid) {
+                continue;
+            }
+            for (role, text) in history_prose(&raw) {
+                let Some(snippet) = snippet_of(&text, &q_lower, 40) else {
+                    continue;
+                };
+                // 同一条提问会出现在下一轮 assistant 的 raw_messages 里，
+                // 不去重的话「命中 N 处」会虚高，列表里还会看到三条一样的话。
+                let fingerprint: String = text.chars().take(80).collect();
+                if !seen.insert(format!("{sid}|{role}|{fingerprint}")) {
+                    continue;
+                }
+                if let Some(m) = meta.get_mut(&sid) {
+                    m.hits += 1;
+                    if m.items.len() < PER_SESSION {
+                        m.items.push(MsgHit { role: role.to_string(), snippet, at: format_ts(&at) });
+                    }
+                }
+            }
+        }
+    }
+
+    // 只回有命中的会话，排序与列表一致：置顶优先，其次最后活动时间。
+    let mut hits: Vec<MsgHitSession> = meta.into_values().filter(|m| m.hits > 0).collect();
+    hits.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.updated.cmp(&a.updated))
+    });
+    let total = hits.len();
+    hits.truncate(limit);
+
+    Ok(json!({
+        "query": q,
+        "sessions": hits,
+        "matchedSessions": total,
+        "truncated": total > limit,
+        "scanned": scanned,
+        "elapsedMs": started.elapsed().as_millis() as u64,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +1168,53 @@ fn general_text(raw: &str) -> String {
 }
 
 /// `history_v2.messages` → assistant 过程文本（多段 text 按顺序拼接）。
+/// 一行正文（`history_v2.messages`）里 user / assistant 两侧的纯文本。
+///
+/// 与 [`assistant_text`] 的区别：那个只取 assistant 一侧、且把所有段拼成一整块；
+/// 搜索需要**分清这句话是谁说的**（列表里要标「提问」还是「回答」），所以按消息拆开。
+pub(crate) fn history_prose(raw: &str) -> Vec<(String, String)> {
+    let Ok(data) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(raw_msgs) = data.get("raw_messages").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for m in raw_msgs {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        match m.get("content") {
+            Some(Value::Array(arr)) => {
+                for p in arr {
+                    if p.get("type").and_then(|v| v.as_str()) != Some("text") {
+                        continue;
+                    }
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            parts.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            Some(Value::String(s)) => {
+                let t = s.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            _ => {}
+        }
+        if !parts.is_empty() {
+            out.push((role.to_string(), parts.join("\n")));
+        }
+    }
+    out
+}
+
 pub(crate) fn assistant_text(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -2272,5 +2526,60 @@ mod tests {
     fn prune_on_missing_dir_is_noop() {
         let root = std::env::temp_dir().join("wb_prune_missing_dir");
         assert_eq!(prune_backups(&root, 1), (0, 0));
+    }
+
+    // ---- 正文搜索的两个易错点：LIKE 转义 与 多字节截断 --------------------
+
+    /// 用户输入里的 `%` / `_` 必须按字面匹配，否则一个 `%` 就变成「搜全部」。
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        assert_eq!(like_pattern("abc"), "%abc%");
+        assert_eq!(like_pattern("100%_x"), "%100\\%\\_x%");
+        // 反斜杠自己也要转义，否则 ESCAPE 把后面的字符吃掉。
+        assert_eq!(like_pattern("a\\b"), "%a\\\\b%");
+    }
+
+    /// 中文按**字符**截断：按字节切会把汉字切成乱码（这句是回归测试）。
+    #[test]
+    fn snippet_cuts_by_chars_not_bytes() {
+        let text = "前面很长的一段中文用来测试截断位置是否安全助手回答在这里后面还有很多内容也要截掉一些才对";
+        let s = snippet_of(text, "助手回答", 4).expect("应命中");
+        assert!(s.contains("助手回答"), "命中词必须留在片段里：{s}");
+        // 每边最多 4 个字符 + 命中 4 字 + 两侧省略号。
+        assert_eq!(s.chars().count(), 4 + 4 + 4 + 2, "实际片段：{s}");
+        assert!(s.starts_with('…') && s.ends_with('…'));
+    }
+
+    /// 命中在开头/结尾时不该多出省略号。
+    #[test]
+    fn snippet_omits_ellipsis_at_edges() {
+        assert_eq!(snippet_of("hello world", "hello", 10).unwrap(), "hello world");
+        assert_eq!(snippet_of("hello world", "world", 10).unwrap(), "hello world");
+        assert!(snippet_of("hello", "absent", 10).is_none());
+    }
+
+    /// 真机探针（`#[ignore]`）：对着本机真实库跑一次正文搜索，只读。
+    ///
+    /// 跑法：`cargo test -p wb-switch-core --lib search_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn search_probe_finds_real_content() {
+        let v = search_messages("trae-cn", "Moonshot", 10).expect("搜索失败");
+        println!(
+            "命中会话 {} 个（扫描 {} 行，{} ms）truncated={}",
+            v["matchedSessions"], v["scanned"], v["elapsedMs"], v["truncated"]
+        );
+        for s in v["sessions"].as_array().cloned().unwrap_or_default() {
+            println!(
+                "[{}] hits={} pinned={} {}",
+                s["session_id"].as_str().unwrap_or(""),
+                s["hits"],
+                s["pinned"],
+                s["title"].as_str().unwrap_or("")
+            );
+            for it in s["items"].as_array().cloned().unwrap_or_default() {
+                println!("   {} | {}", it["role"].as_str().unwrap_or(""), it["snippet"].as_str().unwrap_or(""));
+            }
+        }
     }
 }

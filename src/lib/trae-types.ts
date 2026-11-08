@@ -331,6 +331,41 @@ export interface TraeSessionInfo {
   workspace_key: string;
   /** 原样路径（正斜杠）。 */
   workspace_path: string;
+  /** 是否被 Trae 置顶（客户端里那条「置顶」）。列表按它优先排序。 */
+  pinned: boolean;
+  /** 置顶时刻（秒，0 = 没置顶）。 */
+  pinned_at: number;
+}
+
+/** 正文搜索里的一处命中。 */
+export interface TraeMsgHit {
+  /** `user` = 我提的问题，`assistant` = 回答。 */
+  role: string;
+  /** 命中处前后各截一段，已压成单行。 */
+  snippet: string;
+  at: string;
+}
+
+/** 正文搜索命中的一个会话。 */
+export interface TraeMsgHitSession {
+  session_id: string;
+  title: string;
+  owner_label: string;
+  workspace: string;
+  updated: string;
+  pinned: boolean;
+  /** 命中总处数（`items` 只带前几条做预览）。 */
+  hits: number;
+  items: TraeMsgHit[];
+}
+
+export interface TraeMsgSearchResult {
+  query: string;
+  sessions: TraeMsgHitSession[];
+  matchedSessions?: number;
+  truncated?: boolean;
+  scanned?: number;
+  elapsedMs?: number;
 }
 
 /** Trae 详情里的一个「提问 + 回答」回合（形态对齐 WbSessionTurn，好让两端共用渲染）。 */
@@ -1791,6 +1826,49 @@ export interface WbSessionItem {
    */
   isNewest: boolean;
   dupNote: string;
+  /**
+   * 是否在 WorkBuddy 客户端里置顶。
+   *
+   * 来源是客户端的侧栏快照（`~/.workbuddy/<uid>/sidebar-list-snapshot.json`），
+   * 不是 `workbuddy.db`（那张 `sessions` 表没有置顶列）。所以客户端里刚置顶、
+   * 还没退出重开时，这里可能还是旧值。
+   */
+  pinned: boolean;
+}
+
+/** 三个产品会话页共用的「正文命中一处」。 */
+export interface SessionTextHit {
+  /** `user` = 提问，`assistant` = 回答。 */
+  role: string;
+  snippet: string;
+  at: number;
+}
+
+/** 三个产品会话页共用的正文搜索命中会话。 */
+export interface SessionTextHitSession {
+  sessionId: string;
+  title: string;
+  workspace: string;
+  workspaceKey?: string;
+  updatedAt: number;
+  pinned: boolean;
+  hits: number;
+  items: SessionTextHit[];
+  ownerUid?: string;
+  ownerLabel?: string;
+}
+
+/** 三个产品会话页共用的正文搜索结果。 */
+export interface SessionTextSearchResult {
+  ok?: boolean;
+  error?: string;
+  query: string;
+  sessions: SessionTextHitSession[];
+  matchedSessions?: number;
+  truncated?: boolean;
+  /** 扫了多少个单元（Trae/Qoder = 行，WB = 文件）。 */
+  scanned?: number;
+  elapsedMs?: number;
 }
 
 export interface WbSessionList {

@@ -22,6 +22,8 @@ import {
 } from "lucide-react";
 
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
+import { RenewAllTokensButton } from "@/components/renew-all-tokens";
+import { SHOW_LOCAL_LOGIN_IMPORT } from "@/lib/feature-flags";
 import { CheckinButton } from "@/components/checkin-button";
 import {
   TraeCreditBlock,
@@ -1240,16 +1242,21 @@ export default function TraeSwitchPage() {
             ⚠️ 不再用 `{selected && ...}` 整组隐藏 —— WB 页的按钮是常驻的，
             没有客户端时只置灰，不该「消失」（消失掉的按钮等于告诉用户这个功能不存在）。 */}
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void onImportLocal()}
-            disabled={!selected || busy}
-            title="直接解密本机客户端已登录的账号，无需浏览器授权"
-          >
-            {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-            导入本机登录态
-          </Button>
+          {/* ⚠️ 2026-11-08 用户要求：前端隐藏「导入本机登录态」入口，**后端命令保留**
+              （`trae_import_local_login` / `trae_import_all_local_logins` 仍在注册表里）。
+              恢复方式：`@/lib/feature-flags` 的 `SHOW_LOCAL_LOGIN_IMPORT` 改回 true。 */}
+          {SHOW_LOCAL_LOGIN_IMPORT ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void onImportLocal()}
+              disabled={!selected || busy}
+              title="直接解密本机客户端已登录的账号，无需浏览器授权"
+            >
+              {busy ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+              导入本机登录态
+            </Button>
+          ) : null}
           <Button
             variant="outline"
             size="sm"
@@ -1451,7 +1458,7 @@ export default function TraeSwitchPage() {
               <AlertDescription>
                 {live?.username ?? live?.email ?? "当前账号"}
                 {live?.uid ? `（uid ${shortUid(live.uid)}）` : ""} 还没进账号库。
-                点右上角「导入本机登录态」把它收进来，之后就能像 WorkBuddy 那样一卡一账号地看积分与切换。
+                点右上角「扫码添加账号」授权添加，之后就能像 WorkBuddy 那样一卡一账号地看积分与切换。
               </AlertDescription>
             </Alert>
           ) : null}
@@ -1520,6 +1527,20 @@ export default function TraeSwitchPage() {
               credits={credits}
               accountCount={overview?.vault.length ?? 0}
               clientLabel={selected.label}
+              // 「一键续期」只作用于本页账号（首页不提供），且必须先确认才会跑。
+              actions={
+                clientKey ? (
+                  <RenewAllTokensButton
+                    product="Trae"
+                    ids={(overview?.vault ?? []).map((v) => v.id)}
+                    renew={(id) => api.traeAccountTokenRefresh(clientKey, id, true)}
+                    onFinished={() => {
+                      void loadOverview(clientKey);
+                      void credits.refresh();
+                    }}
+                  />
+                ) : null
+              }
             />
 
             {overview?.vault.length ? (
@@ -1622,7 +1643,7 @@ export default function TraeSwitchPage() {
             ) : (
               <Card>
                 <CardContent className="py-10 text-center text-sm text-muted-foreground">
-                  账号库为空。点「扫码添加账号」授权添加，或「导入本机登录态」把客户端当前登录的账号收进来。
+                  账号库为空。点「扫码添加账号」授权添加，或「导入账号包」把已有账号搬进来。
                 </CardContent>
               </Card>
             )}
