@@ -1,7 +1,7 @@
 {
   "version": 2,
   "source": "github",
-  "updatedAt": "2026-10-30 22:50:00",
+  "updatedAt": "2026-11-09 21:01:00",
   "defaults": {
     "trae-cn": [
       "DeepSeek-V4-Flash",
@@ -101,7 +101,6 @@
       "hy3-b",
       "hy3-c",
       "hy3-x",
-      "hy4-preview",
       "kimi-k2-thinking",
       "kimi-k2.5",
       "kimi-k2.8-preview",
@@ -111,7 +110,14 @@
       "minimax-m2.5",
       "minimax-m2.7",
       "minimax-m3.1-flash",
-      "step-5-preview"
+      "step-5-preview",
+      "hy4free",
+      "hy4std",
+      "space-bunny",
+      "kimi-k2-instruct-taiji",
+      "deepseek-v3-1-lkeap",
+      "deepseek-v3-0324-lkeap",
+      "deepseek-r1-0528-lkeap"
     ],
     "wb-global": [
       "auto",
@@ -144,7 +150,8 @@
       "gfmodel",
       "kmodel_latest",
       "kmodel",
-      "mmodel"
+      "mmodel",
+      "jmodel"
     ],
     "qoder-global": [
       "auto",
@@ -156,7 +163,11 @@
       "gfmodel",
       "kmodel_latest",
       "kmodel",
-      "mmodel"
+      "mmodel",
+      "ultimate",
+      "efficient",
+      "smodel",
+      "cmodel"
     ]
   },
   "user": {}

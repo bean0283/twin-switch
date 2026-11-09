@@ -1251,6 +1251,54 @@ pub fn save_selected(map: &BTreeMap<String, Vec<String>>) -> Result<(), String> 
 mod sync_tests {
     use super::*;
 
+    /// 只读探针：把三端**实际识别到**的模型清单与 `models.json` 的 `defaults`（GitHub 权威清单）
+    /// 逐作用域比对，只打印不写盘。
+    ///
+    /// 用途：发版前确认「客户端又加了新模型」这件事，而不是靠肉眼翻 models.json。
+    /// 跑法：`cargo test -p wb-switch-core --lib probe_model_diff -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn probe_model_diff_against_defaults() {
+        let (models, reports) = discover().await;
+        println!("== 采集报告 ==");
+        for r in &reports {
+            println!("[{} {}] found={} {}", r.product, r.scope, r.found, r.note);
+        }
+
+        let mut live: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for m in &models {
+            live.entry(m.scope.clone()).or_default().push(m.model.clone());
+        }
+        let cat = load_catalog();
+        let mut scopes: Vec<String> = cat.defaults.keys().cloned().collect();
+        for k in live.keys() {
+            if !scopes.contains(k) {
+                scopes.push(k.clone());
+            }
+        }
+        scopes.sort();
+        for scope in scopes {
+            let mut d = cat.defaults.get(&scope).cloned().unwrap_or_default();
+            d.sort();
+            d.dedup();
+            let mut l = live.get(&scope).cloned().unwrap_or_default();
+            l.sort();
+            l.dedup();
+            let added: Vec<&String> = l.iter().filter(|m| !d.contains(m)).collect();
+            let gone: Vec<&String> = d.iter().filter(|m| !l.contains(m)).collect();
+            println!("\n== {scope} == defaults={} live={}", d.len(), l.len());
+            if added.is_empty() && gone.is_empty() {
+                println!("  一致");
+            }
+            if !added.is_empty() {
+                println!("  客户端有、defaults 没有（需新增 {}）：{:?}", added.len(), added);
+            }
+            if !gone.is_empty() {
+                println!("  defaults 有、客户端没有（需确认是否已下线 {}）：{:?}", gone.len(), gone);
+            }
+        }
+    }
+
     /// 把**三个产品**的模型清单一次性同步进 `~/.twin-switch/models.json`。
     ///
     /// 这是「让某个产品的积分可以被别的程序用」的关键一步：`models.json` 决定了
