@@ -34,7 +34,7 @@ pub fn db_path(region: QoderRegion) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-fn open(region: QoderRegion) -> Result<Connection, String> {
+pub(crate) fn open(region: QoderRegion) -> Result<Connection, String> {
     let path = db_path(region).ok_or_else(|| {
         format!(
             "本机没有 {} 的会话库（{} 未登录过或没装）",
@@ -425,7 +425,7 @@ fn client_running(region: QoderRegion) -> bool {
 ///
 /// 用 `Drop` 而不是在每个 `return` 前手动调 —— 中途任何一个 `?` 提前返回
 /// 也能保证「关掉的客户端会被重新拉起」，否则用户会遇到「操作失败还把客户端关了」。
-struct ResumeClientOnDrop {
+pub(crate) struct ResumeClientOnDrop {
     region: QoderRegion,
     was_running: bool,
     /// 是否已经处理过重启（显式 `resume_now` 或确认无需启动）—— 避免 Drop 再启动一次。
@@ -495,7 +495,7 @@ impl Drop for ResumeClientOnDrop {
 
 /// 关客户端并返回「原本是否在跑」的恢复守卫。用法：
 /// `let _resume = close_client_for_write(region)?;`
-fn close_client_for_write(region: QoderRegion) -> Result<ResumeClientOnDrop, String> {
+pub(crate) fn close_client_for_write(region: QoderRegion) -> Result<ResumeClientOnDrop, String> {
     let was_running = client_running(region);
     // ⚠️ 这里必须调 `ensure_client_closed`，**不能**调 `close_client_for_write` ——
     //    之前批量替换脚本把手写的这一行也换成了自己，造成**无限递归 → 栈溢出**，
@@ -509,7 +509,7 @@ fn close_client_for_write(region: QoderRegion) -> Result<ResumeClientOnDrop, Str
 }
 
 /// 写前备份（`main.sqlite` + 同目录的 `-wal` / `-shm`）。返回备份路径。
-fn backup_db(region: QoderRegion) -> Result<PathBuf, String> {
+pub(crate) fn backup_db(region: QoderRegion) -> Result<PathBuf, String> {
     let src = db_path(region).ok_or_else(|| "找不到会话库".to_string())?;
 
     // ⚠️ 备份写到**工具目录**（`~/.twin-switch/qoder/backups/<区域>/`），
@@ -566,7 +566,7 @@ fn prune_backups(dir: &Path, keep: usize) {
     }
 }
 
-fn open_rw(region: QoderRegion) -> Result<Connection, String> {
+pub(crate) fn open_rw(region: QoderRegion) -> Result<Connection, String> {
     let path = db_path(region).ok_or_else(|| {
         format!("本机没有 {} 的会话库", region.display_name())
     })?;

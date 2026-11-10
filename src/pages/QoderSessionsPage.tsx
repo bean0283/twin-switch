@@ -1,9 +1,11 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Archive,
   FolderOpen,
   Layers,
   LayoutList,
   Loader2,
+  PackageOpen,
   Pencil,
   Pin,
   RefreshCw,
@@ -25,8 +27,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { SessionPackImportDialog } from "@/components/session-pack-import-dialog";
 import type { SessionTextHitSession } from "@/lib/trae-types";
 import {
+  asError,
+  qoderSessionPackExport,
   qoderSessionDeleteMany,
   qoderSessionDetail,
   qoderSessionRename,
@@ -36,6 +41,7 @@ import {
   qoderSessionDeleteMessage,
 } from "@/lib/api";
 import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 type SessionRow = {
@@ -128,8 +134,11 @@ export default function QoderSessionsPage() {
    *  ⚠️ 不用 `window.confirm` —— Tauri 的 WebView 里它可能被拦掉直接返回 false，
    *     表现就是「点了删除没有任何反应、也没报错、会话还在」（踩过）。 */
   const [pending, setPending] = useState<SessionRow[]>([]);
-  /** 勾选的会话 id（批量删除用）。 */
+  /** 勾选的会话 id（批量删除 / 导出选中用）。 */
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 会话包导入弹窗。 */
+  const [packOpen, setPackOpen] = useState(false);
+  const [packBusy, setPackBusy] = useState(false);
   /** 表头复选框要能显示「部分选中」的横杠，React 只能通过 ref 设置。 */
   const allRef = useRef<HTMLInputElement>(null);
   /** 正在删（关客户端可能要十几秒，弹窗里必须有可见进度）。 */
@@ -266,6 +275,29 @@ export default function QoderSessionsPage() {
   }, [region, query]);
 
   /** 搜索 + 空间筛选后的行（时间倒序，与客户端列表一致）。 */
+  /**
+   * 导出会话包（可回灌）。
+   *
+   * **勾了就只导勾的**：一次只想带走几条时不该被逼着导全量
+   * （与 Trae / WorkBuddy 两页同一口径，2026-11-10）。
+   */
+  async function onExportPack() {
+    if (packBusy) return;
+    setPackBusy(true);
+    try {
+      const ids = selected.size > 0 ? Array.from(selected) : undefined;
+      const r = await qoderSessionPackExport(region, ids);
+      const mb = (r.bytes / 1_048_576).toFixed(1);
+      toast.success(ids ? `已导出选中的 ${r.sessions} 个会话` : `已导出 ${r.sessions} 个会话`, {
+        description: `${r.filename}（${mb} MB）· 包内含明文对话内容，请妥善保管`,
+      });
+    } catch (e) {
+      toast.error("导出会话包失败", { description: asError(e) });
+    } finally {
+      setPackBusy(false);
+    }
+  }
+
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     return rows
@@ -458,10 +490,37 @@ export default function QoderSessionsPage() {
                 因此这里只按版本筛选。
               </p>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void load()} className="gap-1.5">
-              {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-              刷新
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void onExportPack()}
+                disabled={packBusy || rows.length === 0}
+                title={
+                  selected.size > 0
+                    ? `只导出勾选的 ${selected.size} 个会话（可回灌，用于跨电脑迁移）`
+                    : "导出成可回灌的会话包，用于跨电脑迁移；先勾选就只导那几条"
+                }
+                className="gap-1.5"
+              >
+                {packBusy ? <Loader2 className="size-4 animate-spin" /> : <Archive className="size-4" />}
+                {selected.size > 0 ? `导出选中 (${selected.size})` : "导出会话包"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPackOpen(true)}
+                title="从会话包导入会话（跨电脑迁移用）"
+                className="gap-1.5"
+              >
+                <PackageOpen className="size-4" />
+                导入会话包
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void load()} className="gap-1.5">
+                {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                刷新
+              </Button>
+            </div>
           </div>
         </CardHeader>
       </Card>
@@ -1081,6 +1140,19 @@ export default function QoderSessionsPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* 会话包导入：目标不是「账号」而是**版本** —— Qoder 的会话没有账号归属字段，
+          每个版本各读各的库，所以这里把两个库当成两个落点。 */}
+      <SessionPackImportDialog
+        open={packOpen}
+        onOpenChange={setPackOpen}
+        kind="qoder"
+        targets={[
+          { uid: "global", name: "Qoder 国际版", isCurrent: region === "global" },
+          { uid: "cn", name: "Qoder 国内版", isCurrent: region === "cn" },
+        ]}
+        onImported={() => void load()}
+      />
     </div>
   );
 }

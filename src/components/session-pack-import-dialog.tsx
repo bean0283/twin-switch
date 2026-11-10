@@ -40,8 +40,8 @@ export interface PackTarget {
 interface Props {
   open: boolean;
   onOpenChange: (v: boolean) => void;
-  /** `trae` / `workbuddy`：决定调哪套预检与导入命令。 */
-  kind: "trae" | "workbuddy";
+  /** `trae` / `workbuddy` / `qoder`：决定调哪套预检与导入命令。 */
+  kind: "trae" | "workbuddy" | "qoder";
   /** Trae 导入需要客户端 key；WorkBuddy 忽略。 */
   clientKey?: string;
   targets: PackTarget[];
@@ -95,7 +95,11 @@ export function SessionPackImportDialog({
       setPreviewBusy(true);
       try {
         const prev =
-          kind === "trae" ? await api.traeSessionPackPreview(p) : await api.wbSessionPackPreview(p);
+          kind === "trae"
+            ? await api.traeSessionPackPreview(p)
+            : kind === "qoder"
+              ? await api.qoderSessionPackPreview(p)
+              : await api.wbSessionPackPreview(p);
         setPreview(prev);
       } catch (cause) {
         setPreviewError(api.asError(cause));
@@ -116,9 +120,11 @@ export function SessionPackImportDialog({
     setBusy(true);
     setLines([]);
     setResult(null);
-    // 后端进度走 `trae-import-progress` 事件（两个产品共用同一路事件名）。
+    // 后端进度事件：Trae / WorkBuddy 共用 `trae-import-progress`，Qoder 自己一路
+    // （它走的是另一套写库流程，混在一路会让两边的进度条互相串台）。
     const { listen } = await import("@tauri-apps/api/event");
-    const un = await listen<{ line: string }>("trae-import-progress", (e) => {
+    const evt = kind === "qoder" ? "qoder-import-progress" : "trae-import-progress";
+    const un = await listen<{ line: string }>(evt, (e) => {
       setLines((prev) => [...prev.slice(-400), e.payload.line]);
     });
     try {
@@ -131,6 +137,16 @@ export function SessionPackImportDialog({
             (r.backupMode === "skipped" ? "（未备份：设置里已关闭写库前备份）" : ""),
         );
         toast.success("导入完成", { description: `已写入 ${r.verified_sessions} 个会话` });
+      } else if (kind === "qoder") {
+        const r = await api.qoderSessionPackImport(zipPath, dstUid);
+        setResult(
+          `已导入 ${r.imported} 个会话（${r.messages} 条消息）` +
+            (r.skipped.length > 0 ? `，${r.skipped.length} 个被跳过` : "") +
+            "。Qoder 客户端会自动重启。",
+        );
+        toast.success("导入完成", {
+          description: `已写入 ${r.imported} 个会话 · 备份 ${r.backup.split(/[\/]/).pop() ?? ""}`,
+        });
       } else {
         const r = await api.wbSessionPackImport(zipPath, dstUid);
         const n = Array.isArray(r.imported) ? r.imported.length : 0;
@@ -238,7 +254,9 @@ export function SessionPackImportDialog({
 
           {/* 目标账号 */}
           <div className="space-y-1.5">
-            <div className="text-sm font-medium">导入到哪个账号</div>
+            <div className="text-sm font-medium">
+              {kind === "qoder" ? "导入到哪个版本" : "导入到哪个账号"}
+            </div>
             {targets.length === 0 ? (
               <div className="text-xs text-destructive">
                 没有可用账号。请先在该产品里登录一次，再回来导入。
@@ -253,7 +271,8 @@ export function SessionPackImportDialog({
                 {targets.map((t) => (
                   <option key={t.uid} value={t.uid}>
                     {t.name}
-                    {t.isCurrent ? "（当前登录）" : ""} · uid …{t.uid.slice(-6)}
+                    {t.isCurrent ? "（当前登录）" : ""}
+                    {kind === "qoder" ? "" : ` · uid …${t.uid.slice(-6)}`}
                   </option>
                 ))}
               </select>

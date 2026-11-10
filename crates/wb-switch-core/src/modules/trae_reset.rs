@@ -83,6 +83,78 @@ fn backup_root() -> std::path::PathBuf {
     store_dir().join("trae").join("backups")
 }
 
+/// AI 命令执行记录目录：`ModularData/ai-agent/command-execution/`。
+///
+/// 每个子目录 = 一次「AI 执行命令」的落盘：
+/// `execution.json`（含 **`ownerHash`，即执行该命令的账号指纹**）、`cwd.txt`（本机路径）、
+/// `output.log` / `stderr.log`。
+///
+/// ⚠️ 这个目录在 `trae_carriers::EXCLUDE_DIRS` 里 —— 切号时既不替换、也不清理。
+/// 于是一台机器登录过多少个账号，这里就留着多少份 `ownerHash`。
+/// issue #19 实测：用户手动删掉这些目录之后，客户端里「历史登录账号」的痕迹才消失。
+pub fn command_exec_dir(client: &TraeClient) -> std::path::PathBuf {
+    user_data_dir(client)
+        .join("ModularData")
+        .join("ai-agent")
+        .join("command-execution")
+}
+
+/// 统计 AI 执行记录：`(子目录数, 文件数, 字节数)`。只读。
+pub fn scan_command_traces(client: &TraeClient) -> (usize, usize, u64) {
+    let dir = command_exec_dir(client);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (0, 0, 0);
+    };
+    let mut dirs = 0usize;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for child in rd.flatten() {
+        let p = child.path();
+        if !p.is_dir() {
+            continue;
+        }
+        dirs += 1;
+        let (_, b, f) = measure(&p);
+        bytes += b;
+        files += f;
+    }
+    (dirs, files, bytes)
+}
+
+/// 清掉全部 AI 命令执行记录。返回 `(删除的子目录数, 释放字节数)`。
+///
+/// 只删子目录、保留 `command-execution` 目录本身（客户端会自己往里写）。
+/// **不碰 `database.db`** —— 那是会话库（SQLCipher 加密），删了会话就没了；
+/// 用户 issue 里也确认「清掉这些 log 就够了」。
+pub fn clean_command_traces(client: &TraeClient) -> Result<(usize, u64), String> {
+    let dir = command_exec_dir(client);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Ok((0, 0));
+    };
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    let mut failed = 0usize;
+    for child in rd.flatten() {
+        let p = child.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let (_, b, _) = measure(&p);
+        match std::fs::remove_dir_all(&p) {
+            Ok(_) => {
+                removed += 1;
+                freed += b;
+            }
+            // 单个目录删不掉（客户端正好在写）不算整体失败：剩下的下次再清。
+            Err(_) => failed += 1,
+        }
+    }
+    if removed == 0 && failed > 0 {
+        return Err(format!("有 {failed} 个执行记录目录删不掉（客户端可能在写入）"));
+    }
+    Ok((removed, freed))
+}
+
 /// 预览：会动哪些文件、多大、当前登录是谁、客户端是否在跑。**只读**。
 pub fn preview(client_key: &str) -> Value {
     let Some(client) = get_client(client_key) else {
@@ -113,6 +185,7 @@ pub fn preview(client_key: &str) -> Value {
             "action": if is_leveldb { "可选：整目录清除" } else { "删除登录键" },
         }));
     }
+    let (trace_dirs, trace_files, trace_bytes) = scan_command_traces(client);
     let live = crate::modules::trae_switch::describe_account(client_key);
     json!({
         "ok": true,
@@ -125,6 +198,13 @@ pub fn preview(client_key: &str) -> Value {
         "liveUid": live.get("uid").cloned().unwrap_or(Value::Null),
         "liveLabel": live.get("label").cloned().unwrap_or(Value::Null),
         "entries": items,
+        // AI 命令执行记录（切号时会被清掉，issue #19）
+        "commandTraces": {
+            "path": command_exec_dir(client).to_string_lossy(),
+            "dirs": trace_dirs,
+            "files": trace_files,
+            "bytes": trace_bytes,
+        },
         "totalBytes": total,
         "backupRoot": backup_root().to_string_lossy(),
     })
@@ -160,9 +240,11 @@ fn strip_auth_keys(path: &Path) -> Result<Vec<String>, String> {
 ///
 /// `include_leveldb`：连各 `Local Storage/leveldb` 一起清（最彻底，但会连带清掉界面偏好）。
 /// `relaunch`：清完是否把客户端拉起来（让用户直接手动登录）。
+/// `clean_traces`：顺带清掉 AI 命令执行记录（issue #19 —— 那里面留着每个账号的 `ownerHash`）。
 pub fn reset_login_state(
     client_key: &str,
     include_leveldb: bool,
+    clean_traces: bool,
     relaunch: bool,
     progress: Option<&dyn Fn(&str)>,
 ) -> Result<Value, String> {
@@ -230,6 +312,25 @@ pub fn reset_login_state(
         say(&format!("已清除 {} 个 leveldb 目录", removed_dirs.len()));
     }
 
+    // 4b) 可选：清 AI 命令执行记录（`ModularData/ai-agent/command-execution/*`）。
+    //
+    // 每条记录里有 `execution.json.ownerHash`（执行该命令的账号指纹）与 `cwd.txt`。
+    // 这个目录不参与切号替换，不清就会一直留着「这台机器用过哪些账号」的证据（issue #19）。
+    let (trace_dirs, trace_bytes) = if clean_traces {
+        match clean_command_traces(client) {
+            Ok((n, b)) => {
+                say(&format!("已清理 {n} 条 AI 命令执行记录"));
+                (n, b)
+            }
+            Err(e) => {
+                say(&format!("清理 AI 命令执行记录失败：{e}"));
+                (0, 0)
+            }
+        }
+    } else {
+        (0, 0)
+    };
+
     // 5) 拉起客户端（用户手动登录一次）
     let mut relaunched = false;
     let mut relaunch_error: Option<String> = None;
@@ -246,6 +347,8 @@ pub fn reset_login_state(
         "clientLabel": client.label,
         "removedKeys": removed_keys,
         "removedDirs": removed_dirs,
+        "removedTraceDirs": trace_dirs,
+        "freedTraceBytes": trace_bytes,
         "backupDir": backup.to_string_lossy(),
         "backedFiles": backed,
         "clientStopped": stopped,

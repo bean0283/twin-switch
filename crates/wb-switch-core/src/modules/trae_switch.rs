@@ -855,6 +855,23 @@ pub fn switch_to_with(
     }
     log("已写入目标账号登录态");
 
+    // 2b) 清掉上一个账号留下的「AI 命令执行记录」（issue #19）
+    //
+    // `ModularData/ai-agent/command-execution/<id>/` 里每条都带 `ownerHash`
+    // （执行该命令的账号指纹）和本机路径。这个目录在 `trae_carriers::EXCLUDE_DIRS` 里，
+    // 切号既不替换也不清理 ⇒ 登录过几个号，机器上就留几份指纹，
+    // 客户端据此还能拼出「这台机器用过哪些账号」。
+    //
+    // 失败**不阻断**切号：这是清理附件，登录态才是用户点这一下的目的。
+    match crate::modules::trae_reset::clean_command_traces(client) {
+        Ok((n, bytes)) if n > 0 => log(&format!(
+            "已清理 {n} 条 AI 命令执行记录（{:.1} KB）",
+            bytes as f64 / 1024.0
+        )),
+        Ok(_) => {}
+        Err(e) => log(&format!("清理 AI 命令执行记录失败（切号继续）：{e}")),
+    }
+
     // 3) 拉起 + 守护
     let outcome;
     if cfg.auto_relaunch {

@@ -556,6 +556,40 @@ export function wbSessionPackExport(sessionIds?: string[]): Promise<SessionPackE
 }
 
 /** 预检 WorkBuddy 会话包（只读）。 */
+/**
+ * 导出 Qoder 会话包。`sessionIds` 省略 = 导出该版本全部未删除会话。
+ *
+ * 与另两个产品同一个包格式（`manifest.kind = "qoder"`），差异只在包内是
+ * 逐行的 JSON 而不是 SQLite —— 见 `qoder_session_pack.rs` 顶部说明。
+ */
+export function qoderSessionPackExport(
+  region: string,
+  sessionIds?: string[],
+): Promise<SessionPackExportResult> {
+  return call("qoder_session_pack_export", { region, sessionIds });
+}
+
+/** 预检 Qoder 会话包（只读）。 */
+export function qoderSessionPackPreview(zipPath: string): Promise<SessionPackPreview> {
+  return call("qoder_session_pack_preview", { zipPath });
+}
+
+/** 导入 Qoder 会话包到指定版本（`region` = `cn` / `global`）。 */
+export function qoderSessionPackImport(
+  zipPath: string,
+  region: string,
+): Promise<{
+  ok: boolean;
+  imported: number;
+  messages: number;
+  skipped: string[];
+  backup: string;
+  region: string;
+  note: string;
+}> {
+  return call("qoder_session_pack_import", { zipPath, region });
+}
+
 export function wbSessionPackPreview(zipPath: string): Promise<SessionPackPreview> {
   return call("wb_session_pack_preview", { zipPath });
 }
@@ -1329,8 +1363,69 @@ export function traeResetLoginPreview(clientKey: string): Promise<{
   entries?: { rel: string; kind: string; bytes: number; files: number; leveldb: boolean; action: string }[];
   totalBytes?: number;
   backupRoot?: string;
+  /** AI 命令执行记录（`ModularData/ai-agent/command-execution`）。 */
+  commandTraces?: { path: string; dirs: number; files: number; bytes: number };
 }> {
   return call("trae_reset_login_preview", { clientKey });
+}
+
+/** 「登录痕迹」里的一行：本机登录过的一个账号。 */
+export interface TraeTraceAccount {
+  uid: string;
+  label: string;
+  suffix: string;
+  config: number;
+  modelCache: number;
+  artifacts: number;
+  projects: number;
+  sessions: number;
+  isCurrent: boolean;
+}
+
+export interface TraeTracesScan {
+  ok: boolean;
+  clientKey: string;
+  clientLabel: string;
+  accounts: TraeTraceAccount[];
+  total: number;
+  liveUid: string | null;
+  /** AI 命令执行记录：没有账号维度，只能整体清。 */
+  commandTraces: { dirs: number; files: number; bytes: number };
+  note: string;
+}
+
+/**
+ * 清点本机登录过的账号痕迹（issue #19）。只读，走解密快照。
+ *
+ * 数据来源是本地会话库里带 `user_id` 的表：`user_configuration`（每个登录过的号一行）、
+ * `project` / `model_config_cache` / `local_artifact`，会话数按 `project.user_id` 归集。
+ */
+export function traeTracesScan(clientKey: string): Promise<TraeTracesScan> {
+  return call("trae_traces_scan", { clientKey });
+}
+
+/**
+ * 按 uid 清掉登录痕迹。
+ *
+ * ⚠️ 会写库：停客户端 → 整库备份 → 解密副本删行 → 增量加密回写 → 原子替换 → 重启。
+ * `withSessions` 连该账号的会话与项目一起删（**不可撤回**，但库有备份）。
+ */
+export function traeTracesPurge(
+  clientKey: string,
+  uids: string[],
+  withSessions: boolean,
+  withCommandLog: boolean,
+): Promise<{
+  ok: boolean;
+  uids: string[];
+  withSessions: boolean;
+  stats: Record<string, number>;
+  commandTracesRemoved: number;
+  commandTracesBytes: number;
+  backup: string;
+  note: string;
+}> {
+  return call("trae_traces_purge", { clientKey, uids, withSessions, withCommandLog });
 }
 
 /**
@@ -1343,12 +1438,17 @@ export function traeResetLoginState(
   clientKey: string,
   includeLeveldb: boolean,
   relaunch: boolean,
+  /** 顺带清掉 AI 命令执行记录（`ownerHash` 就藏在那里）。默认 true。 */
+  cleanTraces = true,
 ): Promise<{
   ok: boolean;
   clientKey?: string;
   clientLabel?: string;
   removedKeys?: string[];
   removedDirs?: string[];
+  /** 被清掉的 AI 命令执行记录目录数（issue #19）。 */
+  removedTraceDirs?: number;
+  freedTraceBytes?: number;
   backupDir?: string;
   backedFiles?: number;
   clientStopped?: boolean;
@@ -1356,7 +1456,7 @@ export function traeResetLoginState(
   relaunchError?: string | null;
   note?: string;
 }> {
-  return call("trae_reset_login_state", { clientKey, includeLeveldb, relaunch });
+  return call("trae_reset_login_state", { clientKey, includeLeveldb, cleanTraces, relaunch });
 }
 
 /**

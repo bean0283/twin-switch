@@ -852,10 +852,14 @@ export default function WorkbuddyRecordsPage() {
                 size="sm"
                 onClick={() => void onExportPack()}
                 disabled={loading || refreshing || busy !== null}
-                title="导出成可回灌的会话包（zip 内含会话行 + 正文 + 清单），用于跨电脑迁移"
+                title={
+                  selected.size > 0
+                    ? `只导出勾选的 ${selected.size} 个会话（可回灌，用于跨电脑迁移）`
+                    : "导出成可回灌的会话包（zip 内含会话行 + 正文 + 清单），用于跨电脑迁移；先勾选就只导那几条"
+                }
               >
                 <Archive className="size-4" />
-                导出会话包
+                {selected.size > 0 ? `导出选中 (${selected.size})` : "导出会话包"}
               </Button>
               <Button
                 variant="outline"

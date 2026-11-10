@@ -5,13 +5,7 @@ import { AlertTriangle, KeyRound, Loader2, RotateCcw } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -46,7 +40,14 @@ function humanSize(bytes: number): string {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
-export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
+export function TraeResetLogin({
+  clientKey,
+  bare = false,
+}: {
+  clientKey: string | null;
+  /** 嵌进药丸分区时用：不画卡片外壳，只留说明 + 按钮。 */
+  bare?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,6 +57,13 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
   const [includeLeveldb, setIncludeLeveldb] = useState(false);
   /** 清完把客户端拉起来，让用户直接登录。 */
   const [relaunch, setRelaunch] = useState(true);
+  /**
+   * 顺带清掉 AI 命令执行记录（issue #19）。
+   *
+   * 默认**开**：`ModularData/ai-agent/command-execution/*` 里每条都带 `ownerHash`
+   * （执行那次命令的账号指纹），不清就会一直留着「这台机器用过哪些账号」。
+   */
+  const [cleanTraces, setCleanTraces] = useState(true);
 
   const openDialog = async () => {
     if (!clientKey) return;
@@ -78,10 +86,11 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
     if (!clientKey || busy) return;
     setBusy(true);
     try {
-      const r = await api.traeResetLoginState(clientKey, includeLeveldb, relaunch);
+      const r = await api.traeResetLoginState(clientKey, includeLeveldb, relaunch, cleanTraces);
       const parts = [
         r.removedKeys?.length ? `删除登录键 ${r.removedKeys.length} 个` : "没有登录键可删",
         r.removedDirs?.length ? `清除 ${r.removedDirs.length} 个 leveldb 目录` : "",
+        r.removedTraceDirs ? `清掉 ${r.removedTraceDirs} 条命令执行记录` : "",
         r.clientStopped ? "已退出客户端" : "",
         r.clientRelaunched ? "已重新打开客户端" : "",
         r.relaunchError ? `客户端没能自动打开：${r.relaunchError}` : "",
@@ -97,22 +106,13 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
     }
   };
 
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <RotateCcw className="size-4" />
-          重置登录态
-          <Badge variant="secondary" className="text-[10px]">
-            自救
-          </Badge>
-        </CardTitle>
-        <CardDescription>
-          切到某个账号后能进界面、但发不了消息（或提示需要重新登录）时用：清掉客户端侧的登录载体，
-          重新登录一次即可。账号档案与会话数据都不动，清完照样能把原来的账号切回来。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap items-center gap-2">
+  const head = (
+    <>
+      <CardDescription>
+        切到某个账号后能进界面、但发不了消息（或提示需要重新登录）时用：清掉客户端侧的登录载体，
+        重新登录一次即可。账号档案与会话数据都不动，清完照样能把原来的账号切回来。
+      </CardDescription>
+      <div className={cn("flex flex-wrap items-center gap-2", bare && "mt-3")}>
         <Button variant="outline" size="sm" onClick={() => void openDialog()} disabled={!clientKey}>
           <KeyRound className="size-4" />
           查看将清除的内容…
@@ -120,7 +120,28 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
         <span className="text-[11px] text-muted-foreground">
           只清 storage.json 里的登录键；会先整份备份
         </span>
-      </CardContent>
+      </div>
+    </>
+  );
+
+  return (
+    <>
+      {bare ? (
+        head
+      ) : (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <RotateCcw className="size-4" />
+              重置登录态
+              <Badge variant="secondary" className="text-[10px]">
+                自救
+              </Badge>
+            </CardTitle>
+            {head}
+          </CardHeader>
+        </Card>
+      )}
 
       <Dialog open={open} onOpenChange={(v) => !busy && setOpen(v)}>
         <DialogContent className="max-h-[86vh] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
@@ -199,6 +220,25 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
                   </Alert>
                 )}
 
+                {preview.commandTraces && preview.commandTraces.dirs > 0 ? (
+                  <div className="rounded-lg border p-2">
+                    <div className="mb-1 flex items-center justify-between text-xs">
+                      <span className="text-muted-foreground">AI 命令执行记录</span>
+                      <span className="tabular-nums">
+                        {preview.commandTraces.dirs} 条 · {humanSize(preview.commandTraces.bytes)}
+                      </span>
+                    </div>
+                    <code className="block break-all font-mono text-[11px] text-muted-foreground">
+                      {preview.commandTraces.path}
+                    </code>
+                    <p className="mt-1 text-[11px] leading-relaxed text-amber-700">
+                      每条记录里的 <code className="font-mono">execution.json.ownerHash</code> 是
+                      <b>执行那次命令的账号指纹</b>。这个目录不参与切号替换，所以登录过几个账号就会留下几份，
+                      客户端据此仍能认出「这台机器用过哪些账号」。清掉不影响任何会话。
+                    </p>
+                  </div>
+                ) : null}
+
                 <div className="max-h-52 overflow-auto rounded-lg border">
                   <table className="w-full text-xs">
                     <thead className="border-b bg-muted/40 text-muted-foreground">
@@ -260,6 +300,22 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
                     <input
                       type="checkbox"
                       className="mt-0.5 size-3.5"
+                      checked={cleanTraces}
+                      onChange={(e) => setCleanTraces(e.target.checked)}
+                    />
+                    <span>
+                      同时清掉 AI 命令执行记录
+                      {(preview.commandTraces?.dirs ?? 0) > 0 ? `（${preview.commandTraces?.dirs} 条）` : ""}
+                      <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                        登录痕迹清理的关键一项：那里留着每个账号的 <code className="font-mono">ownerHash</code>。
+                        只删执行日志与路径记录，不碰会话。
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex cursor-pointer items-start gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 size-3.5"
                       checked={relaunch}
                       onChange={(e) => setRelaunch(e.target.checked)}
                     />
@@ -285,6 +341,6 @@ export function TraeResetLogin({ clientKey }: { clientKey: string | null }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </Card>
+    </>
   );
 }

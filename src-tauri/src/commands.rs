@@ -18,7 +18,7 @@ use wb_switch_core::modules::{
     workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
     workbuddy_vault,
 };
-use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_tools};
+use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -645,12 +645,14 @@ pub async fn trae_reset_login_state(
     app: tauri::AppHandle,
     client_key: String,
     include_leveldb: bool,
+    clean_traces: Option<bool>,
     relaunch: bool,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         wb_switch_core::modules::trae_reset::reset_login_state(
             &client_key,
             include_leveldb,
+            clean_traces.unwrap_or(true),
             relaunch,
             Some(&|m| {
                 let _ = app.emit("trae-reset-progress", json!({ "line": m }));
@@ -3936,6 +3938,73 @@ pub async fn qoder_session_search(
 pub async fn qoder_session_rename(region: String, session_id: String, title: String) -> Result<Value, String> {
     let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
     qoder_sessions::rename(r, &session_id, &title)
+}
+
+/// 导出 Qoder 会话包（可回灌）。`session_ids` 省略 = 导出该版本全部未删除会话。
+#[tauri::command]
+pub async fn qoder_session_pack_export(
+    app: tauri::AppHandle,
+    region: String,
+    session_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_session_pack::export_pack(&region, session_ids.as_deref(), Some(&|m| {
+            let _ = app.emit("qoder-import-progress", serde_json::json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 预检 Qoder 会话包（只读）。
+#[tauri::command]
+pub async fn qoder_session_pack_preview(zip_path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_session_pack::preview_pack(&zip_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 导入 Qoder 会话包：写库前会关客户端并整库备份，导入完成后自动把客户端开回来。
+#[tauri::command]
+pub async fn qoder_session_pack_import(
+    app: tauri::AppHandle,
+    zip_path: String,
+    region: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_session_pack::import_pack(&zip_path, &region, Some(&|m| {
+            let _ = app.emit("qoder-import-progress", serde_json::json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 清点本机登录过的账号痕迹（issue #19）：uid / 会话数 / 配置行数 / 是否当前登录。只读。
+#[tauri::command]
+pub async fn trae_traces_scan(client_key: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || wb_switch_core::modules::trae_traces::scan(&client_key))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 按 uid 清掉登录痕迹。`with_sessions` 连会话/项目一起删；`with_command_log` 连
+/// AI 命令执行记录一起清（那个没有账号维度，只能整体清）。
+#[tauri::command]
+pub async fn trae_traces_purge(
+    app: tauri::AppHandle,
+    client_key: String,
+    uids: Vec<String>,
+    with_sessions: bool,
+    with_command_log: bool,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wb_switch_core::modules::trae_traces::purge(&client_key, &uids, with_sessions, with_command_log, Some(&|m| {
+            let _ = app.emit("trae-traces-progress", json!({ "line": m }));
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 删除会话（软删除 `deleted_at`，消息保留）。

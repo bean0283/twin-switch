@@ -50,6 +50,7 @@ pub mod trae_session_pack;
 pub mod trae_profile;
 pub mod trae_remote;
 pub mod trae_reset;
+pub mod trae_traces;
 pub mod trae_session_edit;
 pub mod trae_session_links;
 pub mod trae_switch;
@@ -57,6 +58,7 @@ pub mod trae_synth;
 pub mod trae_vault;
 /// 会话包（`.zip`）的公共部分：manifest 与解包校验，Trae / WorkBuddy 共用。
 pub mod session_pack;
+pub mod qoder_session_pack;
 pub mod update;
 /// 会话「工作空间」判定（Trae / WorkBuddy / Qoder 共用一套规则）。
 pub mod workspace;

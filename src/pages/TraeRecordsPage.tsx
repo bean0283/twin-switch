@@ -447,20 +447,27 @@ export default function TraeRecordsPage() {
    *
    * ⚠️ 与单条「导出 MD」不是一回事：md 只能读，这个包能导入回客户端，
    * 用于把本机会话迁到另一台电脑。
+   *
+   * **勾了就只导勾的**（2026-11-10 用户要求，与 WorkBuddy 页同一口径）：
+   * 一次只想带走几条时，不该被逼着导出来几十 MB 的全量包。
    */
-  async function onExportAll() {
+  async function onExportPack() {
     if (!clientKey || busy) return;
+    const ids = recordSel.size > 0 ? Array.from(recordSel) : undefined;
     await runBusy("导出会话包", async () => {
       try {
-        const res = await api.traeSessionPackExport([clientKey]);
+        const res = await api.traeSessionPackExport([clientKey], ids);
         const mb = (res.bytes / 1_048_576).toFixed(1);
-        toast.success(`已导出 ${res.sessions} 个会话`, {
+        toast.success(
+          ids ? `已导出选中的 ${res.sessions} 个会话` : `已导出 ${res.sessions} 个会话`,
+          {
           description: `${res.filename}（${mb} MB）· 包内含明文对话内容，请妥善保管`,
           action: {
             label: "打开所在目录",
             onClick: () => void api.traeRevealPath(res.path),
           },
-        });
+          },
+        );
       } catch (cause) {
         toast.error("导出会话包失败", { description: api.asError(cause) });
       }
@@ -1293,12 +1300,16 @@ export default function TraeRecordsPage() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void onExportAll()}
+                onClick={() => void onExportPack()}
                 disabled={busy || !status?.exists || !sessions?.length}
-                title="导出成可回灌的会话包（zip 内含会话数据库 + 清单），用于跨电脑迁移"
+                title={
+                  recordSel.size > 0
+                    ? `只导出勾选的 ${recordSel.size} 个会话（可回灌，用于跨电脑迁移）`
+                    : "导出成可回灌的会话包（zip 内含会话数据库 + 清单），用于跨电脑迁移；先勾选就只导那几条"
+                }
               >
                 <Archive className="size-4" />
-                导出会话包
+                {recordSel.size > 0 ? `导出选中 (${recordSel.size})` : "导出会话包"}
               </Button>
               <Button
                 variant="outline"

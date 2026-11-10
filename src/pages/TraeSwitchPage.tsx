@@ -60,6 +60,8 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TraeClientSwitcher, type TraeClientOption } from "@/components/trae-client-switcher";
+import { PillTabs } from "@/components/pill-tabs";
+import { TraeLoginTraces } from "@/components/trae-login-traces";
 import { TraeResetLogin } from "@/components/trae-reset-login";
 import { AccountTokenDialog } from "@/components/account-token-dialog";
 import * as api from "@/lib/api";
@@ -287,6 +289,21 @@ function accountNameOf(entry: TraeVaultEntry): string {
   return entry.id;
 }
 
+/**
+ * 账号维护的三个工具。
+ *
+ * 顺序按用户 2026-11-10 的要求固定：登录痕迹清理 → 重置登录态 → 记忆交接。
+ * 不要按「实现难度」或「使用频率」重排 —— 这三个是递进关系：
+ * 先看这台机器过哪些号 → 清了还进不去就重置登录态 → 换号前把上下文交接出去。
+ */
+const MAINT_TABS = [
+  { id: "traces", label: "登录痕迹清理" },
+  { id: "reset", label: "重置登录态" },
+  { id: "handoff", label: "记忆交接" },
+] as const;
+
+type MaintTab = (typeof MAINT_TABS)[number]["id"];
+
 export default function TraeSwitchPage() {
   const [clients, setClients] = useState<TraeInstalledClient[]>([]);
   /** 排在最前且**确有使用历史**的客户端（全 0 分时是 null）——只用来打「常用」徽标。 */
@@ -328,7 +345,14 @@ export default function TraeSwitchPage() {
   // `onImportPack`）—— 连同弹窗、连同一整组 state 一起删，不留死代码。
   const [renameTarget, setRenameTarget] = useState<TraeVaultEntry | null>(null);
   const [renameName, setRenameName] = useState("");
-  const [handoffOpen, setHandoffOpen] = useState(false);
+  /**
+   * 「账号维护」三个工具的分区（2026-11-10 用户要求做成药丸切换，与设置页一致）。
+   *
+   * 顺序固定：登录痕迹清理 → 重置登录态 → 记忆交接。
+   * 原来三块是纵向堆三张卡，其中「交接记忆」还带一个「展开/收起」——
+   * 分区之后那个折叠没有意义了（切到这一栏就是展开）。
+   */
+  const [maintTab, setMaintTab] = useState<MaintTab>("traces");
 
   /** 底部「回滚」卡里选中的账号 id（回滚 = 切回它）。 */
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null);
@@ -1719,22 +1743,40 @@ export default function TraeSwitchPage() {
             </Card>
           ) : null}
 
-          {/* 交接记忆 */}
+          {/* 账号维护：三件事共用一个药丸分区（2026-11-10 用户要求，与设置页同款）。
+              顺序固定：登录痕迹清理 → 重置登录态 → 记忆交接。 */}
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center gap-2 text-base">
                 <ArchiveRestore className="size-4" />
-                交接记忆
-                <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setHandoffOpen((v) => !v)}>
-                  {handoffOpen ? "收起" : "展开"}
-                </Button>
+                账号维护
               </CardTitle>
               <CardDescription>
-                从解密库自动提取会话要点 → 写入项目工作目录、项目规则与 Trae 记忆库，方便下一个账号接续任务。
+                清痕迹、重置登录态、写交接记忆 —— 三个工具都只动客户端侧的东西，本工具的账号档案一律不动。
               </CardDescription>
             </CardHeader>
-            {handoffOpen ? (
-              <CardContent className="grid gap-3">
+            <CardContent className="space-y-3">
+              <PillTabs
+                items={MAINT_TABS}
+                value={maintTab}
+                onChange={setMaintTab}
+                ariaLabel="账号维护工具"
+              />
+
+              {maintTab === "traces" && (
+                <TraeLoginTraces
+                  clientKey={clientKey}
+                  bare
+                  onDone={() => {
+                    if (clientKey) void loadOverview(clientKey);
+                  }}
+                />
+              )}
+
+              {maintTab === "reset" && <TraeResetLogin clientKey={clientKey} bare />}
+
+              {maintTab === "handoff" && (
+              <div className="grid gap-3">
                 <div className="grid gap-2">
                   <label className="text-xs text-muted-foreground">项目工作目录（绝对路径，留空则跳过记忆库写入）</label>
                   <Input
@@ -1811,13 +1853,10 @@ export default function TraeSwitchPage() {
                     ) : null}
                   </div>
                 ) : null}
-              </CardContent>
-            ) : null}
+              </div>
+              )}
+            </CardContent>
           </Card>
-
-          {/* 重置登录态：切到某账号后「能进界面但发不了消息」时的自救入口（issue #10）。
-              只清客户端侧登录载体，账号档案与会话数据不动。 */}
-          <TraeResetLogin clientKey={clientKey} />
         </>
       ) : (
         <Alert>
