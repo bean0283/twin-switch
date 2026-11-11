@@ -182,6 +182,36 @@ fn save_last_switch(v: &Value) {
     );
 }
 
+/// 上一次「切号同步定时任务」的现场：`~/.twin-switch/workbuddy/automation-sync.json`。
+///
+/// 为什么单独落一份：这份报告以前只跟着切号返回值走，界面上是个几秒就消失的 toast，
+/// 诊断日志又默认关 —— 用户事后想知道「到底同步了几个、为什么没同步」时**没有任何痕迹**。
+/// 现在每次切号都覆盖写一份（带 `at` 时间戳），排查时打开就能看到最后一次的真实结果。
+pub fn last_automation_sync() -> Option<Value> {
+    let p = automation_sync_file();
+    let txt = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+fn automation_sync_file() -> PathBuf {
+    crate::modules::config::store_dir()
+        .join("workbuddy")
+        .join("automation-sync.json")
+}
+
+fn remember_automation_sync(report: &Value) {
+    let p = automation_sync_file();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut v = report.clone();
+    if let Some(o) = v.as_object_mut() {
+        // 时间戳放前面读起来顺；`at` 用毫秒，与库里其它记录同一口径。
+        o.insert("at".into(), json!(now_ms()));
+    }
+    let _ = std::fs::write(p, serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
 /// 切号时用户勾选的会话同步范围（界面传过来，`None` = 老行为：只看看设置）。
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -252,11 +282,30 @@ pub fn switch_to(
     //
     // ⚠️ 失败**不阻断**切号：定时任务是附属功能，切号本身已经成功了，
     //    把报告带回界面照实显示即可（不许静默，也不许因此回滚登录态）。
-    let automation_sync = if settings::sync_workbuddy_automations() {
+    //
+    // ⚠️ 报告里**必须带上 `enabled` / `fromUid` / `toUid`**（2026-11-11 补）：
+    //    之前只有 `{ok, notNeeded, reason}`，三种「没同步」的原因（开关关着 /
+    //    没有源账号 / 目标已有同款）在界面上一模一样，用户只能靠猜。
+    //    现在开关状态与两个 uid 一并回传，界面上写清楚「为什么没同步」。
+    let automation_enabled = settings::sync_workbuddy_automations();
+    // 目标账号已有同一个任务时：`skip`（跳过，默认）/ `overwrite`（用源内容覆盖）。
+    // 真正的分支判定在 `workbuddy_automations::sync_owner_with_mode` 里 —— 两种模式
+    // 共用同一套「同一个任务」的判定键（name + rrule + prompt），这里只负责传模式、
+    // 并把生效模式一并回传给界面（否则用户改了设置也不知道这次到底按哪种跑的）。
+    let automation_mode = settings::workbuddy_automation_sync_mode();
+    let mut automation_sync = if automation_enabled {
         match previous_uid.as_deref().filter(|u| !u.is_empty()) {
             Some(from) if from != target_uid => {
-                match crate::modules::workbuddy_automations::sync_owner(from, &target_uid) {
+                // ⚠️ 成功/失败都由 `sync_owner_with_mode` 内部落诊断日志（带模式与各项条数），
+                //    这里**不再重复记一遍** —— 同一次同步在日志里出现两行、数字还各说各话，
+                //    排查时会先怀疑数据坏了，其实是日志写了两份。
+                match crate::modules::workbuddy_automations::sync_owner_with_mode(
+                    from,
+                    &target_uid,
+                    automation_mode,
+                ) {
                     Ok(v) => v,
+                    // 失败不阻断切号：报告原样带回界面（toast 第二行），日志已落盘。
                     Err(e) => json!({ "ok": false, "error": e }),
                 }
             }
@@ -265,6 +314,17 @@ pub fn switch_to(
     } else {
         json!({ "ok": true, "notNeeded": true, "reason": "设置里已关闭定时任务同步" })
     };
+    // 统一补齐「这次到底有没有尝试同步」几个字段（四种分支同一个形状）。
+    if let Some(o) = automation_sync.as_object_mut() {
+        o.insert("enabled".into(), json!(automation_enabled));
+        o.insert("mode".into(), json!(automation_mode.as_str()));
+        o.insert("fromUid".into(), json!(previous_uid));
+        o.insert("toUid".into(), json!(target_uid));
+    }
+    // 落一份「最近一次同步」到盘上（`~/.twin-switch/workbuddy/automation-sync.json`）。
+    // 原因：toast 会消失、诊断日志默认关 —— 用户回头问「到底同步没同步」时，
+    // 至少还有一个带时间戳的现场。失败不影响切号。
+    remember_automation_sync(&automation_sync);
 
     // 4.6) 会话同步（设置里打开才做）—— **只做增量，绝不搬历史存量**。
     //

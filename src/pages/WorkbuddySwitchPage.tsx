@@ -505,22 +505,45 @@ export default function WorkbuddySwitchPage() {
         void runCompare(groups);
       }
       // 定时任务同步的结果要一起报：删/增都对用户有影响，不能只说「切换成功」。
+      //
+      // ⚠️ 四种「没同步」必须**说得出区别**（2026-11-11 修）：
+      //    开关关着 / 切换前没有登录态 / 本来就是同一个账号 / 源账号本来就没任务。
+      //    以前这四种在界面上都长得像「一切正常」，用户只能猜「是不是没生效」。
       const sync = r.automationSync;
       const syncNote = (() => {
         if (!sync) return "";
-        if (sync.ok === false) return `；定时任务未同步：${sync.error ?? "未知原因"}`;
-        if (sync.notNeeded) return sync.reason ? `；${sync.reason}` : "";
+        if (sync.ok === false) return `定时任务未同步：${sync.error ?? "未知原因"}`;
+        if (sync.enabled === false) {
+          return "定时任务未同步（设置里这项是关的：设置 → 客户端 →「切换账号时同步 WorkBuddy 定时任务」）";
+        }
+        if (sync.notNeeded) return sync.reason ?? "";
         const copied = sync.copied?.length ?? 0;
         const dup = sync.skippedNames?.length ?? 0;
-        if (copied === 0 && dup === 0) return "；没有需要同步的定时任务";
-        return `；定时任务同步 ${copied} 个${dup > 0 ? `（${dup} 个已存在，跳过）` : ""}`;
+        // 覆盖模式独有的结果：改动的是目标账号原有那条，不是新增一条。
+        // 两种结果必须**分开说**，否则「覆盖 4 个」会被读成「又多出 4 个任务」。
+        const overwritten = sync.overwritten?.length ?? 0;
+        // 同名同周期的多余行被并掉的数量（覆盖模式才有）。
+        const mergedCount = sync.mergedNames?.length ?? 0;
+        const extra = sync.extraDuplicates ?? 0;
+        const dupNote =
+          mergedCount > 0
+            ? `；并掉 ${mergedCount} 条同名同周期重复`
+            : extra > 0
+              ? `；另有 ${extra} 条同名同周期重复未合并（改用「覆盖」模式可自动合并）`
+              : "";
+        // 源账号本来就没有任务 ⇒ 不占一行（那不是异常，也没什么可做的）。
+        if (copied === 0 && dup === 0 && overwritten === 0 && mergedCount === 0) {
+          return (sync.sourceCount ?? 0) === 0 ? "" : "没有需要同步的定时任务";
+        }
+        if (overwritten > 0) {
+          return `定时任务${copied > 0 ? `新增 ${copied} 个、` : ""}覆盖 ${overwritten} 个${dupNote}`;
+        }
+        return `定时任务同步 ${copied} 个${dup > 0 ? `（${dup} 个已存在，跳过）` : ""}${dupNote}`;
       })();
       // 会话互通的结果同样要报：它写的是会话库，失败必须让用户看见，不许只报「切换成功」。
       const link = r.sessionLink;
       const linkNote = link ? sessionLinkNote(link) : "";
-      const notes = [syncNote.replace(/^；/, ""), linkNote]
-        .filter((s) => s.length > 0)
-        .join("；");
+      const notes = [syncNote, linkNote].filter((s) => s.length > 0).join("；");
       toast.success(`已切换到 ${acc.name}`, notes ? { description: notes } : undefined);
       await load();
       // 切换已经结束，这扇窗没有剩余职责：留着只会挡住下面已经变成「当前登录」的账号卡。

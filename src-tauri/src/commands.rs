@@ -18,6 +18,8 @@ use wb_switch_core::modules::{
     workbuddy_session_edit, workbuddy_session_pack, workbuddy_sessions, workbuddy_switch,
     workbuddy_vault,
 };
+// 定时任务（`automations` 表）的跨账号同步与去重合并。
+use wb_switch_core::modules::workbuddy_automations;
 use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
 
 // ---------------------------------------------------------------------------
@@ -1332,8 +1334,12 @@ pub struct SettingsPatch {
     pub qoder_exe: Option<std::collections::HashMap<String, String>>,
     /// 切号时是否把 WorkBuddy 的定时任务同步给新账号（`None` = 不改）。
     pub sync_workbuddy_automations: Option<bool>,
-    /// 同步时遇到「同名 + 同周期」怎么办：`skip`（默认）或 `overwrite`（`None` = 不改）。
-    pub automation_sync_mode: Option<String>,
+    /// 目标账号已有同款定时任务时怎么处理（`None` = 不改）。
+    ///
+    /// 取值 `skip`（跳过，默认）/ `overwrite`（用源账号内容覆盖）。
+    /// 判定"同一个任务"的口径两种模式一致：`name + rrule + prompt` 全等。
+    pub workbuddy_automation_sync_mode:
+        Option<wb_switch_core::modules::workbuddy_automations::SyncMode>,
     /// 切号时是否把 WorkBuddy 的会话自动同步给所有账号（`None` = 不改）。
     pub auto_link_workbuddy_sessions: Option<bool>,
     /// **诊断日志**设置（`None` = 不改）。整块覆盖：开关 / 级别 / 保留天数 / 份数 / 单文件上限。
@@ -1357,7 +1363,9 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         "backupBeforeWrite": s.backup_before_write,
         // 切号是否同步定时任务（WorkBuddy 的 automations 按 owner_user_id 归属）。
         "syncWorkbuddyAutomations": s.sync_workbuddy_automations,
-        "automationSyncMode": s.automation_sync_mode,
+        // 已有同款时怎么处理：`"skip"` / `"overwrite"`（外加一句同源的中文文案）。
+        "workbuddyAutomationSyncMode": s.workbuddy_automation_sync_mode.as_str(),
+        "workbuddyAutomationSyncModeLabel": s.workbuddy_automation_sync_mode.label(),
         // 切号是否把会话自动同步给所有账号（写会话库，默认关）。
         "autoLinkWorkbuddySessions": s.auto_link_workbuddy_sessions,
         "beforeWriteSummary": if s.backup_before_write {
@@ -1415,7 +1423,11 @@ pub async fn settings_get() -> Result<Value, String> {
 #[tauri::command]
 pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
     off_main(move || {
-        let mut next = settings::load();
+        // ⚠️ 必须 `load_strict`（**不许** `load`）：`load` 在文件损坏时会退回默认值，
+        //    再被下面 `save` 原样写回 —— 结果是「用户点了保存，所有设置被静默重置」，
+        //    而且已经落盘、无法恢复（这正是「开关自己变回关」的第二条成因）。
+        //    坏文件就该让这次保存**失败并报错**，把 settings.json 原文留给用户去看。
+        let mut next = settings::load_strict()?;
         if let Some(r) = patch.backup_retention {
             next.backup_retention = r;
         }
@@ -1428,13 +1440,10 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         if let Some(v) = patch.sync_workbuddy_automations {
             next.sync_workbuddy_automations = v;
         }
-        if let Some(m) = patch.automation_sync_mode {
-            // 只认两个值：其它任何输入都落回 `skip`（宁可不覆盖，也不猜用户想覆盖）。
-            next.automation_sync_mode = if m.trim().eq_ignore_ascii_case("overwrite") {
-                "overwrite".to_string()
-            } else {
-                "skip".to_string()
-            };
+        if let Some(m) = patch.workbuddy_automation_sync_mode {
+            // 值本身是强类型枚举（serde 只认 `skip` / `overwrite`），非法值在
+            // 反序列化那一步就会被拒 —— 不会出现"存了个看不懂的字符串，切号时不生效"。
+            next.workbuddy_automation_sync_mode = m;
         }
         if let Some(v) = patch.auto_link_workbuddy_sessions {
             next.auto_link_workbuddy_sessions = v;
@@ -2179,6 +2188,27 @@ pub async fn workbuddy_switch_to(
     })
     .await
     .map_err(|e| format!("切换任务失败: {e}"))?
+}
+
+/// 把某个账号下**同名同周期**的重复定时任务合并成一条（不需要切号）。
+///
+/// 存在的理由：重复行可能就长在**当前登录账号**里（本机 `test` 就是这样：一条客户端
+/// 自己建、一条上次同步插的）。这个账号永远不会成为切号的目标，所以只靠切号同步
+/// 永远治不好 —— 必须给用户一个"就地整理"的入口。
+///
+/// `uid` 省略时取当前登录账号。语义与「覆盖」模式一致：保留最早那条的身份与运行
+/// 记录，内容取最后编辑的那份，其余**软删除**（`deleted_at`，可恢复）。
+#[tauri::command]
+pub async fn workbuddy_automations_merge_duplicates(uid: Option<String>) -> Result<Value, String> {
+    off_main(move || {
+        let target = match uid.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) {
+            Some(u) => u,
+            None => workbuddy_auth::current_uid()
+                .ok_or_else(|| "还没有登录 WorkBuddy，无法确定要整理哪个账号".to_string())?,
+        };
+        workbuddy_automations::merge_duplicates(&target)
+    })
+    .await?
 }
 
 /// 对指定关联组**逐份重新比对**（真读盘），返回最新明细。
@@ -4289,7 +4319,8 @@ pub async fn qinglong_config_set(
     env_qoder: Option<String>,
 ) -> Result<Value, String> {
     off_main(move || {
-        let mut s = settings::load();
+        // 同 `settings_set`：读坏了就报错，绝不「默认值覆盖写回」。
+        let mut s = settings::load_strict()?;
         let q = &mut s.qinglong;
         if let Some(v) = enabled {
             q.enabled = v;

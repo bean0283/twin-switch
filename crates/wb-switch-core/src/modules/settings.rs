@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::modules::config::store_dir;
+use crate::modules::workbuddy_automations::SyncMode;
 
 /// 设置文件：`~/.twin-switch/settings.json`。
 pub fn settings_path() -> PathBuf {
@@ -258,7 +259,9 @@ pub fn excess_with_reasons(
 }
 
 /// 完整设置。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ⚠️⚠️ **不许 `#[derive(Default)]`** —— 见下面 [`Settings::default`] 的说明。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// **切号时把定时任务同步给新账号**（默认**开**）。
@@ -271,15 +274,17 @@ pub struct Settings {
     /// 老用户的 `settings.json` 里没有这个键，升级后会**悄悄变成关**（行为突变）。
     #[serde(default = "yes")]
     pub sync_workbuddy_automations: bool,
-    /// **切号同步定时任务时，目标账号已有「同名 + 同周期」的那条怎么办**。
+    /// **目标账号已有同一个定时任务时怎么处理**（2026-11-11 新增）。
     ///
-    /// - `"skip"`（默认）：保持目标那份不动 —— 切号是低频操作，不该悄悄覆盖别人改过的任务。
-    /// - `"overwrite"`：用源账号的定义刷掉目标那份（保留目标的行 id，运行记录与关联不断）。
+    /// - [`SyncMode::Skip`]（默认）：跳过，一行都不碰 —— **与历史行为完全一致**，
+    ///   所以老用户的 `settings.json` 里没有这个键时不会发生任何行为突变；
+    /// - [`SyncMode::Overwrite`]：用源账号的内容刷新目标同款的任务定义
+    ///   （保留目标行的 `id` / `created_at` / `owner_user_id`）。
     ///
-    /// 判断三元组是 `(name, rrule, prompt)`：只看名字不够（同名不同周期是两件事），
-    /// 只看名字+周期也不够（同名同周期但提示词完全不同，那是另一个任务）。
-    #[serde(default = "default_automation_sync_mode")]
-    pub automation_sync_mode: String,
+    /// 判定"同一个任务"的口径两种模式一致：`name + rrule + prompt` 全等且未软删除。
+    /// 详见 [`crate::modules::workbuddy_automations::SyncMode`]。
+    #[serde(default)]
+    pub workbuddy_automation_sync_mode: SyncMode,
     #[serde(default)]
     pub backup_retention: BackupRetention,
     /// **写库前的整库备份**开关（T66）。**默认关闭**。
@@ -377,6 +382,42 @@ pub struct Settings {
     /// 字段说明与提交判据见 [`crate::modules::qinglong`]。
     #[serde(default)]
     pub qinglong: QinglongConfig,
+}
+
+/// **默认值必须与 serde 的 `default = "..."` 逐项一致** —— 这是本模块唯一的默认值来源。
+///
+/// ## 为什么不能 `#[derive(Default)]`（2026-11-11 修的真实 bug）
+///
+/// 那个 derive 让 `Settings::default()` 里每个 bool 都是 `false`，而 serde 侧写的是
+/// `default = "yes"`（`true`）。两条路径给出**不同的默认值**：
+///
+/// - `settings.json` 里**没有**这个键 → serde 走 `yes` ⇒ **开**；
+/// - `settings.json` **不存在 / 为空 / 解析失败** → `Settings::default()` ⇒ **关**。
+///
+/// 于是「设置文件缺失或被判坏」会让「切号同步定时任务」静默变关；之后任何一次保存
+/// （`set_wb_link_since`、`settings_set`）都会把这个 `false` 永久落盘 ——
+/// 用户的观感就是「我明明开过，怎么又不生效了」。
+///
+/// 现在只有一份默认值：`Settings::default()` 就是 serde 缺失键时的取值。
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            // `#[serde(default = "yes")]` ⇒ 开（对应文档里的「默认同步」）。
+            sync_workbuddy_automations: true,
+            // `#[serde(default)]` ⇒ Skip（老行为，不突变）。
+            workbuddy_automation_sync_mode: SyncMode::default(),
+            backup_retention: BackupRetention::default(),
+            // 这两个是**故意默认关**：写库 / 往别人账号写数据必须本人亲手打开。
+            backup_before_write: false,
+            auto_link_workbuddy_sessions: false,
+            trae_exe: HashMap::new(),
+            workbuddy_exe: String::new(),
+            qoder_exe: HashMap::new(),
+            wb_link_since: 0,
+            log: crate::modules::diag_log::DiagLogConfig::default(),
+            qinglong: QinglongConfig::default(),
+        }
+    }
 }
 
 /// 青龙面板连接配置。
@@ -503,6 +544,14 @@ pub fn sync_workbuddy_automations() -> bool {
     load().sync_workbuddy_automations
 }
 
+/// 目标账号已有同款定时任务时怎么处理 —— **唯一出口**。
+///
+/// 与 [`sync_workbuddy_automations`] 同款：切号链路只问它，不许自己 `load()` 再读字段，
+/// 否则「设置里选了覆盖、切号时还在跳过」这种分叉迟早出现。
+pub fn workbuddy_automation_sync_mode() -> SyncMode {
+    load().workbuddy_automation_sync_mode
+}
+
 pub fn backup_before_write() -> bool {
     load().backup_before_write
 }
@@ -521,8 +570,13 @@ pub fn wb_link_since() -> i64 {
 }
 
 /// 记住「已经同步到这个时刻」。写完必须落盘，否则每次切号都会重复处理同一批。
+///
+/// ⚠️ 走 `load_strict`：这里拿到的是**整份设置**，一旦用「坏文件 → 默认值」的
+/// [`load`] 读、再原样写回，就等于**把用户所有设置静默重置成默认值**（而且是永久的，
+/// 因为写回成功了）。宁可这次增量起点没记住（下次重跑一遍，只是多算一次），
+/// 也不许碰坏用户的配置文件。
 pub fn set_wb_link_since(at_ms: i64) -> Result<(), String> {
-    let mut s = load();
+    let mut s = load_strict()?;
     s.wb_link_since = at_ms;
     save(&s).map(|_| ())
 }
@@ -807,6 +861,64 @@ mod tests {
         assert!(ExcessRule::Time.describe(&p).contains("10 天"));
         assert!(ExcessRule::Count.describe(&p).contains("2 份"));
         assert!(ExcessRule::Size.describe(&p).contains("100 MB"));
+    }
+
+    /// ★ 回归测试（2026-11-11）：「默认值」只能有一份。
+    ///
+    /// 修之前 `Settings::default()`（出错/文件缺失时用）与 serde 缺失键时（`default = "yes"`）
+    /// 给出**不同**的 `sync_workbuddy_automations`：前者 `false`、后者 `true`。
+    /// 于是「设置文件缺失或被判坏」会把开关静默变关，下一次保存再把它永久写死。
+    #[test]
+    fn default_is_the_same_as_serde_missing_key() {
+        let d = Settings::default();
+        assert!(
+            d.sync_workbuddy_automations,
+            "定时任务同步必须默认开（文档承诺的就是「切号还看得到原来的任务」）"
+        );
+        // 文件里没有任何键（老用户的 settings.json）⇒ 与 `default()` 逐字段相同
+        let from_empty: Settings = serde_json::from_str("{}").expect("空对象应当可反序列化");
+        assert_eq!(from_empty, d, "serde 默认值与 Settings::default() 必须完全一致");
+        // 其余两项**故意默认关**，别被「顺手统一成 true」
+        assert!(!d.backup_before_write);
+        assert!(!d.auto_link_workbuddy_sessions);
+    }
+
+    /// 用户显式关掉时，反序列化结果必须是 `false` —— 不许被默认值顶回去。
+    #[test]
+    fn explicit_false_survives_deserialization() {
+        let s: Settings =
+            serde_json::from_str(r#"{"syncWorkbuddyAutomations": false}"#).expect("可反序列化");
+        assert!(!s.sync_workbuddy_automations);
+        // 只给了这一项，其余仍取默认值
+        assert!(!s.backup_before_write);
+        assert_eq!(s.backup_retention, BackupRetention::default());
+    }
+
+    /// 「已有同款怎么处理」：缺键 = 跳过（老行为），写了 `overwrite` 才覆盖。
+    ///
+    /// 这条是**升级安全**的核心断言：老用户的 `settings.json` 里没有这个键，
+    /// 反序列化后必须是 Skip，不能因为"新增了一项配置"就悄悄改成覆盖。
+    #[test]
+    fn automation_sync_mode_defaults_to_skip() {
+        assert_eq!(
+            Settings::default().workbuddy_automation_sync_mode,
+            SyncMode::Skip
+        );
+        let empty: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            empty.workbuddy_automation_sync_mode,
+            SyncMode::Skip,
+            "缺键必须等于历史行为（跳过）"
+        );
+        let ow: Settings =
+            serde_json::from_str(r#"{"workbuddyAutomationSyncMode":"overwrite"}"#).unwrap();
+        assert_eq!(ow.workbuddy_automation_sync_mode, SyncMode::Overwrite);
+        // 写回去的键名与值：前端读的就是这一对，改了一侧就会"存了但没生效"
+        let back = serde_json::to_value(&ow).unwrap();
+        assert_eq!(
+            back["workbuddyAutomationSyncMode"],
+            serde_json::json!("overwrite")
+        );
     }
 }
 

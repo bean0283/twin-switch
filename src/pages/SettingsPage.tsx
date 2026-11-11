@@ -43,6 +43,7 @@ import {
 } from "@/lib/backup-policy";
 import { selectableClients } from "@/lib/trae-client-list";
 import type {
+  AutomationSyncMode,
   BackupRetention,
   DiagLogSettings,
   DiagLogStatus,
@@ -114,8 +115,10 @@ export default function SettingsPage() {
   /** WorkBuddy 主程序路径的草稿（空串 = 走自动探测）。 */
   /** 切号是否同步定时任务（null = 还没读到设置，界面显示骨架）。 */
   const [syncAuto, setSyncAuto] = useState<boolean | null>(null);
-  /** 同名同周期时怎么办：`skip`（默认）/ `overwrite`。 */
-  const [syncMode, setSyncMode] = useState<"skip" | "overwrite">("skip");
+  /** 目标账号已有同名同周期任务时怎么办（null = 还没读到设置）。 */
+  const [syncMode, setSyncMode] = useState<AutomationSyncMode | null>(null);
+  /** 正在"就地合并"当前账号的重复定时任务。 */
+  const [mergingAuto, setMergingAuto] = useState(false);
   /** 切号是否自动把会话同步给所有账号（null = 还没读到设置）。 */
   const [autoLinkSessions, setAutoLinkSessions] = useState<boolean | null>(null);
   const [wbDraft, setWbDraft] = useState<string>("");
@@ -161,7 +164,7 @@ export default function SettingsPage() {
       setWbDraft(s.workbuddyExe ?? "");
       setQoderDraft({ ...(s.qoderExe ?? {}) });
       setSyncAuto(s.syncWorkbuddyAutomations ?? true);
-      setSyncMode(s.automationSyncMode === "overwrite" ? "overwrite" : "skip");
+      setSyncMode(s.workbuddyAutomationSyncMode ?? "skip");
       setAutoLinkSessions(s.autoLinkWorkbuddySessions ?? false);
       setLogDraft(s.log ?? null);
       void loadClients(false);
@@ -175,6 +178,7 @@ export default function SettingsPage() {
       setExeDraft(null);
       setQoderDraft({});
       setSyncAuto(null);
+      setSyncMode(null);
       setAutoLinkSessions(null);
       setLogDraft(null);
       setLogStatus(null);
@@ -189,7 +193,8 @@ export default function SettingsPage() {
   }, [load, loadClients]);
 
   async function save() {
-    if (!draft || beforeWrite === null || exeDraft === null) return;
+    // `!snap`：没有一份「上次读到的设置」就没法判断哪些项真改了（保存描述要用它对比）。
+    if (!snap || !draft || beforeWrite === null || exeDraft === null) return;
     setSaving(true);
     try {
       // ⚠️ 传**补丁**而不是整份设置：这里三项都改了，但以后加字段时不会互相覆盖。
@@ -201,7 +206,7 @@ export default function SettingsPage() {
         workbuddyExe: wbDraft.trim(),
         qoderExe: qoderDraft,
         syncWorkbuddyAutomations: syncAuto ?? true,
-        automationSyncMode: syncMode,
+        workbuddyAutomationSyncMode: syncMode ?? "skip",
         autoLinkWorkbuddySessions: autoLinkSessions ?? false,
         // 日志整块覆盖（后端会 sanitized 夹区间，回读值再刷表单）。
         ...(logDraft ? { log: logDraft } : {}),
@@ -215,17 +220,44 @@ export default function SettingsPage() {
       setWbDraft(next.workbuddyExe ?? "");
       setQoderDraft({ ...(next.qoderExe ?? {}) });
       setSyncAuto(next.syncWorkbuddyAutomations ?? true);
-      setSyncMode(next.automationSyncMode === "overwrite" ? "overwrite" : "skip");
+      setSyncMode(next.workbuddyAutomationSyncMode ?? "skip");
       setAutoLinkSessions(next.autoLinkWorkbuddySessions ?? false);
       setLogDraft(next.log ?? null);
       void refreshLogStatus();
       // 路径改了 ⇒ 让探测结果跟着刷新（否则下面那几行还挂着「未找到」）。
       void loadClients(true);
       toast.success("设置已保存", {
-        // 只改了路径时别拿「备份开关」的摘要当前描述 —— 那是另一件事。
-        description: sameExeMap(cleanExeDraft(exeDraft), next.traeExe ?? {})
-          ? next.beforeWriteSummary
-          : "客户端主程序路径已更新",
+        // 描述里**只说这次真改了的东西**。以前不管改了什么，只要路径没变就回
+        // 「写库前备份」那句摘要 —— 在「客户端」页勾了个切号开关，看到的却是
+        // 「已关闭（默认）—— 写库不留历史版本」，两句完全对不上，用户会以为没存上。
+        description: (() => {
+          const changed: string[] = [];
+          const exeChanged =
+            !sameExeMap(cleanExeDraft(exeDraft), next.traeExe ?? {}) ||
+            (snap.workbuddyExe ?? "") !== (next.workbuddyExe ?? "") ||
+            JSON.stringify(snap.qoderExe ?? {}) !== JSON.stringify(next.qoderExe ?? {});
+          if (exeChanged) changed.push("客户端主程序路径");
+          if ((snap.syncWorkbuddyAutomations ?? true) !== next.syncWorkbuddyAutomations) {
+            changed.push(`切号同步定时任务：${next.syncWorkbuddyAutomations ? "开" : "关"}`);
+          }
+          if ((snap.workbuddyAutomationSyncMode ?? "skip") !== next.workbuddyAutomationSyncMode) {
+            changed.push(
+              `同款任务处理：${next.workbuddyAutomationSyncMode === "overwrite" ? "覆盖" : "跳过"}`,
+            );
+          }
+          if ((snap.autoLinkWorkbuddySessions ?? false) !== next.autoLinkWorkbuddySessions) {
+            changed.push(`切号同步会话：${next.autoLinkWorkbuddySessions ? "开" : "关"}`);
+          }
+          if (JSON.stringify(snap.backupRetention) !== JSON.stringify(next.backupRetention)) {
+            changed.push("备份保留策略");
+          }
+          if (snap.backupBeforeWrite !== next.backupBeforeWrite) changed.push("写库前备份");
+          const policyChanged =
+            (!!logDraft && JSON.stringify(logDraft) !== JSON.stringify(snap.log)) ||
+            JSON.stringify(snap.log) !== JSON.stringify(next.log);
+          if (policyChanged) changed.push("诊断日志");
+          return changed.length > 0 ? changed.join("；") : next.beforeWriteSummary;
+        })(),
       });
     } catch (cause) {
       toast.error("保存失败", { description: api.asError(cause).split("\n")[0] });
@@ -248,17 +280,15 @@ export default function SettingsPage() {
       draft.maxTotalMb !== snap.backupRetention.maxTotalMb ||
       beforeWrite !== snap.backupBeforeWrite ||
       (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true) ||
-      syncMode !== (snap.automationSyncMode === "overwrite" ? "overwrite" : "skip") ||
+      (syncMode ?? "skip") !== (snap.workbuddyAutomationSyncMode ?? "skip") ||
       (autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false) ||
       (!!logDraft && JSON.stringify(logDraft) !== JSON.stringify(snap.log)));
 
-  /**
-   * 放弃所有未保存的改动。
+  /** 放弃**所有**草稿改动。
    *
-   * ⚠️ 早先这个逻辑是内联在「备份」分区按钮里的，而且**漏了定时任务同步与会话同步两个开关**
-   * —— 勾上再点「放弃」，那两个开关纹丝不动、`dirty` 一直是 true（2026-11-11 一并修掉）。
-   */
-  function resetAll() {
+   * ⚠️ 必须逐项重置到 `snap`（后端回读值）：漏掉一项就等于「点了放弃、改动还留着」，
+   * 用户下次点保存时会把这份「本该丢掉」的值一起写进去。 */
+  function discard() {
     if (!snap) return;
     setDraft(snap.backupRetention);
     setBeforeWrite(snap.backupBeforeWrite);
@@ -266,7 +296,7 @@ export default function SettingsPage() {
     setWbDraft(snap.workbuddyExe ?? "");
     setQoderDraft({ ...(snap.qoderExe ?? {}) });
     setSyncAuto(snap.syncWorkbuddyAutomations ?? true);
-    setSyncMode(snap.automationSyncMode === "overwrite" ? "overwrite" : "skip");
+    setSyncMode(snap.workbuddyAutomationSyncMode ?? "skip");
     setAutoLinkSessions(snap.autoLinkWorkbuddySessions ?? false);
     setLogDraft(snap.log ?? null);
   }
@@ -310,6 +340,37 @@ export default function SettingsPage() {
       toast.error("没取到路径", { description: api.asError(cause).split("\n")[0] });
     } finally {
       setProbingQoder(null);
+    }
+  }
+
+  /**
+   * 把**当前账号**里「同名同周期」的重复定时任务合并成一条。
+   *
+   * 为什么需要这个按钮：切号同步只在"切号"时发生，而重复行可能就长在正在登录的
+   * 这个账号里（本机 `test` 就是：一条客户端自己建、一条上次同步插的）。这个账号
+   * 永远不会成为切号的目标，所以只靠同步永远治不好 —— 得让用户能就地整理。
+   */
+  async function mergeDuplicateAutomations() {
+    if (mergingAuto) return;
+    setMergingAuto(true);
+    try {
+      const r = await api.workbuddyAutomationsMergeDuplicates();
+      if (r.merged === 0) {
+        toast.success("没有重复的定时任务", {
+          description:
+            r.groups === 0
+              ? "当前账号里没有同名同周期的重复任务。"
+              : `发现 ${r.groups} 组同名同周期，但都是同一条，无需合并。`,
+        });
+      } else {
+        toast.success(`已合并 ${r.merged} 条重复定时任务`, {
+          description: `涉及 ${r.names.join("、")}：保留创建最早那一条（连同它的运行记录），内容取最后一次编辑的版本，多余的行已软删除（可恢复）。`,
+        });
+      }
+    } catch (e) {
+      toast.error("合并失败", { description: String(e) });
+    } finally {
+      setMergingAuto(false);
     }
   }
 
@@ -517,22 +578,34 @@ export default function SettingsPage() {
                   WorkBuddy 的定时任务存在 workbuddy.db 的 automations 表里，**按账号归属**
                   （owner_user_id）。切到另一个账号后原任务在客户端里会「消失」。
                   默认开启同步：切过去还能看到原来的任务（按名称+周期+提示词去重，不会越积越多）。 */}
-              <div className="rounded-lg border bg-muted/30 px-3 py-3">
-                <label className="flex cursor-pointer items-start gap-2.5">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={syncAuto ?? true}
-                    disabled={syncAuto === null}
-                    onChange={(e) => setSyncAuto(e.target.checked)}
-                  />
-                  <span className="min-w-0">
-                    <span className="text-sm font-medium">切换账号时同步 WorkBuddy 定时任务</span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      定时任务按账号归属，切号后在客户端里会「消失」。开启后本工具会把它们复制一份给新账号；
-                      新账号还没有的任务照常补，已存在的（同名 + 同周期）按下面规则处理。
-                      关掉则只切登录态，不碰定时任务。
-                    </span>
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border bg-muted/30 px-3 py-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={syncAuto ?? true}
+                  disabled={syncAuto === null}
+                  onChange={(e) => setSyncAuto(e.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="text-sm font-medium">切换账号时同步 WorkBuddy 定时任务</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    定时任务按账号归属，切号后在客户端里会「消失」。开启后本工具会把它们复制一份给新账号
+                    （同名同周期的算「同一个任务」，按下面的方式处理）。关掉则
+                    <strong className="text-foreground">只切登录态</strong>，不碰定时任务。
+                  </span>
+                  {/* 「勾上了」≠「保存了」—— 这两个状态以前在界面上完全看不出来，
+                      用户以为开过、其实草稿随页面一起没了。这里把**磁盘上的值**写出来。 */}
+                  <span className="mt-1 block text-xs text-muted-foreground" data-saved-sync-auto>
+                    已保存：
+                    <strong className="text-foreground">
+                      {(snap.syncWorkbuddyAutomations ?? true) ? "开" : "关"}
+                    </strong>
+                    {(syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true) ? (
+                      <strong className="text-amber-700 dark:text-amber-400">
+                        {" "}
+                        —— 勾选尚未保存，点下面的「保存」后才生效
+                      </strong>
+                    ) : null}
                   </span>
                 </label>
 
@@ -563,6 +636,71 @@ export default function SettingsPage() {
                 ) : null}
               </div>
 
+              {/* ── 同款任务怎么处理（2026-11-11 新增）────────────────────
+                  两种方式的判定口径**完全一致**：`name + rrule + prompt` 三者全等，
+                  且目标账号里那条没被删除 —— 才算「同一个任务」。
+                    · 跳过（默认）= 保持历史行为，目标账号原有那条一行都不改；
+                    · 覆盖        = 用当前账号的内容刷新它（prompt / 周期 / 模型 / skills /
+                                    推送开关…），保留目标行的 id 与创建时间，
+                                    运行记录是「补进去」而不是「替换掉」。
+                  ⚠️ 必须放在上面那个 <label> **外面**：塞进 label 里，点一下这两个按钮
+                  会把上面的勾选框一起切换（label 的默认行为），看起来像界面在乱跳。 */}
+              <div className="ml-7 flex flex-wrap items-center gap-2" data-sync-mode>
+                <span className="text-xs text-muted-foreground">目标账号已有同名同周期任务时：</span>
+                {(
+                  [
+                    { v: "skip", label: "跳过", hint: "不动目标账号原来那条（默认，保持历史行为）" },
+                    { v: "overwrite", label: "覆盖", hint: "用当前账号的内容刷新它，保留它的创建时间" },
+                  ] as const
+                ).map((o) => (
+                  <Button
+                    key={o.v}
+                    type="button"
+                    size="sm"
+                    variant={(syncMode ?? "skip") === o.v ? "default" : "outline"}
+                    className="h-7 px-2.5 text-xs"
+                    disabled={syncMode === null || !(syncAuto ?? true)}
+                    onClick={() => setSyncMode(o.v)}
+                    title={o.hint}
+                    data-sync-mode-option={o.v}
+                    aria-pressed={(syncMode ?? "skip") === o.v}
+                  >
+                    {o.label}
+                  </Button>
+                ))}
+                <span className="text-xs text-muted-foreground" data-saved-sync-mode>
+                  已保存：
+                  <strong className="text-foreground">
+                    {(snap.workbuddyAutomationSyncMode ?? "skip") === "overwrite" ? "覆盖" : "跳过"}
+                  </strong>
+                  {(syncMode ?? "skip") !== (snap.workbuddyAutomationSyncMode ?? "skip") ? (
+                    <strong className="text-amber-700 dark:text-amber-400">
+                      {" "}
+                      —— 尚未保存
+                    </strong>
+                  ) : null}
+                  {!(syncAuto ?? true) ? "（同步开关关着，这项不生效）" : null}
+                </span>
+                {/* 就地整理：重复行可能就长在当前账号里，等不到切号同步来治。 */}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="ml-auto h-7 px-2.5 text-xs"
+                  disabled={mergingAuto}
+                  onClick={() => void mergeDuplicateAutomations()}
+                  title="把当前账号里同名同周期的重复任务合并成一条（保留最早那条的身份与运行记录，其余软删除）"
+                  data-action="merge-automations"
+                >
+                  {mergingAuto ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Wand2 className="size-3.5" />
+                  )}
+                  合并当前账号的重复任务
+                </Button>
+              </div>
+
               {/* ── 切号时自动同步会话 ───────────────────────────────────
                   会话是在各账号的库里各存一份的（按 user_id 归属），切号后默认只看到
                   那个账号自己的会话。打开后每次切号（WorkBuddy 已关闭、尚未重启那刻）
@@ -588,6 +726,18 @@ export default function SettingsPage() {
                     复制与关联」点一次「一键互相关联」（会先给你数字再确认）。
                     <span className="font-medium text-foreground">默认关闭</span>
                     ：它会往其它账号的会话库里写数据。
+                  </span>
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    已保存：
+                    <strong className="text-foreground">
+                      {(snap.autoLinkWorkbuddySessions ?? false) ? "开" : "关"}
+                    </strong>
+                    {(autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false) ? (
+                      <strong className="text-amber-700 dark:text-amber-400">
+                        {" "}
+                        —— 勾选尚未保存，点下面的「保存」后才生效
+                      </strong>
+                    ) : null}
                   </span>
                 </span>
               </label>
@@ -767,6 +917,26 @@ export default function SettingsPage() {
               </div>
             </CardContent>
           </Card>
+
+          {/* ── 保存条（2026-11-11 补） ──────────────────────────────────
+              ⚠️ 这一页原来**根本没有保存按钮**：本页所有项（主程序路径 + 两个切号开关）
+              都走「草稿 + 保存」模型，但保存按钮只写在「备份」和「青龙面板」两个分区里。
+              结果是 —— 在「客户端」页勾上「切号时同步定时任务」后，界面上没有任何地方
+              能提交它；切走页面改动就没了，而文字还写着「改完点下面的保存才生效」。
+              现在把保存条补在这里，与另两个分区的按钮同形、同一套 `save()`。 */}
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={() => void save()} disabled={saving || !dirty} data-action="save">
+              {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+              保存
+            </Button>
+            <Button variant="outline" disabled={saving || !dirty} onClick={discard} data-action="reset">
+              <RotateCcw className="size-4" />
+              放弃修改
+            </Button>
+            <span className="min-w-0 text-xs text-muted-foreground">
+              {dirty ? "有未保存的改动 —— 点「保存」才会写进 settings.json。" : "已与磁盘上的设置一致。"}
+            </span>
+          </div>
 
           </>}
 
@@ -974,7 +1144,7 @@ export default function SettingsPage() {
               <Button
                 variant="outline"
                 disabled={saving || !dirty}
-                onClick={resetAll}
+                onClick={discard}
                 data-action="reset"
               >
                 <RotateCcw className="size-4" />

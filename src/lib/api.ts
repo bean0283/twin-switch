@@ -3,6 +3,7 @@ import type { ErrorLogKind, UpdateCheckResult, UpdateSnapshot } from "./types";
 import type {
   AutoCheckinRunResult,
   AutoCheckinState,
+  AutomationSyncMode,
   BackupRetention,
   CheckinResult,
   DiagLogSettings,
@@ -64,6 +65,7 @@ import type {
   TraeWorkbuddyList, TraeWorkbuddyPreviewItem, TraeWorkbuddyReport,
   WorkbuddyAccountList,
   WorkbuddySwitchPrecheck,
+  WorkbuddyAutomationMergeResult,
   WorkbuddySwitchResult,
   WorkbuddySwitchSessionPlan,
   WorkbuddySwitchSessionSelection,
@@ -1253,11 +1255,12 @@ export function settingsSet(patch: {
   /** 切号时是否同步 WorkBuddy 的定时任务。 */
   syncWorkbuddyAutomations?: boolean;
   /**
-   * 同步时遇到「同名 + 同周期」怎么办：
-   * - `"skip"`（默认）：保持目标账号那份不动；
-   * - `"overwrite"`：用源账号的定义覆盖目标那份（保留目标行 id，运行记录不断）。
+   * 目标账号已有同一个定时任务时怎么处理。
+   *
+   * `skip`（默认）= 跳过、不动目标原有那条；`overwrite` = 用当前账号的内容刷新同款。
+   * 判定"同一个任务"两种模式一致：`name + rrule + prompt` 全等。
    */
-  automationSyncMode?: string;
+  workbuddyAutomationSyncMode?: AutomationSyncMode;
   /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */
   autoLinkWorkbuddySessions?: boolean;
   /** 诊断日志设置（**整块覆盖**：给全量，不是增量）。 */
@@ -1665,6 +1668,20 @@ export function workbuddySwitchTo(
   sessions?: WorkbuddySwitchSessionSelection,
 ): Promise<WorkbuddySwitchResult> {
   return call("workbuddy_switch_to", { accountId, relaunch, sessions });
+}
+
+/**
+ * 把当前账号下**同名同周期**的重复定时任务合并成一条。
+ *
+ * 为什么要单独一个入口：重复行可能就长在当前登录账号里，而同步只在切号时发生 ——
+ * 当前账号不会成为切号目标，所以永远等不到"顺手治好"。
+ * 语义与「覆盖」模式一致：保留最早那条的身份与运行记录，内容取最后编辑的那份，
+ * 其余软删除（可恢复）。`uid` 省略 = 当前登录账号。
+ */
+export function workbuddyAutomationsMergeDuplicates(
+  uid?: string,
+): Promise<WorkbuddyAutomationMergeResult> {
+  return call("workbuddy_automations_merge_duplicates", { uid: uid ?? null });
 }
 
 /**

@@ -1468,7 +1468,36 @@ export interface WorkbuddySwitchResult {
     reason?: string;
     error?: string;
     copied?: string[];
+    /**
+     * **覆盖模式**下被刷新了内容的目标任务名（`skip` 模式下恒为空）。
+     *
+     * 与 `copied` 分开：一个是"新增了一条"，一个是"改了已有那条"，
+     * 对用户的影响完全不同，混在一个数字里会看不懂。
+     */
+    overwritten?: string[];
+    /** 这次生效的模式（`skip` / `overwrite`）—— 改了设置也能在报告里核对。 */
+    mode?: AutomationSyncMode;
+    /**
+     * **覆盖模式**下被合并掉（软删除）的重复行所属任务名。
+     *
+     * 与 `overwritten` 不同：那里是"刷新了内容"，这里是"多出来的同款被并掉了"。
+     * 同名同周期 = 同一个任务，所以覆盖模式下历史重复会收敛成一条。
+     */
+    mergedNames?: string[];
+    /**
+     * `skip` 模式下目标账号里"同名同周期但多余"的行数（>0 = 有重复未合并）。
+     * 覆盖模式下会被合并，这个数字恒为 0。
+     */
+    extraDuplicates?: number;
     skippedNames?: string[];
+    /** 这次切号时**设置里**是不是开着（`false` ⇒ 压根没尝试，别怪没生效）。 */
+    enabled?: boolean;
+    /** 切换前的账号 uid（源）。`null` = 切换前没有登录态。 */
+    fromUid?: string | null;
+    /** 目标账号 uid。 */
+    toUid?: string;
+    /** 源账号名下的任务总数；`0` = 本来就没任务（不是没同步）。 */
+    sourceCount?: number;
     from?: string;
     to?: string;
   } | null;
@@ -2677,6 +2706,35 @@ export interface DiagLogStatus {
   error?: string;
 }
 
+/**
+ * 「目标账号已有同一个定时任务」时的处理方式（`settings.json` 的
+ * `workbuddyAutomationSyncMode`）。
+ *
+ * - `skip`（默认）：跳过，目标账号原有那条一动不动 —— 与历史行为一致；
+ * - `overwrite`：用当前账号（源）的内容刷新目标同款，保留目标行的 id / 创建时间。
+ *
+ * ⚠️ 两种模式判定「同一个任务」的口径一致：`name + rrule + prompt` 全等且未被删除。
+ */
+export type AutomationSyncMode = "skip" | "overwrite";
+
+/**
+ * `workbuddy_automations_merge_duplicates` 的返回。
+ *
+ * 把**同一个账号**下同名同周期的重复任务合并成一条：保留创建最早那条的身份与
+ * 运行记录，内容取最后编辑的那份，其余软删除（`deleted_at`，可恢复）。
+ */
+export interface WorkbuddyAutomationMergeResult {
+  ok: boolean;
+  /** 被整理的账号 uid。 */
+  uid: string;
+  /** 有几组重复（= 有几个任务名需要合并）。0 = 本来就是干净的。 */
+  groups: number;
+  /** 合并掉（软删除）了几行。 */
+  merged: number;
+  /** 涉及的任务名（每组一个）。 */
+  names: string[];
+}
+
 /** 设置快照（`settings_get` / `settings_set` 的返回，两者**同形**）。 */
 export interface SettingsSnapshot {
   ok: boolean;
@@ -2703,12 +2761,13 @@ export interface SettingsSnapshot {
    */
   syncWorkbuddyAutomations: boolean;
   /**
-   * 切号同步定时任务时，目标账号已有「同名 + 同周期」的那条怎么办。
+   * 目标账号已有同一个任务时怎么处理（`skip` = 跳过，`overwrite` = 覆盖）。
    *
-   * - `"skip"`（默认）：保持目标那份不动，只补新任务；
-   * - `"overwrite"`：用源账号的定义覆盖目标那份（保留目标行 id，运行记录不断）。
+   * 判定「同一个任务」两种模式一致：`name + rrule + prompt` 全等。
    */
-  automationSyncMode: string;
+  workbuddyAutomationSyncMode: AutomationSyncMode;
+  /** 与 `workbuddyAutomationSyncMode` 同源的中文文案（后端给，界面别自己拼）。 */
+  workbuddyAutomationSyncModeLabel: string;
   /**
    * 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库，默认关）。
    *

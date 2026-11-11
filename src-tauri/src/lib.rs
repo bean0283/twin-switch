@@ -394,6 +394,7 @@ pub fn run() {
             commands::workbuddy_account_add_token,
             commands::workbuddy_switch_precheck,
             commands::workbuddy_switch_to,
+            commands::workbuddy_automations_merge_duplicates,
             commands::workbuddy_switch_finish,
             commands::workbuddy_session_group_compare,
             commands::workbuddy_switch_session_plan,
