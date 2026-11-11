@@ -2703,6 +2703,13 @@ export interface SettingsSnapshot {
    */
   syncWorkbuddyAutomations: boolean;
   /**
+   * 切号同步定时任务时，目标账号已有「同名 + 同周期」的那条怎么办。
+   *
+   * - `"skip"`（默认）：保持目标那份不动，只补新任务；
+   * - `"overwrite"`：用源账号的定义覆盖目标那份（保留目标行 id，运行记录不断）。
+   */
+  automationSyncMode: string;
+  /**
    * 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库，默认关）。
    *
    * 打开后每次切号（客户端已关、还没重启那一刻）会自动补齐缺失的会话副本；

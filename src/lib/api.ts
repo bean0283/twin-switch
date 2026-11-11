@@ -1252,6 +1252,12 @@ export function settingsSet(patch: {
   qoderExe?: Record<string, string>;
   /** 切号时是否同步 WorkBuddy 的定时任务。 */
   syncWorkbuddyAutomations?: boolean;
+  /**
+   * 同步时遇到「同名 + 同周期」怎么办：
+   * - `"skip"`（默认）：保持目标账号那份不动；
+   * - `"overwrite"`：用源账号的定义覆盖目标那份（保留目标行 id，运行记录不断）。
+   */
+  automationSyncMode?: string;
   /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */
   autoLinkWorkbuddySessions?: boolean;
   /** 诊断日志设置（**整块覆盖**：给全量，不是增量）。 */

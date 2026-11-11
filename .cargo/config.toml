@@ -1,0 +1,16 @@
+# 构建参数统一放在这里，而不是让每个人记住命令行上的 RUSTFLAGS。
+#
+# 起因：2026-11-11 发现两处不一致 ——
+#   · `构建 TwinSwitch.bat` 里跑的是裸 `cargo build --release`
+#   · 协作文档里的主机验证步骤却带 `RUSTFLAGS="-C target-feature=+crt-static"`
+# 同一份代码、两套参数 ⇒ 一个人产出的 exe 能单文件分发，另一个人的却依赖 VC 运行时。
+# 多人协作时这种差异最难查（「我这儿能跑」）。
+#
+# `+crt-static` 会把 C 运行时静态链进 exe：产物大一点，但拷到任何一台 Windows 上都能直接跑。
+# 两种 toolchain 都写上：Windows 上 gnu（MinGW）和 msvc 都有人用，不能只保一边。
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

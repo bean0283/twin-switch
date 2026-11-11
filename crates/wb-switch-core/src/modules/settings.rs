@@ -271,6 +271,15 @@ pub struct Settings {
     /// 老用户的 `settings.json` 里没有这个键，升级后会**悄悄变成关**（行为突变）。
     #[serde(default = "yes")]
     pub sync_workbuddy_automations: bool,
+    /// **切号同步定时任务时，目标账号已有「同名 + 同周期」的那条怎么办**。
+    ///
+    /// - `"skip"`（默认）：保持目标那份不动 —— 切号是低频操作，不该悄悄覆盖别人改过的任务。
+    /// - `"overwrite"`：用源账号的定义刷掉目标那份（保留目标的行 id，运行记录与关联不断）。
+    ///
+    /// 判断三元组是 `(name, rrule, prompt)`：只看名字不够（同名不同周期是两件事），
+    /// 只看名字+周期也不够（同名同周期但提示词完全不同，那是另一个任务）。
+    #[serde(default = "default_automation_sync_mode")]
+    pub automation_sync_mode: String,
     #[serde(default)]
     pub backup_retention: BackupRetention,
     /// **写库前的整库备份**开关（T66）。**默认关闭**。
@@ -472,6 +481,23 @@ pub fn qoder_exe_override(region: crate::modules::qoder_realm::QoderRegion) -> O
 /// ⚠️ 读盘失败（设置文件坏了）时 [`load`] 退回默认 = **不备份**。这是故意的：
 /// 备份是「留历史」，不是「保命」（保命靠 `trae_backup::swap_in_place` 的原子替换），
 /// 所以坏文件下宁可不动用户的磁盘，也不能凭空写出一堆 609 MB。
+fn default_automation_sync_mode() -> String {
+    "skip".to_string()
+}
+
+/// 切号同步定时任务时，遇到「同名 + 同周期」的做法：`skip`（默认）或 `overwrite`。
+///
+/// 唯一出口：调用方一律问它，别自己 `load()` 读字段再判断 —— 那正是「设置里选了覆盖、
+/// 实际还在跳过」这类分叉的来源。
+pub fn automation_sync_mode() -> String {
+    let m = load().automation_sync_mode.to_lowercase();
+    if m == "overwrite" {
+        m
+    } else {
+        "skip".to_string()
+    }
+}
+
 /// 切号时是否同步定时任务（默认开）。读不到设置文件也按「开」处理。
 pub fn sync_workbuddy_automations() -> bool {
     load().sync_workbuddy_automations

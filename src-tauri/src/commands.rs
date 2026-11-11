@@ -1332,6 +1332,8 @@ pub struct SettingsPatch {
     pub qoder_exe: Option<std::collections::HashMap<String, String>>,
     /// 切号时是否把 WorkBuddy 的定时任务同步给新账号（`None` = 不改）。
     pub sync_workbuddy_automations: Option<bool>,
+    /// 同步时遇到「同名 + 同周期」怎么办：`skip`（默认）或 `overwrite`（`None` = 不改）。
+    pub automation_sync_mode: Option<String>,
     /// 切号时是否把 WorkBuddy 的会话自动同步给所有账号（`None` = 不改）。
     pub auto_link_workbuddy_sessions: Option<bool>,
     /// **诊断日志**设置（`None` = 不改）。整块覆盖：开关 / 级别 / 保留天数 / 份数 / 单文件上限。
@@ -1355,6 +1357,7 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         "backupBeforeWrite": s.backup_before_write,
         // 切号是否同步定时任务（WorkBuddy 的 automations 按 owner_user_id 归属）。
         "syncWorkbuddyAutomations": s.sync_workbuddy_automations,
+        "automationSyncMode": s.automation_sync_mode,
         // 切号是否把会话自动同步给所有账号（写会话库，默认关）。
         "autoLinkWorkbuddySessions": s.auto_link_workbuddy_sessions,
         "beforeWriteSummary": if s.backup_before_write {
@@ -1424,6 +1427,14 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
         }
         if let Some(v) = patch.sync_workbuddy_automations {
             next.sync_workbuddy_automations = v;
+        }
+        if let Some(m) = patch.automation_sync_mode {
+            // 只认两个值：其它任何输入都落回 `skip`（宁可不覆盖，也不猜用户想覆盖）。
+            next.automation_sync_mode = if m.trim().eq_ignore_ascii_case("overwrite") {
+                "overwrite".to_string()
+            } else {
+                "skip".to_string()
+            };
         }
         if let Some(v) = patch.auto_link_workbuddy_sessions {
             next.auto_link_workbuddy_sessions = v;

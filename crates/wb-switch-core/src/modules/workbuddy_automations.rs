@@ -78,7 +78,8 @@ pub fn list_for(owner_uid: &str) -> Result<Vec<Value>, String> {
 
 /// 把 `from_uid` 名下的定时任务**复制**给 `to_uid`。
 ///
-/// - 逐条按 `name + rrule + prompt` 去重（新账号已有同款就跳过）；
+/// - 逐条按 `name + rrule + prompt` 判断「同一条」；
+///   `overwrite = false`（默认）→ 目标已有就跳过，`true` → 用源账号的定义刷掉目标那份；
 /// - 新行 `id` 重新生成、`owner_status` 置 `confirmed`（否则可能被当成旧数据不显示）；
 /// - `next_run_at` 原样带过去，客户端自己会重排；
 /// - 一个事务里做完，中途失败回滚。
@@ -94,7 +95,9 @@ pub fn sync_owner(from_uid: &str, to_uid: &str) -> Result<Value, String> {
 
     conn.execute_batch("begin immediate")
         .map_err(|e| format!("开启事务失败：{e}"))?;
-    let out = match sync_owner_on(&conn, from_uid, to_uid) {
+    // 唯一出口读设置：调用方不各自判断，避免「设置里选了覆盖、实际还在跳过」。
+    let overwrite = crate::modules::settings::automation_sync_mode() == "overwrite";
+    let out = match sync_owner_on(&conn, from_uid, to_uid, overwrite) {
         Ok(v) => v,
         Err(e) => {
             let _ = conn.execute_batch("rollback");
@@ -126,7 +129,12 @@ pub fn sync_owner(from_uid: &str, to_uid: &str) -> Result<Value, String> {
 ///
 /// `automation_delivery_outbox` **不搬**：那是待推送队列，搬过去等于替别的账号
 /// 再发一遍微信/企微消息。
-fn sync_owner_on(conn: &Connection, from_uid: &str, to_uid: &str) -> Result<Value, String> {
+fn sync_owner_on(
+    conn: &Connection,
+    from_uid: &str,
+    to_uid: &str,
+    overwrite: bool,
+) -> Result<Value, String> {
     let mut stmt = conn
         .prepare(
             "select id, name, rrule, prompt, next_run_at
@@ -152,29 +160,80 @@ fn sync_owner_on(conn: &Connection, from_uid: &str, to_uid: &str) -> Result<Valu
     let now = now_ms();
     let mut copied: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut overwritten: Vec<String> = Vec::new();
     let mut runs_total = 0usize;
     let mut states_total = 0usize;
 
     for (src_id, name, rrule, prompt, next_run_at) in src {
+        // 「同一条任务」的判据是 **name + rrule**（用户 2026-11-11 的要求）。
+        //
+        // 早先是 name + rrule + prompt 三字段全同才算重复 —— 可 prompt 是用户最常改的东西：
+        // 在 A 号把提示词调好了，切到 B 号，B 号那条（同名同周期、旧提示词）不算重复，
+        // 于是**又插一条**，客户端里出现两个同名任务。判据放宽到 name + rrule 之后，
+        // 这种情况归成「同一条」，由 `overwrite` 决定是跳过还是刷成源账号那份。
         let exists: i64 = conn
             .query_row(
                 "select count(*) from automations
                  where owner_user_id = ?1 and deleted_at is null
-                   and name = ?2 and rrule = ?3 and prompt = ?4",
-                params![to_uid, name, rrule, prompt],
+                   and name = ?2 and rrule = ?3",
+                params![to_uid, name, rrule],
                 |r| r.get(0),
             )
-            .map_err(|e| format!("检查目标账号是否已有同名任务失败：{e}"))?;
-        if exists > 0 {
-            skipped.push(name);
-            continue;
-        }
-        let new_id = uuid::Uuid::new_v4().to_string();
+            .map_err(|e| format!("检查目标账号是否已有同名同周期任务失败：{e}"))?;
         // 过期的下次运行时间会让客户端立刻补跑一次 —— 按 rrule 挪到未来。
         let next = match next_run_at {
             Some(ts) if ts > now - 60_000 => Some(ts),
             other => next_after(&rrule, now).or(other),
         };
+
+        if exists > 0 {
+            if !overwrite {
+                skipped.push(name);
+                continue;
+            }
+            // 覆盖：**保留目标那份的行 id** —— 它自己的运行记录挂在上面，
+            // 换 id 会让那些记录变孤儿（界面上表现为「任务在、点进去历史没了」）。
+            //
+            // 用「每个字段一个相关子查询」而不是 `UPDATE ... FROM`：
+            // 后者在自连接更新同一张表时匹配不到行（实测返回 0 行、不报错，最难查）。
+            let n = conn
+                .execute(
+                    "update automations set
+                        prompt = (select prompt from automations where id = ?1),
+                        status = (select status from automations where id = ?1),
+                        schedule_type = (select schedule_type from automations where id = ?1),
+                        cwds = (select cwds from automations where id = ?1),
+                        scheduled_at = (select scheduled_at from automations where id = ?1),
+                        valid_from = (select valid_from from automations where id = ?1),
+                        valid_until = (select valid_until from automations where id = ?1),
+                        model_id = (select model_id from automations where id = ?1),
+                        model_is_thinking = (select model_is_thinking from automations where id = ?1),
+                        skills_json = (select skills_json from automations where id = ?1),
+                        push_to_wechat = (select push_to_wechat from automations where id = ?1),
+                        push_to_wecom_bot = (select push_to_wecom_bot from automations where id = ?1),
+                        wecom_bot_source = (select wecom_bot_source from automations where id = ?1),
+                        expert_id = (select expert_id from automations where id = ?1),
+                        expert_marketplace = (select expert_marketplace from automations where id = ?1),
+                        connector_ids_json = (select connector_ids_json from automations where id = ?1),
+                        permission_mode = (select permission_mode from automations where id = ?1),
+                        context_window = (select context_window from automations where id = ?1),
+                        reasoning_effort = (select reasoning_effort from automations where id = ?1),
+                        workspace_scope = (select workspace_scope from automations where id = ?1),
+                        wecom_bot_chat_id = (select wecom_bot_chat_id from automations where id = ?1),
+                        next_run_at = ?2,
+                        updated_at = ?3
+                     where owner_user_id = ?4 and name = ?5 and rrule = ?6 and deleted_at is null",
+                    params![src_id, next, now, to_uid, name, rrule],
+                )
+                .map_err(|e| format!("覆盖定时任务「{name}」失败：{e}"))?;
+            if n > 0 {
+                overwritten.push(name);
+            } else {
+                skipped.push(name);
+            }
+            continue;
+        }
+        let new_id = uuid::Uuid::new_v4().to_string();
         // 逐列 SELECT 复制：**不用手写每个值**，新增列时这里不会漏，也不会把
         // 未知字段写成默认值（那等于悄悄改坏用户的任务配置）。
         let n = conn
@@ -223,6 +282,8 @@ fn sync_owner_on(conn: &Connection, from_uid: &str, to_uid: &str) -> Result<Valu
         // ⚠️ 用 `skippedNames` 而不是 `skipped`：`switch_to` 里「整体跳过」用的是布尔
         //    `skipped`，同名字段两种类型会让前端判断炸掉（这坑刚踩过）。
         "skippedNames": skipped,
+        // 覆盖掉的（只在 overwrite 模式下出现）
+        "overwrittenNames": overwritten,
         "copiedRuns": runs_total,
         "copiedRuntimeStates": states_total,
     }))
@@ -534,10 +595,8 @@ mod tests {
         assert!(next_after("FREQ=WEEKLY;BYDAY=XX", after).is_none());
     }
 
-    /// 一条任务的定义 + 运行记录 + 运行状态：同步后三样都得在，且 next_run_at 不许过期。
-    #[test]
-    fn sync_copies_runs_and_state() {
-        let conn = Connection::open_in_memory().unwrap();
+    /// 测试用的最小 schema（两张子表都要有：只搬定义不搬记录是这次要修的毛病）。
+    fn seed_schema(conn: &Connection) {
         conn.execute_batch(
             r#"
             create table automations (
@@ -566,6 +625,13 @@ mod tests {
             "#,
         )
         .unwrap();
+    }
+
+    /// 一条任务的定义 + 运行记录 + 运行状态：同步后三样都得在，且 next_run_at 不许过期。
+    #[test]
+    fn sync_copies_runs_and_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_schema(&conn);
 
         let past = now_ms() - 3 * 24 * 3600 * 1000; // 三天前就该跑了
         conn.execute(
@@ -584,7 +650,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let out = sync_owner_on(&conn, "u1", "u2").expect("同步应当成功");
+        let out = sync_owner_on(&conn, "u1", "u2", false).expect("同步应当成功");
         assert_eq!(out.get("copiedRuns").and_then(Value::as_u64), Some(1));
         assert_eq!(out.get("copiedRuntimeStates").and_then(Value::as_u64), Some(1));
 
@@ -623,12 +689,57 @@ mod tests {
         assert_eq!(started, None);
 
         // 再同步一次：全部跳过，不产生第二份
-        let again = sync_owner_on(&conn, "u1", "u2").unwrap();
+        let again = sync_owner_on(&conn, "u1", "u2", false).unwrap();
         assert_eq!(again.get("copied").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
         let n: i64 = conn
             .query_row("select count(*) from automations where owner_user_id='u2'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// 覆盖模式：目标账号已有一条「同名同周期」的任务，`overwrite=true` 时
+    /// 应当用源账号的定义刷掉它，且**保留目标那份的 id**（运行记录挂在上面）。
+    #[test]
+    fn sync_overwrites_same_task_and_keeps_target_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_schema(&conn);
+        conn.execute(
+            "insert into automations (id,name,prompt,status,schedule_type,rrule,owner_user_id,created_at,updated_at)
+             values ('src','每日汇报','源提示词','confirmed','recurring','FREQ=DAILY','u1',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into automations (id,name,prompt,status,schedule_type,rrule,owner_user_id,created_at,updated_at)
+             values ('dst','每日汇报','目标自己的提示词','confirmed','recurring','FREQ=DAILY','u2',1,1)",
+            [],
+        )
+        .unwrap();
+
+        // 跳过模式：目标不动
+        let a = sync_owner_on(&conn, "u1", "u2", false).unwrap();
+        assert_eq!(a.get("overwrittenNames").and_then(|v| v.as_array()).map(|x| x.len()), Some(0));
+        let p: String = conn
+            .query_row("select prompt from automations where id='dst'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(p, "目标自己的提示词");
+
+        // 覆盖模式：刷成源提示词，id 仍是 dst（运行记录不会变孤儿）
+        let b = sync_owner_on(&conn, "u1", "u2", true).unwrap();
+        assert_eq!(b.get("overwrittenNames").and_then(|v| v.as_array()).map(|x| x.len()), Some(1));
+        let (id, p2): (String, String) = conn
+            .query_row(
+                "select id, prompt from automations where owner_user_id='u2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "dst", "覆盖必须保留目标行 id");
+        assert_eq!(p2, "源提示词");
+        let n: i64 = conn
+            .query_row("select count(*) from automations where owner_user_id='u2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "覆盖不该多出一条");
     }
 
     /// 只读自检：列出当前登录账号名下的定时任务（不写任何东西）。
