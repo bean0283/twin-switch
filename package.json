@@ -1,7 +1,7 @@
 {
   "name": "twin-switch",
   "private": true,
-  "version": "0.4.13",
+  "version": "0.4.14",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:signed": "node scripts/release.mjs --no-publish",
+    "build:local": "node scripts/local-build.mjs",
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
