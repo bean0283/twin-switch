@@ -1112,12 +1112,11 @@ mod tests {
         assert_eq!(n, 1);
     }
 
-    /// 覆盖模式：目标账号已有一条「同名同周期」的任务，`overwrite=true` 时
+    /// 覆盖模式：目标账号已有一条「同名同周期」的任务，`SyncMode::Overwrite` 时
     /// 应当用源账号的定义刷掉它，且**保留目标那份的 id**（运行记录挂在上面）。
     #[test]
     fn sync_overwrites_same_task_and_keeps_target_id() {
-        let conn = Connection::open_in_memory().unwrap();
-        seed_schema(&conn);
+        let conn = mem_db();
         conn.execute(
             "insert into automations (id,name,prompt,status,schedule_type,rrule,owner_user_id,created_at,updated_at)
              values ('src','每日汇报','源提示词','confirmed','recurring','FREQ=DAILY','u1',1,1)",
@@ -1132,16 +1131,16 @@ mod tests {
         .unwrap();
 
         // 跳过模式：目标不动
-        let a = sync_owner_on(&conn, "u1", "u2", false).unwrap();
-        assert_eq!(a.get("overwrittenNames").and_then(|v| v.as_array()).map(|x| x.len()), Some(0));
+        let a = sync_owner_on(&conn, "u1", "u2", SyncMode::Skip).unwrap();
+        assert_eq!(a.get("overwritten").and_then(|v| v.as_array()).map(|x| x.len()), Some(0));
         let p: String = conn
             .query_row("select prompt from automations where id='dst'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(p, "目标自己的提示词");
 
         // 覆盖模式：刷成源提示词，id 仍是 dst（运行记录不会变孤儿）
-        let b = sync_owner_on(&conn, "u1", "u2", true).unwrap();
-        assert_eq!(b.get("overwrittenNames").and_then(|v| v.as_array()).map(|x| x.len()), Some(1));
+        let b = sync_owner_on(&conn, "u1", "u2", SyncMode::Overwrite).unwrap();
+        assert_eq!(b.get("overwritten").and_then(|v| v.as_array()).map(|x| x.len()), Some(1));
         let (id, p2): (String, String) = conn
             .query_row(
                 "select id, prompt from automations where owner_user_id='u2'",

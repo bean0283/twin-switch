@@ -2713,7 +2713,7 @@ export interface DiagLogStatus {
  * - `skip`（默认）：跳过，目标账号原有那条一动不动 —— 与历史行为一致；
  * - `overwrite`：用当前账号（源）的内容刷新目标同款，保留目标行的 id / 创建时间。
  *
- * ⚠️ 两种模式判定「同一个任务」的口径一致：`name + rrule + prompt` 全等且未被删除。
+ * ⚠️ 两种模式判定「同一个任务」的口径一致：`name` + 等价 rrule（不比 prompt）且未被删除。
  */
 export type AutomationSyncMode = "skip" | "overwrite";
 
@@ -2763,7 +2763,7 @@ export interface SettingsSnapshot {
   /**
    * 目标账号已有同一个任务时怎么处理（`skip` = 跳过，`overwrite` = 覆盖）。
    *
-   * 判定「同一个任务」两种模式一致：`name + rrule + prompt` 全等。
+   * 判定「同一个任务」两种模式一致：`name` + 等价 rrule（不比 prompt）。
    */
   workbuddyAutomationSyncMode: AutomationSyncMode;
   /** 与 `workbuddyAutomationSyncMode` 同源的中文文案（后端给，界面别自己拼）。 */

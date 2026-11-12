@@ -607,37 +607,11 @@ export default function SettingsPage() {
                       </strong>
                     ) : null}
                   </span>
+                </span>
                 </label>
 
-                {/* 同名同周期怎么办 —— 2026-11-11 用户要求可自己选（原来写死「跳过」）。
-                    只在开关打开时出现：关掉同步这一项就没意义，摆着反而让人以为它单独生效。 */}
-                {(syncAuto ?? true) ? (
-                  <div className="mt-2.5 grid gap-1.5 border-t pt-2.5 sm:pl-6">
-                    <span className="text-xs text-muted-foreground">
-                      目标账号已有「同名 + 同周期」的任务时
-                    </span>
-                    <select
-                      className="w-full max-w-md rounded-md border bg-background px-2 py-1.5 text-sm"
-                      value={syncMode}
-                      onChange={(e) =>
-                        setSyncMode(e.target.value === "overwrite" ? "overwrite" : "skip")
-                      }
-                      data-field="automationSyncMode"
-                    >
-                      <option value="skip">跳过 —— 保留目标账号自己那份（默认）</option>
-                      <option value="overwrite">覆盖 —— 用当前账号的提示词刷掉目标那份</option>
-                    </select>
-                    <span className="text-[11px] text-muted-foreground">
-                      {syncMode === "overwrite"
-                        ? "覆盖会保留目标账号那条任务的运行记录，只把提示词 / 模型 / 推送设置换成当前账号的。"
-                        : "跳过时目标账号那份原样不动，只在它没有这条任务时才补一份过去。"}
-                    </span>
-                  </div>
-                ) : null}
-              </div>
-
               {/* ── 同款任务怎么处理（2026-11-11 新增）────────────────────
-                  两种方式的判定口径**完全一致**：`name + rrule + prompt` 三者全等，
+                  两种方式的判定口径**完全一致**：`name` + 等价 rrule（不比 prompt），
                   且目标账号里那条没被删除 —— 才算「同一个任务」。
                     · 跳过（默认）= 保持历史行为，目标账号原有那条一行都不改；
                     · 覆盖        = 用当前账号的内容刷新它（prompt / 周期 / 模型 / skills /
@@ -1318,7 +1292,7 @@ export default function SettingsPage() {
                       size="sm"
                       variant="outline"
                       disabled={saving || !dirty}
-                      onClick={resetAll}
+                      onClick={discard}
                       data-action="resetLog"
                     >
                       <RotateCcw className="size-4" />
@@ -1504,7 +1478,7 @@ export default function SettingsPage() {
       {dirty ? (
         <div className="fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 items-center gap-1.5 rounded-full border bg-background/95 py-1.5 pr-1.5 pl-3.5 shadow-lg backdrop-blur">
           <span className="text-xs text-muted-foreground">有未保存的改动</span>
-          <Button size="sm" variant="ghost" onClick={resetAll} disabled={saving}>
+          <Button size="sm" variant="ghost" onClick={discard} disabled={saving}>
             放弃
           </Button>
           <Button size="sm" onClick={() => void save()} disabled={saving} data-action="saveBar">

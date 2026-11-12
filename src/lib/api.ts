@@ -1258,7 +1258,7 @@ export function settingsSet(patch: {
    * 目标账号已有同一个定时任务时怎么处理。
    *
    * `skip`（默认）= 跳过、不动目标原有那条；`overwrite` = 用当前账号的内容刷新同款。
-   * 判定"同一个任务"两种模式一致：`name + rrule + prompt` 全等。
+   * 判定"同一个任务"两种模式一致：`name` + 等价 rrule（不比 prompt）。
    */
   workbuddyAutomationSyncMode?: AutomationSyncMode;
   /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */

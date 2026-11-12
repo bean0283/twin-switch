@@ -290,7 +290,7 @@ pub fn switch_to(
     let automation_enabled = settings::sync_workbuddy_automations();
     // 目标账号已有同一个任务时：`skip`（跳过，默认）/ `overwrite`（用源内容覆盖）。
     // 真正的分支判定在 `workbuddy_automations::sync_owner_with_mode` 里 —— 两种模式
-    // 共用同一套「同一个任务」的判定键（name + rrule + prompt），这里只负责传模式、
+    // 共用同一套「同一个任务」的判定键（name + 等价 rrule，不比 prompt），这里只负责传模式、
     // 并把生效模式一并回传给界面（否则用户改了设置也不知道这次到底按哪种跑的）。
     let automation_mode = settings::workbuddy_automation_sync_mode();
     let mut automation_sync = if automation_enabled {
