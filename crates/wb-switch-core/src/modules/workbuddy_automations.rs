@@ -433,7 +433,6 @@ fn sync_owner_on(
     // 覆盖模式下被合并掉的重复行（同名同周期，软删除）。skip 模式下恒为空。
     let mut merged: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    let mut overwritten: Vec<String> = Vec::new();
     let mut runs_total = 0usize;
     let mut states_total = 0usize;
     // 目标账号里"同名同周期但多余"的行数。skip 模式只报数、一条都不动。
