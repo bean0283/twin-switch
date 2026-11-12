@@ -126,12 +126,18 @@ function shortUid(uid: string | null | undefined): string {
   return `${uid.slice(0, 8)}…${uid.slice(-6)}`;
 }
 
-/** 令牌到期的人话描述；只在 7 天内到期时提示，减少噪声。 */
+/**
+ * 令牌到期的人话描述；只在 7 天内到期时提示，减少噪声。
+ *
+ * ⚠️ 提醒界按**小时**与 `24 × 7` 比较，不能用「按天取整再比」：剩余 7 天 22 小时
+ *    取整成 7 天会被误判为「7 天后过期」。剩余 ≤ 168 小时才提示。
+ */
 function tokenExpiryLabel(ms: number | null | undefined): string | null {
   if (!ms) return null;
-  const days = Math.floor((ms - Date.now()) / 86400_000);
+  const hours = (ms - Date.now()) / 3_600_000;
+  const days = Math.floor(hours / 24);
   if (days < 0) return "令牌已过期";
-  if (days <= 7) return `${days} 天后过期`;
+  if (hours <= 24 * 7) return `${days} 天后过期`;
   return null;
 }
 

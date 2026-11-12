@@ -74,13 +74,20 @@ import type {
  */
 const AUTO_CLOSE_MS = 2500;
 
-/** 过期时间的人话描述。 */
+/**
+ * 过期时间的人话描述。
+ *
+ * ⚠️ 提醒界按**小时**与 `24 × 7` 比较，不能用「按天取整再比」：剩余 7 天 22 小时
+ *    取整成 7 天会被误判为「7 天后过期」，把超出 7 天的部分也提醒了一遍。
+ *    语义固定为：剩余 ≤ 168 小时才提示；展示值仍向下取整成整天。
+ */
 function expiryLabel(expiresAt: number | null): string | null {
   if (!expiresAt) return null;
-  const days = Math.floor((expiresAt - Date.now()) / 86400_000);
+  const hours = (expiresAt - Date.now()) / 3_600_000;
+  const days = Math.floor(hours / 24);
   if (days < 0) return "凭据已过期";
   if (days === 0) return "今天过期";
-  if (days <= 7) return `${days} 天后过期`;
+  if (hours <= 24 * 7) return `${days} 天后过期`;
   return null;
 }
 
