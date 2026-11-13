@@ -792,4 +792,16 @@ mod tests {
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
     }
+
+    /// 手工网络探针：读真实 `~/.twin-switch` 配置实连青龙，验证 TLS 后端切换。
+    /// 默认忽略，排查时手动跑：
+    /// `cargo test -p wb-switch-core live_ql_probe -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_ql_probe() {
+        let started = std::time::Instant::now();
+        let st = status().await;
+        println!("[probe] 耗时 {:.1}s", started.elapsed().as_secs_f32());
+        println!("{}", serde_json::to_string_pretty(&st).unwrap());
+    }
 }

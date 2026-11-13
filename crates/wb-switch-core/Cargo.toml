@@ -7,7 +7,10 @@ description = "TwinSwitch（双栖）核心逻辑（账号 / 切换 / 会话 / �
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# TLS 用 native-tls（Windows=schannel）：ql.527love.eu.org / ql.527527.fun 源站会在
+# TLS 会话中发起重协商（实测 curl schannel 有 "remote party requests renegotiation"），
+# rustls 不支持重协商会直接失败 —— 浏览器能开、应用连不上的根因（2026-11-13）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "stream"] }
 axum = "0.8"
 # Qoder 的信封 SSE 必须**逐块读**（等整条流结束会一直挂着，真机踩过）。
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

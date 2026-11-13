@@ -389,6 +389,8 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // 连接阶段（DNS + TCP + TLS）单独收紧：系统 DNS 抽风时不至于把总预算吃满。
+        .connect_timeout(std::time::Duration::from_secs(5))
         .user_agent(DEFAULT_HTTP_USER_AGENT)
 }
 
