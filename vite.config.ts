@@ -12,6 +12,12 @@ const base = process.env.VITE_PAGES_DEMO === "1" ? "/twin-switch/" : "/";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  // Windows 上 vite 解析模块 id 时会把盘符规范成大写（F:/…），而 config.root
+  // 直接继承 process.cwd()——若从「小写盘符」的 shell（如 `cd f:/…` 后的 Git Bash）
+  // 启动构建，root 是小写。index.html 内联 <style> 的 html-proxy 虚拟模块
+  // 用「id 去掉 root 前缀」做缓存键，两边大小写不一致就查不到，构建报
+  // "No matching HTML proxy module found"。这里统一把盘符大写。
+  root: path.resolve().replace(/^[a-z]:/, (m) => m.toUpperCase()),
   base,
   plugins: [react(), tailwindcss()],
   resolve: {
