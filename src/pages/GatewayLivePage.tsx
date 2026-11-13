@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { CacheHitCard } from "@/components/cache-hit-card";
 import { GatewayLivePanel } from "@/components/gateway-live-panel";
 import { GatewayTabs } from "@/components/gateway-tabs";
 import { gatewayStatus } from "@/lib/api";
@@ -56,6 +57,10 @@ export default function GatewayLivePage() {
           读取网关状态失败：{err}
         </p>
       )}
+
+      {/* 历史账本的命中率：与上面「本次启动以来」的内存数字分开说，
+          免得用户以为这是实时值（它读的是 gateway-metrics.jsonl + 会话日志）。 */}
+      <CacheHitCard />
 
       <GatewayLivePanel running={running} />
     </div>

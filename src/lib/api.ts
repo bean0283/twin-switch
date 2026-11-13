@@ -45,6 +45,7 @@ import type {
   TraeSessionDetail,
   TraeSessionInfo,
   TraeMsgSearchResult,
+  CacheHitStats,
   SessionTextSearchResult,
   TraeEditCellResult,
   TraeEditDoc,
@@ -1792,6 +1793,15 @@ export function workbuddySessionListByAccount(): Promise<WbSessionListByAccount>
  * ⚠️ 正文是 `~/.workbuddy/projects/**.jsonl`（本机 1.7 GB / 63 个会话），release 实测
  * 一次全扫约 3 秒。**不要跟输入框的每次按键联动**，要么回车触发、要么明确点按钮。
  */
+/**
+ * 缓存命中统计（网关账本 + WorkBuddy 客户端，Trae / Qoder 返回不可用及原因）。
+ *
+ * ⚠️ `refresh = true` 会重扫 1 GB 级会话日志（release 约数秒），只应由用户点击触发。
+ */
+export function cacheHitStats(days?: number, refresh?: boolean): Promise<CacheHitStats> {
+  return call("cache_hit_stats", { days: days ?? null, refresh: refresh ?? null });
+}
+
 export function workbuddySessionSearch(
   uid: string | null,
   query: string,

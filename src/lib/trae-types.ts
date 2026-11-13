@@ -2943,3 +2943,34 @@ export interface CheckinResult {
   items: CheckinItem[];
   summary: CheckinSummary;
 }
+
+/** 缓存命中统计里的一端（网关 / WorkBuddy）；`observed` = 上报过缓存字段的请求数。 */
+export interface CacheHitSide {
+  available: boolean;
+  /** 不可用时的原因（Trae / Qoder 恒有，必须展示给用户）。 */
+  reason?: string;
+  requests?: number;
+  observed?: number;
+  input?: number;
+  output?: number;
+  cached?: number;
+  files?: number;
+  bytes?: number;
+  elapsedMs?: number;
+  scannedAt?: string;
+  fromCache?: boolean;
+  note?: string;
+  byDay?: { date: string; input: number; cached: number; observed: number; requests: number }[];
+  byModel?: { model: string; input: number; cached: number; observed: number; requests: number }[];
+}
+
+/** `cache_hit_stats` 的返回：两根能算的账 + 两端「不可用及原因」。 */
+export interface CacheHitStats {
+  ok?: boolean;
+  error?: string;
+  days: number;
+  gateway?: CacheHitSide;
+  workbuddy?: CacheHitSide;
+  trae?: CacheHitSide;
+  qoder?: CacheHitSide;
+}

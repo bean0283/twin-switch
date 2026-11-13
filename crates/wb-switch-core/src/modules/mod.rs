@@ -8,6 +8,7 @@ pub mod error_log;
 pub mod fs_remove;
 pub mod gateway_keys;
 pub mod gateway_live;
+pub mod cache_stats;
 pub mod gateway_metrics;
 pub mod gateway_models;
 pub mod gateway_pool;

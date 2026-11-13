@@ -20,7 +20,7 @@ use wb_switch_core::modules::{
 };
 // 定时任务（`automations` 表）的跨账号同步与去重合并。
 use wb_switch_core::modules::workbuddy_automations;
-use wb_switch_core::modules::{workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
+use wb_switch_core::modules::{cache_stats, workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -4184,6 +4184,21 @@ pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
 /// 积分共享的**实时监控**快照：内存态，不读磁盘，前端每秒拉一次。
 ///
 /// `window_secs` 支持 60 / 300 / 3600（其它值就近取）。字段见
+/// 缓存命中统计：网关账本 + WorkBuddy 客户端。
+///
+/// ⚠️ 这是个**除法**，所以后端只给原始数（input / cached / observed），命中率由前端
+/// 按统一公式算 —— 前端拿不到 `observed` 就没法区分「没观测」与「命中 0%」。
+///
+/// Trae / Qoder 返回 `available: false` + 原因（客户端日志里没有缓存字段），
+/// 不是失败，界面必须显示原因而不是 0%。
+#[tauri::command]
+pub async fn cache_hit_stats(days: Option<i64>, refresh: Option<bool>) -> Value {
+    // WorkBuddy 那一路要扫 1 GB 级 JSONL（10 分钟缓存兜底），必须离开主线程。
+    off_main(move || cache_stats::report(days.unwrap_or(7), refresh.unwrap_or(false)))
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
 /// `crates/wb-switch-core/src/modules/gateway_live.rs` 的 `snapshot`。
 #[tauri::command]
 pub fn gateway_live_stats(window_secs: Option<u64>) -> Result<Value, String> {

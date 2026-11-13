@@ -253,6 +253,7 @@ pub fn run() {
             commands::qinglong_submit_env,
             commands::gateway_set_enabled,
             commands::gateway_live_stats,
+            commands::cache_hit_stats,
             commands::gateway_set_lan,
             commands::gateway_pool,
             commands::gateway_routing,
