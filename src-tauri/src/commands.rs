@@ -3015,6 +3015,24 @@ pub async fn workbuddy_credits_one(account_id: String) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// 网络自修复（补偿机制；默认代理流程不变，见 `modules::net_repair`）
+// ---------------------------------------------------------------------------
+
+/// 修复前诊断：环境代理检测 + 端口连通性。前端据此决定「尝试修复」按钮的显隐。
+#[tauri::command]
+pub async fn net_repair_status() -> Value {
+    off_main(wb_switch_core::modules::net_repair::status)
+        .await
+        .unwrap_or_else(|e| json!({ "hasProxy": false, "probeError": e }))
+}
+
+/// 执行修复：重建网络客户端 → 复测上游 → 代理不可达时降级直连。
+#[tauri::command]
+pub async fn net_repair_attempt() -> Value {
+    wb_switch_core::modules::net_repair::attempt_repair().await
+}
+
+// ---------------------------------------------------------------------------
 // 诊断日志（默认关闭；见 `modules::diag_log`）
 // ---------------------------------------------------------------------------
 

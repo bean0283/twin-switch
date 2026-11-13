@@ -10,6 +10,7 @@ import {
 } from "@/components/credits-ui";
 import { creditResourceName } from "@/lib/credit-package-names";
 import * as api from "@/lib/api";
+import { isTransportError, useNetRepair } from "@/lib/net-repair";
 import type { WbCreditItem, WbCreditsResult } from "@/lib/trae-types";
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,7 @@ export function useWorkbuddyCredits(): CreditsState {
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expand, setExpand] = useState<WbCreditItem | null>(null);
+  const openRepair = useNetRepair((s) => s.openRepair);
 
   const loadMeta = useCallback(async () => {
     try {
@@ -110,10 +112,13 @@ export function useWorkbuddyCredits(): CreditsState {
         const fresh = await api.workbuddyCreditsQuery(false);
         setResult(fresh);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg);
+        // 传输层失败（连接没建立，多半是代理固化失效）：给一个「尝试修复」的出口。
+        if (isTransportError(msg)) openRepair(msg);
       }
     })();
-  }, [loadMeta]);
+  }, [loadMeta, openRepair]);
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -124,11 +129,16 @@ export function useWorkbuddyCredits(): CreditsState {
         description: `合计剩余 ${credits(res.summary.totalRemaining)}`,
       });
     } catch (e) {
-      toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isTransportError(msg)) {
+        openRepair(msg, () => void refresh());
+        return;
+      }
+      toast.error("积分查询失败", { description: msg });
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [openRepair]);
 
   /**
    * 单账号刷新（后端 `workbuddy_credits_one`：不走缓存、不写缓存）。
@@ -141,10 +151,14 @@ export function useWorkbuddyCredits(): CreditsState {
     try {
       const one = await api.workbuddyCreditsOne(id);
       if (!one || one.ok === false) {
-        toast.error("这个账号的积分没刷到", {
-          description:
-            (one as { error?: string } | null)?.error ?? "接口没有返回这个账号的积分",
-        });
+        const errMsg =
+          (one as { error?: string } | null)?.error ?? "接口没有返回这个账号的积分";
+        // 传输层失败：弹修复窗口，修复成功后自动重刷这个账号；其余错误维持原提示。
+        if (isTransportError(errMsg)) {
+          openRepair(errMsg, () => void refreshOne(id));
+          return;
+        }
+        toast.error("这个账号的积分没刷到", { description: errMsg });
         return;
       }
       setResult((prev) => {
@@ -175,11 +189,16 @@ export function useWorkbuddyCredits(): CreditsState {
         };
       });
     } catch (e) {
-      toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isTransportError(msg)) {
+        openRepair(msg, () => void refreshOne(id));
+        return;
+      }
+      toast.error("积分查询失败", { description: msg });
     } finally {
       setRefreshingId(null);
     }
-  }, [refreshingId]);
+  }, [refreshingId, openRepair]);
 
   return { meta, result, error, busy, refresh, refreshOne, refreshingId, expand, setExpand };
 }

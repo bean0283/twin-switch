@@ -10,6 +10,7 @@ import {
   type CreditView,
 } from "@/components/credits-ui";
 import * as api from "@/lib/api";
+import { isTransportError, useNetRepair } from "@/lib/net-repair";
 import type { TraeCreditEntry, TraeCreditsResult } from "@/lib/trae-types";
 
 /**
@@ -148,6 +149,7 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
   /** 正在单独刷新的账号（同一时刻只允许一个，避免连点打一串接口）。 */
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [expand, setExpand] = useState<TraeCreditEntry | null>(null);
+  const openRepair = useNetRepair((s) => s.openRepair);
 
   useEffect(() => {
     let alive = true;
@@ -162,13 +164,16 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
         if (!alive) return;
         setResult(fresh);
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        const msg = e instanceof Error ? e.message : String(e);
+        if (alive) setError(msg);
+        // 传输层失败（连接没建立，多半是代理固化失效）：给一个「尝试修复」的出口。
+        if (alive && isTransportError(msg)) openRepair(msg);
       }
     })();
     return () => {
       alive = false;
     };
-  }, [clientKey]);
+  }, [clientKey, openRepair]);
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -179,11 +184,16 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
         description: `合计剩余 ${credits(res.summary.totalRemaining)}`,
       });
     } catch (e) {
-      toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isTransportError(msg)) {
+        openRepair(msg, () => void refresh());
+        return;
+      }
+      toast.error("积分查询失败", { description: msg });
     } finally {
       setBusy(false);
     }
-  }, [clientKey]);
+  }, [clientKey, openRepair]);
 
   /**
    * 单账号刷新。
@@ -199,7 +209,12 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
       try {
         const one = (await api.traeCreditsOne(clientKey, id)) as TraeCreditEntry;
         if (one && one.ok === false && one.error) {
-          // 失败：保留旧数字，只把原因说出来（不能悄悄不动，用户会以为刷新没生效）
+          // 失败：保留旧数字，只把原因说出来（不能悄悄不动，用户会以为刷新没生效）。
+          // 传输层失败另开「尝试修复」窗口，修复成功后自动重刷这个账号。
+          if (isTransportError(one.error)) {
+            openRepair(one.error, () => void refreshOne(id));
+            return;
+          }
           toast.error("这个账号的积分没刷到", { description: one.error });
           return;
         }
@@ -226,12 +241,17 @@ export function useTraeCredits(clientKey: string | null): TraeCreditsState {
           };
         });
       } catch (e) {
-        toast.error("积分查询失败", { description: e instanceof Error ? e.message : String(e) });
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isTransportError(msg)) {
+          openRepair(msg, () => void refreshOne(id));
+          return;
+        }
+        toast.error("积分查询失败", { description: msg });
       } finally {
         setRefreshingId(null);
       }
     },
-    [clientKey, refreshingId],
+    [clientKey, refreshingId, openRepair],
   );
 
   /**

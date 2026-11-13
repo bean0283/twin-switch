@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
 // HTTP 客户端
 // ---------------------------------------------------------------------------
 
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static HTTP_CLIENT: RwLock<Option<Arc<reqwest::Client>>> = RwLock::new(None);
 
 fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
@@ -394,12 +394,42 @@ fn http_client_builder() -> reqwest::ClientBuilder {
         .user_agent(DEFAULT_HTTP_USER_AGENT)
 }
 
-fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
+/// 共享 HTTP 客户端：**首次请求时**按进程环境构建一次并长期复用（默认行为与
+/// 原 `OnceLock` 版完全一致，代理流程不变）。用 `RwLock<Option<_>>` 只是为了给
+/// 「尝试修复」（[`reset_http_client`] / [`install_direct_http_client`]）留一个
+/// 重建入口 —— 环境里的代理在进程启动后可能失效（外部代理退出 / 端口变更），
+/// 原来只能重启应用恢复，现在重建一次即可。
+fn http_client() -> Arc<reqwest::Client> {
+    let cached = HTTP_CLIENT.read().expect("http client lock").clone();
+    if let Some(client) = cached {
+        return client;
+    }
+    let client = Arc::new(
         http_client_builder()
             .build()
-            .expect("failed to build reqwest client")
-    })
+            .expect("failed to build reqwest client"),
+    );
+    let mut guard = HTTP_CLIENT.write().expect("http client lock");
+    guard
+        .get_or_insert_with(|| client.clone())
+        .clone()
+}
+
+/// 「尝试修复」专用：丢弃共享客户端，下一次请求按**当前**环境重新构建
+/// （构建逻辑不变，环境里的代理变量照常生效 —— 只是等效于"不重启应用也能重启网络层"）。
+pub fn reset_http_client() {
+    *HTTP_CLIENT.write().expect("http client lock") = None;
+}
+
+/// 修复补偿：把共享客户端替换为**无代理直连**版。只在修复流程确认
+/// 「环境代理不可达、直连可达」时由 `net_repair` 调用；默认流程永远不会走到这里。
+pub fn install_direct_http_client() -> Result<(), String> {
+    let client = http_client_builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("构建直连客户端失败: {e}"))?;
+    *HTTP_CLIENT.write().expect("http client lock") = Some(Arc::new(client));
+    Ok(())
 }
 
 /// 通用 HTTP 请求，返回解析后的 JSON。
@@ -434,7 +464,7 @@ pub async fn http_request_with_proxy(
             })
             .build()
         {
-            Ok(client) => client,
+            Ok(client) => Arc::new(client),
             Err(e) => return json!({"code": -1, "message": format!("代理客户端创建失败: {e}")}),
         },
         None => http_client().clone(),
@@ -531,7 +561,7 @@ pub async fn http_request_raw(
                 builder = builder.redirect(reqwest::redirect::Policy::none());
             }
             match builder.build() {
-                Ok(client) => client,
+                Ok(client) => Arc::new(client),
                 Err(e) => return (0, HashMap::new(), format!("代理客户端创建失败: {e}")),
             }
         }
@@ -543,7 +573,7 @@ pub async fn http_request_raw(
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {
-                    Ok(client) => client,
+                    Ok(client) => Arc::new(client),
                     Err(e) => return (0, HashMap::new(), format!("客户端创建失败: {e}")),
                 }
             }

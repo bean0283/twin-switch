@@ -17,6 +17,7 @@ pub mod gateway_server;
 pub mod gateway_stream;
 pub mod gateway_wb;
 pub mod jwt;
+pub mod net_repair;
 pub mod qinglong;
 pub mod search_text;
 pub mod process_list;

@@ -34,6 +34,7 @@ import WorkbuddyRecordsPage from "@/pages/WorkbuddyRecordsPage";
 import { AppIconMark } from "@/components/product-marks";
 import { UpdateEntry } from "@/components/update-entry";
 import { Toaster } from "@/components/ui/sonner";
+import { NetRepairDialog } from "@/components/net-repair-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 /**
@@ -293,6 +294,7 @@ export default function App() {
           </Route>
         </Routes>
         <Toaster />
+        <NetRepairDialog />
       </BrowserRouter>
     </TooltipProvider>
   );

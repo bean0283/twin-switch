@@ -2137,6 +2137,48 @@ export function workbuddyCreditsOne(accountId: string): Promise<WbCreditItem> {
 }
 
 // ---------------------------------------------------------------------------
+// 网络自修复（补偿机制；见 crates/wb-switch-core/src/modules/net_repair.rs）
+// ---------------------------------------------------------------------------
+
+/** 修复前诊断快照：环境代理检测结果。 */
+export interface NetRepairStatus {
+  /** 进程环境里是否有代理变量（HTTP(S)_PROXY / ALL_PROXY）。 */
+  hasProxy: boolean;
+  /** 命中的环境变量名。 */
+  envKey: string | null;
+  /** 环境变量的原始值（代理 URL）。 */
+  proxyUrl: string | null;
+  /** 解析出的 host:port。 */
+  proxyAddr: string | null;
+  /** TCP 探测：代理端口是否有人应答。null = 无法探测（解析失败）。 */
+  alive: boolean | null;
+  /** 探测失败原因。 */
+  probeError: string | null;
+}
+
+/** 「尝试修复」执行结果。 */
+export interface NetRepairResult {
+  ok: boolean;
+  /** proxy=经代理恢复；direct=已降级直连；fail=无路可走。 */
+  mode: "proxy" | "direct" | "fail";
+  message: string;
+  /** 每一步执行过程（错误窗口里展示）。 */
+  steps: string[];
+  /** 失败时的人工处理建议。 */
+  suggestion: string | null;
+}
+
+/** 修复前诊断：环境代理 + 端口连通性。 */
+export function netRepairStatus(): Promise<NetRepairStatus> {
+  return call("net_repair_status");
+}
+
+/** 执行修复：重建网络客户端 → 复测上游 → 必要时降级直连。 */
+export function netRepairAttempt(): Promise<NetRepairResult> {
+  return call("net_repair_attempt");
+}
+
+// ---------------------------------------------------------------------------
 // 自动更新
 // ---------------------------------------------------------------------------
 

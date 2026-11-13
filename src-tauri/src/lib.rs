@@ -447,6 +447,8 @@ pub fn run() {
             commands::workbuddy_credits_cached,
             commands::workbuddy_credits_query,
             commands::workbuddy_credits_one,
+            commands::net_repair_status,
+            commands::net_repair_attempt,
             commands::workbuddy_account_token,
             commands::workbuddy_account_token_refresh,
             // 自动更新
