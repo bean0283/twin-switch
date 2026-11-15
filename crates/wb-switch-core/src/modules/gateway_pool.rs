@@ -170,6 +170,27 @@ pub fn snapshot() -> Vec<PoolEntry> {
             .any(|d| e.key.ends_with(&format!(":{d}")))
     };
 
+    // ★ 策略是「按优先级」时，列表顺序 = 用户拖出来的顺序（未排过的排在后面，仍按最早过期）。
+    //
+    // 为什么列表要跟着策略走：界面这句话是「账号池的顺序决定新对话用谁」——
+    // 如果选了优先级、列表却还按过期时间排，用户拖完看到的顺序与实际派单对不上，
+    // 就成了「界面说一套、实际走另一套」（这类问题在本项目出现过多次）。
+    if crate::modules::gateway_routing::current().policy
+        == crate::modules::gateway_routing::CreditPolicy::Priority
+    {
+        out.sort_by(|a, b| {
+            let (ra, rb) = (
+                crate::modules::gateway_priority::rank(&a.key).unwrap_or(usize::MAX),
+                crate::modules::gateway_priority::rank(&b.key).unwrap_or(usize::MAX),
+            );
+            b.usable
+                .cmp(&a.usable)
+                .then_with(|| ra.cmp(&rb))
+                .then_with(|| a.expires_at.unwrap_or(i64::MAX).cmp(&b.expires_at.unwrap_or(i64::MAX)))
+        });
+        return with_cooldowns(out, None);
+    }
+
     out.sort_by(|a, b| {
         // ⚠️⚠️ **紧迫度优先于「默认账号」**（2026-10-26 用户实测纠正）。
         //
@@ -755,7 +776,7 @@ fn qoder_entries() -> Vec<PoolEntry> {
                 } else if a.disabled {
                     Some("已停用｜到账号页重新启用该账号".into())
                 } else {
-                    Some("还没有凭据｜点该账号重新登录，或导入本机登录态".into())
+                    Some("还没有凭据｜用「扫码添加账号」重新授权，或「导入账号包」搬一份进来".into())
                 },
             }
         })
@@ -866,7 +887,7 @@ fn workbuddy_entries() -> Vec<PoolEntry> {
                 } else if expired {
                     Some("登录态已过期｜重新登录该账号后重试".into())
                 } else {
-                    Some("还没有凭据｜点该账号重新登录，或导入本机登录态".into())
+                    Some("还没有凭据｜用「扫码添加账号」重新授权，或「导入账号包」搬一份进来".into())
                 },
             })
         })
@@ -1090,7 +1111,7 @@ fn trae_entries() -> Vec<PoolEntry> {
             expires_at,
             usable: has_cred && !expired,
             reason: if !has_cred {
-                Some("缺少可用登录态｜用这个账号登录一次 Trae，再点「导入本机登录态」".into())
+                Some("缺少可用登录态｜到 Trae 账号页用「扫码添加账号」重新授权这个账号".into())
             } else if expired {
                 Some("积分已过期｜重新登录该账号刷新额度，或换用其它账号".into())
             } else {

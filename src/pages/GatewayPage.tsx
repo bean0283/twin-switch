@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { GatewayTabs } from "@/components/gateway-tabs";
 import { PillTabs } from "@/components/pill-tabs";
+import { PriorityOrderDialog } from "@/components/priority-order-dialog";
 
 import {
   gatewayKeyCreate,
@@ -19,6 +20,8 @@ import {
   gatewayPricing,
   gatewayModelsDiscover,
   gatewayPool,
+  gatewayPrioritySet,
+  gatewayPriorityGet,
   gatewayPreview,
   gatewayModelsGet,
   gatewayModelsCatalog,
@@ -196,6 +199,11 @@ const ROUTING_OPTIONS: { value: CreditPolicy; title: string; desc: string }[] = 
     value: "sticky",
     title: "同一对话固定账号",
     desc: "一段对话从头到尾花同一个账号的积分，只有它不可用（冷却/耗尽）才换。下面「账号池」的排序因此只决定**新对话**用谁。",
+  },
+  {
+    value: "priority",
+    title: "按自定义优先级",
+    desc: "按你在下面「账号池」拖出来的顺序用号：排在前面的先用，余额低于 100 积分自动跳到下一个。通用模型按全局顺序；`trae:` 这类特定模型只在该产品内部按这个顺序。每轮都重挑，所以同样可能中途换号。",
   },
   {
     value: "pinned",
@@ -397,8 +405,63 @@ type SubTab = (typeof SUB_TABS)[number]["id"];
 export default function GatewayPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [pool, setPool] = useState<PoolEntry[]>([]);
+  /**
+   * 打开优先级排序弹窗。
+   *
+   * 顺序**从后端取**而不是从 `pool` 推：池子的排序依赖当前策略（非优先级策略下
+   * 是按最早过期排的），拿它当初始顺序会把「用户上次排的顺序」弄丢。
+   */
+  const openPriority = async () => {
+    setPriorityOpen(true);
+    try {
+      const r = await gatewayPriorityGet();
+      setPriorityOrder(Array.isArray(r?.order) ? r.order : []);
+    } catch {
+      // 取失败就用空顺序：弹窗会退回「池子原顺序」，仍然可拖、可保存。
+      setPriorityOrder([]);
+    }
+  };
+
+  /**
+   * 拖动排序：把 `from` 挪到 `to` 的位置，然后整份顺序落盘。
+   *
+   * ⚠️ 传的是**整份列表**而不是「两个 key 交换」：服务端要做「池子里已经没有的 key」对账，
+   * 只传一对会让顺序在「有账号被删」时悄悄错位。
+   */
+  const movePriority = async (from: string, to: string) => {
+    if (!from || from === to) return;
+    const keys = pool.map((e) => e.key);
+    const fi = keys.indexOf(from);
+    const ti = keys.indexOf(to);
+    if (fi < 0 || ti < 0) return;
+    keys.splice(fi, 1);
+    keys.splice(ti, 0, from);
+    try {
+      const r = await gatewayPrioritySet(keys);
+      // 用后端规范化后的顺序重排本地列表：不重新拉池子，免得排序刚生效就被刷新打断。
+      const byKey = new Map(pool.map((e) => [e.key, e]));
+      const next: PoolEntry[] = [];
+      for (const k of r.order) {
+        const e = byKey.get(k);
+        if (e) next.push(e);
+      }
+      for (const e of pool) if (!r.order.includes(e.key)) next.push(e);
+      setPool(next);
+      toast.success("优先级已保存", {
+        description: "从上到下依次使用；余额低于 100 积分的账号会自动跳过。",
+      });
+    } catch (e) {
+      toast.error("保存优先级失败", { description: asError(e).split("\n")[0] });
+    }
+  };
+
   /** 账号池按产品折叠（与清理页的分类块一致）：默认收起，点「展开」看明细。 */
   const [poolCollapsed, setPoolCollapsed] = useState<Set<string>>(new Set());
+  /** 优先级模式下正在拖的账号 key（null = 没在拖）。 */
+  const [dragKey, setDragKey] = useState<string | null>(null);
+  /** 优先级排序弹窗：打开时列出**全部账号**（跨产品一条队列）。 */
+  const [priorityOpen, setPriorityOpen] = useState(false);
+  const [priorityOrder, setPriorityOrder] = useState<string[]>([]);
   const [keys, setKeys] = useState<KeyRow[]>([]);
   /** 当前 token 单价（把额度换算成金额用；后端 `gateway_pricing` 给）。 */
   const [pricing, setPricing] = useState<{
@@ -478,6 +541,11 @@ export default function GatewayPage() {
     try {
       const r = await gatewayRoutingSet(policy, pinned);
       setRouting(r.report);
+      // ★ 池子顺序是**后端按当前策略排好的**（优先级模式＝用户拖的顺序）。
+      // 切完策略必须重取一次，否则列表还停在上一个策略的顺序上 ——
+      // 界面写着「顺序决定用谁」，显示的顺序却与实际派单不一致。
+      const rows = await gatewayPool();
+      if (Array.isArray(rows)) setPool(rows as PoolEntry[]);
     } catch (cause) {
       toast.error("保存选号策略失败", { description: asError(cause) });
     } finally {
@@ -1502,7 +1570,12 @@ export default function GatewayPage() {
                     className="mt-1 size-4 shrink-0 cursor-pointer"
                     name="routing-policy"
                     checked={on}
-                    onChange={() => void saveRouting(o.value)}
+                    onChange={() => {
+                      void saveRouting(o.value);
+                      // 选这一档的下一步必然是「排顺序」——直接弹出来，
+                      // 否则用户只能看到「按优先级」四个字，找不到排序入口（用户 2026-11-14 反馈）。
+                      if (o.value === "priority") void openPriority();
+                    }}
                   />
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -1514,6 +1587,17 @@ export default function GatewayPage() {
                       )}
                     </div>
                     <p className="text-xs leading-relaxed text-muted-foreground">{o.desc}</p>
+                    {/* 选中「按自定义优先级」时露出入口，随时可以重排 */}
+                    {o.value === "priority" && on ? (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <Button variant="outline" size="sm" onClick={() => void openPriority()}>
+                          调整账号顺序…
+                        </Button>
+                        <span className="text-[11px] text-muted-foreground">
+                          共 {pool.length} 个账号，当前按你排的顺序派单
+                        </span>
+                      </div>
+                    ) : null}
                     {/* 选中「只用指定账号」时才露出账号下拉 */}
                     {o.value === "pinned" && on ? (
                       <div className="pt-1">
@@ -1554,7 +1638,15 @@ export default function GatewayPage() {
         )}
       </Card>
 
-      <Card {...fold("pool")} title="账号池" desc="按积分最早过期排序 —— 它决定「新对话」用谁；已在进行的对话是否沿用同一个号，看上面的策略">
+      <Card
+        {...fold("pool")}
+        title="账号池"
+        desc={
+          routing?.policy === "priority"
+            ? "按你拖出来的优先级排序（从上到下依次使用，余额低于 100 积分自动跳到下一个）。通用模型按全局顺序；trae: 这类特定模型只在该产品内部按这个顺序。"
+            : "按积分最早过期排序 —— 它决定「新对话」用谁；已在进行的对话是否沿用同一个号，看上面的策略"
+        }
+      >
         {pool.length === 0 ? (
           <p className="py-6 text-center text-xs text-muted-foreground">
             还没有账号。先去各产品的账号管理里添加。
@@ -1620,15 +1712,44 @@ export default function GatewayPage() {
                           </tr>
                         </thead>
                         <tbody>
-                          {rows.map((r) => (
+                          {rows.map((r, idx) => {
+                            const draggable = routing?.policy === "priority";
+                            return (
                             <tr
                               key={r.key}
+                              // 只有「按优先级」策略下才允许拖：别的策略里列表顺序是按过期算的，
+                              // 拖动既能拖又不会影响派单，属于自欺欺人。
+                              draggable={draggable}
+                              onDragStart={() => setDragKey(r.key)}
+                              onDragOver={(e) => {
+                                if (draggable) e.preventDefault();
+                              }}
+                              onDrop={(e) => {
+                                if (!draggable) return;
+                                e.preventDefault();
+                                const from = dragKey;
+                                setDragKey(null);
+                                if (from) void movePriority(from, r.key);
+                              }}
+                              onDragEnd={() => setDragKey(null)}
                               className={cn(
                                 "border-t border-border/60",
                                 !r.usable && "bg-destructive/[0.03]",
+                                draggable && "cursor-grab active:cursor-grabbing",
+                                dragKey === r.key && "opacity-40",
                               )}
                             >
-                              <td className="px-3 py-2">{r.label}</td>
+                              <td className="px-3 py-2">
+                                {draggable ? (
+                                  <span
+                                    className="mr-1.5 inline-block w-4 text-right align-middle font-mono text-[10px] text-muted-foreground"
+                                    title="优先级序号：数字越小越先用"
+                                  >
+                                    {idx + 1}
+                                  </span>
+                                ) : null}
+                                {r.label}
+                              </td>
                               <td className="px-3 py-2 font-mono">{r.scope}</td>
                               <td className="px-3 py-2 text-right font-mono">
                                 {r.remaining == null ? (
@@ -1694,7 +1815,8 @@ export default function GatewayPage() {
                                 )}
                               </td>
                             </tr>
-                          ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -1706,10 +1828,29 @@ export default function GatewayPage() {
         )}
       </Card>
 
+      <PriorityOrderDialog
+        open={priorityOpen}
+        onOpenChange={setPriorityOpen}
+        accounts={pool}
+        order={priorityOrder}
+        onSaved={() => {
+          // 保存后立刻重取池子：顺序变了，列表顺序也得跟着变（列表顺序＝派单顺序）。
+          void gatewayPool()
+            .then((rows) => {
+              if (Array.isArray(rows)) setPool(rows as PoolEntry[]);
+            })
+            .catch(() => undefined);
+        }}
+      />
+
       <Card
         {...fold("preview")}
         title="选号预览"
-        desc="只算不发，不消耗额度；这里算的是「按最早过期」的结果，实际选号还受上面的策略影响"
+        desc={
+          routing?.policy === "priority"
+            ? "只算不发，不消耗额度；这里按你排的优先级算，实际选号还受上面的策略影响"
+            : "只算不发，不消耗额度；这里算的是「按最早过期」的结果，实际选号还受上面的策略影响"
+        }
       >
         <div className="flex flex-wrap items-center gap-2">
           <input

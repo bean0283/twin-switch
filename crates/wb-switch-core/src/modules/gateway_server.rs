@@ -1172,10 +1172,36 @@ async fn chat(
     // ③ 按「积分最早过期」排出来的那个（preview 已算好）
     let urgency_entry = sel.picked.clone();
 
+    // ③b 优先级模式：按用户在「账号池」里拖出来的顺序，挑第一个此刻能用的号。
+    //
+    // ⚠️ 只在 `pool_now` 里挑 —— 它已经是「过了保底线 100 分」的那一批
+    // （`usable_above_floor`），所以「余额不足 100 自动切换」不用在这里再算一遍钱。
+    // 全部低于保底线时 `pool_now` 会退回全部可用号（并有 `floor_relaxed` 留痕），
+    // 那时按顺序挑第一个也仍是用户想要的行为。
+    let priority_entry = if routing.policy == crate::modules::gateway_routing::CreditPolicy::Priority
+    {
+        pool_now
+            .iter()
+            .filter(|e| sel.candidates.iter().any(|s| s == &e.scope))
+            .filter(|e| gateway_pool::cooling_until(&e.key, Some(&bare)).unwrap_or(0) <= now_ms)
+            .min_by_key(|e| {
+                (
+                    // 没被排过的账号排在所有排过的之后（`usize::MAX`），
+                    // 同组内沿用「最早过期优先」，升级后行为不突变。
+                    crate::modules::gateway_priority::rank(&e.key).unwrap_or(usize::MAX),
+                    e.expires_at.unwrap_or(i64::MAX),
+                )
+            })
+            .cloned()
+    } else {
+        None
+    };
+
     let chosen_key = crate::modules::gateway_routing::pick_key(
         routing.policy,
         pinned_entry.as_ref().map(|e| e.key.clone()),
         sticky_entry.as_ref().map(|e| e.key.clone()),
+        priority_entry.as_ref().map(|e| e.key.clone()),
         urgency_entry.as_ref().map(|e| e.key.clone()),
     );
     let picked = match chosen_key {
@@ -1184,6 +1210,7 @@ async fn chat(
                 .clone()
                 .filter(|e| e.key == k)
                 .or_else(|| sticky_entry.clone().filter(|e| e.key == k))
+                .or_else(|| priority_entry.clone().filter(|e| e.key == k))
                 .or_else(|| urgency_entry.clone().filter(|e| e.key == k))
                 .or_else(|| find_usable(&k));
             let Some(p) = found else {

@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -432,6 +432,74 @@ pub fn install_direct_http_client() -> Result<(), String> {
     Ok(())
 }
 
+/// 直连客户端（`no_proxy()`），只作为**传输层失败后的兜底**。
+///
+/// 为什么不复用共享客户端：共享的那份按环境变量构建，可能正走着一个**死代理**
+/// （代理进程退了、变量还在 User 作用域里）。兜底的意义就是绕开它。
+static DIRECT_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+
+fn direct_client() -> Arc<reqwest::Client> {
+    DIRECT_CLIENT
+        .get_or_init(|| {
+            Arc::new(
+                http_client_builder()
+                    .no_proxy()
+                    .build()
+                    .expect("failed to build direct http client"),
+            )
+        })
+        .clone()
+}
+
+/// 发一次请求（只负责「发出去」这一步，失败即返回错误，由调用方决定要不要换路重试）。
+async fn send_once(
+    client: &reqwest::Client,
+    method: &reqwest::Method,
+    url: &str,
+    headers: Option<&HashMap<String, String>>,
+    body: Option<Value>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = client.request(method.clone(), url);
+    req = req.header("Content-Type", "application/json");
+    if let Some(h) = headers {
+        for (k, v) in h {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    req.send().await
+}
+
+/// 把响应转成既有约定：2xx 解析 JSON；非 2xx 记诊断日志并回形状化的错误对象。
+async fn finish_response(method_label: &str, url: &str, resp: reqwest::Response) -> Value {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        return serde_json::from_str(&text).unwrap_or(Value::Null);
+    }
+    // ⚠️ 所有上游请求的唯一 HTTP 出口之一：非 2xx 一律留一条诊断日志
+    //（默认 error 级别就会记）。这是「账号刷新失败 / 401 / 5xx 只在
+    // 别人机器上出现」时唯一能留下证据的地方。
+    crate::modules::diag_log::error(
+        "http",
+        format!(
+            "{} {} → HTTP {} {}",
+            method_label,
+            url,
+            status.as_u16(),
+            normalize_error_body(&text)
+        ),
+    );
+    serde_json::from_str(&text).unwrap_or_else(|_| {
+        json!({
+            "code": status.as_u16(),
+            "message": normalize_error_body(&text),
+        })
+    })
+}
+
 /// 通用 HTTP 请求，返回解析后的 JSON。
 ///
 /// 行为对齐 Python 版：
@@ -470,50 +538,60 @@ pub async fn http_request_with_proxy(
         None => http_client().clone(),
     };
     let method_label = method.as_str().to_string();
-    let mut req = client.request(method, url);
-    req = req.header("Content-Type", "application/json");
-    if let Some(h) = headers {
-        for (k, v) in h {
-            req = req.header(k, v);
-        }
-    }
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status.is_success() {
-                serde_json::from_str(&text).unwrap_or(Value::Null)
-            } else {
-                // ⚠️ 所有上游请求的唯一 HTTP 出口之一：非 2xx 一律留一条诊断日志
-                //（默认 error 级别就会记）。这是「账号刷新失败 / 401 / 5xx 只在
-                // 别人机器上出现」时唯一能留下证据的地方。
+
+    // ★ 第一次：按当前配置发（共享客户端会读 HTTP_PROXY 等环境变量）。
+    match send_once(&client, &method, url, headers, body.clone()).await {
+        Ok(resp) => finish_response(&method_label, url, resp).await,
+        Err(first_err) => {
+            // 只在「连接 / 超时 / 发送」这三类上换路重试：
+            // `is_body` / `is_decode` / `is_redirect` 属于已经拿到响应之后的问题，
+            // 重发一遍既治不好，又可能让上游多算一次用量。
+            let retryable =
+                first_err.is_connect() || first_err.is_timeout() || first_err.is_request();
+            if !retryable {
                 crate::modules::diag_log::error(
                     "http",
-                    format!(
-                        "{} {} → HTTP {} {}",
-                        method_label,
-                        url,
-                        status.as_u16(),
-                        normalize_error_body(&text)
-                    ),
+                    format!("{} {} → 网络错误: {first_err}", method_label, url),
                 );
-                serde_json::from_str(&text).unwrap_or_else(|_| {
-                    json!({
-                        "code": status.as_u16(),
-                        "message": normalize_error_body(&text),
-                    })
-                })
+                return json!({"code": -1, "message": first_err.to_string()});
             }
-        }
-        Err(e) => {
-            crate::modules::diag_log::error(
+            // ★★ 传输层失败 ⇒ **自动改用直连重试一次**（不换路就只能等用户去点「尝试修复」）。
+            //
+            // 为什么只在这一层重试：`send()` 报错意味着**响应还没开始**，
+            // 请求可以安全重发（业务层 4xx/5xx 不会走到这里，也不会被重试）。
+            //
+            // 为什么需要它：环境里可能残留着已经退出的代理进程的 `HTTP_PROXY`
+            // （代理客户端关掉后变量仍在 User 作用域）。此时每条请求都被推向死端口，
+            // 用户看到的是「网络正常但全都失败」，而直连往往完全是通的。
+            crate::modules::diag_log::warn(
                 "http",
-                format!("{} {} → 网络错误: {e}", method_label, url),
+                format!(
+                    "{} {} → 首次发送失败（{first_err}），改用直连重试",
+                    method_label, url
+                ),
             );
-            json!({"code": -1, "message": e.to_string()})
+            match send_once(&direct_client(), &method, url, headers, body).await {
+                Ok(resp) => {
+                    crate::modules::diag_log::warn(
+                        "http",
+                        format!("{} {} → 直连重试成功（原路径是代理）", method_label, url),
+                    );
+                    finish_response(&method_label, url, resp).await
+                }
+                Err(second_err) => {
+                    crate::modules::diag_log::error(
+                        "http",
+                        format!(
+                            "{} {} → 网络错误: {first_err}（直连重试也失败: {second_err}）",
+                            method_label, url
+                        ),
+                    );
+                    json!({
+                        "code": -1,
+                        "message": format!("{first_err}；直连重试也失败：{second_err}"),
+                    })
+                }
+            }
         }
     }
 }
@@ -790,5 +868,25 @@ mod tests {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
         );
         let _ = http_client_builder();
+    }
+
+    /// 直连回落：两条路都失败时，**两条原因都要留下**。
+    ///
+    /// 用「显式指定一个死端口代理 + 一个本机未监听端口」构造，全程不联网，结果稳定。
+    /// 断言点：消息里必须同时出现首次失败与直连重试失败 —— 只写一句「网络错误」
+    /// 会让用户无法判断到底是代理坏了还是目标不可达。
+    #[tokio::test]
+    async fn fallback_reports_both_failures() {
+        let v = http_request_with_proxy(
+            "http://127.0.0.1:1/nope",
+            "GET",
+            None,
+            None,
+            Some("http://127.0.0.1:1"),
+        )
+        .await;
+        assert_eq!(v["code"], -1, "必须回 code=-1（传输层失败的唯一判据）");
+        let msg = v["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("直连重试也失败"), "必须写明直连也试过：{msg}");
     }
 }

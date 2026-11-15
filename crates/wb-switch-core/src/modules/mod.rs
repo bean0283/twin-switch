@@ -11,6 +11,7 @@ pub mod gateway_live;
 pub mod cache_stats;
 pub mod gateway_metrics;
 pub mod gateway_models;
+pub mod gateway_priority;
 pub mod gateway_pool;
 pub mod gateway_routing;
 pub mod gateway_prompt;

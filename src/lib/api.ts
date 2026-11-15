@@ -2231,7 +2231,22 @@ export async function gatewayPool(): Promise<unknown> {
 }
 
 /** 积分共享的选号策略。 */
-export type CreditPolicy = "strict" | "sticky" | "pinned";
+export type CreditPolicy = "strict" | "sticky" | "pinned" | "priority";
+
+/**
+ * 账号优先级顺序（用户在「账号池」里拖出来的）。
+ *
+ * 只有一条**全局**列表：通用模型按它整体排序；`trae:` 这类特定模型
+ * 只在这条列表里筛出该产品的账号，相对顺序因此天然一致。
+ */
+export function gatewayPriorityGet(): Promise<{ order: string[] }> {
+  return call("gateway_priority_get", {});
+}
+
+/** 保存优先级顺序（传**整份**列表，后端会与当前池子对账后落盘）。 */
+export function gatewayPrioritySet(order: string[]): Promise<{ ok: boolean; order: string[] }> {
+  return call("gateway_priority_set", { order });
+}
 
 export interface RoutingReport {
   path: string;

@@ -118,6 +118,8 @@ export function CacheHitCard({ days = 7 }: { days?: number }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 已经等了多久（秒）。WorkBuddy 那一路要扫 1 GB 级日志，没有计时就像卡死。 */
+  const [waited, setWaited] = useState(0);
 
   const load = useCallback(
     async (refresh: boolean) => {
@@ -143,6 +145,16 @@ export function CacheHitCard({ days = 7 }: { days?: number }) {
   useEffect(() => {
     void load(false);
   }, [load]);
+
+  // 加载中每秒刷新一次已用时。⚠️ 必须 clearInterval，否则页面切走后仍在跑。
+  useEffect(() => {
+    if (!loading && !busy) {
+      setWaited(0);
+      return;
+    }
+    const t = window.setInterval(() => setWaited((n) => n + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [loading, busy]);
 
   const wb = stats?.workbuddy;
   const wbHint = useMemo(() => {
@@ -178,12 +190,27 @@ export function CacheHitCard({ days = 7 }: { days?: number }) {
           data-action="cache-hit-refresh"
         >
           {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-          {busy ? "统计中…" : "重新统计"}
+          {busy ? (waited > 0 ? `统计中 ${waited}s` : "统计中…") : "重新统计"}
         </Button>
       </CardHeader>
       <CardContent className="pt-0">
         {loading ? (
-          <p className="py-6 text-center text-xs text-muted-foreground">读取中…</p>
+          <div className="py-6 text-center text-xs text-muted-foreground">
+            <p>
+              读取中…{waited > 0 ? ` 已用 ${waited} 秒` : ""}
+            </p>
+            {/* 超过 3 秒才解释「在扫什么」：太快时闪一下反而干扰。 */}
+            {waited >= 3 ? (
+              <p className="mt-1 text-[11px]">
+                正在扫描 WorkBuddy 会话日志（1 GB 级），首次统计约需数秒
+              </p>
+            ) : null}
+            {waited >= 10 ? (
+              <p className="mt-1 text-[11px] text-amber-600">
+                仍在扫描 —— 可以先去做别的，结果会缓存 10 分钟，下次打开直接读缓存
+              </p>
+            ) : null}
+          </div>
         ) : error && !stats ? (
           <p className="py-6 text-center text-xs text-destructive">读取失败：{error}</p>
         ) : (

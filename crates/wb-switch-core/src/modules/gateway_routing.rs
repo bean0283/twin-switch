@@ -45,6 +45,15 @@ pub enum CreditPolicy {
     /// 只用指定账号；不可用时依次退化为 `Sticky` → `Strict`。
     #[serde(rename = "pinned")]
     Pinned,
+    /// 按**用户自定义的优先级**（拖拽排序）派单；每轮都按顺序重挑。
+    ///
+    /// 与 `Strict` 的区别：`Strict` 的顺序由「积分最早过期」决定（系统算），
+    /// 这个的顺序由用户排（`gateway_priority`）。两者都每轮重挑，所以都不记会话粘性。
+    ///
+    /// 「不足保底线自动跳过」由调用方用 `usable_above_floor()`（默认 100）实现 ——
+    /// 选号函数只认「已经筛好的候选」，不自己算钱。
+    #[serde(rename = "priority")]
+    Priority,
 }
 
 impl Default for CreditPolicy {
@@ -60,6 +69,7 @@ impl CreditPolicy {
             CreditPolicy::Strict => "strict",
             CreditPolicy::Sticky => "sticky",
             CreditPolicy::Pinned => "pinned",
+            CreditPolicy::Priority => "priority",
         }
     }
 
@@ -68,6 +78,7 @@ impl CreditPolicy {
             "strict" => Some(CreditPolicy::Strict),
             "sticky" => Some(CreditPolicy::Sticky),
             "pinned" => Some(CreditPolicy::Pinned),
+            "priority" => Some(CreditPolicy::Priority),
             _ => None,
         }
     }
@@ -199,12 +210,17 @@ pub fn pick_key(
     policy: CreditPolicy,
     pinned: Option<String>,
     sticky: Option<String>,
+    priority: Option<String>,
     urgency: Option<String>,
 ) -> Option<String> {
     match policy {
         CreditPolicy::Pinned => pinned.or(sticky).or(urgency),
         CreditPolicy::Sticky => sticky.or(urgency),
         CreditPolicy::Strict => urgency,
+        // 优先级模式**不粘会话**：用户排的顺序就是每轮该用的号。
+        // 排第一的号掉到保底线以下时，调用方给的 `priority` 已经是下一个可用号，
+        // 这里再回落到「最早过期」只是兜底（例如优先级里的号全在冷却）。
+        CreditPolicy::Priority => priority.or(urgency),
     }
 }
 
@@ -213,7 +229,9 @@ pub fn pick_key(
 /// `Strict` 不记：它每轮都重挑，绑了也没人用，反而会让用户切回 `sticky` 时
 /// 莫名其妙粘到一个「严格模式下碰巧最后用过」的号。
 pub fn should_bind(policy: CreditPolicy) -> bool {
-    policy != CreditPolicy::Strict
+    // `Priority` 与 `Strict` 一样每轮重挑：绑了没人用，还会让用户切回 `sticky`
+    // 时粘到一个「优先级模式下碰巧最后用过」的号。
+    !matches!(policy, CreditPolicy::Strict | CreditPolicy::Priority)
 }
 
 #[cfg(test)]
@@ -228,7 +246,7 @@ mod tests {
     fn strict_always_takes_urgency() {
         // 指定了号也不用、粘住的也不用 —— 严格模式只认「最早过期」。
         assert_eq!(
-            pick_key(CreditPolicy::Strict, s("pin"), s("stick"), s("urg")),
+            pick_key(CreditPolicy::Strict, s("pin"), s("stick"), s("pri"), s("urg")),
             s("urg")
         );
     }
@@ -236,12 +254,12 @@ mod tests {
     #[test]
     fn sticky_prefers_sticky_then_falls_back() {
         assert_eq!(
-            pick_key(CreditPolicy::Sticky, s("pin"), s("stick"), s("urg")),
+            pick_key(CreditPolicy::Sticky, s("pin"), s("stick"), s("pri"), s("urg")),
             s("stick")
         );
         // 粘住的号不可用时（调用方传 None）落到紧迫度
         assert_eq!(
-            pick_key(CreditPolicy::Sticky, s("pin"), None, s("urg")),
+            pick_key(CreditPolicy::Sticky, s("pin"), None, None, s("urg")),
             s("urg")
         );
     }
@@ -250,21 +268,42 @@ mod tests {
     fn pinned_degrades_through_sticky_to_urgency() {
         // 完整三级：指定 → 粘住 → 紧迫度
         assert_eq!(
-            pick_key(CreditPolicy::Pinned, s("pin"), s("stick"), s("urg")),
+            pick_key(CreditPolicy::Pinned, s("pin"), s("stick"), s("pri"), s("urg")),
             s("pin")
         );
         assert_eq!(
-            pick_key(CreditPolicy::Pinned, None, s("stick"), s("urg")),
+            pick_key(CreditPolicy::Pinned, None, s("stick"), None, s("urg")),
             s("stick")
         );
-        assert_eq!(pick_key(CreditPolicy::Pinned, None, None, s("urg")), s("urg"));
+        assert_eq!(pick_key(CreditPolicy::Pinned, None, None, None, s("urg")), s("urg"));
     }
 
     #[test]
     fn returns_none_when_everything_missing() {
-        for p in [CreditPolicy::Strict, CreditPolicy::Sticky, CreditPolicy::Pinned] {
-            assert_eq!(pick_key(p, None, None, None), None);
+        for p in [
+            CreditPolicy::Strict,
+            CreditPolicy::Sticky,
+            CreditPolicy::Pinned,
+            CreditPolicy::Priority,
+        ] {
+            assert_eq!(pick_key(p, None, None, None, None), None);
         }
+    }
+
+    #[test]
+    fn priority_uses_user_order_and_never_sticks() {
+        // 优先级模式只认用户排的号；粘住的那个不许插队。
+        assert_eq!(
+            pick_key(CreditPolicy::Priority, s("pin"), s("stick"), s("pri"), s("urg")),
+            s("pri")
+        );
+        // 优先级里的号全不可用（调用方传 None）⇒ 回落到最早过期，而不是报错。
+        assert_eq!(
+            pick_key(CreditPolicy::Priority, s("pin"), s("stick"), None, s("urg")),
+            s("urg")
+        );
+        // 每轮重挑 ⇒ 不记粘性。
+        assert!(!should_bind(CreditPolicy::Priority));
     }
 
     #[test]
@@ -275,7 +314,12 @@ mod tests {
 
     #[test]
     fn policy_strings_roundtrip() {
-        for p in [CreditPolicy::Strict, CreditPolicy::Sticky, CreditPolicy::Pinned] {
+        for p in [
+            CreditPolicy::Strict,
+            CreditPolicy::Sticky,
+            CreditPolicy::Pinned,
+            CreditPolicy::Priority,
+        ] {
             assert_eq!(CreditPolicy::parse(p.as_str()), Some(p));
         }
         assert_eq!(CreditPolicy::parse("nonsense"), None);

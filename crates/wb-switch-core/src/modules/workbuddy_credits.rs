@@ -1182,7 +1182,7 @@ async fn query_account(account: &CreditAccount) -> Value {
                 .to_string()
         } else {
             "该账号的登录会话已在别处重新登录而失效（refresh token 被作废）\
-             ⇒ 请点「导入本机登录态」（若该账号正是当前客户端登录的号）或「扫码添加账号」重新登录"
+             ⇒ 请用「扫码添加账号」重新授权（或等本工具启动时自动导入本机登录态）"
                 .to_string()
         }
     } else if is_route_missing(&legacy) || is_route_missing(&summary) {

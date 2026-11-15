@@ -235,7 +235,7 @@ pub fn switch_to(
     let acc = workbuddy_vault::find_account(id)
         .ok_or_else(|| format!("账号不存在：{id}"))?;
     if crate::modules::workbuddy_auth::secret_value(&acc, "access_token").is_none() {
-        return Err("该账号没有可用凭据，无法切换（可删除后重新导入本机登录态）".to_string());
+        return Err("该账号没有可用凭据，无法切换（可删除后用「扫码添加账号」重新添加）".to_string());
     }
     let target_uid = crate::modules::workbuddy_auth::get_str(&acc, "uid").unwrap_or_default();
 

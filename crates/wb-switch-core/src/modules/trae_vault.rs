@@ -173,7 +173,7 @@ pub fn list_vault_accounts(client_key: &str) -> Vec<String> {
 pub fn export_pack(client_key: &str) -> Result<Value, String> {
     let ids = list_vault_accounts(client_key);
     if ids.is_empty() {
-        return Err("账号库是空的 —— 先用「导入本机登录态」收一个进来，再导出".into());
+        return Err("账号库是空的 —— 先用「扫码添加账号」加一个进来，再导出".into());
     }
     let mut accounts: Vec<Value> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();

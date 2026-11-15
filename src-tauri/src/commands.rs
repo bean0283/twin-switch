@@ -20,7 +20,7 @@ use wb_switch_core::modules::{
 };
 // 定时任务（`automations` 表）的跨账号同步与去重合并。
 use wb_switch_core::modules::workbuddy_automations;
-use wb_switch_core::modules::{cache_stats, workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
+use wb_switch_core::modules::{cache_stats, gateway_priority, workbuddy_growth, workbuddy_session_groups, gateway_keys, gateway_routing, gateway_models, gateway_pool, gateway_live, gateway_server, qoder_accounts, qoder_api, qoder_auth_dat, qoder_cleanup, qoder_login, qoder_machine, qoder_realm, qoder_sessions, qoder_session_pack, qoder_tools};
 
 // ---------------------------------------------------------------------------
 // 阻塞型命令的统一出口：**别把重活留在主线程上**
@@ -3236,6 +3236,38 @@ pub async fn gateway_status() -> Result<Value, String> {
 #[tauri::command]
 pub async fn gateway_pool() -> Result<Value, String> {
     Ok(json!(gateway_pool::snapshot()))
+}
+
+/// 账号优先级顺序（用户在账号池里拖出来的）。
+#[tauri::command]
+pub async fn gateway_priority_get() -> Value {
+    json!({ "order": gateway_priority::order() })
+}
+
+/// 保存优先级顺序。
+///
+/// ⚠️ 入参是**整份列表**（前端拖动后的结果），这里做两件事：
+/// ① 与当前池子对账，把已经不在池子里的 key 丢掉（账号被删了不该一直占着名次）；
+/// ② 去重 + 去空白。返回规范化后的顺序，前端据此重新渲染，避免本地状态与磁盘不一致。
+#[tauri::command]
+pub async fn gateway_priority_set(order: Vec<String>) -> Result<Value, String> {
+    let pool_keys: Vec<String> = gateway_pool::snapshot().into_iter().map(|e| e.key).collect();
+    let merged = gateway_priority::merge_with_pool(&pool_keys)
+        .into_iter()
+        // 前端传进来的新顺序优先：先按它排，池子里多出来的（新账号）接在后面。
+        .collect::<Vec<_>>();
+    let wanted: Vec<String> = order
+        .into_iter()
+        .filter(|k| pool_keys.contains(k))
+        .collect();
+    let mut final_order: Vec<String> = wanted.clone();
+    for k in merged {
+        if !final_order.contains(&k) {
+            final_order.push(k);
+        }
+    }
+    let saved = off_main(move || gateway_priority::save(final_order)).await??;
+    Ok(json!({ "ok": true, "order": saved }))
 }
 
 /// 积分共享的选号策略（严格按过期 / 会话粘住 / 只用指定账号）。

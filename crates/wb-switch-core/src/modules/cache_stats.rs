@@ -107,6 +107,23 @@ fn top_models(map: &HashMap<String, Bucket>, limit: usize) -> Value {
 
 // ---------------------------------------------------------------- 网关账本
 
+/// 命中数夹取：`cached` 不得超过 `input`。
+///
+/// 为什么需要：OpenAI 口径的 `input` **包含**缓存命中，所以 `cached ≤ input` 天然成立；
+/// 但 Anthropic 原生口径的 `input_tokens` **不含**缓存（命中的那部分单独放在
+/// `cache_read_input_tokens`）。两种形状混进来时，按 `cached / input` 会算出
+/// **137% 这种数**，而且不报错 —— 属于「看起来正常、实际错」的静默错。
+///
+/// 返回 `(夹取后的 cached, 是否发生过夹取)`：调用方要把发生次数告诉用户，
+/// 否则用户无从判断这个百分比是不是被削过。
+fn clamp_cached(cached: u64, input: u64) -> (u64, bool) {
+    if cached > input {
+        (input, true)
+    } else {
+        (cached, false)
+    }
+}
+
 /// 网关账本：读 `gateway-metrics.jsonl`（环形日志，超过 1 MB 只留尾部）。
 ///
 /// 只统计**拿到过用量**的行：失败请求的 `prompt_tokens` 是 `null`，把它们算进
@@ -126,6 +143,8 @@ pub fn gateway(days: i64) -> Value {
     let mut by_day: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut by_model: HashMap<String, Bucket> = HashMap::new();
     let mut skipped_failed = 0u64;
+    // 命中被夹取的条数（Anthropic 口径混进来的信号，见 `clamp_cached`）。
+    let mut clamped_rows = 0u64;
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -152,13 +171,20 @@ pub fn gateway(days: i64) -> Value {
             .unwrap_or(0)
             .max(0);
         // `cachedTokens` 缺键或 `null` ⇒ 没观测；**不许**当成 0。
+        let input_u = input as u64;
         let cached = v
             .get("cachedTokens")
             .and_then(Value::as_i64)
             .filter(|c| *c >= 0)
-            .map(|c| c as u64);
+            .map(|c| {
+                let (c, was_clamped) = clamp_cached(c as u64, input_u);
+                if was_clamped {
+                    clamped_rows += 1;
+                }
+                c
+            });
         let r = Reading {
-            input: input as u64,
+            input: input_u,
             output: output as u64,
             cached,
         };
@@ -178,9 +204,15 @@ pub fn gateway(days: i64) -> Value {
     out["byModel"] = top_models(&by_model, 8);
     // 「有行但都没用量」与「账本不存在」必须分开说：前者是网关在跑但上游没回用量。
     out["note"] = json!(format!(
-        "来自网关账本（{} 条无用量记录已跳过）",
-        skipped_failed
+        "来自网关账本（{} 条无用量记录已跳过{}）",
+        skipped_failed,
+        if clamped_rows > 0 {
+            format!("；{clamped_rows} 条命中数超过输入，已按输入夹取")
+        } else {
+            String::new()
+        }
     ));
+    out["clamped"] = json!(clamped_rows);
     out
 }
 
@@ -555,6 +587,16 @@ mod tests {
         let absent: Value =
             serde_json::from_str(r#"{"input_tokens":100,"output_tokens":5}"#).unwrap();
         assert_eq!(cached_field(absent.as_object().unwrap()), None, "没上报必须是 None");
+    }
+
+    #[test]
+    fn cached_never_exceeds_input() {
+        // OpenAI 口径：正常值不动。
+        assert_eq!(clamp_cached(60, 100), (60, false));
+        // Anthropic 口径混进来：命中比输入还大 ⇒ 夹到输入，并标记发生过。
+        assert_eq!(clamp_cached(137, 100), (100, true));
+        // 边界：相等不算夹取。
+        assert_eq!(clamp_cached(100, 100), (100, false));
     }
 
     #[test]

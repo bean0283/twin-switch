@@ -256,6 +256,8 @@ pub fn run() {
             commands::cache_hit_stats,
             commands::gateway_set_lan,
             commands::gateway_pool,
+            commands::gateway_priority_get,
+            commands::gateway_priority_set,
             commands::gateway_routing,
             commands::gateway_routing_set,
             commands::gateway_preview,
