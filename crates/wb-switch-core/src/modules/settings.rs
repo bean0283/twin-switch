@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::modules::config::store_dir;
 use crate::modules::workbuddy_automations::SyncMode;
+use crate::modules::workbuddy_source::CompareMode;
 
 /// 设置文件：`~/.twin-switch/settings.json`。
 pub fn settings_path() -> PathBuf {
@@ -289,6 +290,13 @@ pub struct Settings {
     /// 不认别名会让「明明选了覆盖、升级后又变回跳过」。
     #[serde(default, alias = "automationSyncMode")]
     pub workbuddy_automation_sync_mode: SyncMode,
+    /// **WorkBuddy 会话比对方式**（`full` 逐行全量 / `fast` 只比提问条数+提问内容）。
+    ///
+    /// 默认 [`CompareMode::Full`]（历史行为）：老用户的 `settings.json` 里没有这个键，
+    /// 反序列化后就是逐行全量，不发生行为突变。快速口径的权威性**低于**逐行，
+    /// 界面按 `compare_basis` 区分 —— 详见 [`crate::modules::workbuddy_source::CompareMode`]。
+    #[serde(default, alias = "compareMode")]
+    pub workbuddy_session_compare_mode: CompareMode,
     #[serde(default)]
     pub backup_retention: BackupRetention,
     /// **写库前的整库备份**开关（T66）。**默认关闭**。
@@ -410,6 +418,8 @@ impl Default for Settings {
             sync_workbuddy_automations: true,
             // `#[serde(default)]` ⇒ Skip（老行为，不突变）。
             workbuddy_automation_sync_mode: SyncMode::default(),
+            // `#[serde(default)]` ⇒ Full（历史行为，不突变）。
+            workbuddy_session_compare_mode: CompareMode::default(),
             backup_retention: BackupRetention::default(),
             // 这两个是**故意默认关**：写库 / 往别人账号写数据必须本人亲手打开。
             backup_before_write: false,
@@ -537,6 +547,13 @@ pub fn sync_workbuddy_automations() -> bool {
 /// 否则「设置里选了覆盖、切号时还在跳过」这种分叉迟早出现。
 pub fn workbuddy_automation_sync_mode() -> SyncMode {
     load().workbuddy_automation_sync_mode
+}
+
+/// WorkBuddy 会话比对方式 —— **唯一出口**。
+///
+/// 比对链路（自动比对 / 强制比对 / 列表注记）只问它，不许自己 `load()` 再读字段。
+pub fn workbuddy_session_compare_mode() -> CompareMode {
+    load().workbuddy_session_compare_mode
 }
 
 pub fn backup_before_write() -> bool {
@@ -906,6 +923,46 @@ mod tests {
             back["workbuddyAutomationSyncMode"],
             serde_json::json!("overwrite")
         );
+    }
+
+    /// 比对方式：缺键 = 逐行全量（历史行为），`fast` 才走快速口径。
+    ///
+    /// 与 `automation_sync_mode_defaults_to_skip` 同款升级安全断言：老用户
+    /// `settings.json` 里没有这个键，行为不能因「新增配置」而突变。
+    #[test]
+    fn session_compare_mode_defaults_to_full() {
+        assert_eq!(
+            Settings::default().workbuddy_session_compare_mode,
+            CompareMode::Full
+        );
+        let empty: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            empty.workbuddy_session_compare_mode,
+            CompareMode::Full,
+            "缺键必须等于历史行为（逐行全量）"
+        );
+        let fast: Settings =
+            serde_json::from_str(r#"{"workbuddySessionCompareMode":"fast"}"#).unwrap();
+        assert_eq!(fast.workbuddy_session_compare_mode, CompareMode::Fast);
+        // 写回去的键名与值：前端读的就是这一对，改了一侧就会"存了但没生效"
+        let back = serde_json::to_value(&fast).unwrap();
+        assert_eq!(
+            back["workbuddySessionCompareMode"],
+            serde_json::json!("fast")
+        );
+    }
+
+    /// 非法比对方式值必须被拒绝，不许静默退回默认值（用户明明选了 fast，
+    /// 静默变回 full 就是「存了但没生效」）。
+    #[test]
+    fn session_compare_mode_rejects_unknown_value() {
+        let bad: Result<Settings, _> =
+            serde_json::from_str(r#"{"workbuddySessionCompareMode":"nope"}"#);
+        assert!(bad.is_err(), "非法值必须报错而不是退回 Full");
+        // parse_loose 同口径：认不出返回 None
+        assert_eq!(CompareMode::parse_loose("FAST"), Some(CompareMode::Fast));
+        assert_eq!(CompareMode::parse_loose(" fast "), Some(CompareMode::Fast));
+        assert_eq!(CompareMode::parse_loose("wat"), None);
     }
 }
 

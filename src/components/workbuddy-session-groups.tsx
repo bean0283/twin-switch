@@ -103,6 +103,16 @@ const RELATION: Record<string, string> = {
   unknown: "未比对",
 };
 
+/** 关系徽标文案：快速口径（提问比对）的「相同/最新」必须点明口径，
+ * 否则「提问一致」会被读成「完整记录一致」。 */
+function relLabel(m: WbGroupMember): string {
+  if (m.compareBasis === "questions") {
+    if (m.relation === "equal") return "提问相同";
+    if (m.relation === "latest") return "提问最新";
+  }
+  return RELATION[m.relation] || "—";
+}
+
 function relTime(ms: number): string {
   if (!ms) return "—";
   const diff = Date.now() - ms;
@@ -188,6 +198,15 @@ export function WorkbuddySessionGroups() {
   const [unlinkSel, setUnlinkSel] = useState<Set<string>>(new Set());
   const [unlinkBusy, setUnlinkBusy] = useState(false);
 
+  /** 会话比对方式（设置里的选择；读失败按默认 full，后端才是权威）。 */
+  const [compareMode, setCompareMode] = useState<"full" | "fast">("full");
+  useEffect(() => {
+    void api
+      .settingsGet()
+      .then((s) => setCompareMode(s.workbuddySessionCompareMode ?? "full"))
+      .catch(() => {});
+  }, []);
+
   const load = useCallback(async (force = false) => {
     if (!force && CACHE && Date.now() - CACHE.at < CACHE_TTL) {
       setData(CACHE.data);
@@ -255,8 +274,11 @@ export function WorkbuddySessionGroups() {
    */
   const forceCompare = useCallback(async (key: string) => {
     const ok = window.confirm(
-      "强制比对会逐行读取完整正文（单份可达数百 MB），可能需要十几秒到一分钟。\n\n" +
-        "只有体积超限 / 成员过多时才会走到这里；默认是不比对的。\n\n继续吗？",
+      compareMode === "fast"
+        ? "强制比对将按「快速口径」只比提问条数和提问内容（设置里选了快速）。\n\n" +
+            "大库也能比，但提问一致不代表完整记录（回答/工具调用）一致。\n\n继续吗？"
+        : "强制比对会逐行读取完整正文（单份可达数百 MB），可能需要十几秒到一分钟。\n\n" +
+            "只有体积超限 / 成员过多时才会走到这里；默认是不比对的。\n\n继续吗？",
     );
     if (!ok) return;
     setForcing(true);
@@ -272,14 +294,16 @@ export function WorkbuddySessionGroups() {
         description:
           (r as unknown as GroupDetail).statusText
             ? `结论：${(r as unknown as GroupDetail).statusText}`
-            : "已逐行读完，状态见上方",
+            : compareMode === "fast"
+              ? "已按提问口径比完，状态见上方"
+              : "已逐行读完，状态见上方",
       });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
     } finally {
       setForcing(false);
     }
-  }, [load]);
+  }, [load, compareMode]);
 
   const items = useMemo(() => {
     const all = data?.items ?? [];
@@ -685,7 +709,9 @@ export function WorkbuddySessionGroups() {
                       <div className="mt-1 text-xs leading-relaxed text-destructive/80">
                         {detail.status === "diverged"
                           ? "选择要保留的一份；确认后会把它的内容统一到其它可验证的账号。"
-                          : "这些副本的标题被改过或体积超限，本工具没有做逐行比对 —— 不能当成一致。"}
+                          : compareMode === "fast"
+                            ? "这些副本的标题被改过或体积超限（3 GB），本工具没有做快速比对 —— 不能当成一致。"
+                            : "这些副本的标题被改过或体积超限，本工具没有做逐行比对 —— 不能当成一致。"}
                       </div>
                       {/* 只有「无法确认」才给这个入口：它慢，不该出现在别的状态里。 */}
                       {detail.status === "unknown" && (
@@ -702,7 +728,11 @@ export function WorkbuddySessionGroups() {
                             ) : (
                               <ScanSearch className="size-3.5" />
                             )}
-                            {forcing ? "正在逐行比对…" : "强制比对"}
+                            {forcing
+                              ? compareMode === "fast"
+                                ? "正在快速比对…"
+                                : "正在逐行比对…"
+                              : "强制比对"}
                           </Button>
                         </div>
                       )}
@@ -735,7 +765,10 @@ export function WorkbuddySessionGroups() {
                           </div>
                           <div className="mt-1 text-xs leading-relaxed text-amber-700/80 dark:text-amber-300/80">
                             其余副本的比对结论仍然有效，只有变动的那份需要重新确认。
-                            点「强制比对」重新判定（会重新读取全组副本，大文件要等一会儿）。
+                            点「强制比对」重新判定
+                            {compareMode === "fast"
+                              ? "（按提问口径快速比对）。"
+                              : "（会重新读取全组副本，大文件要等一会儿）。"}
                           </div>
                         </>
                       ) : (
@@ -974,7 +1007,7 @@ export function WorkbuddySessionGroups() {
                   />
                   <span className="min-w-0 flex-1 truncate">{m.accountName}</span>
                   <span className="shrink-0 text-[11px] text-muted-foreground">
-                    {RELATION[m.relation] || "—"}
+                    {relLabel(m)}
                   </span>
                 </label>
               );
@@ -1061,9 +1094,11 @@ export function WorkbuddySessionGroups() {
               {viewer?.member.accountName} 的副本
             </DialogTitle>
             <DialogDescription>
-              {viewer?.member.recordCount == null
-                ? "条数未知"
-                : `${viewer.member.recordCount} 条记录`}
+              {viewer?.member.compareBasis === "questions" && viewer.member.questionCount != null
+                ? `${viewer.member.questionCount} 条提问（提问口径）`
+                : viewer?.member.recordCount == null
+                  ? "条数未知"
+                  : `${viewer.member.recordCount} 条记录`}
               {" · "}
               只读预览
             </DialogDescription>
@@ -1252,11 +1287,15 @@ function MemberCard({
             relPill(m.relation),
           )}
         >
-          {RELATION[m.relation] || "—"}
+          {relLabel(m)}
         </span>
       </div>
       <div className="mt-1 text-[11px] text-muted-foreground">
-        {m.recordCount == null ? "条数未知" : `${m.recordCount} 条内容`}
+        {m.compareBasis === "questions" && m.questionCount != null
+          ? `${m.questionCount} 条提问（提问口径）`
+          : m.recordCount == null
+            ? "条数未知"
+            : `${m.recordCount} 条内容`}
       </div>
       <div className="text-[11px] text-muted-foreground/80">
         {relTime(m.updatedAt)}

@@ -144,6 +144,8 @@ pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
     let r = save_accounts_at(&accounts_file(), accounts);
     if r.is_ok() {
         crate::modules::workbuddy_credits::clear_cache();
+        // 账号名可能刚变过 ⇒ 账号解析缓存立刻作废（否则 TTL 窗口内界面还是旧名）。
+        crate::modules::workbuddy_accounts::clear_resolve_cache();
     }
     r
 }

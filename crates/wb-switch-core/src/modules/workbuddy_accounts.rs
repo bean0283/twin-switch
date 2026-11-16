@@ -463,7 +463,40 @@ fn merge_account(
 }
 
 /// 合并全部来源，返回本机已知的 WorkBuddy 账号（按 uid 升序）。
+/// 解析结果缓存（短 TTL）。
+///
+/// 为什么需要：`resolve()` 每次都要读客户端运行日志（main.log / AppStartup.log 可能
+/// 各好几 MB）+ 账号库 + 快照，单次几十到上百毫秒；而「关联会话」装配组时对
+/// **每个成员**都要 `label_for` 一次 —— 本机 182 组 × ~4 成员 ≈ 728 次全量重扫，
+/// 仅这一步就耗掉 40 秒（页面打开慢的主因之一）。账号名极少变，5 秒 TTL 足够新鲜。
+static RESOLVE_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, Vec<WbAccount>)>,
+> = std::sync::Mutex::new(None);
+const RESOLVE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 作废解析缓存（账号库写出口等「名字刚变过」的场景调用）。
+pub fn clear_resolve_cache() {
+    if let Ok(mut guard) = RESOLVE_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 pub fn resolve() -> Vec<WbAccount> {
+    if let Ok(guard) = RESOLVE_CACHE.lock() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if at.elapsed() < RESOLVE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+    let fresh = resolve_fresh();
+    if let Ok(mut guard) = RESOLVE_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn resolve_fresh() -> Vec<WbAccount> {
     let mut map: BTreeMap<String, WbAccount> = BTreeMap::new();
     let mut sources: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
 

@@ -90,6 +90,20 @@ impl Member {
             .map(|s| s.dup_relation.as_str())
             .unwrap_or("")
     }
+    /// 本次结论的比对口径（`full` / `questions` / 空 = 无结论）。
+    fn compare_basis(&self) -> &str {
+        self.session
+            .as_ref()
+            .map(|s| s.compare_basis.as_str())
+            .unwrap_or("")
+    }
+    /// 真实提问条数（快速口径算过才有；0 = 未算 / 不适用）。
+    fn question_count(&self) -> usize {
+        self.session
+            .as_ref()
+            .map(|s| s.question_count)
+            .unwrap_or(0)
+    }
     fn lines(&self) -> Option<usize> {
         let s = self.session.as_ref()?;
         // ⚠️ `stale` / `unknown` 的行数是**上次比对时**的数，文件后来又变过。
@@ -181,6 +195,20 @@ impl Group {
     }
 }
 
+/// 关联组是否需要按组补比对：任一**存在的**成员没有比对结论
+/// （`dup_relation` / `content_digest` 为空 = 同标题聚类没覆盖它）。
+///
+/// 「会话已不存在」的成员（`session = None`）不算 —— 那是「内容缺失」状态的事，
+/// 补比对也补不出来。全员都有结论时跳过，零额外开销（常见路径）。
+fn link_group_needs_annotate(members: &[Member]) -> bool {
+    members.iter().any(|m| {
+        m.session
+            .as_ref()
+            .map(|s| s.dup_relation.is_empty() || s.content_digest.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// 组内成员的标题簇 id（`dup_group`）完全一致时，把它当成备用 key。
 ///
 /// 只有**全部成员都算出了同一个 `dup_group`** 才给别名：标题被改过、成员缺失等
@@ -241,13 +269,29 @@ fn collect() -> Result<(Vec<Group>, Vec<(String, String)>), String> {
 /// `force = true` ⇒ 会话列表走 [`workbuddy_source::list_sessions_forced`]，
 /// **忽略体积/成员数上限真的逐行比对**（用户手动点了「强制比对」才走这条）。
 fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), String> {
+    let trace = std::env::var("WB_GROUPS_TRACE").as_deref() == Ok("1");
+    let t0 = std::time::Instant::now();
     let all = if force {
         workbuddy_source::list_sessions_forced()?
     } else {
         workbuddy_source::list_sessions()?
     };
+    if trace {
+        eprintln!(
+            "[wb-groups-trace] collect: list_sessions {:.2?} ({} 个会话)",
+            t0.elapsed(),
+            all.len()
+        );
+    }
+    let t1 = std::time::Instant::now();
     let accounts = usable_accounts();
     let store = workbuddy_sessions::load_links()?;
+    if trace {
+        eprintln!(
+            "[wb-groups-trace] collect: accounts+links {:.2?}",
+            t1.elapsed()
+        );
+    }
     // 用户明确「取消关联」拆开过的副本：不再参与同标题聚类。
     // 没有这一条，取消关联对「本来就没有正式记录」的组等于没做 —— 刷新又聚回来。
     let split: HashSet<(String, String)> = store
@@ -267,13 +311,14 @@ fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), Strin
 
     let mut groups: Vec<Group> = Vec::new();
     let mut used: HashSet<(String, String)> = HashSet::new();
+    let fast_mode = workbuddy_source::settings_compare_mode_is_fast();
 
     // 1) 正式关联组：这是权威关系，哪怕成员标题被改过也照认。
     for g in store.groups.iter() {
         if g.members.is_empty() {
             continue;
         }
-        let members: Vec<Member> = g
+        let mut members: Vec<Member> = g
             .members
             .iter()
             .map(|m| Member {
@@ -282,6 +327,28 @@ fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), Strin
                 session: index.get(&(m.uid.clone(), m.session_id.clone())).cloned(),
             })
             .collect();
+        // 关联组的「比对」历史上只发生在同标题聚类里：任一成员标题被改过，
+        // 它就不在任何同标题簇里、没被比对，整组只能「无法确认」（2026-11-16
+        // 用户截图：4 份副本 3 份相同、1 份「条数未知」，跟体积上限无关）。
+        // 这里对缺结论的组按组内成员直接补一次比对（跟随比对方式设置 / 强制标记）。
+        if link_group_needs_annotate(&members) {
+            let mut sessions: Vec<WbSession> = members
+                .iter()
+                .filter_map(|m| m.session.clone())
+                .collect();
+            workbuddy_source::annotate_sessions_group(&mut sessions, force, fast_mode);
+            let mut fresh: HashMap<(String, String), WbSession> = sessions
+                .into_iter()
+                .map(|s| ((s.user_id.clone(), s.id.clone()), s))
+                .collect();
+            for m in members.iter_mut() {
+                if let Some(s) = m.session.as_mut() {
+                    if let Some(ns) = fresh.remove(&(s.user_id.clone(), s.id.clone())) {
+                        *s = ns;
+                    }
+                }
+            }
+        }
         for m in g.members.iter() {
             used.insert((m.uid.clone(), m.session_id.clone()));
         }
@@ -347,6 +414,13 @@ fn collect_opt(force: bool) -> Result<(Vec<Group>, Vec<(String, String)>), Strin
 
     // 最近更新的排前面，与客户端列表观感一致。
     groups.sort_by(|a, b| b.updated_at().cmp(&a.updated_at()));
+    if trace {
+        eprintln!(
+            "[wb-groups-trace] collect: 组装配完成 {:.2?} ({} 组)",
+            t1.elapsed(),
+            groups.len()
+        );
+    }
     Ok((groups, accounts))
 }
 
@@ -401,6 +475,16 @@ fn member_payload(m: &Member) -> Value {
         "project": m.project(),
         "updatedAt": m.updated_at(),
         "recordCount": m.lines(),
+        "questionCount": if m.relation() == "stale" || m.relation() == "unknown" || m.compare_basis().is_empty() {
+            // 与 recordCount 同款纪律：过期/没算的数字不给，宁可 null。
+            None
+        } else if m.compare_basis() == "questions" && m.question_count() > 0 {
+            Some(m.question_count())
+        } else {
+            None
+        },
+        // 本次结论的比对口径：`full` 逐行（权威）/ `questions` 提问（快速）/ 空 = 无结论。
+        "compareBasis": m.compare_basis(),
         "contentState": if m.cid().is_empty() { "gone" } else if m.has_body() { "ready" } else { "missing" },
         "relation": m.relation(),
         "isNewest": m.relation() == "latest",
@@ -408,6 +492,19 @@ fn member_payload(m: &Member) -> Value {
         "reason": if m.relation() == "unknown" && !m.notes().is_empty() {
             // 「为什么没比对」由来源模块写清楚（体积超限 / 成员过多 / 缺正文）。
             m.notes()
+        } else if m.compare_basis() == "questions" {
+            // 快速口径：文案必须点明「这是提问层面的结论」，不能冒充逐行权威。
+            match m.relation() {
+                "latest" => "提问内容最新（快速比对口径）".to_string(),
+                "equal" => "与最新副本提问内容一致（完整记录可能有差异）".to_string(),
+                "behind" => "提问少于最新副本，可安全同步".to_string(),
+                "ahead" => "提问比其它副本多（未包含关系）".to_string(),
+                "diverged" => "提问内容分叉，需要人工选择来源".to_string(),
+                "stale" => "上次比对之后这份有新内容，未重新比对".to_string(),
+                "no-body" => "正文文件不存在".to_string(),
+                "unknown" => "未做比对".to_string(),
+                _ => String::new(),
+            }
         } else {
             match m.relation() {
                 "latest" => "内容最新".to_string(),
@@ -468,6 +565,30 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
     // 这时按修改时间判，比抱着旧结论不放要诚实（2026-11-02 用户实测）。
     let has_stale = g.members.iter().any(|m| m.relation() == "stale");
     let has_content_verdict = !has_stale && g.members.iter().any(|m| m.relation() == "latest");
+    // 组级比对口径：有结论的成员**全部**是提问口径才标 `questions`（宁低勿高——
+    // 混着逐行结论时按 full 报，界面才不会把权威性说高了）。
+    let verdict_members = g
+        .members
+        .iter()
+        .filter(|m| matches!(m.relation(), "latest" | "equal" | "behind" | "ahead" | "diverged"));
+    let group_basis = {
+        let mut saw_q = false;
+        let mut saw_full = false;
+        for m in verdict_members {
+            match m.compare_basis() {
+                "questions" => saw_q = true,
+                "full" => saw_full = true,
+                _ => {}
+            }
+        }
+        if saw_full || (saw_q && saw_full) {
+            "full"
+        } else if saw_q {
+            "questions"
+        } else {
+            ""
+        }
+    };
     json!({
         "key": g.key,
         "groupId": g.group_id,
@@ -492,6 +613,8 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
         "newestByTimeSessionId": newest_by_mtime,
         // `content` = 有比对结论；`mtime` = 只能按时间判
         "newestBasis": if has_content_verdict { "content" } else { "mtime" },
+        // 组级比对口径：`full` 逐行（权威）/ `questions` 提问（快速）/ 空 = 无结论。
+        "compareBasis": group_basis,
         "canUnify": g.members.len() >= 2 && g.members.iter().filter(|m| m.has_body()).count() >= 1,
         "missingAccounts": missing_accounts,
         "missingCount": missing_count,
@@ -506,8 +629,21 @@ fn group_payload(g: &Group, accounts: &[(String, String)]) -> Value {
 /// 关联会话列表。`clientRunning` 一并下发：界面据此决定「同步」按钮能不能点，
 /// 而不是让人点完再看到失败。
 pub fn list() -> Result<Value, String> {
+    let trace = std::env::var("WB_GROUPS_TRACE").as_deref() == Ok("1");
+    let t0 = std::time::Instant::now();
     let (groups, accounts) = collect()?;
+    if trace {
+        eprintln!("[wb-groups-trace] list: collect {:.2?}", t0.elapsed());
+    }
+    let t1 = std::time::Instant::now();
     let items: Vec<Value> = groups.iter().map(|g| group_payload(g, &accounts)).collect();
+    if trace {
+        eprintln!(
+            "[wb-groups-trace] list: payload {:.2?} ({} 组)",
+            t1.elapsed(),
+            items.len()
+        );
+    }
     let count = |s: &str| {
         items
             .iter()
@@ -552,10 +688,12 @@ pub fn force_compare(keys: &[String]) -> (usize, u64) {
     const MAX_BYTES: u64 = 3_000_000_000;
 
     let want: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    // 强制比对的口径跟随设置（用户已确认：设置选快速，强制比对也走快速）。
+    let fast = workbuddy_source::settings_compare_mode_is_fast();
     let Ok((groups, _)) = collect() else {
         return (0, 0);
     };
-    let mut values: Vec<(String, std::path::PathBuf, usize, String)> = Vec::new();
+    let mut values: Vec<workbuddy_source::StampRecord> = Vec::new();
     let mut used: u64 = 0;
     let mut skipped_bytes: u64 = 0;
 
@@ -575,8 +713,29 @@ pub fn force_compare(keys: &[String]) -> (usize, u64) {
             }
             used += size;
             let ids = [cid.to_string()];
-            if let Some((lines, digest)) = workbuddy_source::content_stamp(&path, &ids) {
-                values.push((cid.to_string(), path, lines, digest));
+            if fast {
+                // 快速口径：一次读盘算全行+提问两种口径（落盘后复用路径都能命中）。
+                if let Some((lines, digest, q_lines, q_digest)) =
+                    workbuddy_source::stamp_both(&path, &ids)
+                {
+                    values.push(workbuddy_source::StampRecord {
+                        id: cid.to_string(),
+                        path,
+                        lines,
+                        digest,
+                        q_lines: Some(q_lines),
+                        q_digest: Some(q_digest),
+                    });
+                }
+            } else if let Some((lines, digest)) = workbuddy_source::content_stamp(&path, &ids) {
+                values.push(workbuddy_source::StampRecord {
+                    id: cid.to_string(),
+                    path,
+                    lines,
+                    digest,
+                    q_lines: None,
+                    q_digest: None,
+                });
             }
         }
     }
@@ -634,9 +793,16 @@ pub fn detail_forced(group_key: &str) -> Result<Value, String> {
         .and_then(|m| m.as_array())
         .cloned()
         .unwrap_or_default();
-    let values: Vec<(String, std::path::PathBuf, usize, String)> = members
+    let values: Vec<workbuddy_source::StampRecord> = members
         .iter()
         .filter_map(|m| {
+            // 快速口径（questions）的结论在 `annotate_duplicates_opt` 快速分支里
+            // 已经带着**完整**的 q_digest 落盘过 —— 这里 payload 里没有
+            // `questionDigest` 字段，若再落盘会拿 `q_digest: None` 把好记录
+            // 覆盖成半截，所以跳过。
+            if m.get("compareBasis").and_then(|v| v.as_str()) == Some("questions") {
+                return None;
+            }
             let sid = m.get("sessionId")?.as_str()?.to_string();
             if sid.is_empty() {
                 return None;
@@ -647,7 +813,20 @@ pub fn detail_forced(group_key: &str) -> Result<Value, String> {
             }
             let lines = m.get("recordCount")?.as_u64()? as usize;
             let path = workbuddy_source::find_jsonl(&sid)?;
-            Some((sid, path, lines, digest))
+            // 提问口径字段（payload 里有就带上）：快速比对的结论也能落盘复用
+            let q_lines = m.get("questionCount").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let q_digest = m
+                .get("questionDigest")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(workbuddy_source::StampRecord {
+                id: sid,
+                path,
+                lines,
+                digest,
+                q_lines,
+                q_digest,
+            })
         })
         .collect();
     if values.len() >= 2 {
@@ -1477,10 +1656,14 @@ mod tests {
             body_bytes: 100,
             body_lines: 5,
             content_digest: digest.to_string(),
+            question_count: 0,
+            compare_basis: String::new(),
             dup_group: "同一段对话".to_string(),
             is_newest: relation == "latest",
             dup_note: String::new(),
             dup_relation: relation.to_string(),
+            space_id: String::new(),
+            space_dangling: false,
         };
         Member {
             uid: uid.to_string(),
@@ -1496,6 +1679,78 @@ mod tests {
             alias: None,
             members,
         }
+    }
+
+    /// 补比对的触发条件：只有「同标题聚类没覆盖到的成员」才触发，
+    /// 全员有结论时不做任何事（常见路径零开销）。
+    #[test]
+    fn link_group_needs_annotate_detects_uncovered_members() {
+        // 全员有结论（同标题聚类已覆盖）⇒ 不需要补
+        let covered = vec![
+            member("u1", "aaaaaaaaaaaaaaaa", "latest", true),
+            member("u2", "aaaaaaaaaaaaaaaa", "equal", true),
+        ];
+        assert!(!link_group_needs_annotate(&covered));
+
+        // 标题被改过的成员：relation/digest 全空 ⇒ 需要按组补比对
+        let mixed = vec![
+            member("u1", "aaaaaaaaaaaaaaaa", "latest", true),
+            member("u2", "", "", true),
+        ];
+        assert!(link_group_needs_annotate(&mixed));
+
+        // 会话已不存在（session=None）不算 —— 那是「内容缺失」的事
+        let with_gone = vec![
+            member("u1", "aaaaaaaaaaaaaaaa", "latest", true),
+            Member {
+                uid: "u3".to_string(),
+                label: "u3".to_string(),
+                session: None,
+            },
+        ];
+        assert!(!link_group_needs_annotate(&with_gone));
+    }
+
+    /// 快速口径必须能从 payload 里看出来（`compareBasis` / `questionCount` /
+    /// reason 文案），组级口径「宁低勿高」：混着 full 结论时按 full 报。
+    #[test]
+    fn payload_exposes_compare_basis_and_fast_reasons() {
+        let mk_fast = |uid: &str, relation: &str| {
+            let mut m = member(uid, "aaaaaaaaaaaaaaaa", relation, true);
+            if let Some(s) = m.session.as_mut() {
+                s.compare_basis = "questions".to_string();
+                s.question_count = 12;
+            }
+            m
+        };
+        let fast = mk_fast("u1", "latest");
+        let p = member_payload(&fast);
+        assert_eq!(p["compareBasis"], "questions");
+        assert_eq!(p["questionCount"], 12);
+        assert!(
+            p["reason"].as_str().unwrap().contains("快速比对口径"),
+            "{}",
+            p["reason"]
+        );
+
+        let mut full = member("u2", "aaaaaaaaaaaaaaaa", "equal", true);
+        if let Some(s) = full.session.as_mut() {
+            s.compare_basis = "full".to_string();
+        }
+        let p = member_payload(&full);
+        assert_eq!(p["compareBasis"], "full");
+        assert_eq!(
+            p["questionCount"],
+            serde_json::Value::Null,
+            "full 口径不报提问条数（没算过就不给数字）"
+        );
+
+        // 混合口径 ⇒ 组级按 full 报（宁低勿高）
+        let gp = group_payload(&group(vec![mk_fast("u1", "latest"), full]), &[]);
+        assert_eq!(gp["compareBasis"], "full");
+        // 全是快速口径 ⇒ 组级 questions
+        let gp = group_payload(&group(vec![mk_fast("u1", "latest")]), &[]);
+        assert_eq!(gp["compareBasis"], "questions");
     }
 
     #[test]

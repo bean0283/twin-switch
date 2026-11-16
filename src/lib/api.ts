@@ -93,6 +93,7 @@ import type {
   WbEditReport,
   WbEditSaveResult,
   WbEditTargets,
+  WbCompareMode,
   Overview,
   OverviewCache,
   OverviewReclaimCache,
@@ -1262,6 +1263,11 @@ export function settingsSet(patch: {
    * 判定"同一个任务"两种模式一致：`name` + 等价 rrule（不比 prompt）。
    */
   workbuddyAutomationSyncMode?: AutomationSyncMode;
+  /**
+   * WorkBuddy 会话比对方式：`full` 逐行全量（默认，权威）/ `fast` 快速
+   * （只比提问条数+提问内容，大库也能自动比对）。
+   */
+  workbuddySessionCompareMode?: WbCompareMode;
   /** 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库）。 */
   autoLinkWorkbuddySessions?: boolean;
   /** 诊断日志设置（**整块覆盖**：给全量，不是增量）。 */

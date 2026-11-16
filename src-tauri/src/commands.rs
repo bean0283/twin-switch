@@ -1340,6 +1340,11 @@ pub struct SettingsPatch {
     /// 判定"同一个任务"的口径两种模式一致：`name + rrule + prompt` 全等。
     pub workbuddy_automation_sync_mode:
         Option<wb_switch_core::modules::workbuddy_automations::SyncMode>,
+    /// WorkBuddy 会话比对方式（`None` = 不改）。
+    ///
+    /// 取值 `full`（逐行全量，默认）/ `fast`（只比提问条数+提问内容）。
+    pub workbuddy_session_compare_mode:
+        Option<wb_switch_core::modules::workbuddy_source::CompareMode>,
     /// 切号时是否把 WorkBuddy 的会话自动同步给所有账号（`None` = 不改）。
     pub auto_link_workbuddy_sessions: Option<bool>,
     /// **诊断日志**设置（`None` = 不改）。整块覆盖：开关 / 级别 / 保留天数 / 份数 / 单文件上限。
@@ -1366,6 +1371,9 @@ fn settings_snapshot(s: &settings::Settings, path: &std::path::Path) -> Value {
         // 已有同款时怎么处理：`"skip"` / `"overwrite"`（外加一句同源的中文文案）。
         "workbuddyAutomationSyncMode": s.workbuddy_automation_sync_mode.as_str(),
         "workbuddyAutomationSyncModeLabel": s.workbuddy_automation_sync_mode.label(),
+        // 会话比对方式：`"full"` / `"fast"`（外加一句同源的中文文案）。
+        "workbuddySessionCompareMode": s.workbuddy_session_compare_mode.as_str(),
+        "workbuddySessionCompareModeLabel": s.workbuddy_session_compare_mode.label(),
         // 切号是否把会话自动同步给所有账号（写会话库，默认关）。
         "autoLinkWorkbuddySessions": s.auto_link_workbuddy_sessions,
         "beforeWriteSummary": if s.backup_before_write {
@@ -1444,6 +1452,10 @@ pub async fn settings_set(patch: SettingsPatch) -> Result<Value, String> {
             // 值本身是强类型枚举（serde 只认 `skip` / `overwrite`），非法值在
             // 反序列化那一步就会被拒 —— 不会出现"存了个看不懂的字符串，切号时不生效"。
             next.workbuddy_automation_sync_mode = m;
+        }
+        if let Some(m) = patch.workbuddy_session_compare_mode {
+            // 同上：强类型枚举，非法值在反序列化那步就被拒。
+            next.workbuddy_session_compare_mode = m;
         }
         if let Some(v) = patch.auto_link_workbuddy_sessions {
             next.auto_link_workbuddy_sessions = v;

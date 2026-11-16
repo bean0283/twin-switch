@@ -2075,6 +2075,16 @@ export interface WbGroupMember {
   project: string;
   updatedAt: number;
   recordCount: number | null;
+  /**
+   * 真实提问条数（快速比对口径）。`null` = 没算过 / 不适用（逐行口径、过期结论），
+   * 不是 0 条 —— 与 `recordCount` 同款纪律。
+   */
+  questionCount: number | null;
+  /**
+   * 本次结论的比对口径：`full` 逐行（权威）/ `questions` 提问（快速，权威性低一档）
+   * / 空 = 无结论。界面据此区分「完全一致」与「提问一致」。
+   */
+  compareBasis: "full" | "questions" | "" | string;
   /** `ready` 有正文；`missing` 库里有行、正文文件没了；`gone` 会话本身已不存在。 */
   contentState: "ready" | "missing" | "gone" | string;
   /** `latest` / `equal` / `behind` / `ahead` / `diverged` / `no-body` / `unknown`。 */
@@ -2119,6 +2129,11 @@ export interface WbSessionGroup {
   newestByTimeSessionId?: string;
   /** `content` = 有逐行比对结论；`mtime` = 只能按修改时间判。 */
   newestBasis?: "content" | "mtime";
+  /**
+   * 组级比对口径：`full` 逐行（权威）/ `questions` 提问（快速）/ 空 = 无结论。
+   * 混合口径时后端按 `full` 报（宁低勿高），界面据此调整「一致」类文案。
+   */
+  compareBasis?: "full" | "questions" | "" | string;
   canUnify: boolean;
   missingAccounts: Array<{ uid: string; label: string }>;
   /** 还没有这份会话的账号数（仅用于「关联新账号」，不影响状态）。 */
@@ -2718,6 +2733,15 @@ export interface DiagLogStatus {
 export type AutomationSyncMode = "skip" | "overwrite";
 
 /**
+ * WorkBuddy 会话比对方式（`settings.json` 的 `workbuddySessionCompareMode`）。
+ *
+ * - `full`（默认）：逐行全量比对 —— 权威结论；单文件 32 MB 以上自动比对会退化为「未比对」；
+ * - `fast`：快速比对 —— 只比「用户提问条数 + 提问内容」，单文件上限放宽到 3 GB，
+ *   大库自动比对不再退化；权威性低于逐行，界面按 `compareBasis` 区分。
+ */
+export type WbCompareMode = "full" | "fast";
+
+/**
  * `workbuddy_automations_merge_duplicates` 的返回。
  *
  * 把**同一个账号**下同名同周期的重复任务合并成一条：保留创建最早那条的身份与
@@ -2768,6 +2792,10 @@ export interface SettingsSnapshot {
   workbuddyAutomationSyncMode: AutomationSyncMode;
   /** 与 `workbuddyAutomationSyncMode` 同源的中文文案（后端给，界面别自己拼）。 */
   workbuddyAutomationSyncModeLabel: string;
+  /** WorkBuddy 会话比对方式（`full` 逐行全量 / `fast` 快速，默认 `full`）。 */
+  workbuddySessionCompareMode: WbCompareMode;
+  /** 与 `workbuddySessionCompareMode` 同源的中文文案（后端给，界面别自己拼）。 */
+  workbuddySessionCompareModeLabel: string;
   /**
    * 切号时是否把 WorkBuddy 会话自动同步给所有账号（写会话库，默认关）。
    *

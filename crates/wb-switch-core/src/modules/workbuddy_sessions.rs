@@ -161,6 +161,12 @@ pub(crate) fn target_columns(conn: &Connection) -> Result<Vec<String>, String> {
 /// `group_id` / `group_title` 置空是**推断**：客户端用这两列做会话分组展示，
 /// 副本是独立会话，沿用源值会让客户端把副本与源混进同一组（本机 `sessions` 表实测
 /// 确实有这两列）。置空不影响会话本身，只影响分组归属。
+///
+/// `space_id` 置空是**修复**（2026-11-15）：`spaces` 表按 `user_id` 归属，同一工作区
+/// 在每个账号下是不同的 space id。把源账号的 `space_id` 原样抄进副本，副本会挂在
+/// 别人账号的空间上——客户端空间视图按「本账号 spaces 表」过滤，这些行全部隐身
+/// （实测：寰宇 6 个 twin-switch 会话同步过去只显示 1 个，其余 5 个全部消失）。
+/// 置空后客户端启动 seed 时会按 `cwd` 自动补挂**本账号**的空间（已实测验证）。
 fn override_value(
     col: &str,
     value: &SqlValue,
@@ -173,7 +179,7 @@ fn override_value(
         "user_id" => SqlValue::Text(target_uid.to_string()),
         "created_at" | "updated_at" | "last_activity_at" => SqlValue::Integer(now),
         "deleted_at" => SqlValue::Null,
-        "group_id" | "group_title" => SqlValue::Null,
+        "group_id" | "group_title" | "space_id" => SqlValue::Null,
         _ => value.clone(),
     }
 }
@@ -2752,13 +2758,14 @@ mod tests {
                 deleted_at INTEGER,
                 group_id TEXT,
                 group_title TEXT,
+                space_id TEXT,
                 model TEXT
             );",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, cwd, user_id, title, custom_title, created_at, updated_at, deleted_at, group_id, group_title, model)
-             VALUES ('aaa', 'D:/p', 'u1', '标题A', NULL, 100, 200, NULL, 'g1', '组1', 'm')",
+            "INSERT INTO sessions (id, cwd, user_id, title, custom_title, created_at, updated_at, deleted_at, group_id, group_title, space_id, model)
+             VALUES ('aaa', 'D:/p', 'u1', '标题A', NULL, 100, 200, NULL, 'g1', '组1', 'space-of-u1', 'm')",
             [],
         )
         .unwrap();
@@ -2788,16 +2795,20 @@ mod tests {
 
         let owner = row_owner(&conn, "new-id").expect("副本应存在且未删除");
         assert_eq!(owner, "u2");
-        let (title, updated, group): (String, i64, Option<String>) = conn
+        let (title, updated, group, space): (String, i64, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT title, updated_at, group_id FROM sessions WHERE id='new-id'",
+                "SELECT title, updated_at, group_id, space_id FROM sessions WHERE id='new-id'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(title, "标题A", "正文内容列必须原样保留");
         assert_eq!(updated, 12345, "时间戳必须刷新为写入时刻");
         assert_eq!(group, None, "副本的分组必须置空，避免与源会话混组");
+        assert_eq!(
+            space, None,
+            "副本的 space_id 必须置空：spaces 按 user_id 归属，跨账号照抄会让副本在客户端空间视图隐身"
+        );
 
         // 源行必须一字未改。
         let src_owner = row_owner(&conn, "aaa").unwrap();
@@ -2932,10 +2943,14 @@ mod tests {
             body_bytes: 10,
             body_lines: 1,
             content_digest: digest.to_string(),
+            question_count: 0,
+            compare_basis: String::new(),
             dup_group: String::new(),
             is_newest: true,
             dup_note: String::new(),
             dup_relation: String::new(),
+            space_id: String::new(),
+            space_dangling: false,
         }
     }
 

@@ -44,6 +44,7 @@ import {
 import { selectableClients } from "@/lib/trae-client-list";
 import type {
   AutomationSyncMode,
+  WbCompareMode,
   BackupRetention,
   DiagLogSettings,
   DiagLogStatus,
@@ -117,6 +118,8 @@ export default function SettingsPage() {
   const [syncAuto, setSyncAuto] = useState<boolean | null>(null);
   /** 目标账号已有同名同周期任务时怎么办（null = 还没读到设置）。 */
   const [syncMode, setSyncMode] = useState<AutomationSyncMode | null>(null);
+  /** WorkBuddy 会话比对方式（null = 还没读到设置）。 */
+  const [compareMode, setCompareMode] = useState<WbCompareMode | null>(null);
   /** 正在"就地合并"当前账号的重复定时任务。 */
   const [mergingAuto, setMergingAuto] = useState(false);
   /** 切号是否自动把会话同步给所有账号（null = 还没读到设置）。 */
@@ -165,6 +168,7 @@ export default function SettingsPage() {
       setQoderDraft({ ...(s.qoderExe ?? {}) });
       setSyncAuto(s.syncWorkbuddyAutomations ?? true);
       setSyncMode(s.workbuddyAutomationSyncMode ?? "skip");
+      setCompareMode(s.workbuddySessionCompareMode ?? "full");
       setAutoLinkSessions(s.autoLinkWorkbuddySessions ?? false);
       setLogDraft(s.log ?? null);
       void loadClients(false);
@@ -179,6 +183,7 @@ export default function SettingsPage() {
       setQoderDraft({});
       setSyncAuto(null);
       setSyncMode(null);
+      setCompareMode(null);
       setAutoLinkSessions(null);
       setLogDraft(null);
       setLogStatus(null);
@@ -207,6 +212,7 @@ export default function SettingsPage() {
         qoderExe: qoderDraft,
         syncWorkbuddyAutomations: syncAuto ?? true,
         workbuddyAutomationSyncMode: syncMode ?? "skip",
+        workbuddySessionCompareMode: compareMode ?? "full",
         autoLinkWorkbuddySessions: autoLinkSessions ?? false,
         // 日志整块覆盖（后端会 sanitized 夹区间，回读值再刷表单）。
         ...(logDraft ? { log: logDraft } : {}),
@@ -221,6 +227,7 @@ export default function SettingsPage() {
       setQoderDraft({ ...(next.qoderExe ?? {}) });
       setSyncAuto(next.syncWorkbuddyAutomations ?? true);
       setSyncMode(next.workbuddyAutomationSyncMode ?? "skip");
+      setCompareMode(next.workbuddySessionCompareMode ?? "full");
       setAutoLinkSessions(next.autoLinkWorkbuddySessions ?? false);
       setLogDraft(next.log ?? null);
       void refreshLogStatus();
@@ -243,6 +250,11 @@ export default function SettingsPage() {
           if ((snap.workbuddyAutomationSyncMode ?? "skip") !== next.workbuddyAutomationSyncMode) {
             changed.push(
               `同款任务处理：${next.workbuddyAutomationSyncMode === "overwrite" ? "覆盖" : "跳过"}`,
+            );
+          }
+          if ((snap.workbuddySessionCompareMode ?? "full") !== next.workbuddySessionCompareMode) {
+            changed.push(
+              `会话比对方式：${next.workbuddySessionCompareMode === "fast" ? "快速" : "逐行全量"}`,
             );
           }
           if ((snap.autoLinkWorkbuddySessions ?? false) !== next.autoLinkWorkbuddySessions) {
@@ -281,6 +293,7 @@ export default function SettingsPage() {
       beforeWrite !== snap.backupBeforeWrite ||
       (syncAuto ?? true) !== (snap.syncWorkbuddyAutomations ?? true) ||
       (syncMode ?? "skip") !== (snap.workbuddyAutomationSyncMode ?? "skip") ||
+      (compareMode ?? "full") !== (snap.workbuddySessionCompareMode ?? "full") ||
       (autoLinkSessions ?? false) !== (snap.autoLinkWorkbuddySessions ?? false) ||
       (!!logDraft && JSON.stringify(logDraft) !== JSON.stringify(snap.log)));
 
@@ -297,6 +310,7 @@ export default function SettingsPage() {
     setQoderDraft({ ...(snap.qoderExe ?? {}) });
     setSyncAuto(snap.syncWorkbuddyAutomations ?? true);
     setSyncMode(snap.workbuddyAutomationSyncMode ?? "skip");
+    setCompareMode(snap.workbuddySessionCompareMode ?? "full");
     setAutoLinkSessions(snap.autoLinkWorkbuddySessions ?? false);
     setLogDraft(snap.log ?? null);
   }
@@ -715,6 +729,64 @@ export default function SettingsPage() {
                   </span>
                 </span>
               </label>
+
+              {/* ── 会话比对方式 ─────────────────────────────────────────
+                  关联会话/重复标题的比对口径。逐行全量是历史行为（权威结论），
+                  快速只比「用户提问条数 + 提问内容」—— 32 MB 以上的大库自动
+                  比对不再退化成「未比对」，但权威性低一档，界面会标明口径。
+                  「强制比对」按钮也跟随这个口径。 */}
+              <div
+                className="ml-0 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/30 px-3 py-3"
+                data-compare-mode
+              >
+                <span className="text-sm font-medium">会话比对方式：</span>
+                {(
+                  [
+                    {
+                      v: "full",
+                      label: "逐行全量",
+                      hint: "对全部记录逐行比对（默认，权威结论；大库可能显示「未比对」）",
+                    },
+                    {
+                      v: "fast",
+                      label: "快速",
+                      hint: "只比提问条数+提问内容（大库也能自动比对；权威性低于逐行）",
+                    },
+                  ] as const
+                ).map((o) => (
+                  <Button
+                    key={o.v}
+                    type="button"
+                    size="sm"
+                    variant={(compareMode ?? "full") === o.v ? "default" : "outline"}
+                    className="h-7 px-2.5 text-xs"
+                    disabled={compareMode === null}
+                    onClick={() => setCompareMode(o.v)}
+                    title={o.hint}
+                    data-compare-mode-option={o.v}
+                    aria-pressed={(compareMode ?? "full") === o.v}
+                  >
+                    {o.label}
+                  </Button>
+                ))}
+                <span className="text-xs text-muted-foreground" data-saved-compare-mode>
+                  已保存：
+                  <strong className="text-foreground">
+                    {(snap.workbuddySessionCompareMode ?? "full") === "fast" ? "快速" : "逐行全量"}
+                  </strong>
+                  {(compareMode ?? "full") !== (snap.workbuddySessionCompareMode ?? "full") ? (
+                    <strong className="text-amber-700 dark:text-amber-400">
+                      {" "}
+                      —— 尚未保存，点「保存」后才生效
+                    </strong>
+                  ) : null}
+                </span>
+                <span className="block w-full text-xs text-muted-foreground">
+                  快速模式：自动比对与「强制比对」都只比提问条数和提问内容，
+                  单文件上限放宽到 3 GB（逐行全量是 32 MB）；结论会标注「提问口径」，
+                  提问一致不代表完整记录一致。
+                </span>
+              </div>
 
               {/* ── WorkBuddy ─────────────────────────────────────────────
                   与上面几行同一套交互：手动指定 → 运行中进程 → 自动探测。
