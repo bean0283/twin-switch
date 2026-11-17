@@ -2566,6 +2566,8 @@ export function qoderCreditHistory(
   totalNet: number;
   resetEvents: number;
   points: number;
+  /** 各平台在窗口内的原始采样点数（不是差额条数）。用来区分「没采到」和「点不够」。 */
+  pointsByPlatform?: Record<string, number>;
   sampledAt: number;
   enoughData: boolean;
   file: string;

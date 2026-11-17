@@ -199,13 +199,31 @@ export function CreditTrendCard() {
     [data],
   );
 
-  /** 空态归类：样本不足 / 范围内无记录 / 完全没有快照。 */
+  /**
+   * 空态归类：完全没有快照 / 有点但不够算差 / 范围内无变动。
+   *
+   * ⚠️ 原来只判断 `enoughData`（= 差额条数 > 0），于是「采到一个点」也会显示
+   * 「暂无足够的快照数据」，而「一个点都没有」和「差一个点」用户要做的事完全不同：
+   * 前者要先去刷新积分，后者只要再等一次定时采样。这里用原始点数把两者分开。
+   */
+  const pointCounts = data?.pointsByPlatform ?? {};
+  const totalPoints = Object.values(pointCounts).reduce((n, v) => n + v, 0);
   const emptyKind: "no-snapshot" | "not-enough" | "range-empty" | null = useMemo(() => {
     if (!data) return null;
-    if (!data.enoughData) return "no-snapshot";
+    if (totalPoints === 0) return "no-snapshot";
+    if (!data.enoughData) return "not-enough";
     if (chartData.length === 0) return "range-empty";
     return null;
-  }, [data, chartData]);
+  }, [data, chartData, totalPoints]);
+
+  /** 各平台点数的一句话说明，例如「Trae 1 · WorkBuddy 2 · Qoder 3」。 */
+  const pointsHint = useMemo(() => {
+    const name: Record<string, string> = { trae: "Trae", workbuddy: "WorkBuddy", qoder: "Qoder" };
+    return Object.entries(pointCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${name[k] ?? k} ${v}`)
+      .join(" · ");
+  }, [pointCounts]);
 
   const totals = data
     ? { income: data.totalIncome, expense: data.totalUsed, net: data.totalNet }
@@ -363,15 +381,19 @@ export function CreditTrendCard() {
             <PackageOpen className="size-6 text-muted-foreground/60" />
             <p className="text-sm font-medium text-muted-foreground">
               {emptyKind === "no-snapshot"
-                ? "暂无足够的快照数据"
-                : emptyKind === "range-empty"
-                  ? "所选日期范围内无收支记录"
-                  : "暂无收支记录"}
+                ? "还没有任何积分快照"
+                : emptyKind === "not-enough"
+                  ? "快照点还不够算出差额"
+                  : emptyKind === "range-empty"
+                    ? "所选日期范围内收支没有变化"
+                    : "暂无收支记录"}
             </p>
             <p className="max-w-md text-xs text-muted-foreground/80">
               {emptyKind === "no-snapshot"
-                ? "趋势来自相邻两次积分查询的差值：同一账号至少查询过两次才能画出曲线。在 Trae / WorkBuddy / Qoder 账号页点「刷新积分」积累快照后再来看。"
-                : "这个范围里没有积分变动。试着放宽日期范围或切换平台，或先去各账号页刷新积分积累快照。"}
+                ? "趋势来自相邻两次积分查询的差值。去账号页点一次「刷新积分」就会落下第一个点；之后每小时自动采一次，攒到第二个点就能画出曲线。"
+                : emptyKind === "not-enough"
+                  ? `每个账号至少要 2 个点才有一笔差。当前点数：${pointsHint || "—"}。后台每小时自动采一次，等下一轮即可；也可以在账号页手动刷新积分立刻补一个点。`
+                  : "这个范围里积分没有变动。试着放宽日期范围或切换平台。"}
             </p>
           </div>
         ) : (

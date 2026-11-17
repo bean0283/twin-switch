@@ -222,6 +222,49 @@ pub fn run() {
                     }
                 }
             });
+            // ⭐ 积分快照定时采样：趋势图（收支/消耗）的**唯一稳定数据源**。
+            //
+            // 为什么必须有：Trae / WorkBuddy 都没有官方用量端点，只能靠「隔一段时间记
+            // 一笔剩余额度、用相邻两笔做差」。如果只在用户打开页面时才记，
+            // 采样点会稀到只剩「每日重置」，看起来只有收入、没有支出
+            // （2026-11-17 用户反馈「消耗了却看不到、Trae 完全没数据、Qoder 也不对」）。
+            //
+            // 默认 60 分钟：一天 24 个点足够画出「今天消耗了多少」，
+            // 又不会让上游觉得被刷（每次只是查一次额度，不是签到）。
+            // 排查时可 `TWIN_CREDIT_SNAPSHOT_SECS=120` 加速验证（下限 60 秒）。
+            tauri::async_runtime::spawn(async move {
+                let secs = std::env::var("TWIN_CREDIT_SNAPSHOT_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v >= 60)
+                    .unwrap_or(60 * 60);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    // Trae：全部客户端扫一遍（内部有缓存窗口，force 只为跳过它）。
+                    if let Err(e) = commands::trae_credits_query(None, Some(true)).await {
+                        eprintln!("[credit-snapshot] Trae 查询失败：{e}");
+                    }
+                    // WorkBuddy：所有账号一遍。
+                    let wb = commands::workbuddy_credits_query(Some(true)).await;
+                    if wb.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                        eprintln!("[credit-snapshot] WorkBuddy 查询失败：{}", wb.get("error").cloned().unwrap_or_default());
+                    }
+                    // Qoder：没有「批量刷新」命令，逐账号只读查一次额度（失败不影响其它账号）。
+                    for region in [
+                        wb_switch_core::modules::qoder_realm::QoderRegion::Cn,
+                        wb_switch_core::modules::qoder_realm::QoderRegion::Global,
+                    ] {
+                        let Ok(accounts) = wb_switch_core::modules::qoder_accounts::list(region) else {
+                            continue;
+                        };
+                        for acc in accounts {
+                            if let Err(e) = wb_switch_core::modules::qoder_api::refresh_account(&acc).await {
+                                eprintln!("[credit-snapshot] Qoder {} 查询失败：{e}", acc.label());
+                            }
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         // 点窗口关闭按钮：隐藏到托盘，不退出程序

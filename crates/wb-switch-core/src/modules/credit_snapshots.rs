@@ -14,7 +14,10 @@
 //! ## 纪律（与 Qoder 一致）
 //!
 //! 1. **只记真实查到的数**：查失败 / 额度未知不写 —— 绝不写 0 充数；
-//! 2. **10 分钟节流**：同平台同账号距上一点不足 10 分钟就跳过。
+//! 2. **只做 5 秒防抖**（同一秒内重复写没意义），**不做长节流**：
+//!    这是**事实流水**，不是缓存 —— 用户主动查了一次就该留一个点。
+//!    早先这里是 10 分钟节流，结果「消耗积分后手动刷新，趋势纹丝不动」，
+//!    用户以为功能坏了（2026-11-17 反馈）。
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,8 +26,14 @@ use serde_json::{json, Value};
 
 use crate::modules::config;
 
-/// 同一账号两次快照的最小间隔。
-pub const THROTTLE_MS: i64 = 10 * 60 * 1000;
+/// 同一账号两次快照的最小间隔（只防抖，不是节流）。
+pub const THROTTLE_MS: i64 = 5 * 1000;
+
+/// 保留天数：超过就裁掉，避免流水无限增长。
+pub const KEEP_DAYS: i64 = 90;
+
+/// 行数超过这个值才触发裁剪（避免每次写都读全文件）。
+const PRUNE_AT_LINES: usize = 5000;
 
 pub fn history_file() -> PathBuf {
     config::store_dir().join("credit-snapshots.jsonl")
@@ -65,7 +74,47 @@ pub fn record(platform: &str, uid: &str, name: &str, credits: f64, at: i64) -> b
     else {
         return false;
     };
-    f.write_all(format!("{line}\n").as_bytes()).is_ok()
+    let ok = f.write_all(format!("{line}\n").as_bytes()).is_ok();
+    drop(f);
+    if ok {
+        prune_if_needed();
+    }
+    ok
+}
+
+/// 超过 [`PRUNE_AT_LINES`] 行时，把 [`KEEP_DAYS`] 之前的点裁掉。
+///
+/// 为什么按行数触发而不是每次写都裁：裁剪要读全文件 + 重写，
+/// 只有在文件真的大了才值得做；趋势图最多看 90 天，更老的点没人用。
+fn prune_if_needed() {
+    let path = history_file();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < PRUNE_AT_LINES {
+        return;
+    }
+    let cutoff = chrono::Local::now().timestamp_millis() - KEEP_DAYS * 86_400_000;
+    let kept: Vec<&str> = lines
+        .into_iter()
+        .filter(|l| {
+            // 解析不了的行（写一半 / 手工编辑）一律保留：删掉等于丢证据。
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("at").and_then(Value::as_i64))
+                .map(|at| at >= cutoff)
+                .unwrap_or(true)
+        })
+        .collect();
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// 共享流水里的一个点（供汇总模块读取）。

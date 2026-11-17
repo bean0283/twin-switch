@@ -28,7 +28,8 @@ use crate::modules::config;
 use crate::modules::qoder_realm::QoderRegion;
 
 /// 同一账号两次快照的最小间隔。
-const THROTTLE_MS: i64 = 10 * 60 * 1000;
+/// 只防抖，不做长节流：流水是事实，用户查一次就该留点（2026-11-17 反馈）。
+const THROTTLE_MS: i64 = 5 * 1000;
 
 pub fn history_file() -> PathBuf {
     config::store_dir()
@@ -349,6 +350,18 @@ pub fn summary(days: u32, from: Option<&str>, to: Option<&str>, platform: Option
         .collect::<serde_json::Map<String, Value>>()
         .into();
 
+    // 各平台在窗口内的**原始采样点数**（不是差额条数）。
+    //
+    // 为什么需要：趋势空的时候，用户要能分清「功能坏了」和「只是还没采到第二个点」。
+    // 每个账号至少要 2 个点才有一笔差，所以界面要显示每个平台有几个点。
+    let mut points_by_platform: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    for p in &all {
+        if p.at >= since && p.at <= until {
+            *points_by_platform.entry(p.platform.clone()).or_default() += 1;
+        }
+    }
+
     let mut out = json!({
         "ok": true,
         "windowDays": window_days,
@@ -363,6 +376,7 @@ pub fn summary(days: u32, from: Option<&str>, to: Option<&str>, platform: Option
         "totalNet": round2(income_total - used_total),
         "resetEvents": resets,
         "points": points_in_window,
+        "pointsByPlatform": points_by_platform,
         "sampledAt": now,
         // 数据不足时把话说清楚：只有 1 个点算不出差，界面要显示「样本不足」而不是 0。
         "enoughData": points_in_window > 0,
