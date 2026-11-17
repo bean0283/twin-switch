@@ -30,8 +30,10 @@
 //! ## 纪律
 //!
 //! - **默认关**。没开就不发任何请求 —— 「自动」不能变成「背着你联网」。
-//! - 并发只跑一份：启动时的后台任务和首页挂载时都会问一次，
-//!   用 `RUNNING` 闸门保证同一时刻只有一份在跑。
+//! - 并发只跑一份：**三个触发点**（应用启动 8 秒后 / 前端签到卡挂载 / 进程内每日定时）
+//!   都调 `maybe_run`，用 `RUNNING` 闸门保证同一时刻只有一份在跑。
+//! - ⚠️ 每日定时那个触发点是「服务器常驻、没人打开界面」时**唯一**能干活的地方，
+//!   别删：删了就会退化成「只有打开过界面才签」（2026-11-17 用户报障）。
 //! - 失败照样记录（`failed` 计数在 summary 里），否则「今天跑过但全失败」
 //!   会被下次启动当成「还没跑」再撞一遍。
 
@@ -110,6 +112,31 @@ pub fn done_today(s: &Store, scope: &str) -> bool {
 /// 别在调用处再写一遍 `if` —— 两处判据迟早会分叉。
 pub fn scopes_due(s: &Store) -> Vec<&'static str> {
     SCOPES.iter().copied().filter(|sc| !done_today(s, sc)).collect()
+}
+
+/// 每日定时最早几点开始跑（本地时间）。
+///
+/// 为什么不半夜跑：签到是「今天的份额」，零点刚过就跑会连着前后两天挤在几分钟内，
+/// 有的平台会判「频率异常」；6 点之后跑既不吵也没风险。
+pub const TICK_HOUR: u32 = 6;
+
+/// 后台定时是否该真的跑一次（**纯函数**，便于单测）。
+///
+/// 三个条件缺一不可：开关开着、今天还有平台没签、已经过了 [`TICK_HOUR`]。
+pub fn should_tick(store: &Store, hour: u32) -> bool {
+    store.enabled && hour >= TICK_HOUR && !scopes_due(store).is_empty()
+}
+
+/// 供后台定时任务调用：按**当前**时间判断要不要跑。
+///
+/// ⚠️ 这是「进程常驻但没人打开界面」场景下唯一的触发点。
+/// 之前的触发点只有两个：应用启动 8 秒后、前端签到卡挂载时 ——
+/// 服务器上挂着的进程两天不碰界面，第二个时机永远不来，于是整天漏签
+/// （2026-11-17 用户反馈「一天没访问服务器就漏了当天的签到」）。
+pub fn tick_due_now() -> bool {
+    use chrono::Timelike;
+    let hour = chrono::Local::now().hour();
+    should_tick(&load(), hour)
 }
 
 /// 给界面看的完整状态。
@@ -229,6 +256,33 @@ pub async fn maybe_run(trigger: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    fn store_with(enabled: bool, done: &[&str]) -> Store {
+        let mut s = Store { enabled, ..Default::default() };
+        let mut day = BTreeMap::new();
+        for sc in done {
+            day.insert((*sc).to_string(), json!({"at": 1, "trigger": "test"}));
+        }
+        s.days.insert(today(), day);
+        s
+    }
+
+    #[test]
+    fn tick_needs_enabled_due_and_hour() {
+        let none = store_with(false, &[]);
+        assert!(!should_tick(&none, 9), "开关关着绝不许跑（不能背着用户联网）");
+
+        let on = store_with(true, &[]);
+        assert!(should_tick(&on, 9), "开着 + 今天没签 + 过 6 点 ⇒ 该跑");
+        assert!(!should_tick(&on, 5), "不到 6 点不跑（避免零点刚过就撞频率限制）");
+        assert!(should_tick(&on, 6), "6 点整开始允许");
+
+        let all_done = store_with(true, &SCOPES);
+        assert!(!should_tick(&all_done, 9), "今天都签过了就别再打扰上游");
+
+        let partial = store_with(true, &["trae"]);
+        assert!(should_tick(&partial, 9), "只签了 trae，其余平台仍要补");
+    }
     use super::*;
 
     #[test]

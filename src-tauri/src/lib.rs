@@ -185,6 +185,43 @@ pub fn run() {
                     eprintln!("[auto-checkin] 本次自动签到执行了 {ran} 个平台");
                 }
             });
+
+            // ⭐ 每日定时：进程活着就一直转，**不依赖界面**。
+            //
+            // 为什么必须有这一条：原来的触发点只有「启动 8 秒后」和「前端签到卡挂载」。
+            // 服务器上长期挂着（托盘常驻、没人打开界面）时，第二个时机永远不来，
+            // 于是「昨天签过」之后就一直不签了 —— 2026-11-17 用户反馈正是这个：
+            // 「一天完全没访问服务器，就漏了当天的签到」。
+            //
+            // 每 10 分钟问一次够不够准：签到窗口是一整天，晚 10 分钟没有影响；
+            // 太密（比如每分钟）会让日志和磁盘写入变得没意义。
+            // 是否真的要跑由 `tick_due_now()` 判定（开关 + 今天还差哪些 + 过 6 点），
+            // 判据只写在那一个纯函数里。
+            tauri::async_runtime::spawn(async move {
+                // 间隔默认 10 分钟；排查时可临时改小（如 30 秒）验证这条链路真的在转：
+                //   set TWIN_AUTO_CHECKIN_TICK_SECS=30
+                // 下限 5 秒，避免误配成 0 把上游打成刷屏。
+                let secs = std::env::var("TWIN_AUTO_CHECKIN_TICK_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v >= 5)
+                    .unwrap_or(10 * 60);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    if !wb_switch_core::modules::auto_checkin::tick_due_now() {
+                        continue;
+                    }
+                    let r = wb_switch_core::modules::auto_checkin::maybe_run("auto-tick").await;
+                    let ran = r
+                        .get("ran")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if ran > 0 {
+                        eprintln!("[auto-checkin] 定时触发：执行了 {ran} 个平台");
+                    }
+                }
+            });
             Ok(())
         })
         // 点窗口关闭按钮：隐藏到托盘，不退出程序
