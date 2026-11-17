@@ -298,6 +298,21 @@ pub async fn trae_account_overview(client_key: String) -> Result<Value, String> 
     .map_err(|e| e.to_string())?
 }
 
+/// Trae 客户端进程状态（账号页电源按钮的「生命周期状态」用，口径同总览里的 `running`）。
+///
+/// 走 [`trae_switch::is_running`]：对已并入的客户端会回退到承载方 —— 这与切号 /
+/// 维护操作的「能不能动手」判据一致，界面显示的「已启动」就该是同一个答案。
+#[tauri::command]
+pub async fn trae_client_status(client_key: String) -> Result<Value, String> {
+    off_main(move || -> Result<Value, String> {
+        let client = trae_discover::get_client(&client_key)
+            .ok_or_else(|| format!("未知客户端：{client_key}"))?;
+        Ok(json!({ "running": trae_switch::is_running(client) }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 手动刷新单个账号资料（GetUserInfo 真实昵称 + 积分余额），写入 profile.json 缓存。
 /// 仅在用户点击「刷新积分」时调用，避免频繁自动访问接口触发风控。
 #[tauri::command]
@@ -2173,6 +2188,16 @@ pub async fn workbuddy_account_list() -> Result<Value, String> {
     off_main(workbuddy_vault::list)
         .await
         .map_err(|e| format!("读取账号库失败：{e}"))
+}
+
+/// WorkBuddy 客户端进程状态（账号页电源按钮的「生命周期状态」用）。
+///
+/// 只做一次进程快照（内存过滤，不开子进程），轮询开销可忽略。
+/// `running = true` 表示客户端进程存在 —— 前端据此显示「已启动」，
+/// 并在进程消失（正常退出 / 崩溃一律同样处理）时自动回到「未启动」。
+#[tauri::command]
+pub async fn workbuddy_client_status() -> Result<Value, String> {
+    off_main(|| json!({ "running": workbuddy_switch::is_running() })).await
 }
 
 /// 切换前的门禁检查（只读）：进程状态、登录态、目标账号凭据。
@@ -4334,6 +4359,16 @@ pub async fn qoder_session_delete_message(
 #[tauri::command]
 pub async fn qoder_home_summary() -> Result<Value, String> {
     Ok(qoder_tools::home_summary())
+}
+
+/// Qoder 客户端进程状态（按区域探测；账号页电源按钮的「生命周期状态」用）。
+///
+/// 口径与会话写库的 `client_running` 完全同一份（同一批进程名，不跨区）：
+/// CN / Global 是两个独立客户端，切了 tab 探测的就是那个 tab 的进程。
+#[tauri::command]
+pub async fn qoder_client_status(region: String) -> Result<Value, String> {
+    let r = qoder_realm::QoderRegion::parse(&region).ok_or("未知区域")?;
+    off_main(move || json!({ "running": qoder_sessions::client_running(r) })).await
 }
 
 

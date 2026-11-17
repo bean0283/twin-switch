@@ -48,6 +48,7 @@ import {
 } from "@/components/workbuddy-credits";
 import { RenewAllTokensButton } from "@/components/renew-all-tokens";
 import { SHOW_LOCAL_LOGIN_IMPORT } from "@/lib/feature-flags";
+import { useClientLifecycle } from "@/lib/use-client-lifecycle";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { pickDefaultStandard, sessionLinkNote } from "@/lib/wb-switch-note";
@@ -131,6 +132,7 @@ function WorkbuddyAccountCard({
   creditError,
   creditsLoading,
   busy,
+  clientState,
   onSwitch,
   onRename,
   onDelete,
@@ -144,6 +146,8 @@ function WorkbuddyAccountCard({
   creditError: string | null;
   creditsLoading: boolean;
   busy: boolean;
+  /** 客户端生命周期状态（页级，所有卡共用同一个客户端）。 */
+  clientState: "stopped" | "starting" | "running";
   onSwitch: () => void;
   onRename: () => void;
   onDelete: () => void;
@@ -176,10 +180,21 @@ function WorkbuddyAccountCard({
         <>
           <IconAction
             icon={<Power className="size-4" />}
-            label={acc.isCurrent ? "当前登录账号" : "切换到这个账号"}
-            active={acc.isCurrent}
+            label={
+              acc.isCurrent && clientState !== "stopped"
+                ? clientState === "running"
+                  ? "客户端运行中 · 当前登录账号"
+                  : "客户端启动中 · 当前登录账号"
+                : acc.isCurrent
+                  ? "当前登录账号（客户端未运行，点击启动）"
+                  : "切换到这个账号"
+            }
+            // 「已启动」只亮在**当前登录账号**的卡上：这张卡就是客户端此刻生效的账号。
+            // 客户端退出（含异常）后这张卡也回「未启动」，此时点按钮 = 仅启动客户端。
+            active={acc.isCurrent && clientState !== "stopped"}
+            // 启动中禁用：客户端半启动状态再点一次等于要求重复启动。
+            disabled={!acc.hasToken || clientState === "starting"}
             spinning={busy}
-            disabled={!acc.hasToken}
             onClick={onSwitch}
           />
           <IconAction icon={<PencilLine className="size-4" />} label="改显示名" onClick={onRename} />
@@ -221,6 +236,10 @@ export default function WorkbuddySwitchPage() {
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // 客户端生命周期（电源按钮的「已启动/启动中/未启动」）：轮询真实进程，
+  // 切号成功后乐观置「启动中」，失败/进程消失自动回「未启动」。
+  const clientLife = useClientLifecycle(useCallback(() => api.workbuddyClientStatus(), []));
 
   // 切换确认
   const [switchTarget, setSwitchTarget] = useState<WorkbuddyAccount | null>(null);
@@ -451,6 +470,9 @@ export default function WorkbuddySwitchPage() {
     setFinishing(true);
     try {
       const r = await api.workbuddySwitchFinish(resolutions, true);
+      // 收尾是客户端唯一的启动时机（切换时后端推迟了）：拉起即乐观置「启动中」。
+      if (r.relaunched) clientLife.markStarting();
+      else void clientLife.recheck();
       const bad = (r.applied ?? []).filter((a) => !a.ok);
       const unchanged = (r.applied ?? []).reduce((n, a) => n + (a.unchanged ?? 0), 0);
       const wrote = (r.applied ?? []).reduce((n, a) => n + (a.synced ?? 0), 0);
@@ -478,6 +500,8 @@ export default function WorkbuddySwitchPage() {
       toast.error("收尾失败，WorkBuddy 可能还没启动", {
         description: api.asError(e),
       });
+      // 启动没成功：电源按钮立即按真实进程状态回退（多半是「未启动」，可再点）。
+      void clientLife.recheck();
     } finally {
       setFinishing(false);
     }
@@ -495,6 +519,10 @@ export default function WorkbuddySwitchPage() {
         : undefined;
       const r = await api.workbuddySwitchTo(acc.id, true, selection);
       setSwitchResult(r);
+      // 生命周期同步：真的拉起了 → 乐观置「启动中」（轮询确认进程出现后升「运行中」）；
+      // 该启动却没启动（且不是推迟到裁决后）→ 立即复核，按钮回真实状态。
+      if (r.relaunched) clientLife.markStarting();
+      else if (!r.restartDeferred) void clientLife.recheck();
       // 有分歧：客户端此时**还没启动**（后端推迟了），先让用户裁决。
       if (r.restartDeferred && (r.divergence?.length ?? 0) > 0) {
         const groups = r.divergence ?? [];
@@ -561,6 +589,8 @@ export default function WorkbuddySwitchPage() {
       }, AUTO_CLOSE_MS);
     } catch (e) {
       toast.error(api.asError(e));
+      // 切号失败：立即按真实进程状态回退电源按钮（客户端若还在跑就仍是「已启动」）。
+      void clientLife.recheck();
     } finally {
       setBusyId(null);
     }
@@ -1004,6 +1034,7 @@ export default function WorkbuddySwitchPage() {
                 creditError={creditErrorByUid.get(key) ?? null}
                 creditsLoading={creditsLoading}
                 busy={busyId === acc.id}
+                clientState={clientLife.state}
                 onSwitch={() => void openSwitch(acc)}
                 onRename={() => {
                   setRenameTarget(acc);

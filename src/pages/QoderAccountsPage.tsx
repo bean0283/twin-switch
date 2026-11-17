@@ -46,9 +46,11 @@ import {
   qoderRegions,
   traeRevealPath,
   qoderAccountSetCosy,
+  qoderClientStatus,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
+import { useClientLifecycle } from "@/lib/use-client-lifecycle";
 
 type Region = { region: string; label: string; domain: string; cli_dir: string };
 
@@ -202,6 +204,13 @@ export default function QoderAccountsPage() {
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorOpen, setErrorOpen] = useState(false);
+
+  // 客户端生命周期（切换按钮的「已启动/启动中/未启动」）：按当前区域探测
+  // （CN / Global 是两个独立客户端），切号成功后乐观置「启动中」，
+  // 失败/进程消失自动回「未启动」。
+  const clientLife = useClientLifecycle(
+    useCallback(() => qoderClientStatus(tab), [tab]),
+  );
 
   const [login, setLogin] = useState<{ loginId: string; url: string } | null>(null);
   const [loginState, setLoginState] = useState<"idle" | "pending" | "ok" | "error">("idle");
@@ -387,10 +396,14 @@ export default function QoderAccountsPage() {
     }
     try {
       const r = await qoderAccountSwitch(a.region, a.id);
+      // 切号末尾会拉起客户端：乐观置「启动中」，轮询确认进程出现后升「运行中」。
+      clientLife.markStarting();
       toast.success("已切换账号", { description: r.note });
       await reload();
     } catch (e) {
       setError(String(e));
+      // 切号失败：立即按真实进程状态回退（客户端若还在跑就仍是「已启动」）。
+      void clientLife.recheck();
     }
   }
 
@@ -779,9 +792,19 @@ export default function QoderAccountsPage() {
                   <>
                     <IconAction
                       icon={<ArrowLeftRight className="size-4" />}
-                      label="切换（写回 Qoder 客户端登录态）"
+                      label={
+                        a.isCurrent && clientLife.state !== "stopped"
+                          ? clientLife.state === "running"
+                            ? "客户端运行中 · 当前登录账号"
+                            : "客户端启动中 · 当前登录账号"
+                          : "切换（写回 Qoder 客户端登录态）"
+                      }
+                      // 「已启动」只亮在**当前登录账号**的卡上：这张卡就是
+                      // 客户端此刻生效的账号，其余卡不随进程状态亮。
+                      active={a.isCurrent && clientLife.state !== "stopped"}
+                      // 启动中禁用：客户端半启动状态再点一次等于要求重复启动。
+                      disabled={!hasToken || clientLife.state === "starting"}
                       onClick={() => void doSwitch(a)}
-                      disabled={!hasToken}
                     />
                     <IconAction
                       icon={<Pencil className="size-4" />}

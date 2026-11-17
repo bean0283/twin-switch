@@ -250,6 +250,7 @@ pub fn run() {
             commands::qoder_cleanup_empty_trash,
             commands::qoder_cleanup_run,
             commands::qoder_home_summary,
+            commands::qoder_client_status,
             commands::qoder_account_set_cosy,
             // Qoder 机器身份（跨机器迁移：能签到的那台导出、签不了的那台导入）
             commands::qoder_machine_status,
@@ -429,8 +430,10 @@ pub fn run() {
             commands::trae_oauth_browsers,
             commands::trae_import_local_login,
             commands::trae_import_all_local_logins,
+            commands::trae_client_status,
             // WorkBuddy 账号管理（国内版）
             commands::workbuddy_account_list,
+            commands::workbuddy_client_status,
             commands::workbuddy_account_add_token,
             commands::workbuddy_switch_precheck,
             commands::workbuddy_switch_to,

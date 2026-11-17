@@ -1409,11 +1409,20 @@ pub fn home_summary() -> Value {
     let mut total_accounts = 0usize;
     let mut total_credits = 0f64;
     let mut credits_known = 0usize;
+    // 有额度的账号里最近一次积分更新时间（概要卡「数据时间」用）。
+    let mut credits_updated_at: Option<i64> = None;
     for region in [QoderRegion::Cn, QoderRegion::Global] {
         let accounts = crate::modules::qoder_accounts::list(region).unwrap_or_default();
         let usable = accounts.iter().filter(|a| a.is_usable()).count();
         let credits: f64 = accounts.iter().filter_map(|a| a.credits).sum();
         let known = accounts.iter().filter(|a| a.credits.is_some()).count();
+        for a in accounts.iter().filter(|a| a.credits.is_some()) {
+            if let Some(t) = a.credits_updated_at {
+                if credits_updated_at.is_none_or(|m| t > m) {
+                    credits_updated_at = Some(t);
+                }
+            }
+        }
         total_accounts += accounts.len();
         total_credits += credits;
         credits_known += known;
@@ -1437,6 +1446,7 @@ pub fn home_summary() -> Value {
     json!({
         "accounts": total_accounts,
         "credits": if credits_known > 0 { json!(total_credits) } else { Value::Null },
+        "creditsUpdatedAt": credits_updated_at,
         "regions": regions,
         "sessions": sessions,
         "running": running > 0,

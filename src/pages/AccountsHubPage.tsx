@@ -1,6 +1,7 @@
 import { UserRound } from "lucide-react";
 
 import { CreditTrendCard } from "@/components/credit-trend-card";
+import { CreditsSummaryCard } from "@/components/credits-summary-card";
 import { HubCard } from "@/components/hub-card";
 
 /**
@@ -44,7 +45,10 @@ export default function AccountsHubPage() {
         </div>
       </section>
 
-      {/* 每日积分收支趋势：数据来自 Qoder 本机快照差值（目前唯一有按日收支流水的账号库）。 */}
+      {/* 积分概要：三平台缓存积分 + 今日快照差值，全部离线读取。 */}
+      <CreditsSummaryCard />
+
+      {/* 每日积分收支趋势：数据来自本机快照差值（Trae / WorkBuddy / Qoder）。 */}
       <CreditTrendCard />
     </div>
   );

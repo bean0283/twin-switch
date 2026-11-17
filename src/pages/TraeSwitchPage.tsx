@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
@@ -24,6 +24,7 @@ import {
 import { AccountCard, Chip, IconAction } from "@/components/account-card";
 import { RenewAllTokensButton } from "@/components/renew-all-tokens";
 import { SHOW_LOCAL_LOGIN_IMPORT } from "@/lib/feature-flags";
+import { useClientLifecycle } from "@/lib/use-client-lifecycle";
 import { CheckinButton } from "@/components/checkin-button";
 import {
   TraeCreditBlock,
@@ -320,6 +321,16 @@ export default function TraeSwitchPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string[]>([]);
+
+  // 客户端生命周期（电源按钮的「已启动/启动中/未启动」）：按当前选中的客户端探测，
+  // 切号成功后乐观置「启动中」，失败/进程消失自动回「未启动」。
+  // 未选客户端（clientKey 为 null）时探测恒为「未启动」，等选中后轮询会立即纠正。
+  const clientLife = useClientLifecycle(
+    useCallback(
+      () => (clientKey ? api.traeClientStatus(clientKey) : Promise.resolve({ running: false })),
+      [clientKey],
+    ),
+  );
 
   /**
    * 「已并入的客户端还有账号没带过来」的预演结果（`null` = 没探到 / 不用提示）。
@@ -890,6 +901,9 @@ export default function TraeSwitchPage() {
           : undefined;
       const res = await api.traeSwitchTo(clientKey, entry.id, copy);
       pushProgress(res.progress ?? []);
+      // 切号末尾会拉起客户端：乐观置「启动中」，轮询确认进程出现后升「运行中」；
+      // 若启动没成功，宽限期一过（或失败路径的立即复核）会自动回「未启动」。
+      clientLife.markStarting();
       const badge = outcomeBadge(res.outcome);
       // 名字走统一出口：toast 里也不许出现 `oauth_882023` 这种内部 id。
       const who = accountNameOf(entry);
@@ -917,6 +931,8 @@ export default function TraeSwitchPage() {
       //    再弹一次等于把同一个问题问两遍，而且是真的「切完才问」。
     } catch (cause) {
       toast.error("切换失败", { description: api.asError(cause) });
+      // 切号失败：立即按真实进程状态回退电源按钮（客户端若还在跑就仍是「已启动」）。
+      void clientLife.recheck();
     } finally {
       setBusy(false);
     }
@@ -1625,14 +1641,21 @@ export default function TraeSwitchPage() {
                           <IconAction
                             icon={<Power className="size-4" />}
                             label={
-                              isLive
-                                ? "当前登录账号"
-                                : isOauth && !hasCarrier
-                                  ? "切换（首次会以当前登录态为骨架自动合成载体）"
-                                  : "切换到这个账号"
+                              isLive && clientLife.state !== "stopped"
+                                ? clientLife.state === "running"
+                                  ? "客户端运行中 · 当前登录账号"
+                                  : "客户端启动中 · 当前登录账号"
+                                : isLive
+                                  ? "当前登录账号（客户端未运行）"
+                                  : isOauth && !hasCarrier
+                                    ? "切换（首次会以当前登录态为骨架自动合成载体）"
+                                    : "切换到这个账号"
                             }
-                            active={isLive}
-                            disabled={busy || isLive}
+                            // 「已启动」只亮在**当前登录账号**的卡上：这张卡就是
+                            // 客户端此刻生效的账号，其余卡不随进程状态亮。
+                            active={isLive && clientLife.state !== "stopped"}
+                            // 启动中禁用：客户端半启动状态再点一次等于要求重复启动。
+                            disabled={busy || isLive || clientLife.state === "starting"}
                             spinning={busy}
                             onClick={() => void onSwitch(entry)}
                           />

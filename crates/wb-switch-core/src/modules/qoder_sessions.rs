@@ -411,7 +411,10 @@ fn log_line(msg: &str) {
 }
 
 /// 该区域的客户端此刻是否在跑（按可执行文件名，不跨区）。
-fn client_running(region: QoderRegion) -> bool {
+///
+/// `pub`：账号页电源按钮的「客户端生命周期状态」（`qoder_client_status` 命令）也用它，
+/// 与会话写库时的探测保持**同一口径**（同一批进程名）。
+pub fn client_running(region: QoderRegion) -> bool {
     let names: &[&str] = match region {
         QoderRegion::Cn => &["Qoder CN.exe", "Qoder CN Launcher.exe"],
         QoderRegion::Global => &["Qoder.exe", "Qoder Launcher.exe"],

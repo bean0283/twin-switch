@@ -1325,6 +1325,26 @@ export function workbuddyExeFromRunning(): Promise<{ ok: boolean; path: string }
   return call("workbuddy_exe_from_running");
 }
 
+// ---------------------------------------------------------------------------
+// 客户端进程状态（账号页电源按钮的「生命周期状态」）：running = 客户端进程存在。
+// 轮询用，进程消失（正常退出 / 崩溃一律同样处理）→ 界面自动回「未启动」。
+// ---------------------------------------------------------------------------
+
+/** WorkBuddy 客户端是否在跑。 */
+export function workbuddyClientStatus(): Promise<{ running: boolean }> {
+  return call("workbuddy_client_status");
+}
+
+/** Trae 客户端是否在跑（按 clientKey 对应的客户端探测）。 */
+export function traeClientStatus(clientKey: string): Promise<{ running: boolean }> {
+  return call("trae_client_status", { clientKey });
+}
+
+/** Qoder 客户端是否在跑（按区域探测：CN / Global 是两个独立客户端）。 */
+export function qoderClientStatus(region: string): Promise<{ running: boolean }> {
+  return call("qoder_client_status", { region });
+}
+
 /**
  * 一批备份的概览（只读）：增量还是整份、省了多少、**能不能还原**。
  *
@@ -2546,6 +2566,7 @@ export function qoderCreditHistory(
   totalNet: number;
   resetEvents: number;
   points: number;
+  sampledAt: number;
   enoughData: boolean;
   file: string;
 }> {
@@ -2973,6 +2994,8 @@ export async function qoderSessionDeleteMessage(
 export async function qoderHomeSummary(): Promise<{
   accounts: number;
   credits: number | null;
+  /** 有额度账号里最近一次积分更新时间（ms）；没有任何已知额度时为 null。 */
+  creditsUpdatedAt: number | null;
   regions: { region: string; label: string; accounts: number; usable: number; credits: number | null; hasClient: boolean }[];
   sessions: Record<string, number>;
   running: boolean;
