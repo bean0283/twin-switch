@@ -335,6 +335,7 @@ pub fn run() {
             commands::gateway_set_enabled,
             commands::gateway_live_stats,
             commands::cache_hit_stats,
+            commands::sessions_overview,
             commands::gateway_set_lan,
             commands::gateway_pool,
             commands::gateway_priority_get,

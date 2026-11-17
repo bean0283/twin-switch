@@ -3002,3 +3002,27 @@ export interface CacheHitStats {
   trae?: CacheHitSide;
   qoder?: CacheHitSide;
 }
+
+/** 会话概要里的一端的数字（`decryptedBytes` 只有 Trae 有：那是本工具的解密副本）。 */
+export interface SessionsOverviewPlatform {
+  platform: "trae" | "workbuddy" | "qoder" | string;
+  count: number;
+  /** 会话正文总量（WB / Qoder 有，Trae 恒为 0 —— 它的正文在 SQLite 里）。 */
+  bytes: number;
+  /** 本工具的解密副本大小（仅 Trae）。口径不同，**不与 bytes 相加**。 */
+  decryptedBytes: number;
+  active7d: number;
+  stale30d: number;
+  newestAt: number | null;
+  /** 读不到时的原因（数字不完整时非空）。 */
+  note: string | null;
+}
+
+/** `sessions_overview` 的返回。 */
+export interface SessionsOverview {
+  ok?: boolean;
+  error?: string;
+  generatedAt?: number;
+  total?: { count: number; contentBytes: number; active7d: number; stale30d: number };
+  platforms?: SessionsOverviewPlatform[];
+}

@@ -46,6 +46,7 @@ import type {
   TraeSessionInfo,
   TraeMsgSearchResult,
   CacheHitStats,
+  SessionsOverview,
   SessionTextSearchResult,
   TraeEditCellResult,
   TraeEditDoc,
@@ -1824,6 +1825,16 @@ export function workbuddySessionListByAccount(): Promise<WbSessionListByAccount>
  *
  * ⚠️ `refresh = true` 会重扫 1 GB 级会话日志（release 约数秒），只应由用户点击触发。
  */
+/**
+ * 会话概要：三端本地会话的数量 / 占用 / 活跃度。
+ *
+ * 后端要开三个库（Trae 解密 / Qoder sqlite / WorkBuddy 索引），一次调用取全部，
+ * 前端不要为了几个数字再各拉一遍全量列表。
+ */
+export function sessionsOverview(): Promise<SessionsOverview> {
+  return call("sessions_overview", {});
+}
+
 export function cacheHitStats(days?: number, refresh?: boolean): Promise<CacheHitStats> {
   return call("cache_hit_stats", { days: days ?? null, refresh: refresh ?? null });
 }

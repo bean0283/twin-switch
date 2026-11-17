@@ -1,6 +1,7 @@
 import { MessagesSquare } from "lucide-react";
 
 import { HubCard } from "@/components/hub-card";
+import { SessionsSummaryCard } from "@/components/sessions-summary-card";
 
 /**
  * 「会话管理」分组首页。
@@ -41,6 +42,9 @@ export default function SessionsHubPage() {
           />
         </div>
       </section>
+
+      {/* 概要放在入口卡下面：先让用户选去哪，再看「一共多少、该不该清」。 */}
+      <SessionsSummaryCard />
     </div>
   );
 }

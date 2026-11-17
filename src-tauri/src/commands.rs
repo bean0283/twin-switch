@@ -4263,6 +4263,16 @@ pub async fn gateway_set_enabled(enabled: bool) -> Result<Value, String> {
 /// 积分共享的**实时监控**快照：内存态，不读磁盘，前端每秒拉一次。
 ///
 /// `window_secs` 支持 60 / 300 / 3600（其它值就近取）。字段见
+/// 会话概要：三端本地会话的数量 / 占用 / 活跃度（会话管理首页用）。
+///
+/// 走 `off_main`：Trae 要解密 SQLCipher、Qoder 要开 sqlite，都是阻塞活。
+#[tauri::command]
+pub async fn sessions_overview() -> Value {
+    off_main(|| wb_switch_core::modules::sessions_overview::overview())
+        .await
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
 /// 缓存命中统计：网关账本 + WorkBuddy 客户端。
 ///
 /// ⚠️ 这是个**除法**，所以后端只给原始数（input / cached / observed），命中率由前端

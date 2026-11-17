@@ -73,6 +73,7 @@ pub mod workbuddy_vault;
 pub mod workbuddy_switch;
 pub mod workbuddy_oauth;
 pub mod workbuddy_session_pack;
+pub mod sessions_overview;
 pub mod workbuddy_sessions;
 pub mod workbuddy_session_groups;
 pub mod workbuddy_session_edit;
