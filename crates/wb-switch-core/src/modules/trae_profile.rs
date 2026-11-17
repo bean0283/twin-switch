@@ -421,6 +421,21 @@ pub async fn refresh_profile(client_key: &str, id: &str, oauth: &Value) -> Optio
                     "fetched_at": chrono::Local::now().to_rfc3339(),
                 });
                 write_profile(client_key, id, &profile);
+                // 积分快照（10 分钟节流）：真实查到的剩余积分才记，失败 / 未知不写。
+                // 每日收支趋势图的数据源之一（相邻快照做差）。
+                if let Some(credits) = profile.get("credits").and_then(Value::as_f64) {
+                    let name = profile
+                        .get("screen_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    crate::modules::credit_snapshots::record(
+                        "trae",
+                        id,
+                        name,
+                        credits,
+                        chrono::Local::now().timestamp_millis(),
+                    );
+                }
                 return Some(profile);
             }
             if attempt < HOST_ATTEMPTS {

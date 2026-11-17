@@ -1070,6 +1070,28 @@ fn round2(v: f64) -> f64 {
 }
 
 /// 查询单个账号的积分。
+/// 记一笔积分快照（每日收支趋势图的数据源）。
+///
+/// 只在 `query_account` **成功**后调：`totalRemaining` 是刚查到的真实值；
+/// 模块内部 10 分钟节流，查失败 / 未知路径压根不会走到这里。
+fn snapshot_point(account: &CreditAccount, out: &Value) {
+    let Some(credits) = out.get("totalRemaining").and_then(Value::as_f64) else {
+        return;
+    };
+    let uid = if account.uid.trim().is_empty() {
+        &account.id
+    } else {
+        &account.uid
+    };
+    crate::modules::credit_snapshots::record(
+        "workbuddy",
+        uid,
+        &account.name,
+        credits,
+        now_ms(),
+    );
+}
+
 async fn query_account(account: &CreditAccount) -> Value {
     let now = now_ms();
     if let Some(reason) = account.blocked_reason() {
@@ -1147,6 +1169,7 @@ async fn query_account(account: &CreditAccount) -> Value {
         out["refreshed"] = json!(refresh_attempted);
         // 查得到积分 ⇒ 这枚凭据是好的，清掉以前记的失效标记。
         crate::modules::workbuddy_vault::mark_auth_error(&account.id, None);
+        snapshot_point(account, &out);
         return out;
     }
 
@@ -1164,6 +1187,7 @@ async fn query_account(account: &CreditAccount) -> Value {
         out["source"] = json!("legacy");
         out["refreshed"] = json!(refresh_attempted);
         crate::modules::workbuddy_vault::mark_auth_error(&account.id, None);
+        snapshot_point(account, &out);
         return out;
     }
 

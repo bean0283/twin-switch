@@ -3630,15 +3630,25 @@ pub async fn qoder_accounts_refresh_all(region: String) -> Result<Value, String>
 }
 
 
-/// 近 N 天的 Qoder 积分消耗（**本机快照算出来的真实值**，不是官方用量）。
+/// 近 N 天 / 自定义日期范围的每日积分收支（**本机快照算出来的真实值**，不是官方用量）。
 ///
-/// Qoder 没有用量 / 历史端点，这里的数据来自每次成功查询后留下的一笔额度快照
-/// （`~/.twin-switch/qoder/credit-snapshots.jsonl`，10 分钟节流）。
+/// 三个平台一起算：Qoder（qoder/credit-snapshots.jsonl）+ Trae / WorkBuddy
+/// （credit-snapshots.jsonl），数据来自每次成功查询积分后留下的一笔快照（10 分钟节流）。
+/// 额度减少记支出、增加记收入，按日给出收入 / 支出 / 净变化。
+/// `platform`：all / trae / workbuddy / qoder，all 与缺省都算全部。
 /// 样本不足时 `enoughData=false` —— 界面据此显示「样本不足」，而不是画一条 0。
 #[tauri::command]
-pub async fn qoder_credit_history(days: Option<u32>) -> Result<Value, String> {
+pub async fn qoder_credit_history(
+    days: Option<u32>,
+    from: Option<String>,
+    to: Option<String>,
+    platform: Option<String>,
+) -> Result<Value, String> {
     Ok(wb_switch_core::modules::qoder_credit_history::summary(
         days.unwrap_or(7),
+        from.as_deref(),
+        to.as_deref(),
+        platform.as_deref(),
     ))
 }
 

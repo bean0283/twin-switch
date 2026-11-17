@@ -3,6 +3,7 @@ pub mod auto_checkin;
 pub mod checkin;
 pub mod client_usage;
 pub mod config;
+pub mod credit_snapshots;
 pub mod diag_log;
 pub mod error_log;
 pub mod fs_remove;

@@ -2508,19 +2508,53 @@ export async function qoderAccountsRefreshAll(region: string): Promise<unknown> 
   return invoke("qoder_accounts_refresh_all", { region });
 }
 
-/** 近 N 天积分消耗（本机快照算出来的，不是官方用量）。 */
-export function qoderCreditHistory(days = 7): Promise<{
+/**
+ * 近 N 天 / 自定义日期范围的每日积分收支（本机快照算出来的，不是官方用量）。
+ *
+ * 三个平台一起算（Trae / WorkBuddy / Qoder），口径：额度减少记「支出」，
+ * 增加（充值 / 签到 / 周期重置）记「收入」，净变化 = 收入 - 支出。
+ * `from`/`to`（YYYY-MM-DD，含端点）两个都给才走自定义范围，否则按 `days` 近 N 天。
+ * `platform`：all / trae / workbuddy / qoder，all 与缺省都算全部。
+ */
+export type CreditPlatform = "all" | "trae" | "workbuddy" | "qoder";
+
+export function qoderCreditHistory(
+  days = 7,
+  from?: string | null,
+  to?: string | null,
+  platform: CreditPlatform = "all",
+): Promise<{
   ok: boolean;
+  rangeMode: "days" | "custom";
   windowDays: number;
-  days: { day: string; used: number }[];
-  accounts: { uid: string; name: string; region: string; used: number }[];
+  from?: string | null;
+  to?: string | null;
+  platform?: string | null;
+  days: {
+    date: string;
+    day: string;
+    income: number;
+    expense: number;
+    net: number;
+    /** 当日各平台拆分：仅非零平台出现。 */
+    parts?: Record<string, { income: number; expense: number }>;
+  }[];
+  accounts: { platform: string; uid: string; name: string; region: string; used: number }[];
+  platformTotals?: Record<string, { income: number; expense: number }>;
   totalUsed: number;
+  totalIncome: number;
+  totalNet: number;
   resetEvents: number;
   points: number;
   enoughData: boolean;
   file: string;
 }> {
-  return invoke("qoder_credit_history", { days });
+  return invoke("qoder_credit_history", {
+    days,
+    from: from ?? null,
+    to: to ?? null,
+    platform,
+  });
 }
 
 
