@@ -254,6 +254,82 @@ export function traeExportPack(clientKey: string): Promise<{
 }
 
 /** 导入账号备份（自包含 JSON，preferName 可选覆盖账号名）。 */
+/**
+ * Trae：手动填 token 添加账号（不重走授权，不发网络请求）。
+ *
+ * 本地校验：三段式 JWT、payload.data.id 有值、未过期。
+ * 注意：Trae 的 refreshToken 不是 JWT，原样收下。
+ */
+/**
+ * WorkBuddy 数据目录（issue #26 第三条）：本机把 `~/.workbuddy` 挪到别的盘 / 做成 junction 时用。
+ *
+ * 只校验「目录存在」；是否为可用数据根看返回的 `available` / `hasProjects` / `hasDb`。
+ */
+/** 数据目录：缓存 / 备份 / 导出 / 回收站 的默认值与当前值（核心数据不在此列）。 */
+export function dataPathsGet(): Promise<{
+  ok: boolean;
+  core?: string;
+  kinds?: { key: string; label: string; default: string; current: string; custom: boolean }[];
+  error?: string;
+}> {
+  return invoke("data_paths_get", {});
+}
+
+/** `path` 传 null = 恢复该类的默认目录。 */
+export function dataPathsSet(kind: string, path: string | null): Promise<{
+  ok: boolean;
+  error?: string;
+  paths?: {
+    core: string;
+    kinds: { key: string; label: string; default: string; current: string; custom: boolean }[];
+  };
+}> {
+  return invoke("data_paths_set", { kind, path });
+}
+
+export function workbuddyDataRootGet(): Promise<{
+  ok: boolean;
+  current: string;
+  override?: string | null;
+  available: boolean;
+  hasProjects: boolean;
+  hasDb: boolean;
+  error?: string;
+}> {
+  return invoke("workbuddy_data_root_get", {});
+}
+
+/** `path` 传 null = 恢复默认 `~/.workbuddy`。 */
+export function workbuddyDataRootSet(path: string | null): Promise<{
+  ok: boolean;
+  current: string;
+  available: boolean;
+}> {
+  return invoke("workbuddy_data_root_set", { path });
+}
+
+export function traeAccountAddToken(
+  clientKey: string,
+  token: string,
+  refreshToken?: string,
+  name?: string,
+): Promise<{
+  ok: boolean;
+  accountId: string;
+  uid: string;
+  name: string;
+  expiresAt?: string | null;
+  updated?: boolean;
+  note?: string;
+}> {
+  return invoke("trae_account_add_token", {
+    clientKey,
+    token,
+    refreshToken: refreshToken ?? null,
+    name: name ?? null,
+  });
+}
+
 export function traeImportAccount(
   clientKey: string,
   payload: Record<string, unknown>,

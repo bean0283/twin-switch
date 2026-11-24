@@ -85,6 +85,182 @@ static MIGRATION_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 ///
 /// **首次调用会顺带把旧的 `~/.trae-switch-cn` 搬过来**（同盘 `rename`，元数据操作，
 /// 即使目录有 2 GB 也是瞬时的）。所以所有路径都必须走这里，不要在别处拼目录名。
+/// 可换盘的几类数据（**核心数据不在此列**：账号库、凭据、设置永远在 `store_dir`）。
+///
+/// 为什么只允许这几类换：它们都是「体积大、可重建或可搬走」的，
+/// 而账号库/凭据一旦分家，加密与备份的一致性就没法保证（DPAPI 是本机用户维度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataKind {
+    /// 可重建的缓存（Trae 解密副本、扫描缓存）——最占地方的那 600+MB。
+    Cache,
+    /// 备份（写库前备份、清理前备份、导入前备份）。
+    Backups,
+    /// 导出包（账号包、会话包）。
+    Exports,
+    /// 回收站（清理删掉但还能恢复的东西）。
+    Trash,
+}
+
+impl DataKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            DataKind::Cache => "cache",
+            DataKind::Backups => "backups",
+            DataKind::Exports => "exports",
+            DataKind::Trash => "trash",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DataKind::Cache => "缓存（解密副本 / 扫描结果，可重建）",
+            DataKind::Backups => "备份（写库前、清理前、导入前）",
+            DataKind::Exports => "导出包（账号包 / 会话包）",
+            DataKind::Trash => "回收站（清理后可恢复）",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<DataKind> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cache" => Some(DataKind::Cache),
+            "backups" => Some(DataKind::Backups),
+            "exports" => Some(DataKind::Exports),
+            "trash" => Some(DataKind::Trash),
+            _ => None,
+        }
+    }
+}
+
+fn data_paths_file() -> PathBuf {
+    store_dir().join("data-paths.json")
+}
+
+fn read_data_paths() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(data_paths_file())
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// 某一类数据的**根**：用户指定过就用指定值，否则就是 `store_dir` 本身。
+///
+/// ⚠️ 默认值刻意等于 `store_dir`（而不是 `store_dir/<key>`）：现有布局是
+/// `store_dir/trae/decrypted`、`store_dir/qoder/backups` 这种散落结构，
+/// 换默认会让老用户的 600MB 解密副本"凭空消失"。所以这里只替换**根**，
+/// 调用方继续拼自己的子路径（`data_dir(Cache).join("trae").join("decrypted")`）。
+///
+/// ⚠️ 只改**新文件写到哪里**，不搬迁已有文件 —— 搬几十万个文件是另一件事，
+/// 而且中途失败会留下半套数据。界面必须把这句话说清楚。
+pub fn data_dir(kind: DataKind) -> PathBuf {
+    if let Some(v) = read_data_paths().get(kind.key()).and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    store_dir()
+}
+
+/// 写入 / 清除某一类数据的目录。`None` = 恢复默认（`store_dir/<key>`）。
+pub fn set_data_dir(kind: DataKind, path: Option<&str>) -> Result<(), String> {
+    let mut map = read_data_paths();
+    match path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let dir = PathBuf::from(p);
+            if !dir.is_absolute() {
+                return Err("请填绝对路径（例如 D:////TwinSwitchCache）".into());
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| format!("目录不可用：{e}"))?;
+            map.insert(kind.key().to_string(), serde_json::json!(p));
+        }
+        None => {
+            map.remove(kind.key());
+        }
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map_err(|e| e.to_string())?;
+    let f = data_paths_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(&f, body).map_err(|e| format!("写入失败：{e}"))
+}
+
+/// 给界面看的当前配置：默认值、当前生效值、是否被改过。
+pub fn data_paths_snapshot() -> serde_json::Value {
+    let kinds = [DataKind::Cache, DataKind::Backups, DataKind::Exports, DataKind::Trash];
+    let rows: Vec<serde_json::Value> = kinds
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "key": k.key(),
+                "label": k.label(),
+                "default": store_dir().display().to_string(),
+                "current": data_dir(*k).display().to_string(),
+                "custom": data_dir(*k) != store_dir(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "core": store_dir().display().to_string(),
+        "kinds": rows,
+    })
+}
+
+/// WorkBuddy 数据根的手动指定文件（用户把 `~/.workbuddy` 做成 junction / 挪到别的盘时用）。
+fn wb_root_file() -> PathBuf {
+    store_dir().join("workbuddy-data-root.txt")
+}
+
+/// 用户手动指定的 WorkBuddy 数据根（issue #26 第三条）。
+///
+/// 优先环境变量 `TWIN_WB_DATA_ROOT`（排查/测试用），其次配置文件里的一行路径。
+/// **只读配置，不校验内容** —— 校验交给 `workbuddy_source::is_available()`，
+/// 这样「指错了目录」会表现为「不可用并告诉你缺什么」，而不是在这里静默回退到默认目录
+/// （静默回退会让人以为设置生效了，实际读的还是 C 盘那份）。
+pub fn workbuddy_data_root_override() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("TWIN_WB_DATA_ROOT") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t));
+        }
+    }
+    let text = std::fs::read_to_string(wb_root_file()).ok()?;
+    let line = text.lines().next()?.trim().to_string();
+    if line.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(line))
+    }
+}
+
+/// 写入 / 清除手动指定的数据根。`None` = 恢复默认（`~/.workbuddy`）。
+pub fn set_workbuddy_data_root(path: Option<&str>) -> Result<(), String> {
+    let f = wb_root_file();
+    match path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let dir = PathBuf::from(p);
+            if !dir.is_dir() {
+                return Err(format!("目录不存在或不是文件夹：{}", dir.display()));
+            }
+            std::fs::create_dir_all(
+                f.parent().ok_or_else(|| "store_dir 没有父目录".to_string())?,
+            )
+            .map_err(|e| format!("建目录失败：{e}"))?;
+            std::fs::write(&f, format!("{}\n", dir.display()))
+                .map_err(|e| format!("写入失败：{e}"))
+        }
+        None => {
+            match std::fs::remove_file(&f) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("删除失败：{e}")),
+            }
+        }
+    }
+}
+
 pub fn store_dir() -> PathBuf {
     let home = home_dir();
     if let Ok(mut guard) = STORE_DIR_CACHE.lock() {

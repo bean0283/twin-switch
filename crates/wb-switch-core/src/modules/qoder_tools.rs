@@ -93,7 +93,7 @@ pub fn export(region: QoderRegion) -> Result<Value, String> {
 
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let filename = format!("qoder-accounts-{}-{stamp}.json", region.as_str());
-    let dir = crate::modules::config::store_dir().join("qoder").join("exports");
+    let dir = crate::modules::config::data_dir(crate::modules::config::DataKind::Exports).join("qoder").join("exports");
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
     let path = dir.join(&filename);
     let text = serde_json::to_string_pretty(&pkg).map_err(|e| format!("序列化失败：{e}"))?;

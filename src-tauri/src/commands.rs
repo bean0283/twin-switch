@@ -2338,6 +2338,99 @@ pub async fn workbuddy_account_add_token(
     .await?
 }
 
+/// 数据目录：读取「缓存 / 备份 / 导出 / 回收站」四项的默认值与当前值。
+///
+/// 核心数据（账号库、凭据、设置）永远在 `store_dir`，**不提供修改** ——
+/// 分家会让 DPAPI 凭据与备份的一致性无法保证。
+#[tauri::command]
+pub async fn data_paths_get() -> Value {
+    off_main(wb_switch_core::modules::config::data_paths_snapshot)
+        .await
+        .map(|snapshot| {
+            let mut v = json!({ "ok": true });
+            if let (Some(dst), Some(src)) = (v.as_object_mut(), snapshot.as_object()) {
+                for (k, val) in src {
+                    dst.insert(k.clone(), val.clone());
+                }
+            }
+            v
+        })
+        .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// 数据目录：设置某一类（`cache` / `backups` / `exports` / `trash`）。`path` 为空 = 恢复默认。
+#[tauri::command]
+pub async fn data_paths_set(kind: String, path: Option<String>) -> Result<Value, String> {
+    off_main(move || {
+        let k = wb_switch_core::modules::config::DataKind::parse(&kind)
+            .ok_or_else(|| format!("未知的数据类别：{kind}"))?;
+        wb_switch_core::modules::config::set_data_dir(k, path.as_deref())?;
+        Ok(json!({ "ok": true, "paths": wb_switch_core::modules::config::data_paths_snapshot() }))
+    })
+    .await?
+}
+
+/// WorkBuddy：读取当前数据目录（含是否手动指定、缺什么）。
+#[tauri::command]
+pub async fn workbuddy_data_root_get() -> Value {
+    off_main(|| {
+        let override_path = wb_switch_core::modules::config::workbuddy_data_root_override();
+        let current = wb_switch_core::modules::workbuddy_source::data_root();
+        let has_projects = current.join("projects").is_dir();
+        let has_db = current.join("workbuddy.db").is_file();
+        json!({
+            "ok": true,
+            "current": current.display().to_string(),
+            "override": override_path.map(|p| p.display().to_string()),
+            "available": has_projects && has_db,
+            "hasProjects": has_projects,
+            "hasDb": has_db,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+/// WorkBuddy：手动指定数据目录（`None` = 恢复默认 `~/.workbuddy`）。
+///
+/// 只校验「目录存在」；是否是可用的 WB 数据根由调用方读回 `available` 判断 ——
+/// 指错了要能看见「缺 projects/ 或缺 workbuddy.db」，而不是静默失效。
+#[tauri::command]
+pub async fn workbuddy_data_root_set(path: Option<String>) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::config::set_workbuddy_data_root(path.as_deref())?;
+        let current = wb_switch_core::modules::workbuddy_source::data_root();
+        Ok(json!({
+            "ok": true,
+            "current": current.display().to_string(),
+            "available": current.join("projects").is_dir() && current.join("workbuddy.db").is_file(),
+        }))
+    })
+    .await?
+}
+
+/// Trae：**手动填 token** 添加账号（与 WorkBuddy 的「手动添加账号（Token）」同构）。
+///
+/// 只做本地校验（三段式 JWT / 有 uid / 没过期），不发网络请求。
+/// 落盘与「导入账号包」完全同一条路（`trae_cred_import::write_account`）。
+#[tauri::command]
+pub async fn trae_account_add_token(
+    client_key: String,
+    token: String,
+    refresh_token: Option<String>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    off_main(move || {
+        wb_switch_core::modules::trae_cred_import::add_token(
+            &client_key,
+            &token,
+            refresh_token.as_deref(),
+            name.as_deref(),
+        )
+    })
+    .await?
+}
+
 /// 导入本机 WorkBuddy 当前登录态到账号库。
 #[tauri::command]
 pub async fn workbuddy_import_local() -> Result<Value, String> {

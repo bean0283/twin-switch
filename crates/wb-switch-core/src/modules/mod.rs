@@ -39,6 +39,7 @@ pub mod qoder_realm;
 pub mod settings;
 pub mod trae_backup;
 pub mod trae_carriers;
+pub mod trae_cred_import;
 pub mod trae_cleanup;
 pub mod trae_credits;
 pub mod trae_decrypt;

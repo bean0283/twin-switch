@@ -27,6 +27,11 @@ const WB_DIR_NAME: &str = ".workbuddy";
 
 /// WorkBuddy 数据根：`~/.workbuddy`。
 pub fn data_root() -> PathBuf {
+    // 用户把 `~/.workbuddy` 挪到别的盘 / 做成 junction 时，以手动指定为准（issue #26）。
+    // ⚠️ 只在**配置了**的时候覆盖：没配置就走默认，行为与历史版本一致。
+    if let Some(p) = crate::modules::config::workbuddy_data_root_override() {
+        return p;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(WB_DIR_NAME)

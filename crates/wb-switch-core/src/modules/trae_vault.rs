@@ -602,6 +602,26 @@ pub fn export_account(client_key: &str, id: &str) -> Result<Value, String> {
 /// 从导出 JSON 恢复到 vault；冲突时自动加后缀。返回新账号 id。
 pub fn import_account(client_key: &str, payload: &Value, prefer_name: Option<&str>) -> Result<(String, usize), String> {
     if payload.get("format").and_then(|v| v.as_str()) != Some(EXPORT_FORMAT) {
+        // 凭证格式（issue #25）：`{token, refreshToken, ...}` 这种「只有 token」的账号。
+        // 走单独的导入器：它只写 oauth.json + meta.json，**没有载体文件**，
+        // 所以这类账号能查积分/签到、不能切换（界面会标「仅凭证」）。
+        if payload.get("token").is_some()
+            || payload.get("accounts").is_some()
+            || payload.get("refreshToken").is_some()
+        {
+            let r = crate::modules::trae_cred_import::import_credentials(client_key, payload)?;
+            let ids = r
+                .get("ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let id = ids
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or("credential")
+                .to_string();
+            return Ok((id, 0));
+        }
         return Err("不是 trae-switch 导出的账号文件".into());
     }
     let base = sanitize_name(prefer_name.unwrap_or(payload.get("id").and_then(|v| v.as_str()).unwrap_or("imported")));

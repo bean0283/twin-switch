@@ -9,6 +9,7 @@ import {
   FileDown,
   FileUp,
   GitCompare,
+  KeyRound,
   Layers,
   Loader2,
   LogIn,
@@ -360,6 +361,14 @@ export default function TraeSwitchPage() {
   // 「严格按 workbuddy 的界面进行设计」，Trae 页头部只留 WB 那五个入口，这两个**弹窗型**
   // 入口被替换成 WB 那套**文件型**的「导出账号包 / 导入账号包」（见 `onExportPack` /
   // `onImportPack`）—— 连同弹窗、连同一整组 state 一起删，不留死代码。
+  /** 手动填 token 弹窗（与 WorkBuddy 同构）：本地校验，不发网络请求。 */
+  const [tokenOpen, setTokenOpen] = useState(false);
+  const [tokenAccess, setTokenAccess] = useState("");
+  const [tokenRefresh, setTokenRefresh] = useState("");
+  const [tokenName, setTokenName] = useState("");
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+
   const [renameTarget, setRenameTarget] = useState<TraeVaultEntry | null>(null);
   const [renameName, setRenameName] = useState("");
   /**
@@ -1084,6 +1093,39 @@ export default function TraeSwitchPage() {
   // 这两个入口连同它们的弹窗一并删除。账号入库走「导入本机登录态」，
   // 整库搬家走「导出账号包 / 导入账号包」（文件型，与 WB 一致）。
 
+  /**
+   * 手动填 token 添加账号。
+   *
+   * 与 WorkBuddy 那套完全同构：只在本地校验（三段式 / 有 uid / 没过期），
+   * **不发网络请求**——用户填的是现成 token，本地就能判真伪。
+   */
+  async function onSubmitToken() {
+    if (!clientKey) return;
+    setTokenBusy(true);
+    setTokenError(null);
+    try {
+      const r = await api.traeAccountAddToken(
+        clientKey,
+        tokenAccess,
+        tokenRefresh.trim() || undefined,
+        tokenName.trim() || undefined,
+      );
+      toast.success(r.updated ? "账号已存在，已更新 token" : "已添加账号", {
+        description: `uid ${r.uid}${r.expiresAt ? ` · 到期 ${new Date(r.expiresAt).toLocaleString("zh-CN")}` : ""}`,
+      });
+      setTokenOpen(false);
+      setTokenAccess("");
+      setTokenRefresh("");
+      setTokenName("");
+      await loadOverview(clientKey);
+    } catch (cause) {
+      // 错误留在弹窗里（不 toast）：用户要照着提示改 token，弹窗关掉就看不见了。
+      setTokenError(api.asError(cause));
+    } finally {
+      setTokenBusy(false);
+    }
+  }
+
   async function onRename() {
     if (!clientKey || !renameTarget || !renameName.trim()) return;
     try {
@@ -1312,6 +1354,19 @@ export default function TraeSwitchPage() {
           >
             <UserPlus className="size-4" />
             扫码添加账号
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setTokenOpen(true);
+              setTokenError(null);
+            }}
+            disabled={!selected || busy}
+            title="直接粘贴已有的 access_token 添加账号：不重走授权、不发网络请求，本地就能校验"
+          >
+            <KeyRound className="size-4" />
+            手动填 token
           </Button>
           <Button
             variant="outline"
@@ -1920,6 +1975,107 @@ export default function TraeSwitchPage() {
 
       {/* 切换到某账号：与 WorkBuddy 的切号弹窗**逐项同构** ——
           头部说明 + 会话清单（当前账号全部会话 + 与目标账号的关联状态）+ 确认/关闭。 */}
+      {/* 手动填 token（与 WB 页同构）：本地校验，不发网络请求 */}
+      <Dialog
+        open={tokenOpen}
+        onOpenChange={(v) => {
+          if (!v && !tokenBusy) {
+            setTokenOpen(false);
+            setTokenError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>手动添加账号（Token）</DialogTitle>
+            <DialogDescription className="break-words">
+              从已登录的 Trae 里复制 token 填进来即可，<span className="text-foreground">不重新走授权</span>。
+              校验只做本地判断（是否三段、有没有 uid、是否过期），不发网络请求。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">
+                access_token <span className="text-destructive">*</span>
+              </span>
+              <textarea
+                value={tokenAccess}
+                onChange={(e) => setTokenAccess(e.target.value)}
+                placeholder="eyJhbGciOiJSUzI1NiIs…（三段式 JWT，可带 Bearer 前缀）"
+                rows={3}
+                spellCheck={false}
+                className="w-full resize-y rounded-lg border border-border bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed outline-none focus:border-primary"
+              />
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">
+                refreshToken（<span className="text-amber-600 dark:text-amber-400">建议填</span>）
+              </span>
+              <textarea
+                value={tokenRefresh}
+                onChange={(e) => setTokenRefresh(e.target.value)}
+                placeholder="不填也能切换，但 token 过期后只能重新抓一次"
+                rows={2}
+                spellCheck={false}
+                className="w-full resize-y rounded-lg border border-border bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed outline-none focus:border-primary"
+              />
+              <span className="block text-[10px] leading-4 text-muted-foreground">
+                Trae 的 refreshToken 不是 JWT（形如 <code className="font-mono">xxxx=.hex</code>），原样粘贴即可。
+              </span>
+            </label>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">显示名（可选）</span>
+              <Input
+                value={tokenName}
+                onChange={(e) => setTokenName(e.target.value)}
+                placeholder="留空则显示 uid"
+                className="h-8 text-xs"
+              />
+            </label>
+
+            <div className="rounded-lg bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
+              <div className="font-medium text-foreground">怎么拿到 token</div>
+              <div className="mt-1">
+                在已登录的 Trae 里打开 DevTools（Ctrl+Shift+I）→ Application → Local Storage / Cookies，
+                或看任意请求的 <code className="font-mono">authorization: Bearer …</code>；整段复制即可。
+              </div>
+              <div className="mt-1">
+                这类账号没有私钥：能查积分、能切换，但 <span className="text-foreground">token 过期后不会自动续期</span>，
+                到期前请用官方客户端重新登录一次。
+              </div>
+            </div>
+
+            {tokenError && (
+              <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                <span className="break-all">{tokenError}</span>
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={tokenBusy}
+              onClick={() => {
+                setTokenOpen(false);
+                setTokenError(null);
+              }}
+            >
+              取消
+            </Button>
+            <Button size="sm" disabled={tokenBusy || !tokenAccess.trim()} onClick={() => void onSubmitToken()}>
+              {tokenBusy ? <Loader2 className="size-4 animate-spin" /> : null}
+              添加
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={switchTarget !== null}
         onOpenChange={(o) => {

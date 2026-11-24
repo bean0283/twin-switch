@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::modules::config::{self, now_ms, store_dir};
+use crate::modules::config::{self, now_ms};
 use crate::modules::fs_remove::remove_tree_with_retry;
 use crate::modules::workbuddy_accounts;
 use crate::modules::workbuddy_export::{
@@ -61,12 +61,12 @@ fn db_path() -> PathBuf {
 
 /// 回收站根目录。
 fn trash_root() -> PathBuf {
-    store_dir().join("workbuddy_cleanup_trash")
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Trash).join("workbuddy_cleanup_trash")
 }
 
 /// 备份根目录。
 fn backup_root() -> PathBuf {
-    store_dir().join("workbuddy_cleanup_backup")
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Backups).join("workbuddy_cleanup_backup")
 }
 
 /// 形如 `20261004-221500` 的时间戳目录名。
@@ -253,11 +253,26 @@ pub fn cached(force: bool) -> Result<Value, String> {
 pub fn scan() -> Result<Value, String> {
     let root = data_root();
     if !workbuddy_source::is_available() {
+        // ⚠️ **形状必须与正常返回完全一致**（issue #26：少了 `large_holdings`，
+        // 前端 `scan.large_holdings.length` 直接抛 TypeError，整页白屏、连首页都点不回去）。
+        // 「没装客户端」是正常状态，不是异常路径，不该让界面少字段。
         return Ok(json!({
             "available": false,
             "data_root": root.to_string_lossy(),
+            "db_path": "",
+            "running": false,
+            "exe": Value::Null,
+            "generated_at": now_ms(),
+            "log_keep_days": LOG_KEEP_DAYS,
             "categories": [],
-            "totals": { "count": 0, "bytes": 0 },
+            "totals": {
+                "count": 0,
+                "bytes": 0,
+                "recommended_count": 0,
+                "recommended_bytes": 0,
+                "sessions": 0,
+            },
+            "large_holdings": Vec::<Value>::new(),
             "trash": trash_info_json(),
         }));
     }

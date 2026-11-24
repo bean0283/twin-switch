@@ -13,6 +13,7 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import { cn } from "@/lib/utils";
 import HomePage from "@/pages/HomePage";
+import { AppErrorBoundary } from "@/components/error-boundary";
 import AccountsHubPage from "@/pages/AccountsHubPage";
 import SessionsHubPage from "@/pages/SessionsHubPage";
 import MaintenanceHubPage from "@/pages/MaintenanceHubPage";
@@ -248,7 +249,10 @@ function Layout() {
           hasUnifiedTitleBar && "pt-16 [&>div]:pt-4",
         )}
       >
-        <Outlet />
+        {/* 错误边界只包内容区：某页崩了，侧栏仍可点（issue #26「只能退出重开」的根治）。 */}
+        <AppErrorBoundary>
+          <Outlet />
+        </AppErrorBoundary>
       </main>
     </div>
   );

@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { DataPathsCard } from "@/components/data-paths-card";
 import { QoderMachineCard } from "@/components/qoder-machine-card";
 import { QinglongCard } from "@/components/qinglong-card";
 import { PillTabs } from "@/components/pill-tabs";
@@ -1541,6 +1542,10 @@ export default function SettingsPage() {
           设置读取失败时它照样能用（换电脑签不了正需要它）。
           但它属于「这台机器上的客户端」，所以跟着「客户端」分区走，不在别的分区里晃。 */}
       {tab === "client" && <QoderMachineCard />}
+
+      {/* 数据目录：缓存/备份/导出/回收站可换盘；核心数据不可改。
+          放在加载态外面 —— 设置读失败时也要能改路径（正是磁盘紧张时最需要）。 */}
+      <div className="mt-3">{<DataPathsCard />}</div>
 
       {/* 有未保存改动时的浮动保存条。
           ⚠️ 分区之后，「保存」按钮原来只存在于「备份」和「诊断」两栏里 ——

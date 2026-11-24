@@ -6,6 +6,7 @@ import {
   ExternalLink,
   FileDown,
   FileUp,
+  FolderCog,
   KeyRound,
   Loader2,
   LogIn,
@@ -305,6 +306,19 @@ export default function WorkbuddySwitchPage() {
 
   // OAuth 扫码
   const [oauth, setOauth] = useState<WorkbuddyOAuthStart | null>(null);
+  /** 数据目录弹窗（issue #26：把 `~/.workbuddy` 挪到别的盘 / 做成 junction 时手动指定）。 */
+  const [dirOpen, setDirOpen] = useState(false);
+  const [dirValue, setDirValue] = useState("");
+  const [dirInfo, setDirInfo] = useState<{
+    current: string;
+    override?: string | null;
+    available: boolean;
+    hasProjects: boolean;
+    hasDb: boolean;
+  } | null>(null);
+  const [dirBusy, setDirBusy] = useState(false);
+  const [dirError, setDirError] = useState<string | null>(null);
+
   /** 手动添加 token 弹窗。走这条路径**不消耗 re 额度**（不再走一次授权）。 */
   const [tokenOpen, setTokenOpen] = useState(false);
   const [tokenAccess, setTokenAccess] = useState("");
@@ -660,6 +674,55 @@ export default function WorkbuddySwitchPage() {
    * ⚠️ 以前是 Blob + `a.download` 让浏览器下载：落点由 WebView 决定，
    *    用户拿完根本不知道文件在哪，也没有路径能「打开给我看」。
    */
+  /** 打开「数据目录」弹窗：先读当前值（含是否已手动指定）。 */
+  async function openDirDialog() {
+    setDirOpen(true);
+    setDirError(null);
+    try {
+      const r = await api.workbuddyDataRootGet();
+      if (!r.ok) throw new Error(r.error || "读取失败");
+      setDirInfo({
+        current: r.current,
+        override: r.override ?? null,
+        available: r.available,
+        hasProjects: r.hasProjects,
+        hasDb: r.hasDb,
+      });
+      setDirValue(r.current);
+    } catch (e) {
+      setDirError(api.asError(e).split("\n")[0]);
+    }
+  }
+
+  async function saveDir(path: string | null) {
+    setDirBusy(true);
+    setDirError(null);
+    try {
+      const r = await api.workbuddyDataRootSet(path);
+      const info = await api.workbuddyDataRootGet();
+      setDirInfo({
+        current: info.current,
+        override: info.override ?? null,
+        available: info.available,
+        hasProjects: info.hasProjects,
+        hasDb: info.hasDb,
+      });
+      setDirValue(info.current);
+      if (!r.available) {
+        // 保存成功但目录不像 WB 数据根：说清缺什么，不假装成功。
+        setDirError("已保存，但这个目录里没找到 projects/ 或 workbuddy.db —— 请确认选的是 WorkBuddy 数据目录");
+      } else {
+        toast.success("数据目录已更新", { description: r.current });
+        setDirOpen(false);
+        await load();
+      }
+    } catch (e) {
+      setDirError(api.asError(e).split("\n")[0]);
+    } finally {
+      setDirBusy(false);
+    }
+  }
+
   const runExport = async () => {
     setBusyId("export");
     try {
@@ -807,6 +870,15 @@ export default function WorkbuddySwitchPage() {
               改为 `main.tsx` 启动时自动导入（幂等，只搬明文，本地已可用的不覆盖）。
               删按钮时**必须**同步改掉指着它的文案（积分卡片红字 + 首页注意事项），
               否则就是 T42 那个坑的反面：入口没了、提示还在叫用户去点。 */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void openDirDialog()}
+            title="指定 WorkBuddy 数据目录：把 ~/.workbuddy 挪到别的盘、或做成 junction 后，在这里指过去"
+          >
+            <FolderCog className="size-4" />
+            数据目录
+          </Button>
           <Button variant="outline" size="sm" onClick={() => void runExport()} disabled={busyId !== null}>
             <FileDown className="size-4" />
             导出账号包
@@ -852,6 +924,79 @@ export default function WorkbuddySwitchPage() {
       )}
 
       {/* 手动添加 token：不走授权流程，不消耗 re 额度 */}
+      {/* 数据目录（issue #26）：默认 ~/.workbuddy；C 盘紧张/做过 junction 时手动指过去 */}
+      <Dialog open={dirOpen} onOpenChange={(v) => (v ? null : setDirOpen(false))}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>WorkBuddy 数据目录</DialogTitle>
+            <DialogDescription className="break-words">
+              工具默认读 <code className="font-mono">~/.workbuddy</code>。如果你把它挪到了别的盘、
+              或做成了目录映射（junction / 软链），在这里指过去即可。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-lg bg-muted/40 px-3 py-2 text-[11px]">
+              <div>
+                当前使用：<code className="break-all font-mono">{dirInfo?.current ?? "读取中…"}</code>
+              </div>
+              <div className="mt-1 text-muted-foreground">
+                {dirInfo
+                  ? dirInfo.available
+                    ? `已就绪（${dirInfo.override ? "手动指定" : "默认目录"}）`
+                    : `不可用：${dirInfo.hasProjects ? "" : "缺 projects/ 目录 "}${dirInfo.hasDb ? "" : "缺 workbuddy.db"}`
+                  : "—"}
+              </div>
+            </div>
+
+            <label className="block space-y-1">
+              <span className="text-xs font-medium">指定新的数据目录</span>
+              <Input
+                value={dirValue}
+                onChange={(e) => setDirValue(e.target.value)}
+                placeholder="例如 D://WorkBuddyData"
+                className="h-8 font-mono text-xs"
+              />
+              <span className="block text-[10px] leading-4 text-muted-foreground">
+                这个目录里应该直接能看到 <code className="font-mono">projects/</code> 和{" "}
+                <code className="font-mono">workbuddy.db</code>（不是它们的上一级）。
+              </span>
+            </label>
+
+            {dirError && (
+              <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                <span className="break-all">{dirError}</span>
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={dirBusy || !dirInfo?.override}
+              onClick={() => void saveDir(null)}
+              title="清除手动指定，回到 ~/.workbuddy"
+            >
+              恢复默认
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={dirBusy}
+              onClick={() => setDirOpen(false)}
+            >
+              取消
+            </Button>
+            <Button size="sm" disabled={dirBusy || !dirValue.trim()} onClick={() => void saveDir(dirValue.trim())}>
+              {dirBusy ? <Loader2 className="size-4 animate-spin" /> : null}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={tokenOpen}
         onOpenChange={(v) => {

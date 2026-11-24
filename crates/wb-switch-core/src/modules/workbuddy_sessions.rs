@@ -716,7 +716,7 @@ pub fn export_markdown(uid: &str, cid: &str) -> Result<Value, String> {
     let body = workbuddy_source::load_body(cid)?;
     let title = body.ai_title.clone().unwrap_or_else(|| row.title.clone());
     let text = render_markdown(&title, cid, &body.turns);
-    let dir = store_dir().join("exports").join("workbuddy");
+    let dir = crate::modules::config::data_dir(crate::modules::config::DataKind::Exports).join("exports").join("workbuddy");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
     let short: String = cid.chars().take(8).collect();
     let path = dir.join(format!("{}-{short}.md", safe_file_name(&title)));

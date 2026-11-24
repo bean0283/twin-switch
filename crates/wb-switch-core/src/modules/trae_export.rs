@@ -16,12 +16,12 @@ use crate::modules::trae_discover::get_client;
 
 /// 解密库路径：`<工具目录>/trae/decrypted/<clientKey>.db`。
 pub fn decrypted_db_path(client_key: &str) -> PathBuf {
-    store_dir().join("trae").join("decrypted").join(format!("{client_key}.db"))
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Cache).join("trae").join("decrypted").join(format!("{client_key}.db"))
 }
 
 /// 解密快照的元信息文件。
 pub fn snapshot_meta_path(client_key: &str) -> PathBuf {
-    store_dir()
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Cache)
         .join("trae")
         .join("decrypted")
         .join(format!("{client_key}.db.meta.json"))
@@ -30,7 +30,7 @@ pub fn snapshot_meta_path(client_key: &str) -> PathBuf {
 /// 「读取视图」明文路径：实时库 WAL 有待合并帧时，用快照的**副本**合并 WAL，
 /// 保证快照本体始终是「实时库的纯解密结果」（导入流程把它当作差异比对的基准）。
 pub fn decrypted_view_path(client_key: &str) -> PathBuf {
-    store_dir()
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Cache)
         .join("trae")
         .join("decrypted")
         .join(format!("{client_key}.view.db"))
@@ -306,7 +306,7 @@ pub fn import_backup_dir() -> PathBuf {
 
 /// WorkBuddy → Trae 导入的整库备份目录。
 pub fn wb_import_backup_dir() -> PathBuf {
-    store_dir().join("workbuddy_import_backup")
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Backups).join("workbuddy_import_backup")
 }
 
 /// 递归统计一个路径的字节数（文件即自身大小，目录累加）。
@@ -620,7 +620,7 @@ pub fn cleanup_working_files() -> Value {
     }
 
     // 解密快照：直接删，下次刷新会按存盘密钥重新生成
-    let snap_dir = store_dir().join("trae").join("decrypted");
+    let snap_dir = crate::modules::config::data_dir(crate::modules::config::DataKind::Cache).join("trae").join("decrypted");
     let mut snap_freed = 0u64;
     let mut snap_n = 0usize;
     if let Ok(rd) = std::fs::read_dir(&snap_dir) {

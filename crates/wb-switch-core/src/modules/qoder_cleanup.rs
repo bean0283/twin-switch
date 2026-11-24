@@ -46,14 +46,14 @@ pub fn data_root(region: QoderRegion) -> Option<PathBuf> {
 
 /// 我们自己的备份目录（写库前备份就放这）。
 pub fn backup_root() -> PathBuf {
-    crate::modules::config::store_dir()
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Backups)
         .join("qoder")
         .join("backups")
 }
 
 /// 本页回收站根目录。
 pub fn trash_root() -> PathBuf {
-    crate::modules::config::store_dir()
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Trash)
         .join("qoder")
         .join("trash")
 }
@@ -468,7 +468,7 @@ mod tests {
             &trash_root().join("20261024-101010").join("001")
         ));
         assert!(!must_hard_remove(
-            &crate::modules::config::store_dir().join("qoder").join("backups")
+            &crate::modules::config::data_dir(crate::modules::config::DataKind::Backups).join("qoder").join("backups")
         ));
     }
 }

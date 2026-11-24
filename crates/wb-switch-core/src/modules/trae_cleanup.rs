@@ -101,7 +101,7 @@ fn id_of(prefix: &str, p: &Path) -> String {
 
 /// 本页回收站根目录。
 pub fn trash_root() -> PathBuf {
-    store_dir().join("trash")
+    crate::modules::config::data_dir(crate::modules::config::DataKind::Trash).join("trash")
 }
 
 /// 硬删除（文件 / 目录 / 符号链接）。
@@ -399,7 +399,7 @@ fn scan_tool_residue() -> Value {
         (import_backup_dir(), "分批导入的整库备份", "import_backup"),
         (wb_import_backup_dir(), "WorkBuddy 导入的整库备份", "wb_import_backup"),
         (
-            store_dir().join("workbuddy_export_backup"),
+            crate::modules::config::data_dir(crate::modules::config::DataKind::Backups).join("workbuddy_export_backup"),
             "导出到 WorkBuddy 前的整库备份",
             "wb_export_backup",
         ),
@@ -512,7 +512,7 @@ fn scan_tool_residue() -> Value {
         (store_dir().join("trae").join("delete_tmp"), "删除临时目录", "删除中断留下的中间文件", true),
         (store_dir().join("trae").join("edit_tmp"), "编辑回写临时目录", "改回合中断留下的中间文件", true),
         (store_dir().join("trae").join("heal_tmp"), "修复临时目录", "修复整库中断留下的中间文件", true),
-        (store_dir().join("trae").join("decrypted"), "解密快照", "读取会话时的解密副本，删后下次读取自动重建", true),
+        (crate::modules::config::data_dir(crate::modules::config::DataKind::Cache).join("trae").join("decrypted"), "解密快照", "读取会话时的解密副本，删后下次读取自动重建", true),
         (store_dir().join("trae").join("logs"), "工具运行日志", "", true),
         (export_dir(), "导出产物（Markdown）", "「导出」功能生成的文件", false),
     ];
